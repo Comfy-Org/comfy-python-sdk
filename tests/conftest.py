@@ -2,8 +2,8 @@
 
 Keeps the SDK's own test suite independent of a real v2 server or proxy. Each
 test configures ``server.state`` to drive a specific scenario (dedup hit, hash
-mismatch, queue-full-then-ok, SSE reconnect, ...), then points a ``Comfy`` client
-at ``server.base_url``.
+mismatch, queue-full-then-ok, SSE reconnect, ...); the ``server`` fixture points
+the SDK at the stub by setting ``COMFY_BASE_URL``.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
+
+from comfy_sdk import BASE_URL_ENV_VAR
 
 
 @dataclass
@@ -370,9 +372,25 @@ def _stop_server(srv: _Server) -> None:
     srv._thread.join(timeout=5)  # type: ignore[attr-defined]
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_base_url(request, monkeypatch):
+    """Keep a developer's own ``COMFY_BASE_URL`` out of the suite.
+
+    ``tests/integration`` is the exception — that suite is pointed at a live
+    deployment by this very variable. Restoring it through ``monkeypatch``
+    leaves the environment as it was found, either way.
+    """
+    if "integration" in request.path.parts:
+        return
+    monkeypatch.delenv(BASE_URL_ENV_VAR, raising=False)
+
+
 @pytest.fixture
-def server():
+def server(monkeypatch):
     srv = _start_server()
+    # Clients read their target from the environment, so pointing them at the
+    # stub is part of standing it up: tests just construct ``Comfy()``.
+    monkeypatch.setenv(BASE_URL_ENV_VAR, srv.base_url)
     try:
         yield srv
     finally:

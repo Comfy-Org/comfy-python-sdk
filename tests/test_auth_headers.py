@@ -20,7 +20,7 @@ def _wf(client: Comfy):
 
 
 def test_no_api_key_sends_no_authorization_header_at_all(server) -> None:
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.submit(_wf(client))
         job.refresh()
     assert server.state.last_auth_header == ""
@@ -28,7 +28,7 @@ def test_no_api_key_sends_no_authorization_header_at_all(server) -> None:
 
 def test_api_key_sends_bearer_token_on_every_request(server) -> None:
     server.state.require_auth = True
-    with Comfy(server.base_url, api_key="ck_live_test") as client:
+    with Comfy(api_key="ck_live_test") as client:
         job = client.submit(_wf(client))
         job.refresh()
     assert server.state.last_auth_header == "Bearer ck_live_test"

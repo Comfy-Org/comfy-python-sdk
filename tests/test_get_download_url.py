@@ -78,7 +78,7 @@ async def test_async_cloud_redirect_returns_signed_url_and_computed_expiry(serve
 
 def test_output_get_download_url_on_cloud_redirect(server) -> None:
     server.state.redirect_content_to = _SIGNED_URL
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.run(_wf(client))
         out = job.get_outputs("13")[0]
         download = out.get_download_url()
@@ -107,7 +107,7 @@ async def test_async_self_hosted_returns_content_url_and_no_expiry(server) -> No
 
 
 def test_output_get_download_url_on_self_hosted(server) -> None:
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.run(_wf(client))
         out = job.get_outputs("13")[0]
         download = out.get_download_url()  # must not throw
@@ -123,7 +123,7 @@ def test_multi_output_job_each_get_download_url_is_distinct(server) -> None:
         _output_json("13", "asset_out_01"),
         _output_json("14", "asset_out_02"),
     ]
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.run(_wf(client))
         urls = {out.id: out.get_download_url().url for out in job.outputs}
 
@@ -138,7 +138,7 @@ async def test_async_multi_output_job_each_get_download_url_is_distinct(server) 
         _output_json("13", "asset_out_01"),
         _output_json("14", "asset_out_02"),
     ]
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         job = await client.run(_wf(client))
         urls = {}
         for out in job.outputs:
@@ -157,7 +157,7 @@ def test_redirect_target_never_contacted_bearer_never_leaked(server, second_serv
     redirect_url = f"{second_server.base_url}/api/v2/assets/asset_out_01/content"
     server.state.redirect_content_to = redirect_url
 
-    with Comfy(server.base_url, api_key="ck_super_secret") as client:
+    with Comfy(api_key="ck_super_secret") as client:
         job = client.run(_wf(client))
         out = job.get_outputs("13")[0]
         download = out.get_download_url()

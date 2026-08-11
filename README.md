@@ -17,8 +17,9 @@
 ---
 
 Python SDK for running ComfyUI workflows via the **Comfy API v2**. The same
-code runs against a self-hosted ComfyUI instance, Comfy Cloud, or a serverless
-deployment — only the base URL and an optional API key change.
+code runs against Comfy Cloud, a serverless deployment, or a self-hosted
+ComfyUI instance — only the `COMFY_BASE_URL` environment variable and an
+optional API key change.
 
 ## Requirements and install
 
@@ -53,8 +54,7 @@ The SDK works against a ComfyUI instance with **Comfy API v2**. Comfy Cloud and 
 ```python
 from comfy_sdk import Comfy
 
-client = Comfy("http://127.0.0.1:8189")                              # Self-hosted, no API key
-# client = Comfy("https://cloud.comfy.org", api_key="comfyui-...")   # Comfy Cloud
+client = Comfy(api_key="comfyui-...")   # Comfy Cloud
 
 wf = client.workflows.from_file("workflow_api.json")
 
@@ -73,22 +73,40 @@ for output in job.get_outputs("9"):
 
 ## Authentication — one client, per-surface key
 
-| Surface | Example base URL | `api_key` |
-|---|---|---|
-| Self-hosted ComfyUI (behind the API proxy) | `http://127.0.0.1:8189` | Omit — no key is sent, even implicitly |
-| Comfy Cloud | `https://cloud.comfy.org` — the default, may be omitted | Required |
-| Serverless deployment | `https://<deployment>.comfy.org` | Required |
+| Surface | `api_key` |
+|---|---|
+| Comfy Cloud (`https://cloud.comfy.org`) — the default | Required |
+| Serverless deployment | Required |
+| Self-hosted ComfyUI (behind the API proxy) | Omit — no key is sent, even implicitly |
 
 ```python
-client = Comfy(api_key="comfyui-...")                                    # Comfy Cloud (default)
-client = Comfy("http://127.0.0.1:8189")                                  # Self-hosted
-client = Comfy("https://<deployment>.comfy.org", api_key="comfyui-...")  # Serverless
+client = Comfy(api_key="comfyui-...")   # Comfy Cloud
 ```
 
-`AsyncComfy` takes the same two arguments. A key is only ever attached to
-requests aimed at the configured `base_url`'s own origin — a server-returned
-follow-up link (`job.urls.self`/`cancel`/`events`, or a redirected asset
-download) pointing anywhere else never receives it.
+`AsyncComfy` takes the same arguments. A key is only ever attached to requests
+aimed at the target deployment's own origin — a server-returned follow-up link
+(`job.urls.self`/`cancel`/`events`, or a redirected asset download) pointing
+anywhere else never receives it.
+
+### Targeting another deployment
+
+`Comfy()` points at Comfy Cloud and takes no base-URL argument. To run against
+a serverless deployment or a self-hosted instance behind
+[comfy-api-proxy](https://github.com/Comfy-Org/comfy-api-proxy), set
+`COMFY_BASE_URL` in the environment:
+
+```bash
+export COMFY_BASE_URL="https://<deployment>.run.comfy.app"  # serverless
+export COMFY_BASE_URL="http://127.0.0.1:8189"               # self-hosted proxy
+```
+
+It is read each time a client is constructed, must be an `http(s)` URL, and an
+unset or blank value (including whitespace-only) means Comfy Cloud.
+
+Upgrading from an earlier version: `Comfy("<url>", "<key>")` becomes
+`Comfy(api_key="<key>")` with `COMFY_BASE_URL` set. `api_key` is keyword-only,
+so the old positional call raises `TypeError` rather than reading a URL as a
+key.
 
 The SDK identifies itself via a `User-Agent` header (for support and usage
 analytics) — this is request metadata only; no other data is collected. Pass
@@ -200,7 +218,7 @@ add `await` / `async for`:
 from comfy_sdk import AsyncComfy
 
 async def main() -> None:
-    async with AsyncComfy("http://127.0.0.1:8189") as client:
+    async with AsyncComfy(api_key="comfyui-...") as client:
         wf = client.workflows.from_file("workflow_api.json")
         job = await client.run(wf)
         await job.outputs[0].to_file("out.png")

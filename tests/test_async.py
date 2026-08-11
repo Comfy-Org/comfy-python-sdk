@@ -13,7 +13,7 @@ def _wf(client: AsyncComfy):
 
 async def test_async_run_and_download(server, tmp_path) -> None:
     server.state.polls_to_succeed = 2
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         job = await client.run(_wf(client))
         assert job.status == "succeeded"
         out = job.get_outputs("13")[0]
@@ -22,7 +22,7 @@ async def test_async_run_and_download(server, tmp_path) -> None:
 
 
 async def test_async_events_stream_to_terminal(server) -> None:
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         job = await client.submit(_wf(client))
         seen = [e async for e in job.events()]
     assert isinstance(seen[-1], StatusChange)
@@ -36,7 +36,7 @@ async def test_async_sse_reconnect_with_no_replay(server) -> None:
     # the async client must reconnect (fresh live frames, nothing replayed).
     server.state.sse_mode = "reconnect"
     server.state.polls_to_succeed = 1000
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         job = await client.submit(_wf(client))
         seen = [e async for e in job.events()]
 
@@ -53,7 +53,7 @@ async def test_async_range_download_returns_partial(server) -> None:
     # The sync client has range-download coverage (test_download_and_workflows.py);
     # the async `to_bytes(range=...)` path was never exercised.
     server.state.content_bytes = b"0123456789abcdef"
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         job = await client.run(_wf(client))
         out = job.get_outputs("13")[0]
         head = await out.to_bytes(range=(0, 4))
@@ -63,7 +63,7 @@ async def test_async_range_download_returns_partial(server) -> None:
 async def test_async_dedup_fast_path(server, tmp_path) -> None:
     p = tmp_path / "photo.png"
     p.write_bytes(b"async-dedup-bytes")
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         asset = client.assets.from_file(p)
         server.state.known_hashes.add(asset.hash)
         asset_id = await asset.commit()
@@ -79,7 +79,7 @@ async def test_async_real_upload_of_fresh_file_succeeds(server, tmp_path) -> Non
     # AsyncClient instance") the moment httpx tries to send it.
     p = tmp_path / "fresh.bin"
     p.write_bytes(b"a fresh, never-before-seen payload that forces a real upload")
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         asset = client.assets.from_file(p)
         asset_id = await asset.commit()
     assert asset_id == "asset_uploaded_01"
@@ -90,13 +90,13 @@ async def test_async_real_upload_of_fresh_file_succeeds(server, tmp_path) -> Non
 
 async def test_async_error_mapping(server) -> None:
     server.state.job_error = (422, "missing_asset")
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         with pytest.raises(MissingAsset):
             await client.submit(_wf(client))
 
 
 async def test_async_cancel_reaches_server(server) -> None:
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         job = await client.submit(_wf(client))
         await job.cancel()
         assert job.status == "canceling"
@@ -104,7 +104,7 @@ async def test_async_cancel_reaches_server(server) -> None:
 
 async def test_async_wait_raises_timeout(server) -> None:
     server.state.polls_to_succeed = 10_000
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         job = await client.submit(_wf(client))
         with pytest.raises(TimeoutError):
             await job.wait(timeout=0.05)
@@ -114,7 +114,7 @@ async def test_async_core_asset_substitution(server, tmp_path) -> None:
     # The async commit -> mint -> substitute pipeline, mirroring the sync test.
     p = tmp_path / "photo.png"
     p.write_bytes(b"pixels")
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         asset = client.assets.from_file(p)
         wf = client.workflows.from_json(
             {"10": {"class_type": "LoadImage", "inputs": {"image": asset}}}
@@ -127,7 +127,7 @@ async def test_async_core_asset_substitution(server, tmp_path) -> None:
 
 async def test_async_submit_with_api_key_sends_extra_data(server) -> None:
     # Mirrors the sync `test_submit_with_api_key_sends_extra_data_sibling_of_workflow`.
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         await client.submit(_wf(client), api_key="comfyui-secret-key")
     body = server.state.last_jobs_body
     assert body is not None
@@ -135,7 +135,7 @@ async def test_async_submit_with_api_key_sends_extra_data(server) -> None:
 
 
 async def test_async_submit_without_api_key_omits_extra_data(server) -> None:
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         await client.submit(_wf(client))
     body = server.state.last_jobs_body
     assert body is not None
@@ -144,6 +144,6 @@ async def test_async_submit_without_api_key_omits_extra_data(server) -> None:
 
 async def test_async_queue_full_retries_with_retry_after(server) -> None:
     server.state.queue_full_times = 2  # 429 twice, then 201
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         await client.submit(_wf(client))
     assert server.state.submit_count == 3
