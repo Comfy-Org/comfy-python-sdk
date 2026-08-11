@@ -94,9 +94,6 @@ def _edit_workflow(image_ref: object) -> tuple[dict, str]:
 
 @pytest.fixture(scope="module")
 def client() -> Comfy:
-    # tests/conftest.py scrubs COMFY_BASE_URL so the unit suite can never reach
-    # a real deployment; this module is the one that wants it back.
-    os.environ[BASE_URL_ENV_VAR] = BASE_URL
     c = Comfy(api_key=API_KEY)
     yield c
     c.close()

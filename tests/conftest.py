@@ -373,8 +373,15 @@ def _stop_server(srv: _Server) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _no_ambient_base_url(monkeypatch):
-    """Keep a developer's own ``COMFY_BASE_URL`` out of the suite."""
+def _no_ambient_base_url(request, monkeypatch):
+    """Keep a developer's own ``COMFY_BASE_URL`` out of the suite.
+
+    ``tests/integration`` is the exception — that suite is pointed at a live
+    deployment by this very variable. Restoring it through ``monkeypatch``
+    leaves the environment as it was found, either way.
+    """
+    if "integration" in request.path.parts:
+        return
     monkeypatch.delenv(BASE_URL_ENV_VAR, raising=False)
 
 
