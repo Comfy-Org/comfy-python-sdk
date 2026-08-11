@@ -61,12 +61,20 @@ def _resolve_base_url() -> str:
         # raises only when .port is read — do it here rather than let httpx
         # fail later with a murkier message.
         _port = parsed.port
-        valid = parsed.scheme in ("http", "https") and bool(parsed.netloc)
+        # A query or fragment would land in the middle of every request URL,
+        # since the transport builds those by appending the API path.
+        valid = (
+            parsed.scheme in ("http", "https")
+            and bool(parsed.netloc)
+            and not parsed.query
+            and not parsed.fragment
+        )
     except ValueError:
         valid = False
     if not valid:
         raise ValueError(
-            f"{BASE_URL_ENV_VAR} must be an http(s) URL (e.g. 'http://127.0.0.1:8189'); got {raw!r}"
+            f"{BASE_URL_ENV_VAR} must be an http(s) URL with no query or fragment "
+            f"(e.g. 'http://127.0.0.1:8189'); got {raw!r}"
         )
     return raw
 

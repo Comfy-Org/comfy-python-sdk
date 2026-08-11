@@ -64,6 +64,8 @@ def test_surrounding_whitespace_is_ignored(monkeypatch) -> None:
         "http://",  # no host
         "http://127.0.0.1:bad",  # non-numeric port
         "http://127.0.0.1:99999",  # port out of range
+        "https://cloud.comfy.org?x=1",  # query would break every request URL
+        "https://cloud.comfy.org#frag",
         "not a url",
     ],
 )
@@ -88,6 +90,12 @@ async def test_async_env_var_selects_the_deployment(monkeypatch) -> None:
     monkeypatch.setenv(BASE_URL_ENV_VAR, LOCAL)
     async with AsyncComfy() as client:
         assert job_url(client) == LOCAL + "/api/v2/jobs/j1"
+
+
+async def test_async_malformed_env_var_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv(BASE_URL_ENV_VAR, "ftp://cloud.comfy.org")
+    with pytest.raises(ValueError, match=BASE_URL_ENV_VAR):
+        AsyncComfy()
 
 
 async def test_async_rejects_positional_base_url() -> None:
