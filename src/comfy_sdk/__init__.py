@@ -2,7 +2,8 @@
 
 The thick, hand-written layer integrators import. It runs an API-format workflow
 against any Comfy API v2 surface (self-hosted proxy, Comfy Cloud, serverless) —
-the only per-surface difference is the base URL and an optional key — and owns
+the only per-surface difference is the ``COMFY_BASE_URL`` environment variable
+and an optional key — and owns
 everything a generator cannot produce: local blake3 dedup-upload, ``core/ASSET``
 substitution, idempotent submit, live SSE with a poll-authoritative backstop,
 range-aware downloads, and typed errors. It is layered over ``comfy_low`` (the
@@ -12,8 +13,9 @@ Quickstart::
 
     from comfy_sdk import Comfy
 
-    client = Comfy("http://127.0.0.1:8189")            # self-hosted, no key
-    # client = Comfy(api_key="comfyui-...")             # Comfy Cloud (default)
+    client = Comfy(api_key="comfyui-...")              # Comfy Cloud
+    # export COMFY_BASE_URL=http://127.0.0.1:8189      # self-hosted, no key
+    # client = Comfy()
 
     wf = client.workflows.from_file("workflow_api.json")
     asset = client.assets.from_file("photo.png")       # lazy; uploaded on use
@@ -29,7 +31,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
 from .assets import Asset, AssetFactory, AsyncAsset, AsyncAssetFactory
-from .client import COMFY_CLOUD_BASE_URL, AsyncComfy, Comfy
+from .client import BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL, AsyncComfy, Comfy
 from .events import (
     Event,
     Log,
@@ -69,6 +71,7 @@ __all__ = [
     # clients
     "Comfy",
     "COMFY_CLOUD_BASE_URL",
+    "BASE_URL_ENV_VAR",
     "AsyncComfy",
     # assets / workflows / jobs / outputs
     "Asset",

@@ -15,7 +15,7 @@ def test_dedup_fast_path_skips_upload(server, tmp_path) -> None:
     p = tmp_path / "photo.png"
     p.write_bytes(data)
 
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         asset = client.assets.from_file(p)
         # Tell the server it already has these exact bytes (dedup hit).
         server.state.known_hashes.add(asset.hash)
@@ -48,7 +48,7 @@ def test_streaming_upload_does_not_buffer_whole_file(server, monkeypatch) -> Non
     payload = b"x" * (1024 * 1024)
     recorder = _ReadRecorder(payload)
 
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         # from_stream buffers to hash, so drive the low transport directly with a
         # recording file object to observe how the body is read during upload.
         low = client._low
@@ -74,7 +74,7 @@ def test_post_assets_sends_one_multipart_part_per_tag(server, tmp_path) -> None:
     p = tmp_path / "tagged.bin"
     p.write_bytes(payload)
 
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         with open(p, "rb") as fh:
             client._low.post_assets(
                 fh,
@@ -95,7 +95,7 @@ def test_hash_mismatch_surfaced_without_blind_retry(server, tmp_path) -> None:
     p = tmp_path / "photo.png"
     p.write_bytes(b"some-bytes-that-will-mismatch")
 
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         asset = client.assets.from_file(p)
         with pytest.raises(HashMismatch):
             asset.commit()

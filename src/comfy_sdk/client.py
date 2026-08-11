@@ -5,6 +5,10 @@ namespaces plus ``submit`` / ``run`` — over a shared sans-IO core. Only the
 awaiting methods are duplicated; the rules (idempotency, 429 backoff, asset
 materialization, UI-format detection) live in ``_core`` and are called from both.
 
+Both clients target Comfy Cloud. Another deployment — a self-hosted proxy or a
+serverless one — is selected through the ``COMFY_BASE_URL`` environment
+variable; there is no base-URL constructor parameter.
+
 Per-surface key behavior is inherited from ``comfy_low``: pass ``api_key`` to
 the constructor for Comfy Cloud / serverless; leave it unset for a self-hosted
 proxy that has no auth (no credentials are then sent). That constructor key is
@@ -16,8 +20,10 @@ sent in the request body instead.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from comfy_low.errors import ApiError
 from comfy_low.transport import AsyncComfyLow, ComfyLow
@@ -30,11 +36,31 @@ from .workflows import Workflow, WorkflowFactory
 
 # How long to keep retrying a full queue before giving up (seconds).
 _QUEUE_RETRY_BUDGET = 60.0
-#: Base URL of the hosted Comfy Cloud deployment, used when none is given.
-#: Self-hosted ComfyUI and serverless deployments must pass their own base_url.
+#: Base URL of the hosted Comfy Cloud deployment — where a client points by default.
 COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"
+#: Environment variable that redirects a client at another deployment.
+BASE_URL_ENV_VAR = "COMFY_BASE_URL"
 
 _DEFAULT_RETRY_AFTER = 2
+
+
+def _resolve_base_url() -> str:
+    """Comfy Cloud, unless ``COMFY_BASE_URL`` names another deployment.
+
+    Read per construction rather than at import so a process can point
+    successive clients at different deployments. An unset-or-blank variable
+    means Comfy Cloud, so ``COMFY_BASE_URL=`` in a shell profile or ``.env``
+    is not an error.
+    """
+    raw = os.environ.get(BASE_URL_ENV_VAR, "").strip()
+    if not raw:
+        return COMFY_CLOUD_BASE_URL
+    parsed = urlsplit(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(
+            f"{BASE_URL_ENV_VAR} must be an http(s) URL (e.g. 'http://127.0.0.1:8189'); got {raw!r}"
+        )
+    return raw
 
 
 def _guard_ui_format(workflow: Workflow) -> None:
@@ -48,17 +74,21 @@ def _guard_ui_format(workflow: Workflow) -> None:
 
 
 class Comfy:
-    """Synchronous Comfy API v2 client."""
+    """Synchronous Comfy API v2 client.
+
+    Targets Comfy Cloud, or whatever deployment ``COMFY_BASE_URL`` names.
+    ``api_key`` is keyword-only so a pre-``COMFY_BASE_URL`` positional URL
+    fails loudly instead of being read as a key.
+    """
 
     def __init__(
         self,
-        base_url: str = COMFY_CLOUD_BASE_URL,
-        api_key: str | None = None,
         *,
+        api_key: str | None = None,
         timeout: float | None = 30.0,
         client_info: str | None = None,
     ) -> None:
-        self._low = ComfyLow(base_url, api_key, timeout=timeout, client_info=client_info)
+        self._low = ComfyLow(_resolve_base_url(), api_key, timeout=timeout, client_info=client_info)
         self.assets = AssetFactory(self._low)
         self.workflows = WorkflowFactory()
         self.jobs = JobFactory(self._low)
@@ -153,13 +183,14 @@ class AsyncComfy:
 
     def __init__(
         self,
-        base_url: str = COMFY_CLOUD_BASE_URL,
-        api_key: str | None = None,
         *,
+        api_key: str | None = None,
         timeout: float | None = 30.0,
         client_info: str | None = None,
     ) -> None:
-        self._low = AsyncComfyLow(base_url, api_key, timeout=timeout, client_info=client_info)
+        self._low = AsyncComfyLow(
+            _resolve_base_url(), api_key, timeout=timeout, client_info=client_info
+        )
         self.assets = AsyncAssetFactory(self._low)
         self.workflows = WorkflowFactory()
         self.jobs = AsyncJobFactory(self._low)

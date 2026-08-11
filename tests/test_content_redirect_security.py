@@ -28,7 +28,7 @@ def test_cross_origin_content_redirect_does_not_leak_bearer_token(server, second
     server.state.redirect_content_to = redirect_url
     second_server.state.content_bytes = b"served-by-a-completely-different-host"
 
-    with Comfy(server.base_url, api_key="ck_super_secret") as client:
+    with Comfy(api_key="ck_super_secret") as client:
         job = client.run(_wf(client))
         out = job.get_outputs("13")[0]
         data = out.to_bytes()
@@ -52,7 +52,7 @@ def test_cross_origin_content_redirect_to_file_does_not_leak_bearer_token(
     server.state.redirect_content_to = redirect_url
     second_server.state.content_bytes = b"also-served-by-the-other-host"
 
-    with Comfy(server.base_url, api_key="ck_super_secret") as client:
+    with Comfy(api_key="ck_super_secret") as client:
         job = client.run(_wf(client))
         out = job.get_outputs("13")[0]
         dest = out.to_file(tmp_path / "out.bin")

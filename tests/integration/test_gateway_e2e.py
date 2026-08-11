@@ -31,10 +31,10 @@ from pathlib import Path
 
 import pytest
 
-from comfy_sdk import Comfy, OutputReady, StatusChange
+from comfy_sdk import BASE_URL_ENV_VAR, Comfy, OutputReady, StatusChange
 from comfy_sdk.events import Event
 
-BASE_URL = os.environ.get("COMFY_BASE_URL")
+BASE_URL = os.environ.get(BASE_URL_ENV_VAR)
 API_KEY = os.environ.get("COMFY_API_KEY")
 INPUT_NAME = "sdk_e2e_input.png"
 WORKFLOW_FILE = os.environ.get("COMFY_WORKFLOW_FILE")
@@ -94,7 +94,10 @@ def _edit_workflow(image_ref: object) -> tuple[dict, str]:
 
 @pytest.fixture(scope="module")
 def client() -> Comfy:
-    c = Comfy(BASE_URL, api_key=API_KEY)
+    # tests/conftest.py scrubs COMFY_BASE_URL so the unit suite can never reach
+    # a real deployment; this module is the one that wants it back.
+    os.environ[BASE_URL_ENV_VAR] = BASE_URL
+    c = Comfy(api_key=API_KEY)
     yield c
     c.close()
 

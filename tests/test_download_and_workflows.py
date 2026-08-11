@@ -12,7 +12,7 @@ def _wf(client: Comfy):
 
 def test_range_download_returns_partial(server) -> None:
     server.state.content_bytes = b"0123456789abcdef"
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.run(_wf(client))
         out = job.get_outputs("13")[0]
         head = out.to_bytes(range=(0, 4))
@@ -24,7 +24,7 @@ def test_range_download_to_file_writes_only_the_requested_slice(server, tmp_path
     # disk through a separate code path (chunked writes, not a bytearray) and
     # had no coverage at all.
     server.state.content_bytes = b"0123456789abcdef"
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.run(_wf(client))
         out = job.get_outputs("13")[0]
         dest = out.to_file(tmp_path / "partial.bin", range=(4, 9))
@@ -32,7 +32,7 @@ def test_range_download_to_file_writes_only_the_requested_slice(server, tmp_path
 
 
 def test_full_download(server, tmp_path) -> None:
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.run(_wf(client))
         out = job.get_outputs("13")[0]
         dest = out.to_file(tmp_path / "out.bin")
@@ -42,7 +42,7 @@ def test_full_download(server, tmp_path) -> None:
 def test_core_asset_substitution(server, tmp_path) -> None:
     p = tmp_path / "photo.png"
     p.write_bytes(b"pixels")
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         server.state.known_hashes  # dedup not seeded -> will upload
         asset = client.assets.from_file(p)
         wf = client.workflows.from_json(

@@ -10,7 +10,7 @@ def _wf(client: Comfy):
 
 
 def test_typed_events_stream_to_terminal(server) -> None:
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.submit(_wf(client))
         seen = list(job.events())
 
@@ -34,7 +34,7 @@ def test_sse_reconnect_with_no_replay(server) -> None:
     # Keep the poll-authoritative backstop reporting "running" so the client
     # reconnects to the stream rather than short-circuiting to terminal on poll.
     server.state.polls_to_succeed = 1000
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.submit(_wf(client))
         seen = list(job.events())
 
@@ -56,7 +56,7 @@ def test_events_polls_to_terminal_when_stream_ends_without_terminal(server) -> N
     # StatusChange instead of reconnecting.
     server.state.sse_mode = "reconnect"  # 1st connection: one progress frame, clean close
     server.state.polls_to_succeed = 1
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.submit(_wf(client))
         seen = list(job.events())
 
@@ -72,7 +72,7 @@ def test_events_end_silently_when_events_endpoint_not_implemented(server) -> Non
     was introduced, ``events()`` raised the protocol-level ``ApiError``
     (code ``not_implemented``, http_status 501)."""
     server.state.events_not_implemented = True
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.submit(_wf(client))
         assert list(job.events()) == []
         assert job.wait().status == "succeeded"
@@ -82,7 +82,7 @@ def test_events_end_silently_when_events_endpoint_not_implemented(server) -> Non
 
 async def test_async_events_end_silently_when_events_endpoint_not_implemented(server) -> None:
     server.state.events_not_implemented = True
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         job = await client.submit(_wf(client))
         assert [e async for e in job.events()] == []
         assert (await job.wait()).status == "succeeded"

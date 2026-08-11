@@ -16,7 +16,7 @@ def _wf(client: Comfy):
 
 
 def test_user_agent_identifies_the_sdk(server) -> None:
-    with Comfy(server.base_url) as client:
+    with Comfy() as client:
         job = client.submit(_wf(client))
         job.refresh()
     ua = server.state.last_user_agent or ""
@@ -26,7 +26,7 @@ def test_user_agent_identifies_the_sdk(server) -> None:
 
 
 def test_client_info_appends_app_token(server) -> None:
-    with Comfy(server.base_url, client_info="glary-bot") as client:
+    with Comfy(client_info="glary-bot") as client:
         job = client.submit(_wf(client))
         job.refresh()
     ua = server.state.last_user_agent or ""
@@ -38,4 +38,4 @@ def test_client_info_rejects_crlf() -> None:
     # A CR/LF in the caller token must never reach the header (no injection).
     for bad in ("evil\r\nX-Injected: 1", "line\nbreak", "carriage\rreturn"):
         with pytest.raises(ValueError):
-            Comfy("https://cloud.comfy.org", client_info=bad)
+            Comfy(client_info=bad)
