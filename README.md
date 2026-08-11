@@ -101,7 +101,12 @@ export COMFY_BASE_URL="http://127.0.0.1:8189"               # self-hosted proxy
 ```
 
 It is read each time a client is constructed, must be an `http(s)` URL, and an
-unset or empty value means Comfy Cloud.
+unset or blank value (including whitespace-only) means Comfy Cloud.
+
+Upgrading from an earlier version: `Comfy("<url>", "<key>")` becomes
+`Comfy(api_key="<key>")` with `COMFY_BASE_URL` set. `api_key` is keyword-only,
+so the old positional call raises `TypeError` rather than reading a URL as a
+key.
 
 The SDK identifies itself via a `User-Agent` header (for support and usage
 analytics) — this is request metadata only; no other data is collected. Pass

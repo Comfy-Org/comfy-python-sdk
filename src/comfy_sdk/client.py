@@ -56,7 +56,15 @@ def _resolve_base_url() -> str:
     if not raw:
         return COMFY_CLOUD_BASE_URL
     parsed = urlsplit(raw)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    try:
+        # urlsplit defers the port check, so a non-numeric or out-of-range one
+        # raises only when .port is read — do it here rather than let httpx
+        # fail later with a murkier message.
+        _port = parsed.port
+        valid = parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except ValueError:
+        valid = False
+    if not valid:
         raise ValueError(
             f"{BASE_URL_ENV_VAR} must be an http(s) URL (e.g. 'http://127.0.0.1:8189'); got {raw!r}"
         )

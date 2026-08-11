@@ -62,6 +62,8 @@ def test_surrounding_whitespace_is_ignored(monkeypatch) -> None:
         "ftp://cloud.comfy.org",  # not http(s)
         "file:///etc/passwd",
         "http://",  # no host
+        "http://127.0.0.1:bad",  # non-numeric port
+        "http://127.0.0.1:99999",  # port out of range
         "not a url",
     ],
 )
