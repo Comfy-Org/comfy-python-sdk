@@ -1,9 +1,8 @@
-# Comfy API v2 — public spec, vendored into this SDK.
+# Comfy API v2 — public specification.
 #
-# GENERATED / VENDORED ONE-WAY — DO NOT HAND-EDIT.
+# GENERATED ONE-WAY — DO NOT HAND-EDIT.
 # Projected automatically from the canonical Comfy API v2 contract and
-# synced in by CI. Change the upstream contract, not this copy: the SDK's
-# own CI regenerates its low layer from this file and FAILS ON DRIFT.
+# synced by CI. Change the upstream contract, not this public copy.
 
 openapi: 3.0.3
 info:
@@ -15,11 +14,12 @@ servers:
   description: Self-hosted (comfy-api-proxy)
 - url: https://cloud.comfy.org
   description: Comfy Cloud
-- url: https://{deployment}.comfy.org
-  description: Serverless deployment (URL shape not final)
+- url: https://{deployment}.run.comfy.app
+  description: Serverless deployment
   variables:
     deployment:
-      default: my-deployment
+      description: DNS-safe deployment id (subdomain label). Staging uses {deployment}.stg.run.comfy.app.
+      default: dep-1234abcd-56ef-7890-abcd-ef1234567890
 security:
 - bearerAuth: []
 - {}
@@ -91,6 +91,12 @@ paths:
                   items:
                     type: string
                   description: Category tags (e.g. `input`).
+                expires_in:
+                  type: integer
+                  minimum: 60
+                  maximum: 604800
+                  description: 'Optional retention override in seconds (60s–7d): the asset''s `expires_at` becomes now + `expires_in`, replacing the platform''s default retention. Implementations without configurable retention ignore it. The bounds apply to this override only — the platform default is operator-configured and may lie outside them.'
+                  example: 86400
       responses:
         '201':
           description: New blob stored; asset minted.
@@ -166,6 +172,12 @@ paths:
                   type: array
                   items:
                     type: string
+                expires_in:
+                  type: integer
+                  minimum: 60
+                  maximum: 604800
+                  description: 'Optional retention override in seconds (60s–7d): the asset''s `expires_at` becomes now + `expires_in`, replacing the platform''s default retention. Implementations without configurable retention ignore it. The bounds apply to this override only — the platform default is operator-configured and may lie outside them.'
+                  example: 86400
       responses:
         '201':
           description: Asset minted over the existing blob.
@@ -231,6 +243,44 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/UpstreamError'
+    delete:
+      operationId: deleteAsset
+      tags:
+      - assets
+      summary: Delete an asset record
+      description: 'Deletes the asset RECORD. The underlying content-addressed blob is
+
+        untouched while any other asset still references it (hash dedup means
+
+        blobs are shared) — deleting an asset never destroys another asset''s
+
+        bytes.
+
+
+        A second delete of the same id returns `404`, indistinguishable from
+
+        an id that never existed or belongs to another account.
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/AssetId'
+      responses:
+        '204':
+          description: Record deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: '`asset_in_use` — the record cannot be deleted while the platform still depends on it. Each surface defines its own holds (for example: a job''s outputs reference the record, or a content-moderation workflow requires it to be preserved); the response body deliberately never says which hold applies.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
         '500':
           $ref: '#/components/responses/UpstreamError'
   /api/v2/assets/{id}/content:
@@ -394,7 +444,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '429':
-          description: '`queue_full` — bounded queue depth reached.'
+          description: '`queue_full` (bounded queue depth reached) or, on deployment-scoped surfaces, `deployment_not_ready` (deployment still provisioning/starting). Disambiguate by `error.code`; both mean back off and retry after `Retry-After`.'
           headers:
             Retry-After:
               $ref: '#/components/headers/RetryAfter'
@@ -573,14 +623,14 @@ components:
       required: true
       schema:
         type: string
-      example: job_01JZTGXW9Q2M4R8V0B1N3P5D7F
+      example: 7f3d2c1b-9a8e-4d6f-b012-3c4d5e6f7a8b
     AssetId:
       name: id
       in: path
       required: true
       schema:
         type: string
-      example: asset_01JZV8Q3M7K2W9X0Y1Z2A3B4C5
+      example: 9f8a1c0d-2b3e-4f56-8a7b-1c2d3e4f5a6b
     BlakeHash:
       name: hash
       in: path
@@ -643,7 +693,7 @@ components:
       properties:
         id:
           type: string
-          example: asset_01JZV8Q3M7K2W9X0Y1Z2A3B4C5
+          example: 9f8a1c0d-2b3e-4f56-8a7b-1c2d3e4f5a6b
         hash:
           type: string
           nullable: true
@@ -673,6 +723,11 @@ components:
         url_expires_at:
           type: string
           format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 'Retention deadline for the asset itself (distinct from `url_expires_at`, the signed URL''s validity). Null or absent means the asset is non-expiring. On a dedup-hit create response the deadline may be later than now + the requested/default retention: re-referencing content extends its retention, never shortens it.'
     Job:
       type: object
       description: One execution of a workflow. Durable from creation until `expires_at`; `outputs` populates incrementally during execution.
@@ -691,7 +746,7 @@ components:
       properties:
         id:
           type: string
-          example: job_01JZTGXW9Q2M4R8V0B1N3P5D7F
+          example: 7f3d2c1b-9a8e-4d6f-b012-3c4d5e6f7a8b
         status:
           $ref: '#/components/schemas/JobStatus'
         created_at:
@@ -755,7 +810,7 @@ components:
         '
     JobUrls:
       type: object
-      description: Embedded follow-up links — follow these, don't build URLs.
+      description: Embedded follow-up links — follow these, don't build URLs. A link is either an absolute URL or a host-relative reference (leading `/`) that already includes any prefix the serving surface is mounted under (e.g. a serverless gateway's `/deployment/{deployment_id}/api/v2`). Clients MUST resolve a host-relative link against the request origin (scheme + authority), never against a configured base URL — joining it to a base URL that carries the same mount prefix duplicates the prefix.
       required:
       - self
       - events
@@ -843,7 +898,7 @@ components:
         id:
           type: string
           description: Asset UUID.
-          example: asset_01JZV9R4N8...
+          example: 9f8a1c0d-2b3e-4f56-...
         hash:
           type: string
           nullable: true
@@ -898,6 +953,18 @@ components:
         `queue_full` (429 + Retry-After), `insufficient_credits` (402),
 
         `not_found` (404), `unauthorized` (401), `forbidden` (403).
+
+        Deployment-scoped surfaces add: `deployment_not_ready` (429 +
+
+        Retry-After — the deployment can still reach ready; retry) and
+
+        `deployment_stopped` (422 — terminal deployment state; a retry
+
+        cannot succeed without operator action). A 429 is disambiguated
+
+        by `error.code` alone; clients should treat any 429 + Retry-After
+
+        as "back off and retry".
 
         '
       required:
@@ -964,7 +1031,7 @@ components:
           type: string
     AssetReference:
       type: object
-      description: "The typed asset-reference object placed inside workflow JSON where a\nfilename would normally go (documented here for tooling; it is not a\nrequest/response body itself):\n\n    {\"__type\": \"core/ASSET\",\n     \"info\": {\"id\": \"asset_...\", \"hash\": \"blake3:...\",\n              \"file_path\": \"photo.png\"}}\n\n`info.id` (the asset UUID) is required in v1 and authoritative;\n`hash` and `file_path` are optional staging/lookup hints and never\noverride a present `id`. A malformed reference or one that is not\nresolvable/owned by the caller fails submission with 422\n`missing_asset`.\n"
+      description: "The typed asset-reference object placed inside workflow JSON where a\nfilename would normally go (documented here for tooling; it is not a\nrequest/response body itself):\n\n    {\"__type\": \"core/ASSET\",\n     \"info\": {\"id\": \"<asset-uuid>\", \"hash\": \"blake3:...\",\n              \"file_path\": \"photo.png\"}}\n\n`info.id` (the asset UUID) is required in v1 and authoritative;\n`hash` and `file_path` are optional staging/lookup hints and never\noverride a present `id`. A malformed reference or one that is not\nresolvable/owned by the caller fails submission with 422\n`missing_asset`.\n"
       required:
       - __type
       - info
@@ -980,7 +1047,7 @@ components:
           properties:
             id:
               type: string
-              example: asset_01JZV8Q3M7K2W9X0Y1Z2A3B4C5
+              example: 9f8a1c0d-2b3e-4f56-8a7b-1c2d3e4f5a6b
             hash:
               type: string
               example: blake3:9f8a1c0d...
