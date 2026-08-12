@@ -133,7 +133,31 @@ job = client.submit(wf, api_key="comfyui-...")
 
 The SDK sends it once as `extra_data.api_key_comfy_org` alongside the workflow —
 one key authenticates every partner node in the graph. It is never logged or
-persisted by the SDK. Omit `api_key` and no `extra_data` is sent at all.
+persisted by the SDK. Omit `api_key` and leave `embed_workflow` (below) off,
+and no `extra_data` is sent at all.
+
+## Embedding the workflow in output metadata
+
+Pass `embed_workflow=True` to recover the graph later from a generated image —
+useful when debugging:
+
+```python
+job = client.run(wf, embed_workflow=True)
+# or drive it yourself:
+job = client.submit(wf, embed_workflow=True)
+```
+
+The SDK embeds the materialized graph — local files already uploaded and
+substituted with `core/ASSET` references — as `extra_data.extra_pnginfo.workflow`,
+the same key local ComfyUI's `SaveImage` writes into output PNG metadata and
+what the frontend looks for when loading a workflow from an image. Anything in
+the graph's node inputs, including values typed directly into fields, becomes
+visible to anyone who receives the image. The embedded copy keeps those
+`core/ASSET` references rather than resolved values,
+so it stays portable, but re-running it elsewhere needs access to the same
+assets. It's also still the API-format graph, so reroutes and subgraphs from
+the UI editor are not preserved — the known tradeoff, not a bug. Off by
+default; combines with `api_key` freely, since both live under `extra_data`.
 
 ## Assets and `core/ASSET`
 

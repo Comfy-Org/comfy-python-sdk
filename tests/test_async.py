@@ -142,6 +142,34 @@ async def test_async_submit_without_api_key_omits_extra_data(server) -> None:
     assert "extra_data" not in body
 
 
+async def test_async_submit_with_embed_workflow_embeds_materialized_graph(server) -> None:
+    # Mirrors the sync `test_submit_with_embed_workflow_embeds_materialized_graph`.
+    async with AsyncComfy() as client:
+        await client.submit(_wf(client), embed_workflow=True)
+    body = server.state.last_jobs_body
+    assert body is not None
+    assert body["extra_data"] == {"extra_pnginfo": {"workflow": body["workflow"]}}
+
+
+async def test_async_submit_with_embed_workflow_and_api_key_merges_extra_data(server) -> None:
+    async with AsyncComfy() as client:
+        await client.submit(_wf(client), api_key="comfyui-secret-key", embed_workflow=True)
+    body = server.state.last_jobs_body
+    assert body is not None
+    assert body["extra_data"] == {
+        "api_key_comfy_org": "comfyui-secret-key",
+        "extra_pnginfo": {"workflow": body["workflow"]},
+    }
+
+
+async def test_async_run_forwards_embed_workflow_to_submit(server) -> None:
+    async with AsyncComfy() as client:
+        await client.run(_wf(client), embed_workflow=True)
+    body = server.state.last_jobs_body
+    assert body is not None
+    assert body["extra_data"] == {"extra_pnginfo": {"workflow": body["workflow"]}}
+
+
 async def test_async_queue_full_retries_with_retry_after(server) -> None:
     server.state.queue_full_times = 2  # 429 twice, then 201
     async with AsyncComfy() as client:

@@ -159,6 +159,63 @@ def test_submit_with_empty_string_api_key_omits_extra_data(server) -> None:
     assert "extra_data" not in body
 
 
+def test_submit_with_embed_workflow_embeds_materialized_graph(server) -> None:
+    with Comfy() as client:
+        client.submit(_wf(client), embed_workflow=True)
+    body = server.state.last_jobs_body
+    assert body is not None
+    assert body["extra_data"] == {"extra_pnginfo": {"workflow": body["workflow"]}}
+
+
+def test_submit_with_embed_workflow_false_omits_extra_data(server) -> None:
+    # Default is off; explicitly passing False must be byte-identical to
+    # today's wire format -- no `extra_data` key at all.
+    with Comfy() as client:
+        client.submit(_wf(client), embed_workflow=False)
+    body = server.state.last_jobs_body
+    assert body is not None
+    assert "extra_data" not in body
+
+
+def test_submit_with_embed_workflow_and_api_key_merges_extra_data(server) -> None:
+    # Both keys must coexist: the partner-node key alongside the embedded graph.
+    with Comfy() as client:
+        client.submit(_wf(client), api_key="comfyui-secret-key", embed_workflow=True)
+    body = server.state.last_jobs_body
+    assert body is not None
+    assert body["extra_data"] == {
+        "api_key_comfy_org": "comfyui-secret-key",
+        "extra_pnginfo": {"workflow": body["workflow"]},
+    }
+
+
+def test_submit_with_embed_workflow_embeds_materialized_not_raw_graph(server, tmp_path) -> None:
+    # The embedded graph is what actually executes (asset handles substituted
+    # for core/ASSET refs) -- not the caller's pre-materialization Workflow.json,
+    # which still holds the live handle object.
+    p = tmp_path / "photo.png"
+    p.write_bytes(b"pixels")
+    with Comfy() as client:
+        asset = client.assets.from_file(p)
+        wf = client.workflows.from_json(
+            {"10": {"class_type": "LoadImage", "inputs": {"image": asset}}}
+        )
+        client.submit(wf, embed_workflow=True)
+    body = server.state.last_jobs_body
+    assert body is not None
+    embedded = body["extra_data"]["extra_pnginfo"]["workflow"]
+    assert embedded == body["workflow"]
+    assert embedded["10"]["inputs"]["image"]["__type"] == "core/ASSET"
+
+
+def test_run_forwards_embed_workflow_to_submit(server) -> None:
+    with Comfy() as client:
+        client.run(_wf(client), embed_workflow=True)
+    body = server.state.last_jobs_body
+    assert body is not None
+    assert body["extra_data"] == {"extra_pnginfo": {"workflow": body["workflow"]}}
+
+
 def test_run_forwards_api_key_to_submit(server) -> None:
     # `run()` is submit-then-wait; the api_key must still reach the wire.
     with Comfy() as client:

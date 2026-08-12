@@ -139,6 +139,7 @@ class Comfy:
         *,
         api_key: str | None = None,
         idempotency_key: str | None = None,
+        embed_workflow: bool = False,
     ) -> Job:
         """Submit a workflow. Retries ``queue_full`` with ``Retry-After``.
 
@@ -155,11 +156,15 @@ class Comfy:
         token this client was constructed with. It is never persisted or
         logged by the SDK, and is sent as ``extra_data.api_key_comfy_org``
         only when supplied; omitted from the request entirely otherwise.
+
+        ``embed_workflow``, when ``True``, embeds the materialized graph as
+        output metadata so it can be recovered later from a generated image —
+        useful when debugging. Off by default.
         """
         _guard_ui_format(workflow)
         graph = self._materialize(workflow)
         key = idempotency_key or _core.new_idempotency_key()
-        extra_data = _core.extra_data_for(api_key)
+        extra_data = _core.extra_data_for(api_key, graph if embed_workflow else None)
         deadline = time.monotonic() + _QUEUE_RETRY_BUDGET
         while True:
             try:
@@ -178,9 +183,10 @@ class Comfy:
         *,
         api_key: str | None = None,
         timeout: float | None = None,
+        embed_workflow: bool = False,
     ) -> Job:
         """Submit, then poll to terminal (authoritative). Raises on failure."""
-        job = self.submit(workflow, api_key=api_key)
+        job = self.submit(workflow, api_key=api_key, embed_workflow=embed_workflow)
         return job.result() if timeout is None else _run_with_timeout(job, timeout)
 
 
@@ -235,14 +241,15 @@ class AsyncComfy:
         *,
         api_key: str | None = None,
         idempotency_key: str | None = None,
+        embed_workflow: bool = False,
     ) -> AsyncJob:
-        """Mirrors :meth:`Comfy.submit` — see there for ``api_key`` details."""
+        """Mirrors :meth:`Comfy.submit` — see there for ``api_key``/``embed_workflow`` details."""
         import asyncio
 
         _guard_ui_format(workflow)
         graph = await self._materialize(workflow)
         key = idempotency_key or _core.new_idempotency_key()
-        extra_data = _core.extra_data_for(api_key)
+        extra_data = _core.extra_data_for(api_key, graph if embed_workflow else None)
         deadline = time.monotonic() + _QUEUE_RETRY_BUDGET
         while True:
             try:
@@ -261,12 +268,13 @@ class AsyncComfy:
         *,
         api_key: str | None = None,
         timeout: float | None = None,
+        embed_workflow: bool = False,
     ) -> AsyncJob:
         """Async :meth:`Comfy.run` — submit, then poll to terminal. Raises on failure."""
         from ._core import SUCCESS
         from .exceptions import JobFailed
 
-        job = await self.submit(workflow, api_key=api_key)
+        job = await self.submit(workflow, api_key=api_key, embed_workflow=embed_workflow)
         if timeout is None:
             return await job.result()
         await job.wait(timeout=timeout)
