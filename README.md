@@ -159,6 +159,25 @@ a `core/ASSET` reference object (`{"__type": "core/ASSET", "info": {"id":
 ..., "hash": ..., "file_path": ...}}`), which the server resolves back to the
 uploaded asset when it runs the workflow.
 
+Once committed, an asset also carries `job_id` — the id of the job that
+produced it, or `None` for an asset with no producing job (e.g. a plain
+upload) — and `expires_at`, its retention deadline, or `None` if it doesn't
+expire.
+
+Delete an asset with `asset.delete()`, or by id alone with
+`client.assets.delete(asset_id)`:
+
+```python
+asset.delete()
+# or, without holding a handle:
+client.assets.delete(asset_id)
+```
+
+Deletion needs a proxy new enough to serve `DELETE /api/v2/assets/{id}` — an
+older [comfy-api-proxy](https://github.com/Comfy-Org/comfy-api-proxy)
+returns `405` instead. (`AsyncAsset.delete()` / `AsyncAssetFactory.delete()`
+mirror both with `await`.)
+
 ## Live progress
 
 ```python
@@ -182,6 +201,27 @@ live UI feedback, and `wait()`/`result()`/`run()` for the definitive answer.
 output handles regardless of which node produced them (`job.get_outputs(node_id)`
 filters to one node, as in the quickstart above).
 
+## Getting a job's workflow back
+
+The SDK only holds the workflow it submitted for as long as the originating
+`Job` handle stays alive — for a job rehydrated purely by id
+(`client.jobs.get(job_id)`), `get_workflow()` is the only way to see the
+graph:
+
+```python
+job = client.jobs.get(job_id)
+wf = job.get_workflow()
+match wf.format:
+    case "api":   ...   # the executed graph; frontend-only nodes already resolved away
+    case "save":  ...   # the authoring workflow at the pinned version, canvas layout intact
+```
+
+`format` discriminates the shape of `wf.graph`, so branch on it rather than
+assume one. It depends on how the job was submitted, not on anything a caller
+controls — jobs submitted through this SDK always get `"api"` today, since v2
+submission has no version-pinning fields yet. (`AsyncJob.get_workflow()`
+mirrors this with `await`.)
+
 ## Downloading outputs
 
 A finished job exposes its results as `Output` handles — `job.outputs`, or
@@ -194,6 +234,9 @@ out.to_file("result.png")                   # stream to disk in chunks
 data = out.to_bytes()                       # buffer into memory
 out.to_file("head.png", range=(0, 1023))    # range-aware: first 1 KiB only
 ```
+
+Every output also carries `job_id`, the id of the job that produced it — so a
+caller holding just an output can get back to the job that made it.
 
 `get_download_url()` hands back a fetchable URL instead of transferring the
 bytes through your process — give it to a browser, a CDN, or another service:
