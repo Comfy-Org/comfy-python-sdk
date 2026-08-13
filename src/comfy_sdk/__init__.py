@@ -55,7 +55,7 @@ from .exceptions import (
     Unauthorized,
     WorkflowFormatUi,
 )
-from .jobs import AsyncJob, Job
+from .jobs import AsyncJob, Job, JobWorkflow
 from .outputs import AsyncOutput, DownloadUrl, Output
 from .workflows import Workflow, WorkflowFactory
 
@@ -82,6 +82,7 @@ __all__ = [
     "WorkflowFactory",
     "Job",
     "AsyncJob",
+    "JobWorkflow",
     "Output",
     "AsyncOutput",
     "DownloadUrl",
