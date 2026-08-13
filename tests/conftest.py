@@ -99,6 +99,9 @@ def _asset_json(asset_id: str, hash_: str, created_new: bool, size: int) -> dict
         "created_at": "2026-07-10T18:00:00Z",
         "url": "http://example.invalid/blob",
         "url_expires_at": "2026-07-10T19:00:00Z",
+        # Retention deadline for the asset itself — distinct from url_expires_at
+        # above. Omitted (-> None) for a plain upload with no producing job.
+        "expires_at": "2026-08-09T18:00:00Z",
     }
 
 
@@ -268,7 +271,9 @@ def _make_handler(state: ServerState):
             if state.job_poll_count >= state.polls_to_succeed:
                 status = state.terminal_status
                 if status == "succeeded":
-                    outputs = state.job_outputs if state.job_outputs is not None else [_OUTPUT]
+                    raw = state.job_outputs if state.job_outputs is not None else [_OUTPUT]
+                    # Stamp the producing job id, same as a real server would.
+                    outputs = [{**o, "job_id": job_id} for o in raw]
                 else:
                     outputs = []
             else:

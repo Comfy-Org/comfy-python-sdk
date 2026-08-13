@@ -65,6 +65,12 @@ class Output:
     def content_type(self) -> str:
         return self._model.content_type
 
+    @property
+    def job_id(self) -> str | None:
+        """The id of the job that produced this output, or ``None`` if the
+        backend didn't report one."""
+        return self._model.job_id
+
     def to_file(self, path: str | PathLike[str], *, range: tuple[int, int] | None = None) -> Path:
         """Stream this output to ``path`` and return the path written.
 
@@ -153,6 +159,12 @@ class AsyncOutput:
     @property
     def content_type(self) -> str:
         return self._model.content_type
+
+    @property
+    def job_id(self) -> str | None:
+        """The id of the job that produced this output, or ``None`` if the
+        backend didn't report one."""
+        return self._model.job_id
 
     async def to_file(
         self, path: str | PathLike[str], *, range: tuple[int, int] | None = None

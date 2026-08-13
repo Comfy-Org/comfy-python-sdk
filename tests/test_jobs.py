@@ -37,6 +37,15 @@ def test_run_completes_via_polling_when_sse_absent(server, tmp_path) -> None:
     assert server.state.events_connect_count == 0  # SSE never used
 
 
+def test_output_exposes_producing_job_id(server) -> None:
+    # The public Output wrapper must surface job_id, not just the private
+    # generated model — this is the field the whole feature exists to provide.
+    with Comfy() as client:
+        job = client.run(_wf(client))
+        outs = job.get_outputs("13")
+        assert outs[0].job_id == job.id
+
+
 def test_idempotent_submit_rejects_reused_key(server) -> None:
     # Keys are single-use (reject-on-duplicate, no replay): reusing the same
     # explicit key raises IdempotencyKeyReuse rather than replaying the job.

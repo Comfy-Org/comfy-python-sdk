@@ -14,6 +14,7 @@ from __future__ import annotations
 import mimetypes
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from io import BytesIO
 from os import PathLike
 from os.path import basename, getsize
@@ -63,6 +64,8 @@ class _AssetBase:
         self._id: str | None = None
         self._created_new: bool | None = None
         self._url: str | None = None
+        self._job_id: str | None = None
+        self._expires_at: datetime | None = None
         self._idempotency_key = _core.new_idempotency_key()
 
     @property
@@ -84,12 +87,26 @@ class _AssetBase:
     def created_new(self) -> bool | None:
         return self._created_new
 
+    @property
+    def job_id(self) -> str | None:
+        """The id of the job that produced this asset, or ``None`` for an
+        asset with no producing job (e.g. a plain upload)."""
+        return self._job_id
+
+    @property
+    def expires_at(self) -> datetime | None:
+        """Retention deadline for this asset, or ``None`` if it doesn't
+        expire."""
+        return self._expires_at
+
     def _apply(self, asset: LowAsset) -> None:
         self._id = asset.id
         if asset.hash:
             self._hash = asset.hash
         self._created_new = asset.created_new
         self._url = str(asset.url)
+        self._job_id = asset.job_id
+        self._expires_at = asset.expires_at
 
     def __repr__(self) -> str:
         state = self._id or "uncommitted"
