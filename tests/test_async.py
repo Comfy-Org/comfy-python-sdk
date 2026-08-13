@@ -151,7 +151,7 @@ async def test_async_queue_full_retries_with_retry_after(server) -> None:
 
 
 async def test_async_delete_asset_by_id(server) -> None:
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         await client.assets.delete("asset_uuid_01")
         with pytest.raises(NotFound):
             await client.assets.get("asset_uuid_01")
@@ -161,7 +161,7 @@ async def test_async_delete_asset_by_id(server) -> None:
 
 async def test_async_delete_asset_on_asset_instance(server) -> None:
     data = b"async-delete-me-bytes"
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         asset = client.assets.from_bytes(data, filename="photo.png")
         asset_id = await asset.commit()
         await asset.delete()
@@ -174,7 +174,7 @@ async def test_async_delete_asset_on_asset_instance(server) -> None:
 
 
 async def test_async_delete_uncommitted_asset_raises(server) -> None:
-    async with AsyncComfy(server.base_url) as client:
+    async with AsyncComfy() as client:
         asset = client.assets.from_bytes(b"not-uploaded", filename="photo.png")
         with pytest.raises(RuntimeError, match="uncommitted"):
             await asset.delete()

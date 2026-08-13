@@ -133,17 +133,12 @@ class Job:
         Needed for a job rehydrated purely by id (e.g. via
         ``client.jobs.get``) — the SDK only holds the workflow it submitted
         for as long as the same process's :class:`Job` handle is alive, so
-        this is the only way to see the graph otherwise.
-
-        Calls ``GET /api/v2/jobs/{id}/workflow`` via
-        :meth:`comfy_low.transport.ComfyLow.get_job_workflow`, which is
-        hand-written because the operation is not yet in the vendored spec —
-        the server endpoint is still in review. A missing job raises the
-        SDK's normal :class:`~comfy_sdk.exceptions.NotFound`.
+        this is the only way to see the graph otherwise. A missing job raises
+        the SDK's normal :class:`~comfy_sdk.exceptions.NotFound`.
         """
         with translating():
             data = self._low.get_job_workflow(self._model.id)
-        return JobWorkflow(graph=data["workflow"], format=data["format"])
+        return JobWorkflow(graph=data.workflow, format=data.format.value)
 
     # -- live events (best-effort, reconnecting) --------------------------
     def events(self) -> Iterator[Event]:
@@ -258,7 +253,7 @@ class AsyncJob:
         """Async :meth:`Job.get_workflow`."""
         with translating():
             data = await self._low.get_job_workflow(self._model.id)
-        return JobWorkflow(graph=data["workflow"], format=data["format"])
+        return JobWorkflow(graph=data.workflow, format=data.format.value)
 
     async def events(self) -> AsyncIterator[Event]:
         """Async :meth:`Job.events` — typed live stream, auto-reconnecting with

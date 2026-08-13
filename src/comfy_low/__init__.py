@@ -41,9 +41,11 @@ OPERATION_IDS: frozenset[str] = frozenset(
         "assetFromHash",
         "headAssetByHash",
         "getAsset",
+        "deleteAsset",
         "getAssetContent",
         "postJobs",
         "getJob",
+        "getJobWorkflow",
         "getJobEvents",
         "cancelJob",
     }
@@ -55,9 +57,11 @@ OPERATION_METHODS: dict[str, str] = {
     "assetFromHash": "asset_from_hash",
     "headAssetByHash": "head_asset_by_hash",
     "getAsset": "get_asset",
+    "deleteAsset": "delete_asset",
     "getAssetContent": "get_asset_content",
     "postJobs": "post_jobs",
     "getJob": "get_job",
+    "getJobWorkflow": "get_job_workflow",
     "getJobEvents": "get_job_events",
     "cancelJob": "cancel_job",
 }

@@ -1,8 +1,6 @@
 """Job.get_workflow() / AsyncJob.get_workflow() — GET /api/v2/jobs/{id}/workflow.
 
-This endpoint is not yet in spec/openapi.yaml (the server side is still in
-review), so the stub server in conftest.py stands in for it directly rather
-than the SDK talking to a generated model.
+The stub server in conftest.py stands in for the real endpoint.
 """
 
 from __future__ import annotations

@@ -32,7 +32,7 @@ import httpx
 
 from . import _multipart
 from .errors import ApiError, error_from_envelope
-from .models import Asset, Job
+from .models import Asset, Job, JobWorkflowResponse
 from .sse import RawEvent, SSEDecoder
 
 _API = "/api/v2"
@@ -467,21 +467,13 @@ class ComfyLow:
         resp = self.raw_request("POST", path, timeout=timeout)
         return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
 
-    def get_job_workflow(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> dict[str, Any]:
-        """GET /api/v2/jobs/{id}/workflow.
-
-        Hand-written: this operation is not yet in spec/openapi.yaml — the
-        server endpoint is still in review, landing separately. There is no
-        generated model to validate against yet, so this returns the raw,
-        parsed envelope (``{"workflow": {...}, "format": "save" | "api"}``)
-        instead of a typed model; move this onto the generated client once the
-        spec re-syncs.
-        """
+    def get_job_workflow(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> JobWorkflowResponse:
+        """GET /api/v2/jobs/{id}/workflow — the workflow graph behind a job."""
         path = (
             job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/workflow"
         )
         resp = self.raw_request("GET", path, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200,))
+        return JobWorkflowResponse.model_validate(self._p.parse_or_raise(resp, (200,)))
 
 
 class AsyncComfyLow:
@@ -737,13 +729,13 @@ class AsyncComfyLow:
 
     async def get_job_workflow(
         self, job_id_or_url: str, *, timeout: Any = _UNSET
-    ) -> dict[str, Any]:
-        """See the sync ``get_job_workflow`` for why this returns a raw dict."""
+    ) -> JobWorkflowResponse:
+        """Async :meth:`ComfyLow.get_job_workflow`."""
         path = (
             job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/workflow"
         )
         resp = await self.raw_request("GET", path, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200,))
+        return JobWorkflowResponse.model_validate(self._p.parse_or_raise(resp, (200,)))
 
 
 def _looks_like_path(s: str) -> bool:
