@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from datetime import datetime, timezone
 
 import pytest
 
@@ -28,6 +29,28 @@ def test_dedup_fast_path_skips_upload(server, tmp_path) -> None:
     assert server.state.head_count == 1
     assert server.state.from_hash_count == 1
     assert server.state.upload_count == 0
+
+
+def test_uploaded_asset_has_no_producing_job(server, tmp_path) -> None:
+    # A plain upload (never a job output) must report job_id as None on the
+    # public wrapper, not just on the private generated model.
+    p = tmp_path / "photo.png"
+    p.write_bytes(b"plain-upload-bytes")
+
+    with Comfy() as client:
+        asset = client.assets.from_file(p)
+        asset.commit()
+        assert asset.job_id is None
+
+
+def test_committed_asset_exposes_expiry(server, tmp_path) -> None:
+    p = tmp_path / "photo.png"
+    p.write_bytes(b"expiring-bytes")
+
+    with Comfy() as client:
+        asset = client.assets.from_file(p)
+        asset.commit()
+        assert asset.expires_at == datetime(2026, 8, 9, 18, 0, tzinfo=timezone.utc)
 
 
 class _ReadRecorder(io.BytesIO):
