@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Iterator
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import httpx
 
@@ -27,6 +28,24 @@ from .exceptions import JobFailed, translating
 from .outputs import AsyncOutput, Output
 
 _RECONNECT_PAUSE = 0.1
+
+
+@dataclass(frozen=True)
+class JobWorkflow:
+    """The workflow that produced a job — see :meth:`Job.get_workflow`.
+
+    ``format`` discriminates the shape of ``graph``, so a caller can tell
+    which one it holds instead of the two shapes being silently collapsed:
+
+    * ``"api"`` — the executed graph. API-format, so frontend-only constructs
+      (Note nodes, Get/Set) are already resolved away.
+    * ``"save"`` — the authoring workflow at the version the job ran,
+      un-mangled. Only occurs for a job that pins a workflow version; a job
+      submitted through this SDK today always gets ``"api"``.
+    """
+
+    graph: dict[str, Any]
+    format: Literal["save", "api"]
 
 
 class Job:
@@ -107,6 +126,19 @@ class Job:
         with translating():
             self._model = self._low.cancel_job(self._model.urls.cancel or self._model.id)
         return self
+
+    def get_workflow(self) -> JobWorkflow:
+        """Fetch the workflow that produced this job.
+
+        Needed for a job rehydrated purely by id (e.g. via
+        ``client.jobs.get``) — the SDK only holds the workflow it submitted
+        for as long as the same process's :class:`Job` handle is alive, so
+        this is the only way to see the graph otherwise. A missing job raises
+        the SDK's normal :class:`~comfy_sdk.exceptions.NotFound`.
+        """
+        with translating():
+            data = self._low.get_job_workflow(self._model.id)
+        return JobWorkflow(graph=data.workflow, format=data.format.value)
 
     # -- live events (best-effort, reconnecting) --------------------------
     def events(self) -> Iterator[Event]:
@@ -216,6 +248,12 @@ class AsyncJob:
         with translating():
             self._model = await self._low.cancel_job(self._model.urls.cancel or self._model.id)
         return self
+
+    async def get_workflow(self) -> JobWorkflow:
+        """Async :meth:`Job.get_workflow`."""
+        with translating():
+            data = await self._low.get_job_workflow(self._model.id)
+        return JobWorkflow(graph=data.workflow, format=data.format.value)
 
     async def events(self) -> AsyncIterator[Event]:
         """Async :meth:`Job.events` — typed live stream, auto-reconnecting with

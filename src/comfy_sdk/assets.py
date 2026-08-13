@@ -128,6 +128,14 @@ class Asset(_AssetBase):
         assert self._id is not None
         return self._id
 
+    def delete(self) -> None:
+        """Delete this asset from storage."""
+        if self._id is None:
+            raise RuntimeError("cannot delete an uncommitted asset")
+        with translating():
+            self._low.delete_asset(self._id)
+        self._id = None
+
     def as_reference(self) -> dict[str, object]:
         """The ``core/ASSET`` object (commits first if needed)."""
         self.commit()
@@ -165,6 +173,14 @@ class AsyncAsset(_AssetBase):
         self._apply(asset)
         assert self._id is not None
         return self._id
+
+    async def delete(self) -> None:
+        """Delete this asset from storage."""
+        if self._id is None:
+            raise RuntimeError("cannot delete an uncommitted asset")
+        with translating():
+            await self._low.delete_asset(self._id)
+        self._id = None
 
     async def as_reference(self) -> dict[str, object]:
         await self.commit()
@@ -242,6 +258,11 @@ class AssetFactory:
         asset._apply(model)
         return asset
 
+    def delete(self, asset_id: str) -> None:
+        """Delete an asset by UUID."""
+        with translating():
+            self._low.delete_asset(asset_id)
+
 
 class AsyncAssetFactory:
     """``client.assets`` — async alternative constructors for :class:`AsyncAsset`."""
@@ -285,6 +306,11 @@ class AsyncAssetFactory:
         asset = AsyncAsset(self._low, _rehydrated_source(model, asset_id))
         asset._apply(model)
         return asset
+
+    async def delete(self, asset_id: str) -> None:
+        """Delete an asset by UUID."""
+        with translating():
+            await self._low.delete_asset(asset_id)
 
 
 def _no_opener() -> tuple[BinaryIO, int | None]:

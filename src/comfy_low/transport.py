@@ -32,7 +32,7 @@ import httpx
 
 from . import _multipart
 from .errors import ApiError, error_from_envelope
-from .models import Asset, Job
+from .models import Asset, Job, JobWorkflowResponse
 from .sse import RawEvent, SSEDecoder
 
 _API = "/api/v2"
@@ -341,6 +341,11 @@ class ComfyLow:
         resp = self.raw_request("GET", f"/assets/{asset_id}", timeout=timeout)
         return Asset.model_validate(self._p.parse_or_raise(resp, (200,)))
 
+    def delete_asset(self, asset_id: str, *, timeout: Any = _UNSET) -> None:
+        """DELETE /api/v2/assets/{id} — removes the asset record and its content."""
+        resp = self.raw_request("DELETE", f"/assets/{asset_id}", timeout=timeout)
+        self._p.parse_or_raise(resp, (204,))
+
     @contextmanager
     def get_asset_content(
         self,
@@ -461,6 +466,14 @@ class ComfyLow:
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/cancel"
         resp = self.raw_request("POST", path, timeout=timeout)
         return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
+
+    def get_job_workflow(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> JobWorkflowResponse:
+        """GET /api/v2/jobs/{id}/workflow — the workflow graph behind a job."""
+        path = (
+            job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/workflow"
+        )
+        resp = self.raw_request("GET", path, timeout=timeout)
+        return JobWorkflowResponse.model_validate(self._p.parse_or_raise(resp, (200,)))
 
 
 class AsyncComfyLow:
@@ -617,6 +630,11 @@ class AsyncComfyLow:
         resp = await self.raw_request("GET", f"/assets/{asset_id}", timeout=timeout)
         return Asset.model_validate(self._p.parse_or_raise(resp, (200,)))
 
+    async def delete_asset(self, asset_id: str, *, timeout: Any = _UNSET) -> None:
+        """DELETE /api/v2/assets/{id} — removes the asset record and its content."""
+        resp = await self.raw_request("DELETE", f"/assets/{asset_id}", timeout=timeout)
+        self._p.parse_or_raise(resp, (204,))
+
     @asynccontextmanager
     async def get_asset_content(
         self,
@@ -708,6 +726,16 @@ class AsyncComfyLow:
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/cancel"
         resp = await self.raw_request("POST", path, timeout=timeout)
         return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
+
+    async def get_job_workflow(
+        self, job_id_or_url: str, *, timeout: Any = _UNSET
+    ) -> JobWorkflowResponse:
+        """Async :meth:`ComfyLow.get_job_workflow`."""
+        path = (
+            job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/workflow"
+        )
+        resp = await self.raw_request("GET", path, timeout=timeout)
+        return JobWorkflowResponse.model_validate(self._p.parse_or_raise(resp, (200,)))
 
 
 def _looks_like_path(s: str) -> bool:

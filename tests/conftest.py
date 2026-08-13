@@ -55,11 +55,20 @@ class ServerState:
     # Set to a list of output dicts (see `_output_json`) to test a job with
     # multiple outputs, each backed by a distinct asset id.
     job_outputs: list[dict] | None = None
+    # GET /jobs/{id}/workflow response. `job_workflow_not_found=True` answers
+    # 404 job_not_found instead, for the missing-job path.
+    job_workflow_graph: dict[str, Any] = field(
+        default_factory=lambda: {"3": {"class_type": "KSampler", "inputs": {}}}
+    )
+    job_workflow_format: str = "api"
+    job_workflow_not_found: bool = False
 
     # --- counters the tests assert on ---
     upload_count: int = 0
     from_hash_count: int = 0
     head_count: int = 0
+    delete_count: int = 0
+    deleted_assets: set[str] = field(default_factory=set)
     job_poll_count: int = 0
     events_connect_count: int = 0
     submit_count: int = 0
@@ -176,6 +185,20 @@ def _make_handler(state: ServerState):
             self.send_response(404)
             self.end_headers()
 
+        # -- DELETE --
+        def do_DELETE(self) -> None:
+            if not self._auth_ok():
+                self._err(401, "unauthorized", "no key")
+                return
+            m = re.match(r"/api/v2/assets/([^/]+)$", self.path)
+            if m:
+                state.delete_count += 1
+                state.deleted_assets.add(m.group(1))
+                self.send_response(204)
+                self.end_headers()
+                return
+            self._err(404, "not_found")
+
         # -- GET --
         def do_GET(self) -> None:
             if not self._auth_ok():
@@ -184,6 +207,9 @@ def _make_handler(state: ServerState):
 
             m = re.match(r"/api/v2/assets/([^/]+)/content$", self.path)
             if m:
+                if m.group(1) in state.deleted_assets:
+                    self._err(404, "not_found")
+                    return
                 if state.redirect_content_to:
                     self._redirect(state.redirect_content_to)
                 else:
@@ -191,11 +217,18 @@ def _make_handler(state: ServerState):
                 return
             m = re.match(r"/api/v2/assets/([^/]+)$", self.path)
             if m:
+                if m.group(1) in state.deleted_assets:
+                    self._err(404, "not_found")
+                    return
                 self._json(200, _asset_json(m.group(1), state.server_hash, False, 33))
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/events$", self.path)
             if m:
                 self._serve_events(m.group(1))
+                return
+            m = re.match(r"/api/v2/jobs/([^/]+)/workflow$", self.path)
+            if m:
+                self._serve_job_workflow(m.group(1))
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)$", self.path)
             if m:
@@ -242,6 +275,15 @@ def _make_handler(state: ServerState):
                 status = "running"
                 outputs = []
             self._json(200, _job_json(job_id, status, outputs))
+
+        def _serve_job_workflow(self, job_id: str) -> None:
+            if state.job_workflow_not_found:
+                self._err(404, "job_not_found", "no such job")
+                return
+            self._json(
+                200,
+                {"workflow": state.job_workflow_graph, "format": state.job_workflow_format},
+            )
 
         def _serve_events(self, job_id: str) -> None:
             state.events_connect_count += 1

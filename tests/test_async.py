@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from comfy_low.errors import NotFound
 from comfy_sdk import AsyncComfy, MissingAsset, Progress, StatusChange
 
 
@@ -147,3 +148,35 @@ async def test_async_queue_full_retries_with_retry_after(server) -> None:
     async with AsyncComfy() as client:
         await client.submit(_wf(client))
     assert server.state.submit_count == 3
+
+
+async def test_async_delete_asset_by_id(server) -> None:
+    async with AsyncComfy() as client:
+        await client.assets.delete("asset_uuid_01")
+        with pytest.raises(NotFound):
+            await client.assets.get("asset_uuid_01")
+
+    assert server.state.delete_count == 1
+
+
+async def test_async_delete_asset_on_asset_instance(server) -> None:
+    data = b"async-delete-me-bytes"
+    async with AsyncComfy() as client:
+        asset = client.assets.from_bytes(data, filename="photo.png")
+        asset_id = await asset.commit()
+        await asset.delete()
+        with pytest.raises(NotFound):
+            await client.assets.get(asset_id)
+
+    assert asset_id == "asset_uploaded_01"
+    assert server.state.delete_count == 1
+    assert asset.id is None
+
+
+async def test_async_delete_uncommitted_asset_raises(server) -> None:
+    async with AsyncComfy() as client:
+        asset = client.assets.from_bytes(b"not-uploaded", filename="photo.png")
+        with pytest.raises(RuntimeError, match="uncommitted"):
+            await asset.delete()
+
+    assert server.state.delete_count == 0
