@@ -55,6 +55,13 @@ class ServerState:
     # Set to a list of output dicts (see `_output_json`) to test a job with
     # multiple outputs, each backed by a distinct asset id.
     job_outputs: list[dict] | None = None
+    # GET /jobs/{id}/workflow response. `job_workflow_not_found=True` answers
+    # 404 job_not_found instead, for the missing-job path.
+    job_workflow_graph: dict[str, Any] = field(
+        default_factory=lambda: {"3": {"class_type": "KSampler", "inputs": {}}}
+    )
+    job_workflow_format: str = "api"
+    job_workflow_not_found: bool = False
 
     # --- counters the tests assert on ---
     upload_count: int = 0
@@ -197,6 +204,10 @@ def _make_handler(state: ServerState):
             if m:
                 self._serve_events(m.group(1))
                 return
+            m = re.match(r"/api/v2/jobs/([^/]+)/workflow$", self.path)
+            if m:
+                self._serve_job_workflow(m.group(1))
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)$", self.path)
             if m:
                 self._serve_job(m.group(1))
@@ -242,6 +253,15 @@ def _make_handler(state: ServerState):
                 status = "running"
                 outputs = []
             self._json(200, _job_json(job_id, status, outputs))
+
+        def _serve_job_workflow(self, job_id: str) -> None:
+            if state.job_workflow_not_found:
+                self._err(404, "job_not_found", "no such job")
+                return
+            self._json(
+                200,
+                {"workflow": state.job_workflow_graph, "format": state.job_workflow_format},
+            )
 
         def _serve_events(self, job_id: str) -> None:
             state.events_connect_count += 1
