@@ -341,6 +341,11 @@ class ComfyLow:
         resp = self.raw_request("GET", f"/assets/{asset_id}", timeout=timeout)
         return Asset.model_validate(self._p.parse_or_raise(resp, (200,)))
 
+    def delete_asset(self, asset_id: str, *, timeout: Any = _UNSET) -> None:
+        """DELETE /api/v2/assets/{id} — removes the asset record and its content."""
+        resp = self.raw_request("DELETE", f"/assets/{asset_id}", timeout=timeout)
+        self._p.parse_or_raise(resp, (204,))
+
     @contextmanager
     def get_asset_content(
         self,
@@ -632,6 +637,11 @@ class AsyncComfyLow:
     async def get_asset(self, asset_id: str, *, timeout: Any = _UNSET) -> Asset:
         resp = await self.raw_request("GET", f"/assets/{asset_id}", timeout=timeout)
         return Asset.model_validate(self._p.parse_or_raise(resp, (200,)))
+
+    async def delete_asset(self, asset_id: str, *, timeout: Any = _UNSET) -> None:
+        """DELETE /api/v2/assets/{id} — removes the asset record and its content."""
+        resp = await self.raw_request("DELETE", f"/assets/{asset_id}", timeout=timeout)
+        self._p.parse_or_raise(resp, (204,))
 
     @asynccontextmanager
     async def get_asset_content(

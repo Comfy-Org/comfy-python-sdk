@@ -6,6 +6,7 @@ import io
 
 import pytest
 
+from comfy_low.errors import NotFound
 from comfy_sdk import Comfy, HashMismatch
 
 
@@ -102,3 +103,36 @@ def test_hash_mismatch_surfaced_without_blind_retry(server, tmp_path) -> None:
 
     # Exactly one upload attempt — a 409 hash_mismatch must not be blindly retried.
     assert server.state.upload_count == 1
+
+
+def test_delete_asset_by_id(server) -> None:
+    with Comfy(server.base_url) as client:
+        client.assets.delete("asset_uuid_01")
+        with pytest.raises(NotFound):
+            client.assets.get("asset_uuid_01")
+
+    assert server.state.delete_count == 1
+
+
+def test_delete_asset_on_asset_instance(server) -> None:
+    data = b"delete-me-bytes"
+    with Comfy(server.base_url) as client:
+        asset = client.assets.from_bytes(data, filename="photo.png")
+        asset.commit()
+        asset_id = asset.id
+        asset.delete()
+        with pytest.raises(NotFound):
+            client.assets.get(asset_id)
+
+    assert asset_id == "asset_uploaded_01"
+    assert server.state.delete_count == 1
+    assert asset.id is None
+
+
+def test_delete_uncommitted_asset_raises(server) -> None:
+    with Comfy(server.base_url) as client:
+        asset = client.assets.from_bytes(b"not-uploaded", filename="photo.png")
+        with pytest.raises(RuntimeError, match="uncommitted"):
+            asset.delete()
+
+    assert server.state.delete_count == 0
