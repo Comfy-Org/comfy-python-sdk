@@ -13,7 +13,7 @@ class Asset(BaseModel):
     A user-owned record identified by a server-assigned UUID, backing an immutable blob whose content carries a server-computed blake3 hash. `hash` may be computed lazily: an asset record (and its retrievable bytes) can exist before its hash is filled in.
     """
 
-    id: Annotated[str, Field(examples=['asset_01JZV8Q3M7K2W9X0Y1Z2A3B4C5'])]
+    id: Annotated[str, Field(examples=['9f8a1c0d-2b3e-4f56-8a7b-1c2d3e4f5a6b'])]
     hash: Annotated[
         str | None,
         Field(
@@ -35,6 +35,44 @@ class Asset(BaseModel):
         AnyUrl, Field(description='Short-lived content URL (signed, or proxy-served).')
     ]
     url_expires_at: AwareDatetime
+    expires_at: Annotated[
+        AwareDatetime | None,
+        Field(
+            description="Retention deadline for the asset itself (distinct from `url_expires_at`, the signed URL's validity). Null or absent means the asset is non-expiring. On a dedup-hit create response the deadline may be later than now + the requested/default retention: re-referencing content extends its retention, never shortens it."
+        ),
+    ] = None
+    job_id: Annotated[
+        str | None,
+        Field(
+            description='ID of the job that produced this asset. Absent for uploaded assets, which have no producing job.'
+        ),
+    ] = None
+
+
+class Format(Enum):
+    """
+    Discriminates the `workflow` field's shape. `save`: the original authoring workflow JSON, at the version pinned to the job. `api`: the executed API-format prompt graph.
+    """
+
+    save = 'save'
+    api = 'api'
+
+
+class JobWorkflowResponse(BaseModel):
+    """
+    The workflow behind a job. See GET /api/v2/jobs/{id}/workflow's description for exactly when `format` is `save` vs `api`.
+    """
+
+    workflow: Annotated[
+        dict[str, Any],
+        Field(description='The workflow, verbatim, in the shape `format` says.'),
+    ]
+    format: Annotated[
+        Format,
+        Field(
+            description="Discriminates the `workflow` field's shape. `save`: the original authoring workflow JSON, at the version pinned to the job. `api`: the executed API-format prompt graph."
+        ),
+    ]
 
 
 class JobStatus(Enum):
@@ -56,7 +94,7 @@ class JobStatus(Enum):
 
 class JobUrls(BaseModel):
     """
-    Embedded follow-up links — follow these, don't build URLs.
+    Embedded follow-up links — follow these, don't build URLs. A link is either an absolute URL or a host-relative reference (leading `/`) that already includes any prefix the serving surface is mounted under (e.g. a serverless gateway's `/deployment/{deployment_id}/api/v2`). Clients MUST resolve a host-relative link against the request origin (scheme + authority), never against a configured base URL — joining it to a base URL that carries the same mount prefix duplicates the prefix.
     """
 
     self: str
@@ -136,6 +174,12 @@ class ErrorEnvelope(BaseModel):
     (404), `idempotency_key_reuse` (422),
     `queue_full` (429 + Retry-After), `insufficient_credits` (402),
     `not_found` (404), `unauthorized` (401), `forbidden` (403).
+    Deployment-scoped surfaces add: `deployment_not_ready` (429 +
+    Retry-After — the deployment can still reach ready; retry) and
+    `deployment_stopped` (422 — terminal deployment state; a retry
+    cannot succeed without operator action). A 429 is disambiguated
+    by `error.code` alone; clients should treat any 429 + Retry-After
+    as "back off and retry".
 
     """
 
@@ -175,7 +219,7 @@ class FieldType(Enum):
 
 
 class Info(BaseModel):
-    id: Annotated[str, Field(examples=['asset_01JZV8Q3M7K2W9X0Y1Z2A3B4C5'])]
+    id: Annotated[str, Field(examples=['9f8a1c0d-2b3e-4f56-8a7b-1c2d3e4f5a6b'])]
     hash: Annotated[str | None, Field(examples=['blake3:9f8a1c0d...'])] = None
     file_path: Annotated[str | None, Field(examples=['photo.png'])] = None
 
@@ -187,7 +231,7 @@ class AssetReference(BaseModel):
     request/response body itself):
 
         {"__type": "core/ASSET",
-         "info": {"id": "asset_...", "hash": "blake3:...",
+         "info": {"id": "<asset-uuid>", "hash": "blake3:...",
                   "file_path": "photo.png"}}
 
     `info.id` (the asset UUID) is required in v1 and authoritative;
@@ -213,13 +257,16 @@ class Output(BaseModel):
     content_type: Annotated[str, Field(examples=['image/png'])]
     size_bytes: Annotated[int, Field(examples=[1848320])]
     id: Annotated[
-        str, Field(description='Asset UUID.', examples=['asset_01JZV9R4N8...'])
+        str, Field(description='Asset UUID.', examples=['9f8a1c0d-2b3e-4f56-...'])
     ]
     hash: Annotated[
         str | None, Field(description='`blake3:<hex>`; null until lazily computed.')
     ]
     url: AnyUrl
     url_expires_at: AwareDatetime
+    job_id: Annotated[
+        str | None, Field(description='ID of the job that produced this output.')
+    ] = None
 
 
 class Job(BaseModel):
@@ -227,7 +274,7 @@ class Job(BaseModel):
     One execution of a workflow. Durable from creation until `expires_at`; `outputs` populates incrementally during execution.
     """
 
-    id: Annotated[str, Field(examples=['job_01JZTGXW9Q2M4R8V0B1N3P5D7F'])]
+    id: Annotated[str, Field(examples=['7f3d2c1b-9a8e-4d6f-b012-3c4d5e6f7a8b'])]
     status: JobStatus
     created_at: AwareDatetime
     started_at: Annotated[AwareDatetime | None, Field(...)]
