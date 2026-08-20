@@ -336,6 +336,10 @@ Clients for the same Comfy API v2 contract:
 
 ## Development
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the uv-based setup, the full list of
+checks CI requires, and why `src/comfy_low/models/_generated.py` must never be
+hand-edited.
+
 ```bash
 pip install -e ".[dev]"
 ruff check .
@@ -348,7 +352,7 @@ Regenerating and checking the vendored protocol layer (a separate CI job):
 
 ```bash
 pip install -e ".[codegen]"
-python scripts/gen_models.sh     # regenerate comfy_low models from spec/openapi.yaml
+bash scripts/gen_models.sh       # regenerate comfy_low models from spec/openapi.yaml
 python scripts/check_drift.py    # same check CI runs; fails if committed models drifted
 ```
 
