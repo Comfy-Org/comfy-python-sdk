@@ -67,3 +67,145 @@ def test_plain_graph_passes_through_the_walk_unchanged():
     graph = {"1": {"inputs": {"seed": 42, "model": "x.safetensors"}}}
     assert find_asset_handles(graph) == []
     assert substitute_asset_handles(graph, {}) == graph
+
+
+def test_remove_node_model_attention_backend():
+    graph = {
+        "1": {
+            "inputs": {
+                "unet_name": "z.safetensors",
+                "weight_dtype": "default",
+            },
+            "class_type": "UNETLoader",
+            "_meta": {"title": "Load Diffusion Model"},
+        },
+        "2": {
+            "inputs": {
+                "lora_name": "e.safetensors",
+                "strength_model": 1,
+                "model": ["1", 0],
+            },
+            "class_type": "LoraLoaderModelOnly",
+            "_meta": {"title": "Load LoRA"},
+        },
+        "3": {
+            "inputs": {
+                "attention": "pytorch attention",
+                "model": ["2", 0],
+            },
+            "class_type": "ModelAttentionBackend",
+            "_meta": {"title": "ModelAttentionBackend"},
+        },
+        "4": {
+            "inputs": {
+                "seed": 0,
+                "steps": 20,
+                "cfg": 8,
+                "sampler_name": "euler",
+                "scheduler": "simple",
+                "denoise": 1,
+                "model": ["3", 0],
+            },
+            "class_type": "KSampler",
+            "_meta": {"title": "KSampler"},
+        },
+    }
+    wf = Workflow(graph)
+    wf.remove_node("3")
+
+    assert "3" not in wf.json
+    assert wf.json["4"]["inputs"]["model"] == ["2", 0]
+
+
+def test_remove_node_redirects_image_scale():
+    graph = {
+        "1": {
+            "inputs": {"image": "example.png"},
+            "class_type": "LoadImage",
+            "_meta": {"title": "Load Image (A)"},
+        },
+        "2": {
+            "inputs": {"images": ["5", 0]},
+            "class_type": "PreviewImage",
+            "_meta": {"title": "Preview Image (B)"},
+        },
+        "3": {
+            "inputs": {"images": ["5", 0]},
+            "class_type": "PreviewImage",
+            "_meta": {"title": "Preview Image (C)"},
+        },
+        "4": {
+            "inputs": {"images": ["5", 0]},
+            "class_type": "PreviewImage",
+            "_meta": {"title": "Preview Image (D)"},
+        },
+        "5": {
+            "inputs": {
+                "upscale_method": "nearest-exact",
+                "megapixels": 1,
+                "resolution_steps": 1,
+                "image": ["1", 0],
+            },
+            "class_type": "ImageScaleToTotalPixels",
+            "_meta": {"title": "Scale Image to Total Pixels (E)"},
+        },
+    }
+    wf = Workflow(graph)
+    wf.remove_node("5")
+
+    assert "5" not in wf.json
+    assert wf.json["2"]["inputs"]["images"] == ["1", 0]
+    assert wf.json["3"]["inputs"]["images"] == ["1", 0]
+    assert wf.json["4"]["inputs"]["images"] == ["1", 0]
+
+
+def test_remove_node_redirects_preview_any():
+    graph = {
+        "1": {
+            "inputs": {
+                "prompt": "test",
+                "max_length": 512,
+                "sampling_mode": "on",
+                "sampling_mode.temperature": 0.7,
+                "sampling_mode.top_k": 64,
+                "sampling_mode.top_p": 0.95,
+                "sampling_mode.min_p": 0.05,
+                "sampling_mode.repetition_penalty": 1.05,
+                "sampling_mode.seed": 0,
+                "sampling_mode.presence_penalty": 0,
+                "thinking": False,
+                "use_default_template": True,
+                "clip": ["4", 0],
+            },
+            "class_type": "TextGenerate",
+            "_meta": {"title": "Generate Text"},
+        },
+        "2": {
+            "inputs": {"source": ["1", 0]},
+            "class_type": "PreviewAny",
+            "_meta": {"title": "Preview as Text"},
+        },
+        "3": {
+            "inputs": {
+                "filename_prefix": "ComfyUI",
+                "format": "txt",
+                "text": ["2", 0],
+            },
+            "class_type": "SaveText",
+            "_meta": {"title": "Save Text"},
+        },
+        "4": {
+            "inputs": {
+                "clip_name": "qwen3vl_4b_bf16.safetensors",
+                "type": "stable_diffusion",
+                "device": "default",
+            },
+            "class_type": "CLIPLoader",
+            "_meta": {"title": "Load CLIP"},
+        },
+    }
+    wf = Workflow(graph)
+    wf.remove_node("2")
+
+    assert "2" not in wf.json
+    assert wf.json["3"]["inputs"]["text"] == ["1", 0]
