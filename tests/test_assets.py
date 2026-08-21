@@ -7,8 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from comfy_low.errors import NotFound
-from comfy_sdk import Comfy, HashMismatch
+from comfy_sdk import Comfy, HashMismatch, NotFound
 
 
 def test_dedup_fast_path_skips_upload(server, tmp_path) -> None:

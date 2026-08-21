@@ -30,7 +30,7 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow
 
 from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
-from .exceptions import QueueFull, WorkflowFormatUi, to_sdk_error
+from .exceptions import WorkflowFormatUi, to_sdk_error
 from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory
 from .workflows import Workflow, WorkflowFactory
 
@@ -140,7 +140,7 @@ class Comfy:
         api_key: str | None = None,
         idempotency_key: str | None = None,
     ) -> Job:
-        """Submit a workflow. Retries ``queue_full`` with ``Retry-After``.
+        """Submit a workflow. Retries any 429 that carries ``Retry-After``.
 
         Sends an auto-generated ``Idempotency-Key`` so the server rejects an
         accidental exact resend of *this* request (``422 idempotency_key_reuse``)
@@ -166,11 +166,24 @@ class Comfy:
                 model = self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
                 return Job(self._low, model)
             except ApiError as exc:
-                err = to_sdk_error(exc)
-                if isinstance(err, QueueFull) and time.monotonic() < deadline:
-                    time.sleep(err.retry_after or _DEFAULT_RETRY_AFTER)
+                # Disambiguated by status + Retry-After, not `code` alone
+                # (e.g. `deployment_not_ready`); a bare `queue_full` 429 (no
+                # header) must still retry on the default pause — dropping
+                # that fallback is the regression this predicate already hit.
+                retryable = exc.http_status == 429 and (
+                    exc.retry_after is not None or exc.code == "queue_full"
+                )
+                remaining = deadline - time.monotonic()
+                if retryable and remaining > 0:
+                    raw_delay = (
+                        exc.retry_after if exc.retry_after is not None else _DEFAULT_RETRY_AFTER
+                    )
+                    # Clamp: a server-supplied Retry-After is untrusted input —
+                    # never sleep past the retry budget, and never negative.
+                    delay = max(0.0, min(raw_delay, remaining))
+                    time.sleep(delay)
                     continue
-                raise err from exc
+                raise to_sdk_error(exc) from exc
 
     def run(
         self,
@@ -249,11 +262,19 @@ class AsyncComfy:
                 model = await self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
                 return AsyncJob(self._low, model)
             except ApiError as exc:
-                err = to_sdk_error(exc)
-                if isinstance(err, QueueFull) and time.monotonic() < deadline:
-                    await asyncio.sleep(err.retry_after or _DEFAULT_RETRY_AFTER)
+                # See the sync `submit` above for the predicate and clamp.
+                retryable = exc.http_status == 429 and (
+                    exc.retry_after is not None or exc.code == "queue_full"
+                )
+                remaining = deadline - time.monotonic()
+                if retryable and remaining > 0:
+                    raw_delay = (
+                        exc.retry_after if exc.retry_after is not None else _DEFAULT_RETRY_AFTER
+                    )
+                    delay = max(0.0, min(raw_delay, remaining))
+                    await asyncio.sleep(delay)
                     continue
-                raise err from exc
+                raise to_sdk_error(exc) from exc
 
     async def run(
         self,

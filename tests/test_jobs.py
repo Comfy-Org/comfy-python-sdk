@@ -4,12 +4,15 @@ backpressure retry, and error -> typed-exception mapping.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 import comfy_sdk.client as _client_module
 from comfy_low.errors import IdempotencyKeyReuse as LowIdempotencyKeyReuse
 from comfy_sdk import (
     Comfy,
+    ComfyError,
     IdempotencyKeyReuse,
     InvalidWorkflow,
     JobFailed,
@@ -75,6 +78,89 @@ def test_queue_full_retries_with_retry_after(server) -> None:
         job = client.submit(_wf(client))
     assert job.id.startswith("job_")
     assert server.state.submit_count == 3  # two rejections + one success
+
+
+def test_submit_retries_429_with_a_code_other_than_queue_full(server) -> None:
+    # The contract disambiguates a retryable 429 by status + Retry-After, not
+    # by `code` — `deployment_not_ready` (a serverless cold start) must retry
+    # exactly like `queue_full` does, even though `to_sdk_error` doesn't map it
+    # to `QueueFull`.
+    server.state.retryable_429_times = 2
+    with Comfy() as client:
+        job = client.submit(_wf(client))
+    assert job.id.startswith("job_")
+    assert server.state.submit_count == 3  # two rejections + one success
+
+
+def test_queue_full_retries_with_no_retry_after_header(server, monkeypatch) -> None:
+    # A bare `queue_full` 429 (no Retry-After header at all) must still
+    # retry, using the client's default pause — this was the one 429 path
+    # that already worked before the status+Retry-After predicate landed,
+    # and it regressed when that predicate first shipped without an
+    # explicit `code == "queue_full"` fallback.
+    monkeypatch.setattr(_client_module, "_DEFAULT_RETRY_AFTER", 0)
+    server.state.queue_full_times_no_retry_after = 2
+    with Comfy() as client:
+        job = client.submit(_wf(client))
+    assert job.id.startswith("job_")
+    assert server.state.submit_count == 3  # two rejections + one success
+
+
+def test_submit_clamps_huge_retry_after_to_remaining_budget(server, monkeypatch) -> None:
+    # Security regression: the deadline used to be checked before the sleep
+    # but never against the sleep's own duration, so a server-supplied
+    # Retry-After of e.g. 10_000_000 committed the caller to a ~115-day
+    # sleep in one shot. The delay must be clamped to what's left of the
+    # retry budget, not to the header's raw value.
+    monkeypatch.setattr(_client_module, "_QUEUE_RETRY_BUDGET", 5.0)
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    server.state.queue_full_retry_after_header = "10000000"
+    with Comfy() as client:
+        job = client.submit(_wf(client))
+    assert job.id.startswith("job_")
+    assert server.state.submit_count == 2  # one rejection + one success
+    assert len(sleeps) == 1
+    assert 0 <= sleeps[0] <= 5.0  # clamped to the budget, nowhere near 10_000_000
+
+
+def test_submit_negative_retry_after_does_not_crash(server, monkeypatch) -> None:
+    # comfy_low's header parsing is a bare `int(raw)`, so "-5" parses to -5
+    # rather than None. Unclamped, `time.sleep(-5)` raises ValueError — the
+    # caller would get a raw ValueError instead of the documented ComfyError
+    # contract. The clamp must floor the delay at 0.
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    server.state.queue_full_retry_after_header = "-5"
+    with Comfy() as client:
+        job = client.submit(_wf(client))  # must not raise ValueError
+    assert job.id.startswith("job_")
+    assert sleeps == [0.0]
+
+
+def test_submit_retry_after_zero_sleeps_for_zero_not_default(server, monkeypatch) -> None:
+    # Pins the incidental fix from the explicit `is not None` check: the old
+    # `retry_after or _DEFAULT_RETRY_AFTER` treated a literal `Retry-After: 0`
+    # as absent and slept the full default. Without this assertion a
+    # regression back to that pattern only shows up as CI getting slower.
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    server.state.queue_full_times = 1  # stub sends Retry-After: 0
+    with Comfy() as client:
+        client.submit(_wf(client))
+    assert sleeps == [0.0]
+
+
+def test_submit_does_not_retry_429_without_retry_after_and_non_queue_full_code(server) -> None:
+    # Closes the untested "not retryable" branch: 429, no Retry-After
+    # header, and a code other than `queue_full` must raise immediately.
+    # The other 429 tests each cover one side of the predicate's `or` and
+    # never the combination that lands on "not retryable".
+    server.state.job_error = (429, "deployment_not_ready")
+    with Comfy() as client:
+        with pytest.raises(ComfyError):
+            client.submit(_wf(client))
+    assert server.state.submit_count == 1  # no retry
 
 
 def test_queue_full_gives_up_once_retry_budget_elapses(server, monkeypatch) -> None:

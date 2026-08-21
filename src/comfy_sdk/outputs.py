@@ -17,6 +17,8 @@ from typing import BinaryIO
 from comfy_low.models import Output as LowOutput
 from comfy_low.transport import AsyncComfyLow, ComfyLow
 
+from .exceptions import translating
+
 _CHUNK = 64 * 1024
 
 
@@ -80,7 +82,7 @@ class Output:
         ``range=(0, 4)`` yields the first five bytes.
         """
         dest = Path(path)
-        with self._low.get_asset_content(self._model.id, range=range) as resp:
+        with translating(), self._low.get_asset_content(self._model.id, range=range) as resp:
             with open(dest, "wb") as fh:
                 for chunk in resp.iter_bytes(_CHUNK):
                     fh.write(chunk)
@@ -93,7 +95,7 @@ class Output:
         closed — that stays the caller's. See :meth:`to_file` for ``range``.
         """
         written = 0
-        with self._low.get_asset_content(self._model.id, range=range) as resp:
+        with translating(), self._low.get_asset_content(self._model.id, range=range) as resp:
             for chunk in resp.iter_bytes(_CHUNK):
                 stream.write(chunk)
                 written += len(chunk)
@@ -107,7 +109,7 @@ class Output:
         See :meth:`to_file` for ``range``.
         """
         buf = bytearray()
-        with self._low.get_asset_content(self._model.id, range=range) as resp:
+        with translating(), self._low.get_asset_content(self._model.id, range=range) as resp:
             for chunk in resp.iter_bytes(_CHUNK):
                 buf.extend(chunk)
         return bytes(buf)
@@ -122,7 +124,8 @@ class Output:
         ``expires_at`` is ``None``. (A genuine failure — e.g. an unknown output
         id — still raises the same typed error as any other call.)
         """
-        url, expires_at = self._low.get_asset_content_url(self._model.id)
+        with translating():
+            url, expires_at = self._low.get_asset_content_url(self._model.id)
         return DownloadUrl(url=url, expires_at=expires_at)
 
     def __repr__(self) -> str:
@@ -171,23 +174,36 @@ class AsyncOutput:
     ) -> Path:
         """Async :meth:`Output.to_file` — same chunked write and inclusive ``range``."""
         dest = Path(path)
-        async with self._low.get_asset_content(self._model.id, range=range) as resp:
-            with open(dest, "wb") as fh:
-                async for chunk in resp.aiter_bytes(_CHUNK):
-                    fh.write(chunk)
+        with translating():
+            async with self._low.get_asset_content(self._model.id, range=range) as resp:
+                with open(dest, "wb") as fh:
+                    async for chunk in resp.aiter_bytes(_CHUNK):
+                        fh.write(chunk)
         return dest
+
+    async def to_stream(self, stream: BinaryIO, *, range: tuple[int, int] | None = None) -> int:
+        """Async :meth:`Output.to_stream` — same write-only semantics."""
+        written = 0
+        with translating():
+            async with self._low.get_asset_content(self._model.id, range=range) as resp:
+                async for chunk in resp.aiter_bytes(_CHUNK):
+                    stream.write(chunk)
+                    written += len(chunk)
+        return written
 
     async def to_bytes(self, *, range: tuple[int, int] | None = None) -> bytes:
         """Async :meth:`Output.to_bytes` — buffers the whole body in memory."""
         buf = bytearray()
-        async with self._low.get_asset_content(self._model.id, range=range) as resp:
-            async for chunk in resp.aiter_bytes(_CHUNK):
-                buf.extend(chunk)
+        with translating():
+            async with self._low.get_asset_content(self._model.id, range=range) as resp:
+                async for chunk in resp.aiter_bytes(_CHUNK):
+                    buf.extend(chunk)
         return bytes(buf)
 
     async def get_download_url(self) -> DownloadUrl:
         """See the sync ``Output.get_download_url`` for the redirect/inline split."""
-        url, expires_at = await self._low.get_asset_content_url(self._model.id)
+        with translating():
+            url, expires_at = await self._low.get_asset_content_url(self._model.id)
         return DownloadUrl(url=url, expires_at=expires_at)
 
     def __repr__(self) -> str:
