@@ -24,7 +24,7 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow
 
 from . import _core
 from .events import Event, StatusChange, event_from_raw
-from .exceptions import JobFailed, translating
+from .exceptions import JobFailed, to_sdk_error, translating
 from .outputs import AsyncOutput, Output
 
 _RECONNECT_PAUSE = 0.1
@@ -165,7 +165,7 @@ class Job:
             except ApiError as exc:
                 if exc.http_status == 501:
                     return  # surface has no SSE — poll paths remain authoritative
-                raise
+                raise to_sdk_error(exc) from exc
             except (httpx.HTTPError, httpx.StreamError):
                 pass  # connection dropped mid-stream — reconnect below
             if terminal_seen:
@@ -277,7 +277,7 @@ class AsyncJob:
             except ApiError as exc:
                 if exc.http_status == 501:
                     return  # surface has no SSE — poll paths remain authoritative
-                raise
+                raise to_sdk_error(exc) from exc
             except (httpx.HTTPError, httpx.StreamError):
                 pass
             if terminal_seen:
@@ -299,7 +299,8 @@ class JobFactory:
         self._low = low
 
     def get(self, job_id: str) -> Job:
-        return Job(self._low, self._low.get_job(job_id))
+        with translating():
+            return Job(self._low, self._low.get_job(job_id))
 
 
 class AsyncJobFactory:
@@ -307,4 +308,5 @@ class AsyncJobFactory:
         self._low = low
 
     async def get(self, job_id: str) -> AsyncJob:
-        return AsyncJob(self._low, await self._low.get_job(job_id))
+        with translating():
+            return AsyncJob(self._low, await self._low.get_job(job_id))

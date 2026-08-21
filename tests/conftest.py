@@ -35,8 +35,28 @@ class ServerState:
     require_auth: bool = False
     # POST /jobs returns 429 queue_full this many times before succeeding.
     queue_full_times: int = 0
+    # Like `queue_full_times`, but the 429 carries no Retry-After header at
+    # all — the bare-`queue_full` path, which retries using the client's
+    # default pause rather than a server-given delay.
+    queue_full_times_no_retry_after: int = 0
+    # POST /jobs answers 429 queue_full with this literal Retry-After header
+    # value once, then succeeds — for a test to send an out-of-range value
+    # (e.g. a huge number, to prove the client clamps to its retry budget,
+    # or a negative one, to prove a malformed header doesn't crash the
+    # sync loop or busy-loop the async one).
+    queue_full_retry_after_header: str | None = None
+    # POST /jobs returns a 429 naming a code OTHER than `queue_full` (with a
+    # Retry-After header) this many times before succeeding — the contract
+    # disambiguates a retryable 429 by status + Retry-After, not by `code`
+    # (e.g. `deployment_not_ready` on a serverless cold start).
+    retryable_429_times: int = 0
+    retryable_429_code: str = "deployment_not_ready"
     # POST /jobs returns this error envelope (status, code) instead of 201.
     job_error: tuple[int, str] | None = None
+    # GET /jobs/{id} answers 404 job_not_found instead of the job.
+    job_not_found: bool = False
+    # GET /jobs/{id}/events answers this (status, code) instead of connecting.
+    events_error: tuple[int, str] | None = None
     # Number of GET /jobs/{id} polls before the job reports succeeded.
     polls_to_succeed: int = 1
     # Terminal status the job reaches.
@@ -267,6 +287,9 @@ def _make_handler(state: ServerState):
             self.wfile.write(data)
 
         def _serve_job(self, job_id: str) -> None:
+            if state.job_not_found:
+                self._err(404, "job_not_found", "no such job")
+                return
             state.job_poll_count += 1
             if state.job_poll_count >= state.polls_to_succeed:
                 status = state.terminal_status
@@ -292,6 +315,10 @@ def _make_handler(state: ServerState):
 
         def _serve_events(self, job_id: str) -> None:
             state.events_connect_count += 1
+            if state.events_error is not None:
+                status, code = state.events_error
+                self._err(status, code, f"events error {code}")
+                return
             if state.events_not_implemented:
                 self._err(501, "not_implemented", "SSE is not supported on this surface")
                 return
@@ -379,6 +406,30 @@ def _make_handler(state: ServerState):
                 self._json(
                     429,
                     {"error": {"code": "queue_full", "message": "full"}},
+                    headers={"Retry-After": "0"},
+                )
+                return
+
+            if state.queue_full_times_no_retry_after > 0:
+                state.queue_full_times_no_retry_after -= 1
+                self._json(429, {"error": {"code": "queue_full", "message": "full"}})
+                return
+
+            if state.queue_full_retry_after_header is not None:
+                header = state.queue_full_retry_after_header
+                state.queue_full_retry_after_header = None
+                self._json(
+                    429,
+                    {"error": {"code": "queue_full", "message": "full"}},
+                    headers={"Retry-After": header},
+                )
+                return
+
+            if state.retryable_429_times > 0:
+                state.retryable_429_times -= 1
+                self._json(
+                    429,
+                    {"error": {"code": state.retryable_429_code, "message": "warming up"}},
                     headers={"Retry-After": "0"},
                 )
                 return
