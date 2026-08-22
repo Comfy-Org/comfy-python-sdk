@@ -14,6 +14,20 @@ from os import PathLike
 from typing import Any
 
 
+def _is_link(obj: Any) -> bool:
+    """Return ``True`` if ``obj`` is a ComfyUI API-format connection link
+    (``[node_id: str, output_index: int]``)."""
+    if not isinstance(obj, list):
+        return False
+    if len(obj) != 2:
+        return False
+    if not isinstance(obj[0], str):
+        return False
+    if not isinstance(obj[1], int) and not isinstance(obj[1], float):
+        return False
+    return True
+
+
 class Workflow:
     """An API-format ComfyUI graph, ready to submit.
 
@@ -36,6 +50,80 @@ class Workflow:
         node = self.json.setdefault(node_id, {})
         inputs = node.setdefault("inputs", {})
         inputs[field] = value
+
+    def add_node(
+        self,
+        class_type: str,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        inputs: dict[str, Any] | None = None,
+    ) -> str:
+        """Insert a new node, redirecting downstream connections through it.
+
+        The new node is assigned an auto-incremented ID (one greater than the
+        highest existing node ID).  ``class_type`` and optional ``inputs`` are
+        stored on the node.  Any link in ``inputs`` (e.g.
+        ``{"model": ["2", 0]}``) that points to an existing node causes *all*
+        downstream consumers of that source output to be redirected to the new
+        node's corresponding output.
+
+        ``before`` / ``after`` are informational — they document which existing
+        node the new node is placed relative to, but do not affect the
+        redirection logic (which is driven entirely by the links in ``inputs``).
+
+        Args:
+            class_type: ComfyUI class type (e.g. ``"KSampler"``).
+            before: If set, the new node is inserted before this node.
+            after: If set, the new node is inserted after this node.
+            inputs: Input dict for the new node. Links in this dict drive
+                downstream redirection.
+
+        Returns:
+            The auto-generated node ID.
+
+        Raises:
+            ValueError: If both ``before`` and ``after`` are given.
+        """
+        if before and after:
+            raise ValueError("Specify either 'before' or 'after', not both")
+
+        # Auto-generate node_id: one greater than the highest existing ID
+        if self.json:
+            max_id = max(int(nid) for nid in self.json)
+            node_id = str(max_id + 1)
+        else:
+            node_id = "1"
+
+        node_entry: dict[str, Any] = {"class_type": class_type}
+        if inputs:
+            node_entry["inputs"] = inputs
+        self.json[node_id] = node_entry
+
+        new_inputs = inputs or {}
+
+        # Collect (upstream_node_id, output_index) pairs from links in inputs
+        upstream_outputs: dict[str, set[int]] = {}
+        for value in new_inputs.values():
+            if _is_link(value):
+                src_node = value[0]
+                src_output = int(value[1])
+                if src_node in self.json:
+                    upstream_outputs.setdefault(src_node, set()).add(src_output)
+
+        # Redirect downstream consumers of those upstream outputs
+        for src_node, output_indices in upstream_outputs.items():
+            for nid, node in self.json.items():
+                if nid == node_id:
+                    continue
+                node_inputs = node.get("inputs")
+                if not node_inputs:
+                    continue
+                for key, value in list(node_inputs.items()):
+                    if _is_link(value) and value[0] == src_node and int(value[1]) in output_indices:
+                        node_inputs[key] = [node_id, value[1]]
+
+        return node_id
 
     def __repr__(self) -> str:
         return f"Workflow(nodes={len(self.json)})"
