@@ -82,6 +82,10 @@ PUBLIC_COMFY_ORG_REPOS = {
     "comfy-python-sdk",
     "comfy-swift-sdk",
     "comfy-typescript-sdk",
+    # This repo's pre-rename name (v0.1.5 moved it to comfy-python-sdk).
+    # Public, and GitHub still redirects it, so historical references -- the
+    # CHANGELOG's rename note, old release-notes compare links -- stay valid.
+    "ComfyPythonSDK",
     "ComfyUI_frontend",
     "ComfyUI",
 }
