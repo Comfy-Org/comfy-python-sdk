@@ -84,6 +84,12 @@ PUBLIC_COMFY_ORG_REPOS = {
     "comfy-typescript-sdk",
     "ComfyUI_frontend",
     "ComfyUI",
+    # Reusable GitHub Actions workflows (cursor-review and friends). Verified
+    # public: `gh repo view Comfy-Org/github-workflows` reports
+    # visibility=PUBLIC. It has to be public for a `uses:` reference from this
+    # repo to resolve at all -- a private reusable workflow would fail the run,
+    # so a passing cursor-review run is itself evidence of its visibility.
+    "github-workflows",
 }
 # CODEOWNERS team handles (`@Comfy-Org/<team>`) are inherently public on a
 # public repo -- GitHub renders the CODEOWNERS owners to anyone who can see the
