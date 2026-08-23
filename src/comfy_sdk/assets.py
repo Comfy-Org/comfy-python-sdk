@@ -270,7 +270,8 @@ class AssetFactory:
 
     def get(self, asset_id: str) -> Asset:
         """Rehydrate an already-committed asset by UUID."""
-        model = self._low.get_asset(asset_id)
+        with translating():
+            model = self._low.get_asset(asset_id)
         asset = Asset(self._low, _rehydrated_source(model, asset_id))
         asset._apply(model)
         return asset
@@ -319,7 +320,8 @@ class AsyncAssetFactory:
         return AsyncAsset(self._low, _bytes_source(content, filename, ct))
 
     async def get(self, asset_id: str) -> AsyncAsset:
-        model = await self._low.get_asset(asset_id)
+        with translating():
+            model = await self._low.get_asset(asset_id)
         asset = AsyncAsset(self._low, _rehydrated_source(model, asset_id))
         asset._apply(model)
         return asset

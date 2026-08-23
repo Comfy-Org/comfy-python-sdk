@@ -231,6 +231,8 @@ can pull down whichever way suits the caller:
 ```python
 out = job.get_outputs("13")[0]
 out.to_file("result.png")                   # stream to disk in chunks
+with open("result.bin", "wb") as stream:
+    written = out.to_stream(stream)          # write to an already-open binary stream
 data = out.to_bytes()                       # buffer into memory
 out.to_file("head.png", range=(0, 1023))    # range-aware: first 1 KiB only
 ```
@@ -265,6 +267,8 @@ async def main() -> None:
         wf = client.workflows.from_file("workflow_api.json")
         job = await client.run(wf)
         await job.outputs[0].to_file("out.png")
+        with open("out.bin", "wb") as stream:
+            await job.outputs[0].to_stream(stream)
 ```
 
 ## Typed errors
@@ -272,6 +276,10 @@ async def main() -> None:
 `comfy_sdk` translates the API's error envelope into a small set of
 exceptions, all importable from the top-level package and all subclasses of
 `ComfyError`:
+
+Catch these SDK-level exceptions around `Comfy`/`AsyncComfy` methods. Public
+asset, job, event, and output helpers translate protocol errors, so catches of
+`comfy_low.errors.*` belong only around direct low-level transport calls.
 
 - `Unauthorized`, `Forbidden`, `NotFound` — auth and lookup failures.
 - `InvalidWorkflow`, `WorkflowFormatUi` — the graph itself was rejected;
@@ -289,8 +297,8 @@ exceptions, all importable from the top-level package and all subclasses of
   with the same key.
 - `InsufficientCredits` — the account can't afford the job.
 - `QueueFull` — backpressure; carries `.retry_after` seconds. `client.submit`
-  already retries this automatically for a bounded budget before giving up
-  and raising it.
+  retries 429 responses with `Retry-After` for a bounded budget (including
+  deployment warm-up), then raises the translated error if backpressure remains.
 - `JobFailed` — a job reached a non-`succeeded` terminal state; `.error`
   carries node-level detail when the platform provided one.
 
