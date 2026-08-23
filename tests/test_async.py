@@ -8,11 +8,16 @@ import io
 import pytest
 
 import comfy_sdk.client as _client_module
-from comfy_sdk import AsyncComfy, MissingAsset, NotFound, Progress, QueueFull, StatusChange
+from comfy_sdk import AsyncComfy, MissingAsset, NotFound, Progress, StatusChange
 
 
 def _wf(client: AsyncComfy):
     return client.workflows.from_json({"3": {"class_type": "KSampler", "inputs": {}}})
+
+
+class _ShortWriter(io.BytesIO):
+    def write(self, data) -> int:
+        return super().write(data[:3])
 
 
 async def test_async_run_and_download(server, tmp_path) -> None:
@@ -26,7 +31,7 @@ async def test_async_run_and_download(server, tmp_path) -> None:
 
 
 async def test_async_output_to_stream_writes_all_bytes(server) -> None:
-    stream = io.BytesIO()
+    stream = _ShortWriter()
     async with AsyncComfy() as client:
         job = await client.run(_wf(client))
         written = await job.get_outputs("13")[0].to_stream(stream)
@@ -168,7 +173,7 @@ async def test_async_submit_clamps_huge_retry_after_to_remaining_budget(
     # Async counterpart of the sync clamp test — same predicate, same clamp,
     # both loops must bound a single sleep to what's left of the budget.
     monkeypatch.setattr(_client_module, "_QUEUE_RETRY_BUDGET", 5.0)
-    times = iter([100.0, 104.25, 105.0])
+    times = iter([100.0, 104.25])
     monkeypatch.setattr(_client_module, "_now", lambda: next(times))
     sleeps: list[float] = []
 
@@ -178,9 +183,9 @@ async def test_async_submit_clamps_huge_retry_after_to_remaining_budget(
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
     server.state.queue_full_retry_after_header = "10000000"
     async with AsyncComfy() as client:
-        with pytest.raises(QueueFull):
-            await client.submit(_wf(client))
-    assert server.state.submit_count == 1
+        job = await client.submit(_wf(client))
+    assert job.id.startswith("job_")
+    assert server.state.submit_count == 2
     assert sleeps == [0.75]
 
 

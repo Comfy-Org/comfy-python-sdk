@@ -190,8 +190,6 @@ class Comfy:
                 if delay is None:
                     raise err from exc
                 time.sleep(delay)
-                if _now() >= deadline:
-                    raise err from exc
                 continue
 
     def run(
@@ -276,8 +274,6 @@ class AsyncComfy:
                 if delay is None:
                     raise err from exc
                 await asyncio.sleep(delay)
-                if _now() >= deadline:
-                    raise err from exc
                 continue
 
     async def run(

@@ -22,6 +22,19 @@ from .exceptions import translating
 _CHUNK = 64 * 1024
 
 
+def _write_all(stream: BinaryIO, chunk: bytes) -> int:
+    """Write a complete chunk, including through partial writes."""
+    written = 0
+    while written < len(chunk):
+        count = stream.write(chunk[written:])
+        if count is None or count <= 0:
+            raise OSError("stream.write() made no progress")
+        if count > len(chunk) - written:
+            raise OSError("stream.write() returned an invalid byte count")
+        written += count
+    return written
+
+
 @dataclass(frozen=True)
 class DownloadUrl:
     """A directly-fetchable URL for one output, e.g. to hand to a downstream
@@ -97,8 +110,7 @@ class Output:
         written = 0
         with translating(), self._low.get_asset_content(self._model.id, range=range) as resp:
             for chunk in resp.iter_bytes(_CHUNK):
-                stream.write(chunk)
-                written += len(chunk)
+                written += _write_all(stream, chunk)
         return written
 
     def to_bytes(self, *, range: tuple[int, int] | None = None) -> bytes:
@@ -187,8 +199,7 @@ class AsyncOutput:
         with translating():
             async with self._low.get_asset_content(self._model.id, range=range) as resp:
                 async for chunk in resp.aiter_bytes(_CHUNK):
-                    stream.write(chunk)
-                    written += len(chunk)
+                    written += _write_all(stream, chunk)
         return written
 
     async def to_bytes(self, *, range: tuple[int, int] | None = None) -> bytes:

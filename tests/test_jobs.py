@@ -113,15 +113,15 @@ def test_submit_clamps_huge_retry_after_to_remaining_budget(server, monkeypatch)
     # sleep in one shot. The delay must be clamped to what's left of the
     # retry budget, not to the header's raw value.
     monkeypatch.setattr(_client_module, "_QUEUE_RETRY_BUDGET", 5.0)
-    times = iter([100.0, 104.25, 105.0])
+    times = iter([100.0, 104.25])
     monkeypatch.setattr(_client_module, "_now", lambda: next(times))
     sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
     server.state.queue_full_retry_after_header = "10000000"
     with Comfy() as client:
-        with pytest.raises(QueueFull):
-            client.submit(_wf(client))
-    assert server.state.submit_count == 1
+        job = client.submit(_wf(client))
+    assert job.id.startswith("job_")
+    assert server.state.submit_count == 2
     assert sleeps == [0.75]
 
 

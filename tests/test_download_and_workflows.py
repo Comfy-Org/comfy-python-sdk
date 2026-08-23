@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import io
+
+import pytest
+
 from comfy_sdk import Comfy
 from comfy_sdk._core import find_asset_handles, substitute_asset_handles
 
 
 def _wf(client: Comfy):
     return client.workflows.from_json({"3": {"class_type": "KSampler", "inputs": {}}})
+
+
+class _ShortWriter(io.BytesIO):
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = limit
+
+    def write(self, data) -> int:
+        return super().write(data[: self.limit])
 
 
 def test_range_download_returns_partial(server) -> None:
@@ -37,6 +50,23 @@ def test_full_download(server, tmp_path) -> None:
         out = job.get_outputs("13")[0]
         dest = out.to_file(tmp_path / "out.bin")
     assert dest.read_bytes() == server.state.content_bytes
+
+
+def test_to_stream_retries_partial_writes(server) -> None:
+    stream = _ShortWriter(limit=3)
+    with Comfy() as client:
+        job = client.run(_wf(client))
+        written = job.get_outputs("13")[0].to_stream(stream)
+    assert written == len(server.state.content_bytes)
+    assert stream.getvalue() == server.state.content_bytes
+
+
+def test_to_stream_rejects_zero_byte_writes(server) -> None:
+    stream = _ShortWriter(limit=0)
+    with Comfy() as client:
+        job = client.run(_wf(client))
+        with pytest.raises(OSError, match="made no progress"):
+            job.get_outputs("13")[0].to_stream(stream)
 
 
 def test_core_asset_substitution(server, tmp_path) -> None:
