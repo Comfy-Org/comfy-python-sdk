@@ -36,6 +36,8 @@ def test_client_info_appends_app_token(server) -> None:
 
 def test_client_info_rejects_crlf() -> None:
     # A CR/LF in the caller token must never reach the header (no injection).
+    # The Cloud default requires a key, so supply one: the point here is that
+    # `client_info` is rejected, not which construction error arrives first.
     for bad in ("evil\r\nX-Injected: 1", "line\nbreak", "carriage\rreturn"):
         with pytest.raises(ValueError):
-            Comfy(client_info=bad)
+            Comfy(api_key="comfyui-test", client_info=bad)

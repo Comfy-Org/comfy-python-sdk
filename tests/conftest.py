@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from comfy_sdk import BASE_URL_ENV_VAR
+from comfy_sdk import API_KEY_ENV_VAR, BASE_URL_ENV_VAR
 
 
 @dataclass
@@ -481,6 +481,20 @@ def _no_ambient_base_url(request, monkeypatch):
     if "integration" in request.path.parts:
         return
     monkeypatch.delenv(BASE_URL_ENV_VAR, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_api_key(monkeypatch):
+    """Never let the developer's own ``COMFY_API_KEY`` reach a test client.
+
+    Autouse and unconditional: the SDK now falls back to that variable, so a key
+    exported in the shell (or on a CI runner running the live gateway e2e job)
+    would silently authenticate clients the suite builds deliberately *without*
+    one — turning the no-credentials-sent assertions green for the wrong reason.
+    The gateway e2e test reads the variable at import time and passes it
+    explicitly, so it is unaffected.
+    """
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
 
 
 @pytest.fixture

@@ -14,8 +14,9 @@ Quickstart::
     from comfy_sdk import Comfy
 
     client = Comfy(api_key="comfyui-...")              # Comfy Cloud
-    # export COMFY_BASE_URL=http://127.0.0.1:8189      # self-hosted, no key
-    # client = Comfy()
+    # export COMFY_API_KEY=comfyui-...                 # ...or from the environment
+    # client = Comfy()                                 # explicit key wins over it
+    # export COMFY_BASE_URL=http://127.0.0.1:8189      # self-hosted, no key needed
 
     wf = client.workflows.from_file("workflow_api.json")
     asset = client.assets.from_file("photo.png")       # lazy; uploaded on use
@@ -31,7 +32,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
 from .assets import Asset, AssetFactory, AsyncAsset, AsyncAssetFactory
-from .client import BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL, AsyncComfy, Comfy
+from .client import API_KEY_ENV_VAR, BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL, AsyncComfy, Comfy
 from .events import (
     Event,
     Log,
@@ -49,6 +50,7 @@ from .exceptions import (
     InsufficientCredits,
     InvalidWorkflow,
     JobFailed,
+    MissingApiKey,
     MissingAsset,
     NotFound,
     QueueFull,
@@ -72,6 +74,7 @@ __all__ = [
     "Comfy",
     "COMFY_CLOUD_BASE_URL",
     "BASE_URL_ENV_VAR",
+    "API_KEY_ENV_VAR",
     "AsyncComfy",
     # assets / workflows / jobs / outputs
     "Asset",
@@ -105,6 +108,7 @@ __all__ = [
     "IdempotencyKeyReuse",
     "InsufficientCredits",
     "NotFound",
+    "MissingApiKey",
     "Unauthorized",
     "Forbidden",
 ]

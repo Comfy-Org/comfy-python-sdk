@@ -88,6 +88,56 @@ aimed at the target deployment's own origin — a server-returned follow-up link
 (`job.urls.self`/`cancel`/`events`, or a redirected asset download) pointing
 anywhere else never receives it.
 
+### Where the key comes from
+
+Each client resolves its credential once, at construction, in a fixed order:
+
+1. the explicit **`api_key=` argument** — it always wins;
+2. the **`COMFY_API_KEY` environment variable**, when no argument was passed;
+3. neither → **`MissingApiKey`**, raised locally against Comfy Cloud, which
+   always requires a key. Nothing is sent, so you find out from the constructor
+   rather than from a `401` on your first call.
+
+```bash
+export COMFY_API_KEY="comfyui-..."
+```
+
+```python
+client = Comfy()                        # uses COMFY_API_KEY
+client = Comfy(api_key="comfyui-...")   # this key, whatever the environment says
+```
+
+Both sources are read fresh on every construction (so a process can build
+successive clients under different credentials), and both are trimmed — leading
+and trailing whitespace is stripped, and a blank value counts as *unset*, so
+`COMFY_API_KEY=` in a shell profile and a key read from a file with a trailing
+newline both do the obvious thing.
+
+Step 3 applies only to Comfy Cloud. A deployment named by `COMFY_BASE_URL` may
+have no auth at all, so if nothing resolves there the client is built without a
+credential and sends none — the self-hosted row of the table above is unchanged.
+A serverless deployment does require a key, and picks up `COMFY_API_KEY` the
+same way; supply one or the server will answer `401`.
+
+The key is write-only from the outside: it is never logged, never rendered by a
+client's `repr()`/`str()` (they report `authenticated=True|False`, never the
+key), and never placed in an exception message.
+
+`MissingApiKey` is a `ComfyError` like every other SDK exception, and is
+distinct from `Unauthorized` — no key at all, versus a key the server rejected:
+
+```python
+from comfy_sdk import Comfy, MissingApiKey
+
+try:
+    client = Comfy()
+except MissingApiKey as exc:
+    print(exc)   # names COMFY_API_KEY and the api_key= argument
+```
+
+The low-level `comfy_low.ComfyLow` transport is unaffected: it takes the key it
+is handed and reads no environment, since resolution is a `comfy_sdk` concern.
+
 ### Targeting another deployment
 
 `Comfy()` points at Comfy Cloud and takes no base-URL argument. To run against

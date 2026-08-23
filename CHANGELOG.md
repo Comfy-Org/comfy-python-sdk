@@ -12,7 +12,26 @@ notes for each version.
 
 ## [Unreleased]
 
-_Nothing yet — add an entry here when your change lands._
+### Added
+
+- Credential resolution with a documented order: the explicit `api_key=`
+  argument first, then the `COMFY_API_KEY` environment variable. Against Comfy
+  Cloud, which always requires a key, neither raises the new `MissingApiKey`
+  locally at construction — naming `COMFY_API_KEY` in the message — instead of
+  costing a round trip to be told `401`. Both sources are trimmed, and a blank
+  value counts as unset.
+- `MissingApiKey` (a `ComfyError`, `code="missing_api_key"`) and
+  `API_KEY_ENV_VAR` are exported from `comfy_sdk`.
+- `Comfy`/`AsyncComfy` now have an explicit `repr()` reporting the base URL and
+  `authenticated=True|False`. The key is never rendered, logged, or included in
+  an exception message.
+
+### Changed
+
+- A client targeting a deployment named by `COMFY_BASE_URL` is unchanged: with
+  no key resolved it is still built without one and still sends no credentials,
+  which is what a self-hosted ComfyUI behind the API proxy needs. Only the Comfy
+  Cloud default gained the local error.
 
 ## [0.1.8] - 2026-08-13
 

@@ -104,6 +104,13 @@ class _Prepared:
         self._origin_url = f"{parts.scheme}://{parts.netloc}"
         self._user_agent = _build_user_agent(client_info)
 
+    def __repr__(self) -> str:
+        # This object holds the bearer token, so its repr is written out rather
+        # than inherited: `authenticated` reports only whether one is set.
+        return (
+            f"{type(self).__name__}(base_url={self.base_url!r}, authenticated={bool(self.api_key)})"
+        )
+
     def url(self, path: str) -> str:
         # A server link (job.urls.*, marked by containing /api/) already carries
         # the server's mount prefix, so it resolves against the origin — joining
@@ -217,6 +224,20 @@ class ComfyLow:
     def timeout(self) -> httpx.Timeout:
         """The httpx client's default timeout. A per-request ``timeout=`` still wins."""
         return self._client.timeout
+
+    @property
+    def authenticated(self) -> bool:
+        """Whether a credential is attached to same-origin requests.
+
+        The key itself is deliberately not exposed here: this is the read a
+        layer above (or a ``repr``) needs, and it cannot leak the credential.
+        """
+        return bool(self._p.api_key)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(base_url={self.base_url!r}, authenticated={self.authenticated})"
+        )
 
     # -- lifecycle --------------------------------------------------------
     def close(self) -> None:
@@ -517,6 +538,16 @@ class AsyncComfyLow:
     def timeout(self) -> httpx.Timeout:
         """The httpx client's default timeout. A per-request ``timeout=`` still wins."""
         return self._client.timeout
+
+    @property
+    def authenticated(self) -> bool:
+        """Whether a credential is attached — mirrors :attr:`ComfyLow.authenticated`."""
+        return bool(self._p.api_key)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(base_url={self.base_url!r}, authenticated={self.authenticated})"
+        )
 
     async def aclose(self) -> None:
         if self._own_client:
