@@ -17,7 +17,22 @@ from typing import BinaryIO
 from comfy_low.models import Output as LowOutput
 from comfy_low.transport import AsyncComfyLow, ComfyLow
 
+from .exceptions import translating
+
 _CHUNK = 64 * 1024
+
+
+def _write_all(stream: BinaryIO, chunk: bytes) -> int:
+    """Write a complete chunk, including through partial writes."""
+    written = 0
+    while written < len(chunk):
+        count = stream.write(chunk[written:])
+        if count is None or count <= 0:
+            raise OSError("stream.write() made no progress")
+        if count > len(chunk) - written:
+            raise OSError("stream.write() returned an invalid byte count")
+        written += count
+    return written
 
 
 @dataclass(frozen=True)
@@ -80,7 +95,7 @@ class Output:
         ``range=(0, 4)`` yields the first five bytes.
         """
         dest = Path(path)
-        with self._low.get_asset_content(self._model.id, range=range) as resp:
+        with translating(), self._low.get_asset_content(self._model.id, range=range) as resp:
             with open(dest, "wb") as fh:
                 for chunk in resp.iter_bytes(_CHUNK):
                     fh.write(chunk)
@@ -93,10 +108,9 @@ class Output:
         closed — that stays the caller's. See :meth:`to_file` for ``range``.
         """
         written = 0
-        with self._low.get_asset_content(self._model.id, range=range) as resp:
+        with translating(), self._low.get_asset_content(self._model.id, range=range) as resp:
             for chunk in resp.iter_bytes(_CHUNK):
-                stream.write(chunk)
-                written += len(chunk)
+                written += _write_all(stream, chunk)
         return written
 
     def to_bytes(self, *, range: tuple[int, int] | None = None) -> bytes:
@@ -107,13 +121,13 @@ class Output:
         See :meth:`to_file` for ``range``.
         """
         buf = bytearray()
-        with self._low.get_asset_content(self._model.id, range=range) as resp:
+        with translating(), self._low.get_asset_content(self._model.id, range=range) as resp:
             for chunk in resp.iter_bytes(_CHUNK):
                 buf.extend(chunk)
         return bytes(buf)
 
     def get_download_url(self) -> DownloadUrl:
-        """A directly-fetchable URL for this output — never throws.
+        """A directly-fetchable URL for this output.
 
         On a Cloud/serverless backend this is a short-lived, self-authorizing
         signed URL for object storage: anyone holding it can read the bytes
@@ -122,7 +136,8 @@ class Output:
         ``expires_at`` is ``None``. (A genuine failure — e.g. an unknown output
         id — still raises the same typed error as any other call.)
         """
-        url, expires_at = self._low.get_asset_content_url(self._model.id)
+        with translating():
+            url, expires_at = self._low.get_asset_content_url(self._model.id)
         return DownloadUrl(url=url, expires_at=expires_at)
 
     def __repr__(self) -> str:
@@ -171,23 +186,35 @@ class AsyncOutput:
     ) -> Path:
         """Async :meth:`Output.to_file` — same chunked write and inclusive ``range``."""
         dest = Path(path)
-        async with self._low.get_asset_content(self._model.id, range=range) as resp:
-            with open(dest, "wb") as fh:
-                async for chunk in resp.aiter_bytes(_CHUNK):
-                    fh.write(chunk)
+        with translating():
+            async with self._low.get_asset_content(self._model.id, range=range) as resp:
+                with open(dest, "wb") as fh:
+                    async for chunk in resp.aiter_bytes(_CHUNK):
+                        fh.write(chunk)
         return dest
+
+    async def to_stream(self, stream: BinaryIO, *, range: tuple[int, int] | None = None) -> int:
+        """Async :meth:`Output.to_stream` — same write-only semantics."""
+        written = 0
+        with translating():
+            async with self._low.get_asset_content(self._model.id, range=range) as resp:
+                async for chunk in resp.aiter_bytes(_CHUNK):
+                    written += _write_all(stream, chunk)
+        return written
 
     async def to_bytes(self, *, range: tuple[int, int] | None = None) -> bytes:
         """Async :meth:`Output.to_bytes` — buffers the whole body in memory."""
         buf = bytearray()
-        async with self._low.get_asset_content(self._model.id, range=range) as resp:
-            async for chunk in resp.aiter_bytes(_CHUNK):
-                buf.extend(chunk)
+        with translating():
+            async with self._low.get_asset_content(self._model.id, range=range) as resp:
+                async for chunk in resp.aiter_bytes(_CHUNK):
+                    buf.extend(chunk)
         return bytes(buf)
 
     async def get_download_url(self) -> DownloadUrl:
         """See the sync ``Output.get_download_url`` for the redirect/inline split."""
-        url, expires_at = await self._low.get_asset_content_url(self._model.id)
+        with translating():
+            url, expires_at = await self._low.get_asset_content_url(self._model.id)
         return DownloadUrl(url=url, expires_at=expires_at)
 
     def __repr__(self) -> str:

@@ -30,7 +30,7 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow
 
 from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
-from .exceptions import QueueFull, WorkflowFormatUi, to_sdk_error
+from .exceptions import WorkflowFormatUi, to_sdk_error
 from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory
 from .workflows import Workflow, WorkflowFactory
 
@@ -42,6 +42,25 @@ COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"
 BASE_URL_ENV_VAR = "COMFY_BASE_URL"
 
 _DEFAULT_RETRY_AFTER = 2
+_now = time.monotonic
+
+
+def _retry_delay(exc: ApiError, deadline: float) -> float | None:
+    """Return a bounded 429 retry delay, or ``None`` when the error should surface."""
+    if exc.http_status != 429:
+        return None
+    if exc.retry_after is None:
+        # The spec requires Retry-After on deployment_not_ready. Keep the
+        # fallback only for legacy queue_full responses that omit it.
+        if exc.code != "queue_full":
+            return None
+        raw_delay = _DEFAULT_RETRY_AFTER
+    else:
+        raw_delay = exc.retry_after
+    remaining = deadline - _now()
+    if remaining <= 0:
+        return None
+    return max(0.0, min(raw_delay, remaining))
 
 
 def _resolve_base_url() -> str:
@@ -140,7 +159,7 @@ class Comfy:
         api_key: str | None = None,
         idempotency_key: str | None = None,
     ) -> Job:
-        """Submit a workflow. Retries ``queue_full`` with ``Retry-After``.
+        """Submit a workflow. Retries any 429 that carries ``Retry-After``.
 
         Sends an auto-generated ``Idempotency-Key`` so the server rejects an
         accidental exact resend of *this* request (``422 idempotency_key_reuse``)
@@ -160,17 +179,18 @@ class Comfy:
         graph = self._materialize(workflow)
         key = idempotency_key or _core.new_idempotency_key()
         extra_data = _core.extra_data_for(api_key)
-        deadline = time.monotonic() + _QUEUE_RETRY_BUDGET
+        deadline = _now() + _QUEUE_RETRY_BUDGET
         while True:
             try:
                 model = self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
                 return Job(self._low, model)
             except ApiError as exc:
                 err = to_sdk_error(exc)
-                if isinstance(err, QueueFull) and time.monotonic() < deadline:
-                    time.sleep(err.retry_after or _DEFAULT_RETRY_AFTER)
-                    continue
-                raise err from exc
+                delay = _retry_delay(exc, deadline)
+                if delay is None:
+                    raise err from exc
+                time.sleep(delay)
+                continue
 
     def run(
         self,
@@ -243,17 +263,18 @@ class AsyncComfy:
         graph = await self._materialize(workflow)
         key = idempotency_key or _core.new_idempotency_key()
         extra_data = _core.extra_data_for(api_key)
-        deadline = time.monotonic() + _QUEUE_RETRY_BUDGET
+        deadline = _now() + _QUEUE_RETRY_BUDGET
         while True:
             try:
                 model = await self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
                 return AsyncJob(self._low, model)
             except ApiError as exc:
                 err = to_sdk_error(exc)
-                if isinstance(err, QueueFull) and time.monotonic() < deadline:
-                    await asyncio.sleep(err.retry_after or _DEFAULT_RETRY_AFTER)
-                    continue
-                raise err from exc
+                delay = _retry_delay(exc, deadline)
+                if delay is None:
+                    raise err from exc
+                await asyncio.sleep(delay)
+                continue
 
     async def run(
         self,
