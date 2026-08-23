@@ -115,7 +115,7 @@ class Output:
         return bytes(buf)
 
     def get_download_url(self) -> DownloadUrl:
-        """A directly-fetchable URL for this output — never throws.
+        """A directly-fetchable URL for this output.
 
         On a Cloud/serverless backend this is a short-lived, self-authorizing
         signed URL for object storage: anyone holding it can read the bytes

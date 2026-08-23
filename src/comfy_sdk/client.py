@@ -42,6 +42,25 @@ COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"
 BASE_URL_ENV_VAR = "COMFY_BASE_URL"
 
 _DEFAULT_RETRY_AFTER = 2
+_now = time.monotonic
+
+
+def _retry_delay(exc: ApiError, deadline: float) -> float | None:
+    """Return a bounded 429 retry delay, or ``None`` when the error should surface."""
+    if exc.http_status != 429:
+        return None
+    if exc.retry_after is None:
+        # The spec requires Retry-After on deployment_not_ready. Keep the
+        # fallback only for legacy queue_full responses that omit it.
+        if exc.code != "queue_full":
+            return None
+        raw_delay = _DEFAULT_RETRY_AFTER
+    else:
+        raw_delay = exc.retry_after
+    remaining = deadline - _now()
+    if remaining <= 0:
+        return None
+    return max(0.0, min(raw_delay, remaining))
 
 
 def _resolve_base_url() -> str:
@@ -160,30 +179,20 @@ class Comfy:
         graph = self._materialize(workflow)
         key = idempotency_key or _core.new_idempotency_key()
         extra_data = _core.extra_data_for(api_key)
-        deadline = time.monotonic() + _QUEUE_RETRY_BUDGET
+        deadline = _now() + _QUEUE_RETRY_BUDGET
         while True:
             try:
                 model = self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
                 return Job(self._low, model)
             except ApiError as exc:
-                # Disambiguated by status + Retry-After, not `code` alone
-                # (e.g. `deployment_not_ready`); a bare `queue_full` 429 (no
-                # header) must still retry on the default pause — dropping
-                # that fallback is the regression this predicate already hit.
-                retryable = exc.http_status == 429 and (
-                    exc.retry_after is not None or exc.code == "queue_full"
-                )
-                remaining = deadline - time.monotonic()
-                if retryable and remaining > 0:
-                    raw_delay = (
-                        exc.retry_after if exc.retry_after is not None else _DEFAULT_RETRY_AFTER
-                    )
-                    # Clamp: a server-supplied Retry-After is untrusted input —
-                    # never sleep past the retry budget, and never negative.
-                    delay = max(0.0, min(raw_delay, remaining))
-                    time.sleep(delay)
-                    continue
-                raise to_sdk_error(exc) from exc
+                err = to_sdk_error(exc)
+                delay = _retry_delay(exc, deadline)
+                if delay is None:
+                    raise err from exc
+                time.sleep(delay)
+                if _now() >= deadline:
+                    raise err from exc
+                continue
 
     def run(
         self,
@@ -256,25 +265,20 @@ class AsyncComfy:
         graph = await self._materialize(workflow)
         key = idempotency_key or _core.new_idempotency_key()
         extra_data = _core.extra_data_for(api_key)
-        deadline = time.monotonic() + _QUEUE_RETRY_BUDGET
+        deadline = _now() + _QUEUE_RETRY_BUDGET
         while True:
             try:
                 model = await self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
                 return AsyncJob(self._low, model)
             except ApiError as exc:
-                # See the sync `submit` above for the predicate and clamp.
-                retryable = exc.http_status == 429 and (
-                    exc.retry_after is not None or exc.code == "queue_full"
-                )
-                remaining = deadline - time.monotonic()
-                if retryable and remaining > 0:
-                    raw_delay = (
-                        exc.retry_after if exc.retry_after is not None else _DEFAULT_RETRY_AFTER
-                    )
-                    delay = max(0.0, min(raw_delay, remaining))
-                    await asyncio.sleep(delay)
-                    continue
-                raise to_sdk_error(exc) from exc
+                err = to_sdk_error(exc)
+                delay = _retry_delay(exc, deadline)
+                if delay is None:
+                    raise err from exc
+                await asyncio.sleep(delay)
+                if _now() >= deadline:
+                    raise err from exc
+                continue
 
     async def run(
         self,

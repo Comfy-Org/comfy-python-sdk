@@ -113,15 +113,16 @@ def test_submit_clamps_huge_retry_after_to_remaining_budget(server, monkeypatch)
     # sleep in one shot. The delay must be clamped to what's left of the
     # retry budget, not to the header's raw value.
     monkeypatch.setattr(_client_module, "_QUEUE_RETRY_BUDGET", 5.0)
+    times = iter([100.0, 104.25, 105.0])
+    monkeypatch.setattr(_client_module, "_now", lambda: next(times))
     sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
     server.state.queue_full_retry_after_header = "10000000"
     with Comfy() as client:
-        job = client.submit(_wf(client))
-    assert job.id.startswith("job_")
-    assert server.state.submit_count == 2  # one rejection + one success
-    assert len(sleeps) == 1
-    assert 0 <= sleeps[0] <= 5.0  # clamped to the budget, nowhere near 10_000_000
+        with pytest.raises(QueueFull):
+            client.submit(_wf(client))
+    assert server.state.submit_count == 1
+    assert sleeps == [0.75]
 
 
 def test_submit_negative_retry_after_does_not_crash(server, monkeypatch) -> None:
@@ -152,10 +153,8 @@ def test_submit_retry_after_zero_sleeps_for_zero_not_default(server, monkeypatch
 
 
 def test_submit_does_not_retry_429_without_retry_after_and_non_queue_full_code(server) -> None:
-    # Closes the untested "not retryable" branch: 429, no Retry-After
-    # header, and a code other than `queue_full` must raise immediately.
-    # The other 429 tests each cover one side of the predicate's `or` and
-    # never the combination that lands on "not retryable".
+    # The OpenAPI contract requires deployment_not_ready to carry
+    # Retry-After. A malformed response without it surfaces immediately.
     server.state.job_error = (429, "deployment_not_ready")
     with Comfy() as client:
         with pytest.raises(ComfyError):
