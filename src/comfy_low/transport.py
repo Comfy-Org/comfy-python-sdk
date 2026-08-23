@@ -10,6 +10,12 @@ escape hatches the hand-written ``comfy_sdk`` layer builds on:
 * **per-request timeout / abort** — every method takes ``timeout`` and the raw
   httpx cancellation applies.
 
+One binding is *not* backed by an ``operationId``: ``post_model_run``. The
+vendored contract declares no model routes yet, so it is hand-written against
+the agreed wire shape, kept out of ``comfy_low.OPERATION_IDS``, and confined to
+``model_run_request`` / ``_MODEL_RUN_PATH`` so vendoring the real route later is
+a one-place change.
+
 This layer contains no orchestration, retries, hashing, or reconnection — those
 live in ``comfy_sdk``.
 """
@@ -20,7 +26,7 @@ import asyncio
 import platform
 import secrets
 import sys
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
@@ -46,7 +52,45 @@ _UNSET = object()
 # blocking iter_lines() forever. (Pass timeout=None to opt out of the timeout.)
 _SSE_IDLE_TIMEOUT = httpx.Timeout(10.0, read=45.0)
 
+#: Default timeout for a model run. A run is *awaited server-side*: the server
+#: holds the connection until the generation is complete, polling the upstream
+#: provider itself when that provider is submit/poll. So the client has to be
+#: willing to wait minutes, not the tens of seconds a normal API call gets —
+#: the client's own default (30s) would abort a perfectly healthy generation.
+#: ``connect`` stays short: an unreachable host is not a slow generation.
+MODEL_RUN_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
+
+#: Route for a model run. NOT an ``operationId`` from ``spec/openapi.yaml`` —
+#: the vendored v2 contract declares no model routes, so this binding is
+#: hand-written and is deliberately absent from ``comfy_low.OPERATION_IDS``
+#: (the spec-coverage test asserts that set equals the spec's, exactly).
+#: Everything about the wire shape is confined to this constant and
+#: :func:`model_run_request` so it is one place to reconcile when the route is
+#: vendored into the spec and the models are regenerated from it.
+_MODEL_RUN_PATH = "/models/run"
+
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def model_run_request(
+    model: str,
+    arguments: Mapping[str, Any],
+    idempotency_key: str | None,
+) -> tuple[str, dict[str, Any], dict[str, str]]:
+    """Sans-IO ``(path, json_body, headers)`` for one model run.
+
+    The model id travels in the *body*, not the path: ids are commonly
+    provider-namespaced and contain ``/`` (``vendor/family/variant``), which in
+    a path segment needs percent-encoding that intermediaries normalize
+    inconsistently. A named body field also leaves room for sibling fields
+    later without moving the route.
+
+    ``arguments`` is copied into a plain dict so any ``Mapping`` is accepted and
+    the caller's object is never handed to the JSON encoder directly.
+    """
+    body: dict[str, Any] = {"model": model, "arguments": dict(arguments)}
+    headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
+    return _MODEL_RUN_PATH, body, headers
 
 
 def _build_user_agent(client_info: str | None) -> str:
@@ -490,6 +534,31 @@ class ComfyLow:
         resp = self.raw_request("GET", path, timeout=timeout)
         return JobWorkflowResponse.model_validate(self._p.parse_or_raise(resp, (200,)))
 
+    # -- models -----------------------------------------------------------
+    def post_model_run(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = MODEL_RUN_TIMEOUT,
+    ) -> dict[str, Any]:
+        """POST /api/v2/models/run — run a model, awaited server-side.
+
+        One request, one response: the server does not answer until the
+        generation is complete, so the decoded body *is* the finished result.
+        That holds for a submit/poll provider too — the polling happens server
+        side, inside this call, which is why the default ``timeout`` is
+        :data:`MODEL_RUN_TIMEOUT` rather than the client's own.
+
+        The body is returned verbatim — the provider's native payload, with no
+        model class layered over it. This is not a spec operation; see
+        :data:`_MODEL_RUN_PATH`.
+        """
+        path, body, headers = model_run_request(model, arguments, idempotency_key)
+        resp = self.raw_request("POST", path, headers=headers, json=body, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 201))
+
 
 class AsyncComfyLow:
     """Asynchronous protocol bindings — mirrors :class:`ComfyLow`."""
@@ -762,6 +831,20 @@ class AsyncComfyLow:
         )
         resp = await self.raw_request("GET", path, timeout=timeout)
         return JobWorkflowResponse.model_validate(self._p.parse_or_raise(resp, (200,)))
+
+    # -- models -----------------------------------------------------------
+    async def post_model_run(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = MODEL_RUN_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Async :meth:`ComfyLow.post_model_run`."""
+        path, body, headers = model_run_request(model, arguments, idempotency_key)
+        resp = await self.raw_request("POST", path, headers=headers, json=body, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 201))
 
 
 def _looks_like_path(s: str) -> bool:

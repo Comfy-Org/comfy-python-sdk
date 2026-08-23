@@ -12,7 +12,17 @@ notes for each version.
 
 ## [Unreleased]
 
-_Nothing yet — add an entry here when your change lands._
+### Added
+
+- `client.models.run(model, arguments)` on both `Comfy` and `AsyncComfy` — one
+  call that returns the completed generation. Where the platform has to
+  submit-and-poll an upstream provider, that polling happens server side inside
+  the call, so the client contract stays a single request. The result is the
+  provider's native payload, returned as-is rather than wrapped. The awaitable
+  form is `AsyncComfy`, not a `run_async()` suffix — there is deliberately no
+  suffixed variant, and a test asserts its absence. Runs use their own
+  10-minute timeout (the client's default is sized for ordinary API calls) and
+  send an `Idempotency-Key` on every call.
 
 ## [0.1.8] - 2026-08-13
 
