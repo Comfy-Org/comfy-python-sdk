@@ -203,6 +203,21 @@ class ComfyLow:
         self._own_client = client is None
         self._client = client or httpx.Client(timeout=timeout, follow_redirects=True)
 
+    # -- configuration ----------------------------------------------------
+    # Read-only views of the settings this transport was built with, so a layer
+    # above (a ``comfy_sdk`` client namespace) can report the configuration it
+    # shares without reaching into private attributes. Both read through to the
+    # live objects, so a later change to either is reflected here.
+    @property
+    def base_url(self) -> str:
+        """Base URL every relative API path is resolved against."""
+        return self._p.base_url
+
+    @property
+    def timeout(self) -> httpx.Timeout:
+        """The httpx client's default timeout. A per-request ``timeout=`` still wins."""
+        return self._client.timeout
+
     # -- lifecycle --------------------------------------------------------
     def close(self) -> None:
         if self._own_client:
@@ -491,6 +506,17 @@ class AsyncComfyLow:
         self._p = _Prepared(base_url, api_key, client_info)
         self._own_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+
+    # -- configuration (mirrors :class:`ComfyLow`) -------------------------
+    @property
+    def base_url(self) -> str:
+        """Base URL every relative API path is resolved against."""
+        return self._p.base_url
+
+    @property
+    def timeout(self) -> httpx.Timeout:
+        """The httpx client's default timeout. A per-request ``timeout=`` still wins."""
+        return self._client.timeout
 
     async def aclose(self) -> None:
         if self._own_client:

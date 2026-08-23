@@ -1,7 +1,9 @@
 """The clients integrators import: :class:`Comfy` (sync) and :class:`AsyncComfy`.
 
 Both expose the same surface — ``assets`` / ``workflows`` / ``jobs`` constructor
-namespaces plus ``submit`` / ``run`` — over a shared sans-IO core. Only the
+namespaces, the ``models`` namespace, plus ``submit`` / ``run`` — over a shared
+sans-IO core. Every namespace is bound to the client's own transport, so they
+share its credentials, base URL, connection pool and timeout. Only the
 awaiting methods are duplicated; the rules (idempotency, 429 backoff, asset
 materialization, UI-format detection) live in ``_core`` and are called from both.
 
@@ -32,6 +34,7 @@ from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
 from .exceptions import WorkflowFormatUi, to_sdk_error
 from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory
+from .models import AsyncModels, Models
 from .workflows import Workflow, WorkflowFactory
 
 # How long to keep retrying a full queue before giving up (seconds).
@@ -127,6 +130,9 @@ class Comfy:
         self.assets = AssetFactory(self._low)
         self.workflows = WorkflowFactory()
         self.jobs = JobFactory(self._low)
+        #: ``client.models`` — the model namespace, sharing this client's
+        #: transport (credentials, base URL, connection pool, timeout).
+        self.models = Models(self._low)
 
     def close(self) -> None:
         """Release the underlying HTTP connection pool.
@@ -230,6 +236,8 @@ class AsyncComfy:
         self.assets = AsyncAssetFactory(self._low)
         self.workflows = WorkflowFactory()
         self.jobs = AsyncJobFactory(self._low)
+        #: Async counterpart of :attr:`Comfy.models`, on this client's transport.
+        self.models = AsyncModels(self._low)
 
     async def aclose(self) -> None:
         """Async :meth:`Comfy.close`. Prefer ``async with AsyncComfy(...)``."""

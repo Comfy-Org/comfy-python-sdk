@@ -254,6 +254,28 @@ with no API key of their own. On a self-hosted proxy it's the content endpoint
 backend and never downloads the bytes first. (`AsyncOutput` mirrors all of the
 above with `await`.)
 
+## The `models` namespace
+
+Model operations live in a namespace on the client you already constructed —
+`client.models` — rather than in a second client object:
+
+```python
+client = Comfy(api_key="comfyui-...")
+
+client.models.base_url   # the client's own base URL, where model requests go
+client.models.timeout    # the client's own HTTP timeout
+```
+
+The namespace is bound to that client's transport, so it uses the client's
+credentials, base URL, connection pool and timeout, and a configuration change
+made on the client afterwards applies through `models` as well — there is no
+second set of settings to keep in sync. `AsyncComfy` carries the same `models`
+namespace, and nothing extra is imported or constructed for it:
+`from comfy_sdk import Comfy` stays the only entry point.
+
+`base_url` and `timeout` are a read-only view of that shared configuration;
+model operations are added to this namespace as they land.
+
 ## Sync and async
 
 `Comfy` and `AsyncComfy` expose the identical surface — swap the import and
