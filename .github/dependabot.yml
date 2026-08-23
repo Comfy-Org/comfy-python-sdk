@@ -1,0 +1,53 @@
+version: 2
+updates:
+  # Python dependencies declared in pyproject.toml (runtime deps plus the
+  # pil/codegen/dev extras). "pip" is Dependabot's ecosystem name for the
+  # PEP 621 project table; it reads pyproject.toml, not requirements.txt.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    labels:
+      - "dependencies"
+    groups:
+      # One PR for the low-risk bumps, so routine patch churn does not eat
+      # the PR limit and hide a major that actually needs review.
+      python-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Pinned on purpose: the codegen-drift CI job diffs the generated models
+      # byte-for-byte, so a generator bump reformats the output and fails the
+      # gate until src/comfy_low/models/_generated.py is regenerated in the
+      # same commit. Majors still come through for a deliberate upgrade.
+      - dependency-name: "datamodel-code-generator"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
