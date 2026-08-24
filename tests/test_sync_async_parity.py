@@ -1,4 +1,4 @@
-"""Sync/async public-surface parity across the 7 mirrored class pairs.
+"""Sync/async public-surface parity across the 8 mirrored class pairs.
 
 The README promises "swap the import and add ``await``" as the only
 difference; this asserts the public method names actually match. Regression
@@ -17,6 +17,7 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow
 from comfy_sdk.assets import Asset, AssetFactory, AsyncAsset, AsyncAssetFactory
 from comfy_sdk.client import AsyncComfy, Comfy
 from comfy_sdk.jobs import AsyncJob, AsyncJobFactory, Job, JobFactory
+from comfy_sdk.models import AsyncModels, Models
 from comfy_sdk.outputs import AsyncOutput, Output
 
 _PAIRS: list[tuple[str, type, type]] = [
@@ -26,6 +27,7 @@ _PAIRS: list[tuple[str, type, type]] = [
     ("Job", Job, AsyncJob),
     ("JobFactory", JobFactory, AsyncJobFactory),
     ("Output", Output, AsyncOutput),
+    ("Models", Models, AsyncModels),
     ("ComfyLow", ComfyLow, AsyncComfyLow),
 ]
 

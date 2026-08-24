@@ -56,9 +56,10 @@ CI runs two more jobs beyond the four above:
 
 - **`build-check`** — builds the sdist and wheel and runs `twine check`, so a
   broken distribution is caught in PR CI instead of at release time.
-- **`public-repo-hygiene`** — `python3 scripts/check_public_repo_hygiene.py`
-  scans for internal-only references. This is a public repo; the check is a
-  permanent gate, not a one-time cleanup.
+- **`public-repo-hygiene`** — a thin caller into the shared reusable workflow
+  in `Comfy-Org/github-workflows`, which scans for internal-only references.
+  This is a public repo; the check is a permanent gate, not a one-time
+  cleanup. See AGENTS.md for details.
 
 ## The codegen trap: `src/comfy_low/models/_generated.py`
 
