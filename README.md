@@ -406,6 +406,56 @@ indefinitely. Each call also sends a fresh `Idempotency-Key`, so an accidental
 exact resend is rejected by the server instead of billing a second generation;
 pass `idempotency_key=` to choose the value yourself.
 
+### Retrying a run without paying for it twice
+
+A failed `models.run` is retried automatically. **Every attempt of one call
+sends the same `Idempotency-Key`**, and a new call mints a new one — that is
+what lets a server tell a retry apart from a second order, on a surface where
+one call is a billed generation.
+
+The default policy:
+
+| Condition | Behaviour |
+|---|---|
+| Retried | 5xx responses, and connect-phase transport failures (connection refused, connect timeout, no pooled connection, proxy error) |
+| Not retried | every 4xx — `400`/`content_policy_violation`, `404`, `409`, `422`, `401`, `402` — because asking again cannot change a deterministic refusal. `429` is also left alone: it names its own pace in `Retry-After` rather than wanting a blind backoff |
+| Not retried by default | a failure that leaves the request's fate unknown — most importantly a client-side timeout, where the server may still be generating |
+| Budget | 60 seconds of **total elapsed time** from the first attempt, not a number of attempts |
+| Backoff | 0.5s doubling to a 15s ceiling, with full jitter (each wait is drawn from `[0, ceiling]`) |
+
+The budget bounds when the *last* attempt may **start**; an attempt already
+running is never interrupted by it, so a slow generation is never abandoned
+half-way. The worst-case wall clock for a call is therefore the budget plus one
+`timeout`.
+
+Tune or disable it per client:
+
+```python
+from comfy_sdk import Comfy, NO_RETRY, RetryPolicy
+
+Comfy(retry=NO_RETRY)                          # exactly one attempt, ever
+Comfy(retry=RetryPolicy(max_elapsed=300.0))    # keep trying for five minutes
+
+client.models.retry                            # the policy in force, read-only
+```
+
+A client-side timeout is the one case left out by default. `run` holds the
+connection open while the server generates, so a timeout means "no answer yet",
+not "it did not happen" — retrying it starts a second generation unless the
+server replays the repeated key rather than re-running it. Against a server
+that does replay, opt in:
+
+```python
+Comfy(retry=RetryPolicy(max_elapsed=1200.0, retry_possibly_in_flight=True))
+```
+
+Raise `max_elapsed` when you do: one full-length client timeout on a run can
+spend the default 60-second budget on its own, leaving no room for the retry
+you just asked for.
+
+`retry` governs `client.models` only. `submit()`/`run()` on the client keep
+their own 429 handling, which follows the server's `Retry-After`.
+
 ## Sync and async
 
 `Comfy` and `AsyncComfy` expose the identical surface — swap the import and

@@ -14,6 +14,23 @@ notes for each version.
 
 ### Added
 
+- Automatic retry for `client.models.run`, on by default, with the
+  `Idempotency-Key` sent unconditionally on **every** attempt of one logical
+  call — a new call mints a new key. That is what keeps a retry from being
+  billed as a second generation. Retried: 5xx responses and connect-phase
+  transport failures. Not retried: every 4xx (a deterministic refusal such as
+  `content_policy_violation`, `404`, `409` or `422` cannot change on the second
+  ask), `429` (it names its own pace in `Retry-After`), and — unless
+  `retry_possibly_in_flight=True` — a failure that leaves the request's fate
+  unknown, most importantly a client-side timeout on a run the server may still
+  be generating. The budget is 60 seconds of **total elapsed time** from the
+  first attempt rather than an attempt count, and it bounds when the last
+  attempt may *start*: an attempt already running is never interrupted, so a
+  slow generation is never abandoned half-way. Backoff is 0.5s doubling to a
+  15s ceiling with full jitter. Configure with `Comfy(retry=RetryPolicy(...))`
+  or switch it off with `Comfy(retry=NO_RETRY)`; `client.models.retry` reads
+  back the policy in force. `RetryPolicy`, `DEFAULT_RETRY` and `NO_RETRY` are
+  exported from `comfy_sdk`.
 - `client.models.run(model, arguments)` on both `Comfy` and `AsyncComfy` — one
   call that returns the completed generation. Where the platform has to
   submit-and-poll an upstream provider, that polling happens server side inside

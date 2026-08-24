@@ -99,6 +99,13 @@ class ServerState:
     model_run_delay: float = 0.0
     # (status, code) answered instead of the result.
     model_run_error: tuple[int, str] | None = None
+    # POST /models/run fails this many times before serving the result — the
+    # transient-failure-then-success path a retry policy exists for. Decremented
+    # per request, and checked *before* `model_run_error`, which is the
+    # permanent-failure knob.
+    model_run_fail_times: int = 0
+    # (status, code) each of those transient failures answers with.
+    model_run_transient_error: tuple[int, str] = (503, "internal_error")
     # Status code for a successful run (201 exercises the created-shaped path).
     model_run_status: int = 200
 
@@ -433,6 +440,11 @@ def _make_handler(state: ServerState):
             if state.model_run_delay:
                 # The server holding the connection while it polls upstream.
                 time.sleep(state.model_run_delay)
+            if state.model_run_fail_times > 0:
+                state.model_run_fail_times -= 1
+                status, code = state.model_run_transient_error
+                self._err(status, code, f"transient model run error {code}")
+                return
             if state.model_run_error is not None:
                 status, code = state.model_run_error
                 self._err(status, code, f"model run error {code}")

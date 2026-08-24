@@ -59,6 +59,7 @@ from .exceptions import (
 )
 from .jobs import AsyncJob, Job, JobWorkflow
 from .outputs import AsyncOutput, DownloadUrl, Output
+from .retry import DEFAULT_RETRY, NO_RETRY, RetryPolicy
 from .workflows import Workflow, WorkflowFactory
 
 try:
@@ -111,4 +112,8 @@ __all__ = [
     "MissingApiKey",
     "Unauthorized",
     "Forbidden",
+    # retry policy
+    "RetryPolicy",
+    "DEFAULT_RETRY",
+    "NO_RETRY",
 ]

@@ -19,7 +19,7 @@ import httpx
 import pytest
 
 from comfy_low.transport import MODEL_RUN_TIMEOUT, AsyncComfyLow, ComfyLow, model_run_request
-from comfy_sdk import AsyncComfy, Comfy
+from comfy_sdk import NO_RETRY, AsyncComfy, Comfy
 from comfy_sdk.exceptions import ComfyError, NotFound, Unauthorized
 from comfy_sdk.models import AsyncModels, Models
 
@@ -233,8 +233,12 @@ async def test_a_failing_async_run_raises_the_sdk_exception(server) -> None:
 
 
 def test_an_unmapped_failure_still_lands_as_a_comfy_error(server) -> None:
+    # `NO_RETRY` because a 503 is retryable: under the default policy this
+    # would spend the whole retry budget re-asking a permanently-failing stub
+    # before raising. What is under test here is the mapping, not the policy —
+    # tests/test_models_run_retry.py covers the retrying half.
     server.state.model_run_error = (503, "model_unavailable")
-    with Comfy() as client:
+    with Comfy(retry=NO_RETRY) as client:
         with pytest.raises(ComfyError) as excinfo:
             client.models.run(MODEL, ARGS)
     assert excinfo.value.code == "model_unavailable"
