@@ -1,0 +1,72 @@
+# Description: Team-gated multi-model Cursor review — a thin caller for the
+# reusable workflow in Comfy-Org/github-workflows, which is the single source of
+# truth for the panel, judge, prompts, and scripts. Triggered by the
+# 'cursor-review' label.
+#
+# Access control (team-only, two layers):
+#   1. Only users with triage permission or higher can apply a label in a public
+#      repo, so the public cannot trigger this.
+#   2. The reusable workflow's secret-bearing jobs do not run on fork PRs (forks
+#      get no secrets), so CURSOR_API_KEY is reachable only on internal branches.
+name: CI - Cursor Review
+
+on:
+  pull_request:
+    types: [labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # Re-labeling cancels an in-flight run for the same PR + label.
+  group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+  cancel-in-progress: true
+
+jobs:
+  cursor-review:
+    # No job-level `if` on purpose: label filtering belongs to the reusable
+    # workflow's Gate, which knows the `review_label` input and also implements
+    # the unblock path (removing `skip-cursor-review` while `cursor-review` is
+    # still applied re-triggers the review). Filtering `unlabeled` out here
+    # would kill that path and hardcode a label name the reusable already owns.
+    # The Gate no-ops in a couple of seconds on labels it doesn't care about.
+    #
+    # SHA-pinned. Bump this SHA to pick up upstream changes; keep
+    # `workflows_ref` matching so prompts/scripts load from the same commit as
+    # the workflow definition.
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@6a374b7c0d6ea603dad12a7dcbf80e6d65e314e1 # github-workflows main (6a374b7)
+    with:
+      # Repo-specific generated/heavy paths. `extra_generated_globs` is the
+      # right knob rather than `diff_excludes`: it feeds the shared
+      # check-pr-size classifier, so matching files stay out of BOTH the diff
+      # handed to the panel AND the `diff_size_cap` count. `diff_excludes`
+      # filters only the reviewed patch, so a large regeneration listed there
+      # would be hidden from the panel yet still counted toward the cap —
+      # tripping it and skipping the whole review.
+      #
+      # Supplying this input REPLACES the upstream default list, so the
+      # defaults are restated verbatim before this repo's own paths. These are
+      # plain globs, not git pathspecs (no `:!` prefix — that is
+      # `diff_excludes`' syntax). A pattern containing `/` is anchored to the
+      # whole repo-relative path unless it opens with `**/`.
+      #
+      # Not restated: the eight dependency lockfiles (uv.lock included) are
+      # classifier built-ins already. Only `_generated.py` is machine-produced
+      # by scripts/gen_models.sh — the sibling `__init__.py` is hand-written and
+      # must stay visible to the panel.
+      extra_generated_globs: >-
+        **/node_modules/**
+        **/dist/**
+        **/vendor/**
+        **/*.generated.*
+        **/*.min.js
+        **/*.min.css
+        src/comfy_low/models/_generated.py
+        assets/**
+      # Load the prompts/scripts from the same ref as `uses:`.
+      workflows_ref: 6a374b7c0d6ea603dad12a7dcbf80e6d65e314e1
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      # Optional — enables start/complete Slack DMs to the triggerer.
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
