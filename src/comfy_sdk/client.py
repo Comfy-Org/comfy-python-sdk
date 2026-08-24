@@ -36,7 +36,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from comfy_low.errors import ApiError
-from comfy_low.transport import AsyncComfyLow, ComfyLow
+from comfy_low.transport import AsyncComfyLow, ComfyLow, origin
 
 from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
@@ -111,6 +111,26 @@ def _resolve_base_url() -> str:
     return raw
 
 
+def _same_deployment(url: str, other: str) -> bool:
+    """Whether two base URLs name the same deployment.
+
+    Compared by normalized origin (scheme, host, effective port — shared with
+    the transport's same-origin credential rule) plus path, rather than by
+    string. ``https://cloud.comfy.org:443/`` is Comfy Cloud with its default
+    port written out, and reading it as *some other* deployment would hand the
+    caller a keyless client and a server 401 on the first request instead of
+    the local error this module promises.
+
+    The path is part of the comparison because a deployment mounted under the
+    same host (``https://cloud.comfy.org/self-hosted``) is a different target,
+    and the keyless carve-out has to keep applying to it.
+    """
+    return (origin(url), urlsplit(url).path.rstrip("/")) == (
+        origin(other),
+        urlsplit(other).path.rstrip("/"),
+    )
+
+
 def _resolve_api_key(explicit: str | None, base_url: str) -> str | None:
     """The explicit argument, then ``COMFY_API_KEY``, then a clear local error.
 
@@ -131,7 +151,7 @@ def _resolve_api_key(explicit: str | None, base_url: str) -> str | None:
     for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR)):
         if candidate and candidate.strip():
             return candidate.strip()
-    if base_url.rstrip("/") == COMFY_CLOUD_BASE_URL:
+    if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):
         raise MissingApiKey(
             f"no API key: pass api_key=... to the client, or set {API_KEY_ENV_VAR} in the "
             f"environment. Comfy Cloud ({COMFY_CLOUD_BASE_URL}) requires one; set "
@@ -202,7 +222,7 @@ class Comfy:
         purpose instead of left to whoever edits this class next.
         """
         return (
-            f"{type(self).__name__}(base_url={self._low.base_url!r}, "
+            f"{type(self).__name__}(base_url={self._low.safe_base_url!r}, "
             f"authenticated={self._low.authenticated})"
         )
 
@@ -314,7 +334,7 @@ class AsyncComfy:
     def __repr__(self) -> str:
         """Key-free, exactly as :meth:`Comfy.__repr__`."""
         return (
-            f"{type(self).__name__}(base_url={self._low.base_url!r}, "
+            f"{type(self).__name__}(base_url={self._low.safe_base_url!r}, "
             f"authenticated={self._low.authenticated})"
         )
 

@@ -15,6 +15,11 @@ case below sets exactly the environment it names.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+
 import httpx
 import pytest
 
@@ -34,6 +39,25 @@ LOCAL = "http://127.0.0.1:8189"
 
 # Both clients resolve credentials identically, so every case runs against both.
 CLIENTS = pytest.mark.parametrize("client_cls", [Comfy, AsyncComfy], ids=["sync", "async"])
+
+
+@contextmanager
+def constructed(client_cls: type, **kwargs: Any) -> Iterator[Any]:
+    """Construct a client and always release its transport.
+
+    Each client owns an httpx transport, so every one built here has to be
+    closed. Only ``AsyncComfy`` needs a loop to close, and hiding that in one
+    helper is what lets a case below stay a single parametrized test running
+    against both clients instead of a sync copy and an async copy.
+    """
+    client = client_cls(**kwargs)
+    try:
+        yield client
+    finally:
+        if isinstance(client, AsyncComfy):
+            asyncio.run(client.aclose())
+        else:
+            client.close()
 
 
 def auth_header(client: Comfy | AsyncComfy) -> str | None:
@@ -66,8 +90,8 @@ def test_key_resolution_order(monkeypatch, client_cls, explicit, env, expected) 
         with pytest.raises(MissingApiKey):
             client_cls(api_key=explicit)
         return
-    client = client_cls(api_key=explicit)
-    assert auth_header(client) == expected
+    with constructed(client_cls, api_key=explicit) as client:
+        assert auth_header(client) == expected
 
 
 # --- the failure is local, clear, and named -------------------------------
@@ -121,30 +145,30 @@ def test_missing_key_is_a_comfy_error(client_cls) -> None:
 @CLIENTS
 def test_key_is_never_in_repr_or_str(client_cls) -> None:
     """The most common way a credential lands in a CI log."""
-    client = client_cls(api_key=EXPLICIT)
-    for rendered in (repr(client), str(client), repr(client._low), repr(client._low._p)):
-        assert EXPLICIT not in rendered
-    # ...and the repr still says something useful about the credential.
-    assert "authenticated=True" in repr(client)
-    assert client._low.authenticated is True
+    with constructed(client_cls, api_key=EXPLICIT) as client:
+        for rendered in (repr(client), str(client), repr(client._low), repr(client._low._p)):
+            assert EXPLICIT not in rendered
+        # ...and the repr still says something useful about the credential.
+        assert "authenticated=True" in repr(client)
+        assert client._low.authenticated is True
 
 
 @CLIENTS
 def test_key_from_the_environment_is_never_in_repr_or_str(monkeypatch, client_cls) -> None:
     """Same guarantee whichever source the key came from."""
     monkeypatch.setenv(API_KEY_ENV_VAR, FROM_ENV)
-    client = client_cls()
-    assert FROM_ENV not in repr(client)
-    assert FROM_ENV not in str(client)
-    assert FROM_ENV not in repr(client._low._p)
+    with constructed(client_cls) as client:
+        assert FROM_ENV not in repr(client)
+        assert FROM_ENV not in str(client)
+        assert FROM_ENV not in repr(client._low._p)
 
 
 @CLIENTS
 def test_keyless_client_reports_unauthenticated(monkeypatch, client_cls) -> None:
     monkeypatch.setenv(BASE_URL_ENV_VAR, LOCAL)
-    client = client_cls()
-    assert "authenticated=False" in repr(client)
-    assert client._low.authenticated is False
+    with constructed(client_cls) as client:
+        assert "authenticated=False" in repr(client)
+        assert client._low.authenticated is False
 
 
 def test_key_is_never_in_a_rejected_request_error(server) -> None:
@@ -172,7 +196,8 @@ def test_key_is_never_in_a_rejected_request_error(server) -> None:
 def test_surrounding_whitespace_is_stripped(monkeypatch, client_cls, raw) -> None:
     """A key read out of a file keeps its trailing newline; it must not reach the header."""
     monkeypatch.setenv(API_KEY_ENV_VAR, raw)
-    assert auth_header(client_cls()) == f"Bearer {FROM_ENV}"
+    with constructed(client_cls) as client:
+        assert auth_header(client) == f"Bearer {FROM_ENV}"
 
 
 @CLIENTS
@@ -184,14 +209,16 @@ def test_blank_counts_as_unset_at_either_source(monkeypatch, client_cls, blank) 
         client_cls()
     # A blank explicit argument falls through to a usable environment key.
     monkeypatch.setenv(API_KEY_ENV_VAR, FROM_ENV)
-    assert auth_header(client_cls(api_key=blank)) == f"Bearer {FROM_ENV}"
+    with constructed(client_cls, api_key=blank) as client:
+        assert auth_header(client) == f"Bearer {FROM_ENV}"
 
 
 @CLIENTS
 def test_self_hosted_deployment_still_needs_no_key(monkeypatch, client_cls) -> None:
     """The documented keyless surface is untouched: no error, and no credential."""
     monkeypatch.setenv(BASE_URL_ENV_VAR, LOCAL)
-    assert auth_header(client_cls()) is None
+    with constructed(client_cls) as client:
+        assert auth_header(client) is None
 
 
 @CLIENTS
@@ -199,7 +226,8 @@ def test_environment_key_is_used_against_a_named_deployment(monkeypatch, client_
     """The fallback is not Cloud-only — a serverless target picks it up too."""
     monkeypatch.setenv(BASE_URL_ENV_VAR, LOCAL)
     monkeypatch.setenv(API_KEY_ENV_VAR, FROM_ENV)
-    assert auth_header(client_cls()) == f"Bearer {FROM_ENV}"
+    with constructed(client_cls) as client:
+        assert auth_header(client) == f"Bearer {FROM_ENV}"
 
 
 @CLIENTS
@@ -208,6 +236,92 @@ def test_cloud_named_explicitly_still_requires_a_key(monkeypatch, client_cls) ->
     monkeypatch.setenv(BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL + "/")
     with pytest.raises(MissingApiKey):
         client_cls()
+
+
+@CLIENTS
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        pytest.param(COMFY_CLOUD_BASE_URL + ":443", id="explicit-default-port"),
+        pytest.param(COMFY_CLOUD_BASE_URL + ":443/", id="explicit-default-port-slash"),
+        pytest.param("https://CLOUD.Comfy.ORG", id="mixed-case-host"),
+    ],
+)
+def test_cloud_by_another_spelling_still_requires_a_key(monkeypatch, client_cls, spelling) -> None:
+    """The rule follows the deployment, not the string that happens to name it.
+
+    ``https://cloud.comfy.org:443`` is Comfy Cloud with its default port
+    written out. Matching Cloud by string alone would miss it, hand back a
+    keyless client, and turn this module's local error into a server 401 on the
+    first request — exactly the failure the local check exists to prevent.
+    """
+    monkeypatch.setenv(BASE_URL_ENV_VAR, spelling)
+    with pytest.raises(MissingApiKey):
+        client_cls()
+
+
+@CLIENTS
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        pytest.param("https://cloud.comfy.org/self-hosted", id="path-mounted"),
+        pytest.param("https://cloud.comfy.org:8443", id="other-port"),
+    ],
+)
+def test_a_different_deployment_on_the_same_host_stays_keyless(
+    monkeypatch, client_cls, spelling
+) -> None:
+    """Recognizing more spellings of Cloud must not swallow the neighbours.
+
+    A deployment mounted under a path on the same host — or reached on another
+    port — is a different target, and the documented keyless carve-out still
+    applies to it. This is the other half of the test above: the comparison has
+    to be wide enough to catch Cloud and narrow enough to leave these alone.
+    """
+    monkeypatch.setenv(BASE_URL_ENV_VAR, spelling)
+    with constructed(client_cls) as client:
+        assert auth_header(client) is None
+
+
+# --- a credential embedded in the base URL never leaks either --------------
+
+PROXY_SECRET = "comfyui-proxy-secret"
+PROXY_BASE_URL = f"https://proxy-user:{PROXY_SECRET}@proxy.example"
+
+
+@CLIENTS
+def test_base_url_userinfo_is_redacted_in_every_repr(monkeypatch, client_cls) -> None:
+    """The other credential a client can hold: one embedded in its base URL.
+
+    ``COMFY_BASE_URL=https://user:token@proxy.example`` is a valid way to reach
+    a deployment behind an authenticating proxy, and a repr that prints it
+    verbatim leaks it to the same CI logs and tracebacks the API key is kept
+    out of. Only what is *rendered* is redacted — the transport still resolves
+    requests against the URL it was given, so the proxy credential keeps
+    working.
+    """
+    monkeypatch.setenv(BASE_URL_ENV_VAR, PROXY_BASE_URL)
+    with constructed(client_cls) as client:
+        for rendered in (
+            repr(client),
+            str(client),
+            repr(client._low),
+            repr(client._low._p),
+            repr(client.models),
+        ):
+            assert PROXY_SECRET not in rendered
+            assert "proxy-user" not in rendered
+            assert "***@proxy.example" in rendered
+        assert client._low.base_url == PROXY_BASE_URL
+
+
+@CLIENTS
+def test_a_base_url_without_userinfo_is_rendered_unchanged(monkeypatch, client_cls) -> None:
+    """Redaction stays invisible in the ordinary case — the target reads plainly."""
+    monkeypatch.setenv(BASE_URL_ENV_VAR, LOCAL)
+    with constructed(client_cls) as client:
+        assert f"base_url={LOCAL!r}" in repr(client)
+        assert f"base_url={LOCAL!r}" in repr(client._low)
 
 
 def test_environment_key_reaches_the_server(server, monkeypatch) -> None:

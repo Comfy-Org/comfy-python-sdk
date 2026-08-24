@@ -140,7 +140,9 @@ and trailing whitespace is stripped, and a blank value counts as *unset*, so
 `COMFY_API_KEY=` in a shell profile and a key read from a file with a trailing
 newline both do the obvious thing.
 
-Step 3 applies only to Comfy Cloud. A deployment named by `COMFY_BASE_URL` may
+Step 3 applies only to Comfy Cloud, recognized by its normalized origin and
+path rather than by the exact string — `https://cloud.comfy.org:443/` is the
+same deployment and gets the same local error. A deployment named by `COMFY_BASE_URL` may
 have no auth at all, so if nothing resolves there the client is built without a
 credential and sends none — the self-hosted row of the table above is unchanged.
 A serverless deployment does require a key, and picks up `COMFY_API_KEY` the
@@ -148,7 +150,10 @@ same way; supply one or the server will answer `401`.
 
 The key is write-only from the outside: it is never logged, never rendered by a
 client's `repr()`/`str()` (they report `authenticated=True|False`, never the
-key), and never placed in an exception message.
+key), and never placed in an exception message. The same holds for a credential
+carried in the base URL itself — `COMFY_BASE_URL=https://user:token@proxy.example`
+reaches a deployment behind an authenticating proxy, and every `repr()` renders
+it as `https://***@proxy.example` while requests still use the URL as given.
 
 `MissingApiKey` is a `ComfyError` like every other SDK exception, and is
 distinct from `Unauthorized` — no key at all, versus a key the server rejected:
