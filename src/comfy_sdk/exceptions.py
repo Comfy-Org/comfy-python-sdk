@@ -34,10 +34,23 @@ class ComfyError(Exception):
         self.details = details
 
 
+class MissingApiKey(ComfyError):
+    """No credential could be resolved for a surface that requires one.
+
+    Raised locally at client construction — before any request — when neither an
+    explicit ``api_key`` argument nor ``COMFY_API_KEY`` supplied a key and the
+    target is Comfy Cloud. Distinct from :class:`Unauthorized`, which is the
+    server rejecting a key that *was* sent. The message names the environment
+    variable, and never contains a key (there is none to contain).
+    """
+
+
 class Unauthorized(ComfyError):
     """The surface rejected the request for lack of a valid key.
 
     Comfy Cloud and serverless require a key; a self-hosted proxy needs none.
+    Its local counterpart is :class:`MissingApiKey` — no key at all, caught at
+    construction rather than on the wire.
     """
 
 

@@ -23,6 +23,31 @@ notes for each version.
   suffixed variant, and a test asserts its absence. Runs use their own
   10-minute timeout (the client's default is sized for ordinary API calls) and
   send an `Idempotency-Key` on every call.
+- Credential resolution with a documented order: the explicit `api_key=`
+  argument first, then the `COMFY_API_KEY` environment variable. Against Comfy
+  Cloud, which always requires a key, neither raises the new `MissingApiKey`
+  locally at construction — naming `COMFY_API_KEY` in the message — instead of
+  costing a round trip to be told `401`. Both sources are trimmed, and a blank
+  value counts as unset. Comfy Cloud is recognized by normalized origin (scheme,
+  host, effective port) and path rather than by string, so a `COMFY_BASE_URL`
+  that spells it differently — `https://cloud.comfy.org:443/`, or with a
+  mixed-case host — gets the same local error rather than a server `401`.
+- `MissingApiKey` (a `ComfyError`, `code="missing_api_key"`) and
+  `API_KEY_ENV_VAR` are exported from `comfy_sdk`.
+- `Comfy`/`AsyncComfy` now have an explicit `repr()` reporting the base URL and
+  `authenticated=True|False`. The key is never rendered, logged, or included in
+  an exception message. A credential embedded in the base URL itself
+  (`COMFY_BASE_URL=https://user:token@proxy.example`, for a deployment behind an
+  authenticating proxy) is redacted to `***@host` in every `repr()` — the
+  client, its transport and its `models` namespace — while requests still go out
+  against the URL exactly as given.
+
+### Changed
+
+- A client targeting a deployment named by `COMFY_BASE_URL` is unchanged: with
+  no key resolved it is still built without one and still sends no credentials,
+  which is what a self-hosted ComfyUI behind the API proxy needs. Only the Comfy
+  Cloud default gained the local error.
 
 ## [0.1.8] - 2026-08-13
 

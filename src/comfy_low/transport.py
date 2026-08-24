@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any, BinaryIO
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
@@ -127,8 +127,15 @@ def _retry_after(resp: httpx.Response) -> int | None:
         return None
 
 
-def _origin(url: str) -> tuple[str, str, int | None]:
-    """Normalized ``(scheme, host, port)`` — the parts that define same-origin."""
+def origin(url: str) -> tuple[str, str, int | None]:
+    """Normalized ``(scheme, host, port)`` — the parts that define same-origin.
+
+    Public because it is the single definition of "same target" in the SDK: the
+    transport decides here whether a URL may carry the bearer token, and
+    ``comfy_sdk.client`` compares against it to recognize Comfy Cloud however
+    the caller spelled it. Two spellings that differ only in case or in an
+    explicitly written default port are the same origin.
+    """
     parts = urlsplit(url)
     scheme = (parts.scheme or "").lower()
     port = parts.port
@@ -137,16 +144,45 @@ def _origin(url: str) -> tuple[str, str, int | None]:
     return (scheme, (parts.hostname or "").lower(), port)
 
 
+def redact_userinfo(url: str) -> str:
+    """``url`` with any userinfo replaced by ``***`` — the form safe to render.
+
+    A base URL may legitimately carry credentials in its netloc
+    (``https://user:token@proxy.example`` for an authenticating proxy), and a
+    client is exactly the object that ends up in a traceback, a debugger frame
+    or a CI log. So every ``repr`` renders this form while the URL the
+    transport actually requests against keeps the userinfo intact — the
+    credential is hidden from display, not taken away from the caller.
+    """
+    parts = urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    host = parts.netloc.rsplit("@", 1)[1]
+    return urlunsplit((parts.scheme, f"***@{host}", parts.path, parts.query, parts.fragment))
+
+
 class _Prepared:
     """Sans-IO request building shared by both transports."""
 
     def __init__(self, base_url: str, api_key: str | None, client_info: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self._base_origin = _origin(self.base_url)
+        #: ``base_url`` with any userinfo redacted — what every ``repr`` shows.
+        self.safe_base_url = redact_userinfo(self.base_url)
+        self._base_origin = origin(self.base_url)
         parts = urlsplit(self.base_url)
         self._origin_url = f"{parts.scheme}://{parts.netloc}"
         self._user_agent = _build_user_agent(client_info)
+
+    def __repr__(self) -> str:
+        # This object holds the bearer token, so its repr is written out rather
+        # than inherited: `authenticated` reports only whether one is set, and
+        # the base URL is the redacted form so a credential embedded *in it*
+        # does not leak either.
+        return (
+            f"{type(self).__name__}(base_url={self.safe_base_url!r}, "
+            f"authenticated={bool(self.api_key)})"
+        )
 
     def url(self, path: str) -> str:
         # A server link (job.urls.*, marked by containing /api/) already carries
@@ -168,7 +204,7 @@ class _Prepared:
         # server-returned absolute follow-up links (job.urls.self/cancel/events)
         # must not carry the key to a different scheme/host/port. Relative paths
         # are always resolved under base_url, so they are unaffected.
-        if self.api_key and _origin(url) == self._base_origin:
+        if self.api_key and origin(url) == self._base_origin:
             h["Authorization"] = f"Bearer {self.api_key}"
         if extra:
             h.update(extra)
@@ -258,9 +294,29 @@ class ComfyLow:
         return self._p.base_url
 
     @property
+    def safe_base_url(self) -> str:
+        """:attr:`base_url` with any userinfo redacted — the form safe to log."""
+        return self._p.safe_base_url
+
+    @property
     def timeout(self) -> httpx.Timeout:
         """The httpx client's default timeout. A per-request ``timeout=`` still wins."""
         return self._client.timeout
+
+    @property
+    def authenticated(self) -> bool:
+        """Whether a credential is attached to same-origin requests.
+
+        The key itself is deliberately not exposed here: this is the read a
+        layer above (or a ``repr``) needs, and it cannot leak the credential.
+        """
+        return bool(self._p.api_key)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(base_url={self.safe_base_url!r}, "
+            f"authenticated={self.authenticated})"
+        )
 
     # -- lifecycle --------------------------------------------------------
     def close(self) -> None:
@@ -583,9 +639,25 @@ class AsyncComfyLow:
         return self._p.base_url
 
     @property
+    def safe_base_url(self) -> str:
+        """:attr:`base_url` with any userinfo redacted — the form safe to log."""
+        return self._p.safe_base_url
+
+    @property
     def timeout(self) -> httpx.Timeout:
         """The httpx client's default timeout. A per-request ``timeout=`` still wins."""
         return self._client.timeout
+
+    @property
+    def authenticated(self) -> bool:
+        """Whether a credential is attached — mirrors :attr:`ComfyLow.authenticated`."""
+        return bool(self._p.api_key)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(base_url={self.safe_base_url!r}, "
+            f"authenticated={self.authenticated})"
+        )
 
     async def aclose(self) -> None:
         if self._own_client:

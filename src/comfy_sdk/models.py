@@ -53,7 +53,10 @@ class _ModelsBase:
         return self._low.timeout
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}(base_url={self.base_url!r})"
+        # Redacted like the host client's repr: a base URL may carry proxy
+        # credentials in its userinfo, and this namespace lands in the same
+        # tracebacks and CI logs the client does.
+        return f"{type(self).__name__}(base_url={self._low.safe_base_url!r})"
 
 
 class Models(_ModelsBase):
