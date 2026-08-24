@@ -321,6 +321,36 @@ namespace, and nothing extra is imported or constructed for it:
 `base_url` and `timeout` are a read-only view of that shared configuration;
 model operations are added to this namespace as they land.
 
+### `models.run` — one call, one result
+
+```python
+result = client.models.run("acme/flux/dev", {"prompt": "a cat", "steps": 4})
+result["images"][0]["url"]
+```
+
+`run` returns when the generation is **complete**. There is no submit step and
+nothing to poll: where the platform has to submit-and-poll an upstream
+provider, that happens server side inside this one call. The value you get back
+is the provider's own payload — decoded JSON, handed over as-is, with no
+wrapper class between you and the fields the provider documented.
+
+The awaitable form is the **async client**, not a differently-named method:
+
+```python
+async with AsyncComfy(api_key="comfyui-...") as client:
+    result = await client.models.run("acme/flux/dev", {"prompt": "a cat"})
+```
+
+There is no `run_async()`, and there will not be one — one operation, one name,
+and `await` is what makes it asynchronous.
+
+Because the server may legitimately hold the connection for minutes, `run` uses
+its own 10-minute timeout rather than the client's (which is sized for ordinary
+API calls). Pass `timeout=` seconds, an `httpx.Timeout`, or `None` to wait
+indefinitely. Each call also sends a fresh `Idempotency-Key`, so an accidental
+exact resend is rejected by the server instead of billing a second generation;
+pass `idempotency_key=` to choose the value yourself.
+
 ## Sync and async
 
 `Comfy` and `AsyncComfy` expose the identical surface — swap the import and
