@@ -71,6 +71,33 @@ for output in job.get_outputs("9"):
     output.to_file(output.name)
 ```
 
+### Constructing a workflow
+
+`client.workflows` builds a `Workflow` from wherever your API-format graph already lives. All three constructors are local — none of them touches the network:
+
+| Constructor | Takes |
+|---|---|
+| `from_file(path)` | a path to a `workflow_api.json` on disk |
+| `from_json(graph)` | a graph already in memory, as a `dict` |
+| `from_str(text)` | the JSON text of a graph |
+
+Callers that assemble the graph in code — a service or a cron with no JSON file to ship alongside it — want `from_json`:
+
+```python
+graph = {                                   # API format, same shape as workflow_api.json (abridged)
+    "3": {"class_type": "KSampler", "inputs": {"seed": 0, "steps": 20}},
+    "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0]}},
+}
+
+wf = client.workflows.from_json(graph)      # or from_str(json.dumps(graph))
+wf.set_input("3", "seed", 42)               # sugar for graph["3"]["inputs"]["seed"] = 42
+
+job = client.run(wf)
+data = job.get_outputs("9")[0].to_bytes()   # bytes in memory, no file written
+```
+
+`from_json` wraps the dict you hand it rather than copying, and `wf.json` *is* that graph — still a plain, freely-mutable `dict` if you'd rather edit it directly than go through `set_input`. `AsyncComfy` exposes the same three constructors on `client.workflows`.
+
 ## Authentication — one client, per-surface key
 
 | Surface | `api_key` |
@@ -301,8 +328,26 @@ On Comfy Cloud / serverless the URL is a short-lived, **self-authorizing**
 signed storage URL: whoever holds it can read the asset until `expires_at`
 with no API key of their own. On a self-hosted proxy it's the content endpoint
 (normal auth still applies) and `expires_at` is `None`. It works on every
-backend and never downloads the bytes first. (`AsyncOutput` mirrors all of the
-above with `await`.)
+backend and never downloads the bytes first.
+
+### Outputs are kind-typed
+
+Outputs aren't assumed to be images. `output.type` is the normalized kind of what the node produced — one of `image`, `video`, `audio`, `text`, `file`, `latent` — and sits alongside `output.content_type` (the exact MIME type), `output.name` and `output.size_bytes`. Branch on it rather than sniffing the filename:
+
+```python
+for out in job.outputs:
+    match out.type:
+        case "image":
+            out.to_file(out.name)                        # stream straight to disk
+        case "audio":
+            transcode(out.to_bytes(), out.content_type)  # bytes in memory, nothing written
+        case "video":
+            enqueue(out.get_download_url().url)          # hand the URL off, transfer nothing
+        case _:
+            print(out.type, out.name, out.size_bytes)
+```
+
+(`AsyncOutput` mirrors all of the above with `await`.)
 
 ## The `models` namespace
 
@@ -325,6 +370,36 @@ namespace, and nothing extra is imported or constructed for it:
 
 `base_url` and `timeout` are a read-only view of that shared configuration;
 model operations are added to this namespace as they land.
+
+### `models.run` — one call, one result
+
+```python
+result = client.models.run("acme/flux/dev", {"prompt": "a cat", "steps": 4})
+result["images"][0]["url"]
+```
+
+`run` returns when the generation is **complete**. There is no submit step and
+nothing to poll: where the platform has to submit-and-poll an upstream
+provider, that happens server side inside this one call. The value you get back
+is the provider's own payload — decoded JSON, handed over as-is, with no
+wrapper class between you and the fields the provider documented.
+
+The awaitable form is the **async client**, not a differently-named method:
+
+```python
+async with AsyncComfy(api_key="comfyui-...") as client:
+    result = await client.models.run("acme/flux/dev", {"prompt": "a cat"})
+```
+
+There is no `run_async()`, and there will not be one — one operation, one name,
+and `await` is what makes it asynchronous.
+
+Because the server may legitimately hold the connection for minutes, `run` uses
+its own 10-minute timeout rather than the client's (which is sized for ordinary
+API calls). Pass `timeout=` seconds, an `httpx.Timeout`, or `None` to wait
+indefinitely. Each call also sends a fresh `Idempotency-Key`, so an accidental
+exact resend is rejected by the server instead of billing a second generation;
+pass `idempotency_key=` to choose the value yourself.
 
 ## Sync and async
 

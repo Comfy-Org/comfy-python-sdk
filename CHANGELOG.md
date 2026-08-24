@@ -14,6 +14,15 @@ notes for each version.
 
 ### Added
 
+- `client.models.run(model, arguments)` on both `Comfy` and `AsyncComfy` — one
+  call that returns the completed generation. Where the platform has to
+  submit-and-poll an upstream provider, that polling happens server side inside
+  the call, so the client contract stays a single request. The result is the
+  provider's native payload, returned as-is rather than wrapped. The awaitable
+  form is `AsyncComfy`, not a `run_async()` suffix — there is deliberately no
+  suffixed variant, and a test asserts its absence. Runs use their own
+  10-minute timeout (the client's default is sized for ordinary API calls) and
+  send an `Idempotency-Key` on every call.
 - Credential resolution with a documented order: the explicit `api_key=`
   argument first, then the `COMFY_API_KEY` environment variable. Against Comfy
   Cloud, which always requires a key, neither raises the new `MissingApiKey`

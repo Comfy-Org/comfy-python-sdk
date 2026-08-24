@@ -83,6 +83,25 @@ class ServerState:
     job_workflow_format: str = "api"
     job_workflow_not_found: bool = False
 
+    # --- POST /models/run (the awaited model run) ---
+    # The provider's native payload the run resolves to. Deliberately not a
+    # Comfy-shaped envelope: the SDK must hand it back untouched.
+    model_run_result: dict[str, Any] = field(
+        default_factory=lambda: {
+            "images": [{"url": "http://example.invalid/gen.png", "width": 1024, "height": 1024}],
+            "seed": 42,
+            "timings": {"inference": 3.5},
+        }
+    )
+    # Seconds the run holds the connection before answering — stands in for a
+    # generation the server polls internally, so a client whose timeout is too
+    # short aborts a healthy run.
+    model_run_delay: float = 0.0
+    # (status, code) answered instead of the result.
+    model_run_error: tuple[int, str] | None = None
+    # Status code for a successful run (201 exercises the created-shaped path).
+    model_run_status: int = 200
+
     # --- counters the tests assert on ---
     upload_count: int = 0
     from_hash_count: int = 0
@@ -106,6 +125,11 @@ class ServerState:
     # `None` before any request; `""` if a request arrived without one.
     last_auth_header: str | None = None
     last_user_agent: str | None = None
+    model_run_count: int = 0
+    last_model_run_body: dict[str, Any] | None = None
+    # Every Idempotency-Key seen on POST /models/run, in arrival order (`None`
+    # records a run that arrived without the header at all).
+    model_run_idempotency_keys: list[str | None] = field(default_factory=list)
 
 
 def _asset_json(asset_id: str, hash_: str, created_new: bool, size: int) -> dict:
@@ -167,6 +191,17 @@ def _make_handler(state: ServerState):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a: Any) -> None:
             pass
+
+        def handle_one_request(self) -> None:
+            # A test that deliberately aborts a slow request (an over-short
+            # client timeout against `model_run_delay`) closes the socket while
+            # this thread is still writing. That is the scenario under test,
+            # not a server fault — so don't dump a traceback for it. Only these
+            # two exception types are swallowed; anything else still surfaces.
+            try:
+                super().handle_one_request()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
 
         # -- helpers --
         def _json(self, status: int, payload: dict, headers: dict | None = None) -> None:
@@ -364,6 +399,9 @@ def _make_handler(state: ServerState):
             if self.path == "/api/v2/jobs":
                 self._post_jobs()
                 return
+            if self.path == "/api/v2/models/run":
+                self._post_model_run()
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
                 self._json(200, _job_json(m.group(1), "canceling"))
@@ -387,6 +425,19 @@ def _make_handler(state: ServerState):
                 self._json(201, _asset_json("asset_dedup_01", body["hash"], False, 33))
             else:
                 self._err(404, "blob_not_found", "no such blob")
+
+        def _post_model_run(self) -> None:
+            state.model_run_count += 1
+            state.last_model_run_body = json.loads(self._read_body() or b"{}")
+            state.model_run_idempotency_keys.append(self.headers.get("Idempotency-Key"))
+            if state.model_run_delay:
+                # The server holding the connection while it polls upstream.
+                time.sleep(state.model_run_delay)
+            if state.model_run_error is not None:
+                status, code = state.model_run_error
+                self._err(status, code, f"model run error {code}")
+                return
+            self._json(state.model_run_status, state.model_run_result)
 
         def _post_jobs(self) -> None:
             state.submit_count += 1
