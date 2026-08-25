@@ -99,8 +99,25 @@ class ServerState:
     model_run_delay: float = 0.0
     # (status, code) answered instead of the result.
     model_run_error: tuple[int, str] | None = None
+    # POST /models/run fails this many times before serving the result — the
+    # transient-failure-then-success path a retry policy exists for. Decremented
+    # per request, and checked *before* `model_run_error`, which is the
+    # permanent-failure knob.
+    model_run_fail_times: int = 0
+    # (status, code) each of those transient failures answers with.
+    model_run_transient_error: tuple[int, str] = (503, "internal_error")
     # Status code for a successful run (201 exercises the created-shaped path).
     model_run_status: int = 200
+    # Model the deployment `retry_possibly_in_flight` exists for: one that
+    # *replays* a repeated Idempotency-Key rather than rejecting it, so a key
+    # is released rather than claimed when a request fails 5xx. Default False
+    # is the vendored contract (reject-on-duplicate, no replay), under which a
+    # same-key retry after a 5xx can only come back 422.
+    model_run_replays_idempotency_key: bool = False
+    # Seconds sent as Retry-After alongside `model_run_error`, when that error
+    # is the 429 the policy is allowed to pace itself against. `None` sends no
+    # header at all, which is the 429 the policy must *not* retry.
+    model_run_retry_after: str | None = None
 
     # --- counters the tests assert on ---
     upload_count: int = 0
@@ -130,6 +147,10 @@ class ServerState:
     # Every Idempotency-Key seen on POST /models/run, in arrival order (`None`
     # records a run that arrived without the header at all).
     model_run_idempotency_keys: list[str | None] = field(default_factory=list)
+    # Keys POST /models/run has *claimed*, so a reuse can be rejected exactly
+    # as POST /jobs rejects one. Kept apart from `idempotency` only so a model
+    # test cannot perturb a workflow test's bookkeeping.
+    model_run_idempotency: dict[str, str] = field(default_factory=dict)
 
 
 def _asset_json(asset_id: str, hash_: str, created_new: bool, size: int) -> dict:
@@ -429,14 +450,48 @@ def _make_handler(state: ServerState):
         def _post_model_run(self) -> None:
             state.model_run_count += 1
             state.last_model_run_body = json.loads(self._read_body() or b"{}")
-            state.model_run_idempotency_keys.append(self.headers.get("Idempotency-Key"))
+            key = self.headers.get("Idempotency-Key")
+            state.model_run_idempotency_keys.append(key)
+
+            # The same reject-on-duplicate rule `_post_jobs` implements, for
+            # the same reason: a stub more permissive than the contract would
+            # let a retry design that the real server rejects pass its tests.
+            if key and key in state.model_run_idempotency:
+                self._err(422, "idempotency_key_reuse", "Idempotency-Key already used")
+                return
+
             if state.model_run_delay:
                 # The server holding the connection while it polls upstream.
                 time.sleep(state.model_run_delay)
+
+            def claim_if_outcome_unknown(status: int) -> None:
+                # The contract releases a key for a request that definitively
+                # failed without starting work (a 4xx) and keeps it claimed
+                # when the outcome is unknown (a 5xx). A replaying deployment
+                # is the exception, and is what the opt-in is for.
+                if key and status >= 500 and not state.model_run_replays_idempotency_key:
+                    state.model_run_idempotency[key] = "claimed"
+
+            def fail(status: int, code: str, message: str) -> None:
+                claim_if_outcome_unknown(status)
+                headers = (
+                    {"Retry-After": state.model_run_retry_after}
+                    if state.model_run_retry_after is not None
+                    else None
+                )
+                self._json(status, {"error": {"code": code, "message": message}}, headers=headers)
+
+            if state.model_run_fail_times > 0:
+                state.model_run_fail_times -= 1
+                status, code = state.model_run_transient_error
+                fail(status, code, f"transient model run error {code}")
+                return
             if state.model_run_error is not None:
                 status, code = state.model_run_error
-                self._err(status, code, f"model run error {code}")
+                fail(status, code, f"model run error {code}")
                 return
+            if key:
+                state.model_run_idempotency[key] = "done"
             self._json(state.model_run_status, state.model_run_result)
 
         def _post_jobs(self) -> None:

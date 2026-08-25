@@ -43,6 +43,7 @@ from .assets import AssetFactory, AsyncAssetFactory
 from .exceptions import MissingApiKey, WorkflowFormatUi, to_sdk_error
 from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory
 from .models import AsyncModels, Models
+from .retry import DEFAULT_RETRY, RetryPolicy
 from .workflows import Workflow, WorkflowFactory
 
 # How long to keep retrying a full queue before giving up (seconds).
@@ -179,6 +180,12 @@ class Comfy:
     fails loudly instead of being read as a key. Omit it to fall back to
     ``COMFY_API_KEY``; against Comfy Cloud, neither raises
     :class:`~comfy_sdk.exceptions.MissingApiKey` at construction.
+
+    ``retry`` is the policy ``client.models`` calls fail under —
+    :data:`~comfy_sdk.retry.DEFAULT_RETRY` unless replaced, and
+    :data:`~comfy_sdk.retry.NO_RETRY` to make every call exactly one attempt.
+    It does not govern ``submit``/``run``, whose 429 handling follows the
+    server's own ``Retry-After`` instead.
     """
 
     def __init__(
@@ -187,6 +194,7 @@ class Comfy:
         api_key: str | None = None,
         timeout: float | None = 30.0,
         client_info: str | None = None,
+        retry: RetryPolicy = DEFAULT_RETRY,
     ) -> None:
         base_url = _resolve_base_url()
         key = _resolve_api_key(api_key, base_url)
@@ -195,8 +203,9 @@ class Comfy:
         self.workflows = WorkflowFactory()
         self.jobs = JobFactory(self._low)
         #: ``client.models`` — the model namespace, sharing this client's
-        #: transport (credentials, base URL, connection pool, timeout).
-        self.models = Models(self._low)
+        #: transport (credentials, base URL, connection pool, timeout) and its
+        #: retry policy.
+        self.models = Models(self._low, retry)
 
     def close(self) -> None:
         """Release the underlying HTTP connection pool.
@@ -311,6 +320,7 @@ class AsyncComfy:
         api_key: str | None = None,
         timeout: float | None = 30.0,
         client_info: str | None = None,
+        retry: RetryPolicy = DEFAULT_RETRY,
     ) -> None:
         base_url = _resolve_base_url()
         key = _resolve_api_key(api_key, base_url)
@@ -319,7 +329,7 @@ class AsyncComfy:
         self.workflows = WorkflowFactory()
         self.jobs = AsyncJobFactory(self._low)
         #: Async counterpart of :attr:`Comfy.models`, on this client's transport.
-        self.models = AsyncModels(self._low)
+        self.models = AsyncModels(self._low, retry)
 
     async def aclose(self) -> None:
         """Async :meth:`Comfy.close`. Prefer ``async with AsyncComfy(...)``."""
