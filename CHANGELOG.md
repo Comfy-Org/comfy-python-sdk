@@ -17,20 +17,29 @@ notes for each version.
 - Automatic retry for `client.models.run`, on by default, with the
   `Idempotency-Key` sent unconditionally on **every** attempt of one logical
   call — a new call mints a new key. That is what keeps a retry from being
-  billed as a second generation. Retried: 5xx responses and connect-phase
-  transport failures. Not retried: every 4xx (a deterministic refusal such as
-  `content_policy_violation`, `404`, `409` or `422` cannot change on the second
-  ask), `429` (it names its own pace in `Retry-After`), and — unless
-  `retry_possibly_in_flight=True` — a failure that leaves the request's fate
-  unknown, most importantly a client-side timeout on a run the server may still
-  be generating. The budget is 60 seconds of **total elapsed time** from the
-  first attempt rather than an attempt count, and it bounds when the last
-  attempt may *start*: an attempt already running is never interrupted, so a
-  slow generation is never abandoned half-way. Backoff is 0.5s doubling to a
-  15s ceiling with full jitter. Configure with `Comfy(retry=RetryPolicy(...))`
-  or switch it off with `Comfy(retry=NO_RETRY)`; `client.models.retry` reads
-  back the policy in force. `RetryPolicy`, `DEFAULT_RETRY` and `NO_RETRY` are
-  exported from `comfy_sdk`.
+  billed as a second generation, and it is also what decides which failures are
+  retried at all: the key is single-use and reject-on-duplicate with no
+  response replay, so only failures that leave it unclaimed are worth another
+  attempt. Retried by default: connect-phase transport failures (the request
+  never reached the server), and a `429` carrying `Retry-After` (a reject that
+  started no work, so the key is released) — paced by the `Retry-After` the
+  server sent rather than a blind backoff. Not retried: every other 4xx, since
+  a deterministic refusal such as `content_policy_violation`, `404`, `409` or
+  `422` cannot change on the second ask. Not retried unless
+  `retry_possibly_in_flight=True`: anything whose outcome is unknown — a 5xx
+  response, or a client-side timeout on a run the server may still be
+  generating — because the key stays claimed across those and a same-key retry
+  would come back `422 idempotency_key_reuse` in place of the real error. Turn
+  the opt-in on for a deployment that replays a repeated key. The budget is 60
+  seconds of **total elapsed time** from the first attempt rather than an
+  attempt count, and it bounds when the last attempt may *start*: an attempt
+  already running is never interrupted, so a slow generation is never abandoned
+  half-way. Backoff is 0.5s doubling to a 15s ceiling with full jitter, clamped
+  to whatever is left of the budget. Configure with
+  `Comfy(retry=RetryPolicy(...))` or switch it off with
+  `Comfy(retry=NO_RETRY)`; `client.models.retry` reads back the policy in
+  force. `RetryPolicy`, `DEFAULT_RETRY` and `NO_RETRY` are exported from
+  `comfy_sdk`.
 - `client.models.run(model, arguments)` on both `Comfy` and `AsyncComfy` — one
   call that returns the completed generation. Where the platform has to
   submit-and-poll an upstream provider, that polling happens server side inside

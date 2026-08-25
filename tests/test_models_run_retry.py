@@ -4,14 +4,24 @@ The assertion this file exists for is
 ``test_every_attempt_of_one_call_sends_the_same_idempotency_key``: a retry that
 mints a fresh key is indistinguishable, server-side, from a second order, and
 on a surface where one call is a billed generation that is the difference
-between a retry and a double charge. Everything else here is the policy that
-decides *whether* to make that second attempt — 5xx and connect-phase failures
-yes, a deterministic 4xx refusal no, a request that may still be running
-server-side not unless asked — plus the elapsed-time bound that stops the
-attempts stacking up.
+between a retry and a double charge.
 
-The stub server in ``conftest.py`` drives the wire half (``model_run_fail_times``
-for transient failure, ``model_run_error`` for a permanent one); the schedule
+Everything else here is the policy that decides *whether* to make that second
+attempt, and the thing that decides it is the key's own contract rather than a
+guess about the network. ``spec/openapi.yaml`` makes ``Idempotency-Key``
+single-use, reject-on-duplicate, with no response replay, and says which
+failures release the key (a definitive reject that started no work) and which
+keep it claimed (a 5xx or upstream timeout, where the outcome is unknown). So
+the default policy retries only what the one key survives — a connect-phase
+failure, and a ``429`` that names its own ``Retry-After`` — and everything in
+the unknown-outcome class sits behind ``retry_possibly_in_flight``, for the
+deployment that replays a repeated key instead of rejecting it.
+
+The stub server in ``conftest.py`` drives the wire half and now enforces that
+same reject-on-duplicate rule (``model_run_replays_idempotency_key`` switches
+it to the replaying deployment), so a retry design the real server would reject
+cannot pass here. The never-delivered class is asserted against ``_FlakyLow``
+instead: a stub HTTP server that is up cannot refuse a connection. The schedule
 and deadline arithmetic is asserted directly against
 :class:`~comfy_sdk.retry.RetryPolicy` and :class:`~comfy_sdk.retry.Retrier`,
 where a fake clock makes it exact instead of timing-dependent.
@@ -20,13 +30,16 @@ where a fake clock makes it exact instead of timing-dependent.
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
+from typing import Any, cast
 
 import httpx
 import pytest
 
 from comfy_sdk import DEFAULT_RETRY, NO_RETRY, AsyncComfy, Comfy, RetryPolicy
-from comfy_sdk.exceptions import ComfyError
-from comfy_sdk.retry import Retrier, is_retryable_status
+from comfy_sdk.exceptions import ComfyError, IdempotencyKeyReuse
+from comfy_sdk.models import AsyncModels, Models
+from comfy_sdk.retry import Retrier, is_unknown_outcome_status, retry_after_of
 from comfy_sdk.router_exceptions import ContentPolicyViolation, InternalError
 
 
@@ -43,6 +56,53 @@ class _FakeClock:
         self._t += seconds
 
 
+class _FlakyLow:
+    """A transport whose first ``fail_times`` attempts never reach the server.
+
+    The default policy's retry surface is the never-delivered class — the one
+    place a repeated ``Idempotency-Key`` is provably still spendable, because
+    the request never got far enough for the server to claim it. A stub HTTP
+    server that is listening cannot produce that failure, so the one-key
+    contract is asserted against a transport that can.
+    """
+
+    def __init__(self, fail_times: int = 0) -> None:
+        self.fail_times = fail_times
+        self.keys: list[str | None] = []
+        self.payloads: list[dict[str, Any]] = []
+        self.result: dict[str, Any] = {"images": [{"url": "http://example.invalid/x.png"}]}
+
+    def _attempt(self, arguments: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+        self.keys.append(key)
+        self.payloads.append(dict(arguments))
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise httpx.ConnectError("connection refused")
+        return self.result
+
+    def post_model_run(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = None,
+    ) -> dict[str, Any]:
+        return self._attempt(arguments, idempotency_key)
+
+
+class _AsyncFlakyLow(_FlakyLow):
+    async def post_model_run(  # type: ignore[override]
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = None,
+    ) -> dict[str, Any]:
+        return self._attempt(arguments, idempotency_key)
+
+
 MODEL = "acme/flux/dev"
 ARGS = {"prompt": "a cat", "steps": 4}
 
@@ -51,62 +111,86 @@ ARGS = {"prompt": "a cat", "steps": 4}
 #: is only that the attempts happen at all.
 FAST = RetryPolicy(max_elapsed=5.0, initial_backoff=0.01, max_backoff=0.02)
 
+#: ``FAST`` for a deployment that replays a repeated key, which is the only
+#: kind against which retrying an unknown outcome is correct.
+FAST_OPTED_IN = RetryPolicy(
+    max_elapsed=5.0, initial_backoff=0.01, max_backoff=0.02, retry_possibly_in_flight=True
+)
+
+
+def _models(low: _FlakyLow, policy: RetryPolicy = FAST) -> Models:
+    return Models(cast(Any, low), policy)
+
+
+def _async_models(low: _AsyncFlakyLow, policy: RetryPolicy = FAST) -> AsyncModels:
+    return AsyncModels(cast(Any, low), policy)
+
 
 # --- the same key on every attempt of one call ---------------------------
 
 
-def test_every_attempt_of_one_call_sends_the_same_idempotency_key(server) -> None:
+def test_every_attempt_of_one_call_sends_the_same_idempotency_key() -> None:
     # The assertion that prevents the double charge: three attempts, one key.
     # A retry carrying a fresh key would read server-side as three separate
     # generations to run and bill.
-    server.state.model_run_fail_times = 2
-    with Comfy(retry=FAST) as client:
-        assert client.models.run(MODEL, ARGS) == server.state.model_run_result
-    keys = server.state.model_run_idempotency_keys
-    assert server.state.model_run_count == 3
-    assert len(keys) == 3
-    assert all(k for k in keys)
-    assert len(set(keys)) == 1
+    low = _FlakyLow(fail_times=2)
+    assert _models(low).run(MODEL, ARGS) == low.result
+    assert len(low.keys) == 3
+    assert all(k for k in low.keys)
+    assert len(set(low.keys)) == 1
 
 
-async def test_every_attempt_of_one_async_call_sends_the_same_key(server) -> None:
-    server.state.model_run_fail_times = 2
-    async with AsyncComfy(retry=FAST) as client:
-        assert await client.models.run(MODEL, ARGS) == server.state.model_run_result
-    keys = server.state.model_run_idempotency_keys
-    assert len(keys) == 3
-    assert len(set(keys)) == 1
+async def test_every_attempt_of_one_async_call_sends_the_same_key() -> None:
+    low = _AsyncFlakyLow(fail_times=2)
+    assert await _async_models(low).run(MODEL, ARGS) == low.result
+    assert len(low.keys) == 3
+    assert len(set(low.keys)) == 1
 
 
-def test_a_second_call_is_a_new_key_even_though_both_retried(server) -> None:
+def test_a_second_call_is_a_new_key_even_though_both_retried() -> None:
     # The other half of the contract: a key is per logical call, not per
     # client and not per process. Two calls that each retried must not share
     # one — that would make the second call a replay of the first.
-    server.state.model_run_fail_times = 1
-    with Comfy(retry=FAST) as client:
-        client.models.run(MODEL, ARGS)
-        server.state.model_run_fail_times = 1
-        client.models.run(MODEL, ARGS)
-    keys = server.state.model_run_idempotency_keys
-    first_call, second_call = keys[:2], keys[2:]
+    low = _FlakyLow(fail_times=1)
+    models = _models(low)
+    models.run(MODEL, ARGS)
+    low.fail_times = 1
+    models.run(MODEL, ARGS)
+    first_call, second_call = low.keys[:2], low.keys[2:]
     assert len(set(first_call)) == 1
     assert len(set(second_call)) == 1
     assert set(first_call) != set(second_call)
 
 
 async def test_a_second_async_call_is_a_new_key(server) -> None:
-    async with AsyncComfy(retry=FAST) as client:
+    async with AsyncComfy() as client:
         await client.models.run(MODEL, ARGS)
         await client.models.run(MODEL, ARGS)
     first, second = server.state.model_run_idempotency_keys
     assert first != second
 
 
-def test_an_explicit_key_is_reused_across_retries_verbatim(server) -> None:
-    server.state.model_run_fail_times = 2
-    with Comfy(retry=FAST) as client:
-        client.models.run(MODEL, ARGS, idempotency_key="caller-chosen-07")
-    assert server.state.model_run_idempotency_keys == ["caller-chosen-07"] * 3
+def test_an_explicit_key_is_reused_across_retries_verbatim() -> None:
+    low = _FlakyLow(fail_times=2)
+    _models(low).run(MODEL, ARGS, idempotency_key="caller-chosen-07")
+    assert low.keys == ["caller-chosen-07"] * 3
+
+
+def test_the_body_is_frozen_before_the_first_attempt() -> None:
+    # A mutation between attempts would put a different body under the *same*
+    # key, which is the same-key-different-body case the contract rejects
+    # outright — so the payload is snapshotted where the key is minted.
+    arguments: dict[str, Any] = {"prompt": "a cat"}
+
+    class _MutatingLow(_FlakyLow):
+        def _attempt(self, args: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+            result = super()._attempt(args, key)
+            arguments["prompt"] = "something else entirely"
+            return result
+
+    low = _MutatingLow(fail_times=2)
+    _models(low).run(MODEL, arguments)
+    assert [p["prompt"] for p in low.payloads] == ["a cat"] * 3
 
 
 # --- what gets retried ---------------------------------------------------
@@ -114,24 +198,31 @@ def test_an_explicit_key_is_reused_across_retries_verbatim(server) -> None:
 
 def test_retry_is_on_by_default(server) -> None:
     # No `retry=` argument anywhere: a transient failure is survived out of
-    # the box, which is the point of the default being on.
+    # the box, which is the point of the default being on. A 429 that names a
+    # pace is the wire-level failure the *default* policy retries — the
+    # contract releases the key for a reject that started no work.
     server.state.model_run_fail_times = 1
+    server.state.model_run_transient_error = (429, "concurrency_limit_exceeded")
+    server.state.model_run_retry_after = "0"
     with Comfy() as client:
         assert client.models.run(MODEL, ARGS) == server.state.model_run_result
     assert server.state.model_run_count == 2
+    assert len(set(server.state.model_run_idempotency_keys)) == 1
 
 
 def test_the_default_policy_retries_and_bounds_by_elapsed_time() -> None:
     assert DEFAULT_RETRY.enabled
     assert DEFAULT_RETRY.max_elapsed > 0
     assert DEFAULT_RETRY.jitter
-    # Off by default: retrying a request that may still be generating is only
-    # safe against a server that replays the key rather than re-running it.
+    # Off by default: retrying a request whose outcome is unknown is only
+    # correct against a server that replays the key rather than rejecting it.
     assert not DEFAULT_RETRY.retry_possibly_in_flight
 
 
 def test_retry_can_be_disabled(server) -> None:
     server.state.model_run_fail_times = 1
+    server.state.model_run_transient_error = (429, "concurrency_limit_exceeded")
+    server.state.model_run_retry_after = "0"
     with Comfy(retry=NO_RETRY) as client:
         with pytest.raises(ComfyError):
             client.models.run(MODEL, ARGS)
@@ -140,6 +231,8 @@ def test_retry_can_be_disabled(server) -> None:
 
 async def test_retry_can_be_disabled_on_the_async_client(server) -> None:
     server.state.model_run_fail_times = 1
+    server.state.model_run_transient_error = (429, "concurrency_limit_exceeded")
+    server.state.model_run_retry_after = "0"
     async with AsyncComfy(retry=NO_RETRY) as client:
         with pytest.raises(ComfyError):
             await client.models.run(MODEL, ARGS)
@@ -175,15 +268,39 @@ def test_a_deterministic_refusal_is_never_retried(server, status: int, code: str
     assert server.state.model_run_count == 1
 
 
-def test_a_429_is_not_retried_by_this_policy(server) -> None:
-    # Deliberate: a 429 names its own pace in `Retry-After`, and honouring that
-    # is a different mechanism from the blind backoff here. Blindly retrying it
-    # would ignore the pace the server asked for.
+def test_a_429_without_a_pace_is_not_retried(server) -> None:
+    # The spec's retry signal is "429 + Retry-After". One without a pace is
+    # not asking to be asked again, and guessing a delay for it is the
+    # thundering-herd case full jitter exists to avoid.
     server.state.model_run_error = (429, "queue_full")
     with Comfy(retry=FAST) as client:
         with pytest.raises(ComfyError):
             client.models.run(MODEL, ARGS)
     assert server.state.model_run_count == 1
+
+
+def test_a_429_that_names_a_pace_is_retried_at_that_pace(server) -> None:
+    # The transport already parses Retry-After onto the error; discarding it
+    # and backing off blind is what would re-flatten a server that just told
+    # us how fast to come back.
+    server.state.model_run_fail_times = 2
+    server.state.model_run_transient_error = (429, "queue_full")
+    server.state.model_run_retry_after = "0"
+    with Comfy(retry=FAST) as client:
+        assert client.models.run(MODEL, ARGS) == server.state.model_run_result
+    assert server.state.model_run_count == 3
+    assert len(set(server.state.model_run_idempotency_keys)) == 1
+
+
+def test_the_server_named_pace_is_used_instead_of_the_backoff_schedule() -> None:
+    clock = _FakeClock()
+    policy = RetryPolicy(max_elapsed=60.0, initial_backoff=1.0, max_backoff=2.0, jitter=False)
+    retrier = Retrier(policy, now=clock, rng=lambda: 1.0)
+    paced = ComfyError("slow down", code="queue_full", http_status=429)
+    paced.retry_after = 7  # type: ignore[attr-defined]
+    # 7s is well above `max_backoff`: a pace the server named is honoured as
+    # given rather than capped by a ceiling meant for our own guesswork.
+    assert retrier.delay_before_retry(paced) == 7.0
 
 
 async def test_a_deterministic_refusal_is_never_retried_on_the_async_client(server) -> None:
@@ -195,17 +312,37 @@ async def test_a_deterministic_refusal_is_never_retried_on_the_async_client(serv
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
-def test_a_5xx_is_retried(server, status: int) -> None:
+def test_a_5xx_is_not_retried_against_a_reject_on_duplicate_server(server, status: int) -> None:
+    # The heart of it. The contract keeps the key *claimed* when the outcome is
+    # unknown, so a same-key retry after a 5xx cannot succeed — it comes back
+    # 422 idempotency_key_reuse and replaces the real error with a confusing
+    # one. So the default policy does not make it, and the caller sees the 5xx.
+    server.state.model_run_error = (status, "internal_error")
+    with Comfy(retry=FAST) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert server.state.model_run_count == 1
+    assert excinfo.value.http_status == status
+    assert not isinstance(excinfo.value, IdempotencyKeyReuse)
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_a_5xx_is_retried_under_the_replay_opt_in(server, status: int) -> None:
+    server.state.model_run_replays_idempotency_key = True
     server.state.model_run_transient_error = (status, "internal_error")
     server.state.model_run_fail_times = 1
-    with Comfy(retry=FAST) as client:
+    with Comfy(retry=FAST_OPTED_IN) as client:
         assert client.models.run(MODEL, ARGS) == server.state.model_run_result
     assert server.state.model_run_count == 2
+    assert len(set(server.state.model_run_idempotency_keys)) == 1
 
 
 def test_a_permanent_5xx_eventually_surfaces_as_the_sdk_error(server) -> None:
+    server.state.model_run_replays_idempotency_key = True
     server.state.model_run_error = (500, "internal_error")
-    policy = RetryPolicy(max_elapsed=0.2, initial_backoff=0.01, max_backoff=0.02)
+    policy = RetryPolicy(
+        max_elapsed=0.2, initial_backoff=0.01, max_backoff=0.02, retry_possibly_in_flight=True
+    )
     with Comfy(retry=policy) as client:
         with pytest.raises(ComfyError) as excinfo:
             client.models.run(MODEL, ARGS)
@@ -240,6 +377,7 @@ async def test_an_async_client_timeout_is_not_retried_by_default(server) -> None
 def test_opting_in_retries_a_client_timeout_under_the_one_key(server) -> None:
     # The opt-in for a server that replays a repeated key. Even here the key is
     # unchanged, so the second attempt is the same request, not a second order.
+    server.state.model_run_replays_idempotency_key = True
     server.state.model_run_delay = 1.5
     policy = RetryPolicy(
         max_elapsed=1.0,
@@ -273,8 +411,11 @@ def test_retries_stop_at_the_elapsed_budget_not_at_an_attempt_count(server) -> N
     # A per-attempt budget multiplies: N attempts each granted their own wait
     # stack into a total nobody chose. This bound is wall-clock across the
     # whole call, so however cheap an attempt is, the call still ends.
+    server.state.model_run_replays_idempotency_key = True
     server.state.model_run_error = (503, "internal_error")
-    policy = RetryPolicy(max_elapsed=0.3, initial_backoff=0.01, max_backoff=0.02)
+    policy = RetryPolicy(
+        max_elapsed=0.3, initial_backoff=0.01, max_backoff=0.02, retry_possibly_in_flight=True
+    )
     started = time.monotonic()
     with Comfy(retry=policy) as client:
         with pytest.raises(ComfyError):
@@ -288,28 +429,61 @@ def test_retries_stop_at_the_elapsed_budget_not_at_an_attempt_count(server) -> N
 
 def test_the_deadline_is_measured_from_the_first_attempt() -> None:
     clock = _FakeClock()
-    policy = RetryPolicy(max_elapsed=10.0, initial_backoff=1.0, max_backoff=1.0, jitter=False)
+    policy = RetryPolicy(
+        max_elapsed=10.0,
+        initial_backoff=1.0,
+        max_backoff=1.0,
+        jitter=False,
+        retry_possibly_in_flight=True,
+    )
     retrier = Retrier(policy, now=clock, rng=lambda: 1.0)
     failure = InternalError("boom", http_status=500)
 
-    # Nine one-second waits fit inside the ten-second budget...
-    for _ in range(9):
+    # Ten one-second waits fit inside the ten-second budget...
+    for _ in range(10):
         delay = retrier.delay_before_retry(failure)
         assert delay == 1.0
         clock.advance(delay)
-    # ...and the tenth would start an attempt at the deadline, so it does not.
+    # ...and by then the budget is spent, so no further attempt starts.
     assert retrier.delay_before_retry(failure) is None
-    assert retrier.attempts == 10
+    assert retrier.attempts == 11
 
 
-def test_a_slow_attempt_spends_the_budget_it_actually_used() -> None:
-    # The bound is elapsed time, so one attempt that takes most of the budget
-    # leaves no room for another — however few attempts have been made.
+def test_a_delay_that_would_overshoot_is_clamped_to_what_is_left() -> None:
+    # Clamped rather than abandoned: with full jitter drawn over [0, ceiling],
+    # one unlucky draw would otherwise end a call that still had seconds of
+    # budget, making identical calls take a randomly varying number of
+    # attempts. `client.py::_retry_delay` bounds its 429 wait the same way.
     clock = _FakeClock()
-    policy = RetryPolicy(max_elapsed=10.0, initial_backoff=1.0, max_backoff=1.0, jitter=False)
+    policy = RetryPolicy(
+        max_elapsed=10.0,
+        initial_backoff=1.0,
+        max_backoff=1.0,
+        jitter=False,
+        retry_possibly_in_flight=True,
+    )
     retrier = Retrier(policy, now=clock, rng=lambda: 1.0)
     clock.advance(9.5)
+    assert retrier.delay_before_retry(InternalError("boom", http_status=500)) == 0.5
+
+
+def test_a_spent_budget_yields_no_delay_at_all() -> None:
+    clock = _FakeClock()
+    policy = RetryPolicy(max_elapsed=10.0, retry_possibly_in_flight=True)
+    retrier = Retrier(policy, now=clock, rng=lambda: 1.0)
+    clock.advance(10.0)
     assert retrier.delay_before_retry(InternalError("boom", http_status=500)) is None
+
+
+def test_a_short_budget_still_retries_rather_than_reporting_a_lie() -> None:
+    # `enabled` is True here, and now it means something: the first delay is
+    # clamped into the budget instead of the policy silently never retrying.
+    policy = RetryPolicy(max_elapsed=0.3, retry_possibly_in_flight=True)
+    assert policy.enabled
+    retrier = Retrier(policy, now=_FakeClock(), rng=lambda: 1.0)
+    delay = retrier.delay_before_retry(InternalError("boom", http_status=500))
+    assert delay is not None
+    assert 0 < delay <= 0.3
 
 
 def test_a_disabled_policy_never_yields_a_delay() -> None:
@@ -329,6 +503,23 @@ def test_backoff_grows_and_holds_at_the_ceiling() -> None:
 def test_backoff_cannot_overflow_on_a_pathological_attempt_count() -> None:
     policy = RetryPolicy(initial_backoff=1.0, backoff_factor=2.0, max_backoff=8.0, jitter=False)
     assert policy.backoff(100_000) == 8.0
+
+
+def test_backoff_cannot_overflow_on_a_pathological_factor() -> None:
+    # `initial_backoff * backoff_factor**exponent` is fully evaluated before
+    # any `min()` could cap it, and CPython's float `**` raises OverflowError
+    # rather than saturating — which would escape the retry loop and replace
+    # the genuine API error with an arithmetic one.
+    policy = RetryPolicy(initial_backoff=1.0, backoff_factor=1e200, max_backoff=8.0, jitter=False)
+    assert [policy.backoff(n) for n in range(1, 6)] == [1.0, 8.0, 8.0, 8.0, 8.0]
+
+
+def test_a_gentle_factor_keeps_growing_past_a_large_attempt_count() -> None:
+    # Clamping the exponent instead would freeze growth long before the
+    # ceiling for any factor that climbs slowly.
+    policy = RetryPolicy(initial_backoff=0.5, backoff_factor=1.01, max_backoff=15.0, jitter=False)
+    assert policy.backoff(66) > policy.backoff(65) > policy.backoff(64)
+    assert policy.backoff(1000) == 15.0
 
 
 def test_jitter_spreads_each_delay_below_its_ceiling() -> None:
@@ -363,6 +554,29 @@ def test_an_incoherent_policy_is_rejected_at_construction(kwargs: dict) -> None:
         RetryPolicy(**kwargs)
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        # Infinity passes every ordered check and never reaches its deadline,
+        # so `run` would retry a permanently failing server forever.
+        {"max_elapsed": float("inf")},
+        # NaN fails every ordered check, so it constructs and then misbehaves:
+        # a NaN budget reads as "retrying disabled", a NaN backoff makes the
+        # caller's `sleep` raise in place of the real error.
+        {"max_elapsed": float("nan")},
+        {"initial_backoff": float("nan")},
+        {"backoff_factor": float("nan")},
+        {"max_backoff": float("nan")},
+        {"max_backoff": float("inf")},
+        {"backoff_factor": float("inf")},
+    ],
+    ids=lambda v: str(v),
+)
+def test_a_non_finite_policy_is_rejected_at_construction(kwargs: dict) -> None:
+    with pytest.raises(ValueError):
+        RetryPolicy(**kwargs)
+
+
 def test_a_policy_is_immutable() -> None:
     # Shared by every call on a client, so one call cannot rewrite another's.
     with pytest.raises(AttributeError):
@@ -373,13 +587,28 @@ def test_a_policy_is_immutable() -> None:
 
 
 @pytest.mark.parametrize("status", [500, 501, 502, 503, 504, 599])
-def test_5xx_is_retryable(status: int) -> None:
-    assert is_retryable_status(status)
+def test_5xx_leaves_the_outcome_unknown(status: int) -> None:
+    assert is_unknown_outcome_status(status)
+    # ...and so is not retried unless the deployment replays repeated keys.
+    assert not DEFAULT_RETRY.should_retry(InternalError("boom", http_status=status))
+    opted_in = RetryPolicy(retry_possibly_in_flight=True)
+    assert opted_in.should_retry(InternalError("boom", http_status=status))
 
 
 @pytest.mark.parametrize("status", [200, 400, 401, 402, 403, 404, 409, 422, 429, 499])
-def test_everything_below_500_is_not(status: int) -> None:
-    assert not is_retryable_status(status)
+def test_everything_below_500_has_a_known_outcome(status: int) -> None:
+    assert not is_unknown_outcome_status(status)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [(0, 0.0), (5, 5.0), (2.5, 2.5), (None, None), (-1, None), (float("nan"), None), ("3", None)],
+    ids=lambda v: str(v),
+)
+def test_a_named_pace_is_read_off_the_error_or_treated_as_absent(raw, expected) -> None:
+    exc = ComfyError("throttled", code="queue_full", http_status=429)
+    exc.retry_after = raw  # type: ignore[attr-defined]
+    assert retry_after_of(exc) == expected
 
 
 def test_a_typed_router_refusal_is_classified_by_its_status() -> None:
@@ -387,7 +616,30 @@ def test_a_typed_router_refusal_is_classified_by_its_status() -> None:
     # a typed router error is judged the same way as the protocol error the
     # model surface raises today.
     assert not DEFAULT_RETRY.should_retry(ContentPolicyViolation("refused", http_status=400))
-    assert DEFAULT_RETRY.should_retry(InternalError("boom", http_status=500))
+    opted_in = RetryPolicy(retry_possibly_in_flight=True)
+    assert opted_in.should_retry(InternalError("boom", http_status=500))
+
+
+def test_a_router_error_reaches_the_retry_loop_at_all() -> None:
+    # Router errors derive from ComfyError, not ApiError, so a `run` that only
+    # caught ApiError would never hand one to the policy — making the branch
+    # above unreachable and retry a silent no-op the day this route raises
+    # them.
+    class _RouterFailingLow(_FlakyLow):
+        def _attempt(self, args: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+            self.keys.append(key)
+            if self.fail_times > 0:
+                self.fail_times -= 1
+                raise InternalError("upstream blew up", http_status=500)
+            return self.result
+
+    low = _RouterFailingLow(fail_times=1)
+    policy = RetryPolicy(
+        max_elapsed=5.0, initial_backoff=0.01, max_backoff=0.02, retry_possibly_in_flight=True
+    )
+    assert _models(low, policy).run(MODEL, ARGS) == low.result
+    assert len(low.keys) == 2
+    assert len(set(low.keys)) == 1
 
 
 @pytest.mark.parametrize(
@@ -401,7 +653,7 @@ def test_a_typed_router_refusal_is_classified_by_its_status() -> None:
 )
 def test_a_connect_phase_failure_is_retryable(exc: Exception) -> None:
     # The request was never delivered, so there is nothing running server-side
-    # for a retry to duplicate.
+    # for a retry to duplicate and the key was never claimed.
     assert DEFAULT_RETRY.should_retry(exc)
 
 

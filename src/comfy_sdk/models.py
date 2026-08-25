@@ -45,14 +45,23 @@ from comfy_low.transport import MODEL_RUN_TIMEOUT, AsyncComfyLow, ComfyLow
 from ._core import new_idempotency_key
 from .exceptions import translating
 from .retry import DEFAULT_RETRY, Retrier, RetryPolicy
+from .router_exceptions import RouterError
 
 #: Failures the policy is even asked about. A protocol ``ApiError`` is a
-#: response the server sent; an ``httpx.TransportError`` is no response at all.
-#: Being in this tuple is not "retryable" — most of these are not, and
-#: :meth:`RetryPolicy.should_retry` decides which. What it buys is that
-#: anything *else* propagates untouched, so a bug in the SDK itself is never
-#: mistaken for a flaky network and quietly re-run.
-_CANDIDATE_FAILURES = (ApiError, httpx.TransportError)
+#: response the server sent, a ``RouterError`` is the same thing modelled by
+#: this surface's own typed hierarchy, and an ``httpx.TransportError`` is no
+#: response at all. Being in this tuple is not "retryable" — most of these are
+#: not, and :meth:`RetryPolicy.should_retry` decides which. What it buys is
+#: that anything *else* propagates untouched, so a bug in the SDK itself is
+#: never mistaken for a flaky network and quietly re-run.
+#:
+#: ``RouterError`` is listed even though ``post_model_run`` raises ``ApiError``
+#: today: the typed errors in :mod:`comfy_sdk.router_exceptions` were built for
+#: this very surface and derive from ``ComfyError``, not ``ApiError``, so
+#: omitting them would make :meth:`RetryPolicy.should_retry`'s router branch
+#: unreachable and turn retry into a silent no-op the day this route starts
+#: raising them, with no test failing.
+_CANDIDATE_FAILURES = (ApiError, RouterError, httpx.TransportError)
 
 _now = time.monotonic
 
@@ -127,24 +136,32 @@ class Models(_ModelsBase):
         call unless ``idempotency_key`` is given, so an accidental exact resend
         is the server's to reject rather than a second charged generation.
 
-        A failed attempt is retried under the client's policy — 5xx and
-        connect-phase failures, backed off with jitter and bounded by total
-        elapsed time. **Every attempt of this one call reuses the one key**,
-        which is what stops a retry from being billed as a second generation;
-        calling ``run`` again is a new call and mints a new key. See
+        A failed attempt is retried under the client's policy, backed off with
+        jitter and bounded by total elapsed time. **Every attempt of this one
+        call reuses the one key**, which is what stops a retry from being
+        billed as a second generation; calling ``run`` again is a new call and
+        mints a new key. Because the key is single-use and reject-on-duplicate,
+        only failures that leave it unclaimed are retried by default —
+        connect-phase failures, and a ``429`` that names a ``Retry-After``. A
+        completed 5xx or a client-side timeout leaves the outcome unknown, and
+        with it the key claimed, so those need
+        ``RetryPolicy(retry_possibly_in_flight=True)``. See
         :mod:`comfy_sdk.retry`, and ``Comfy(retry=NO_RETRY)`` to switch it off.
         """
         low = cast(ComfyLow, self._low)
         # Minted once, outside the loop: reusing this exact value on every
         # attempt is the whole reason a retry here is not a second charge.
         key = idempotency_key or new_idempotency_key()
+        # Snapshotted for the same reason the key is. Re-reading the caller's
+        # mapping inside each attempt would let a mutation between attempts
+        # send a different body under the *same* key, which is precisely the
+        # same-key-different-body case the contract rejects outright.
+        payload = dict(arguments)
         retrier = Retrier(self._retry, now=_now)
         with translating():
             while True:
                 try:
-                    return low.post_model_run(
-                        model, arguments, idempotency_key=key, timeout=timeout
-                    )
+                    return low.post_model_run(model, payload, idempotency_key=key, timeout=timeout)
                 except _CANDIDATE_FAILURES as exc:
                     delay = retrier.delay_before_retry(exc)
                     if delay is None:
@@ -175,12 +192,16 @@ class AsyncModels(_ModelsBase):
         """
         low = cast(AsyncComfyLow, self._low)
         key = idempotency_key or new_idempotency_key()
+        # Snapshotted before the first attempt — see :meth:`Models.run`. The
+        # window is wider here: the caller's coroutine can mutate `arguments`
+        # while the retry sleeps.
+        payload = dict(arguments)
         retrier = Retrier(self._retry, now=_now)
         with translating():
             while True:
                 try:
                     return await low.post_model_run(
-                        model, arguments, idempotency_key=key, timeout=timeout
+                        model, payload, idempotency_key=key, timeout=timeout
                     )
                 except _CANDIDATE_FAILURES as exc:
                     delay = retrier.delay_before_retry(exc)
