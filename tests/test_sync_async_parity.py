@@ -21,24 +21,32 @@ somebody forgot to add to it. Pairs are discovered two ways:
   only the client root.
 
 For each pair this compares public member *names*, whether each is reached as
-a method or as a property, and the parameter names, order and kinds of the
-methods they share. It also bans a spelling that encodes sync-vs-async anywhere
-on the surface, and refuses to pass on an empty introspection result: a parity
-test that discovered nothing would be green for the wrong reason.
+a method or as a property, the parameter names, order, kinds *and defaults* of
+the methods they share, and — the property the "add ``await``" half of the
+promise actually rests on — that the async side of a shared method is the
+awaitable one and the sync side is not. It also bans a spelling that encodes
+sync-vs-async anywhere on the surface, and refuses to pass on an empty
+introspection result: a parity test that discovered nothing would be green for
+the wrong reason.
 
 Dunders (``__enter__``/``__aenter__``, ...) are excluded — they are a mechanical
 consequence of sync vs async, not part of the call surface a swap has to match.
-Deliberate asymmetries live in ``_RENAMES`` / ``_ALLOWED_ASYMMETRY`` below, each
-with the reason it is deliberate; anything not listed there fails.
+Deliberate asymmetries live in ``_RENAMES`` / ``_ALLOWED_ASYMMETRY`` /
+``_SYNC_ON_BOTH`` below, each with the reason it is deliberate; anything not
+listed there fails.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import importlib
 import inspect
+import os
 import pkgutil
 import re
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -46,6 +54,7 @@ import pytest
 import comfy_low
 import comfy_sdk
 from comfy_sdk import AsyncComfy, Comfy
+from comfy_sdk.client import BASE_URL_ENV_VAR
 
 #: The packages whose public classes make up the surface under test.
 _PACKAGES = (comfy_sdk, comfy_low)
@@ -59,20 +68,45 @@ _DUMMY_KEY = "comfyui-parity-test-key"
 
 # --- deliberate asymmetries ---------------------------------------------
 #
-# These two tables are the only escape hatch. An asymmetry not written here
+# These tables are the only escape hatch. An asymmetry not written here
 # fails, which is the point: an intentional exception stays visible, and an
-# accidental one still breaks the build.
+# accidental one still breaks the build. All three are keyed on the
+# module-qualified *sync* class name (see ``_pair_key``) rather than on a
+# pair's display label, because a label is whichever discovery mechanism
+# reached the pair first and is therefore not a stable key to write against.
 
-#: Async spellings of the same operation under a different name. asyncio's
-#: convention is ``aclose()`` for an awaitable closer; ``close()`` cannot be
-#: reused for it, because a name callers expect to be synchronous returning an
-#: un-awaited coroutine fails silently. httpx and asyncio's own streams spell
-#: it the same way.
+#: Async spellings of the same operation under a different name, applied to the
+#: *async* side only. asyncio's convention is ``aclose()`` for an awaitable
+#: closer; ``close()`` cannot be reused for it, because a name callers expect to
+#: be synchronous returning an un-awaited coroutine fails silently. httpx and
+#: asyncio's own streams spell it the same way. Renaming only the async side is
+#: what keeps the normalisation direction-aware: a sync class that grew an
+#: ``aclose``, or an async class that kept a bare ``close``, is a real
+#: divergence and still has to fail.
 _RENAMES = {"aclose": "close"}
 
-#: ``(pair label, member name) -> why it legitimately exists on one side only.``
+#: ``(pair key, member name) -> why it legitimately exists on one side only.``
 #: Empty today: once ``aclose`` is normalised, the surfaces are symmetric.
 _ALLOWED_ASYMMETRY: dict[tuple[str, str], str] = {}
+
+#: ``(pair key, member name) -> why the async side is deliberately not
+#: awaitable.`` Every other shared method has to be awaitable on the async
+#: client, since that is the entire "add ``await``" contract; these do no I/O,
+#: so awaiting them would be ceremony with nothing behind it.
+_SYNC_ON_BOTH: dict[tuple[str, str], str] = {
+    ("comfy_sdk.assets.AssetFactory", "from_file"): (
+        "builds a handle around a local path; the upload is the awaitable step (commit)"
+    ),
+    ("comfy_sdk.assets.AssetFactory", "from_bytes"): (
+        "builds a handle around bytes already in memory; the upload is commit"
+    ),
+    ("comfy_sdk.assets.AssetFactory", "from_stream"): (
+        "drains a synchronous BinaryIO to hash it; the upload is commit"
+    ),
+    ("comfy_sdk.jobs.Job", "get_outputs"): (
+        "reads outputs already on the handle — no re-fetch, so nothing to await"
+    ),
+}
 
 #: A name that encodes sync-vs-async instead of letting the client encode it.
 #: ``run_async`` is the specific decision this guards — there is one ``run``,
@@ -110,6 +144,20 @@ def _public_classes() -> list[type]:
                     continue  # re-exported from elsewhere (httpx, pydantic, ...)
                 classes[(obj.__module__, obj.__qualname__)] = obj
     return list(classes.values())
+
+
+def _ours(cls: type) -> bool:
+    """Whether ``cls`` is defined in one of the two packages under test."""
+    return inspect.isclass(cls) and cls.__module__.split(".")[0] in _PACKAGE_NAMES
+
+
+def _qualified(cls: type) -> str:
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _pair_key(sync_cls: type) -> str:
+    """The stable key a pair is written against in the asymmetry tables."""
+    return _qualified(sync_cls)
 
 
 def _counterpart(async_cls: type, name: str, classes: list[type]) -> type:
@@ -150,34 +198,95 @@ def _name_convention_pairs() -> list[tuple[str, type, type]]:
     return pairs
 
 
+@contextlib.contextmanager
+def _default_deployment() -> Iterator[None]:
+    """Build the probe clients against the default deployment, not the runner's.
+
+    ``_resolve_base_url()`` *raises* on a malformed ``COMFY_BASE_URL``, and the
+    construction below runs at import — i.e. at collection time, before any
+    fixture could adjust the environment. Inheriting an ambient value would let
+    a stray export in a developer's shell turn this whole module into a
+    collection error that has nothing to do with parity.
+    """
+    saved = os.environ.pop(BASE_URL_ENV_VAR, None)
+    try:
+        yield
+    finally:
+        if saved is not None:
+            os.environ[BASE_URL_ENV_VAR] = saved
+
+
+def _run(coro: Any) -> None:
+    """Drive one coroutine to completion on a loop of our own.
+
+    A private loop rather than :func:`asyncio.run` so this does not depend on
+    (or disturb) whatever the importing process has installed as the current
+    event loop.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _namespace_types(client: Any) -> dict[str, type]:
+    """The types behind a client's public namespace attributes, by name.
+
+    Instance ``vars`` covers the namespaces assigned in ``__init__``, which is
+    all of them today; class-level ``property`` / ``cached_property``
+    descriptors are walked too, so a namespace later exposed that way keeps its
+    pair coverage instead of silently dropping out of the comparison.
+    """
+    names = {name for name in vars(client) if not name.startswith("_")}
+    cls = type(client)
+    for name in dir(cls):
+        if name.startswith("_"):
+            continue
+        descriptor = inspect.getattr_static(cls, name, None)
+        if isinstance(descriptor, (property, functools.cached_property)):
+            names.add(name)
+    return {name: type(getattr(client, name)) for name in sorted(names)}
+
+
 def _client_namespaces() -> tuple[dict[str, type], dict[str, type]]:
     """The public namespace attributes of a sync and an async client, by name.
 
     Constructing both is the only way to see them, since they are assigned in
-    ``__init__``. Neither client makes a request here, and both are closed
-    before the types are handed back.
+    ``__init__``. Neither client makes a request here, and each is closed
+    independently — an :class:`~contextlib.ExitStack` rather than one
+    ``finally``, so a raise from the second construction still closes the first
+    client's pool, and a raise from one close still runs the other.
     """
-    sync_client = Comfy(api_key=_DUMMY_KEY)
-    async_client = AsyncComfy(api_key=_DUMMY_KEY)
-    try:
-        sync_ns = {n: type(v) for n, v in vars(sync_client).items() if not n.startswith("_")}
-        async_ns = {n: type(v) for n, v in vars(async_client).items() if not n.startswith("_")}
-        return sync_ns, async_ns
-    finally:
-        sync_client.close()
-        # No loop is running at import time, which is when this is called.
-        asyncio.run(async_client.aclose())
+    with _default_deployment(), contextlib.ExitStack() as stack:
+        sync_client = Comfy(api_key=_DUMMY_KEY)
+        stack.callback(sync_client.close)
+        async_client = AsyncComfy(api_key=_DUMMY_KEY)
+        stack.callback(lambda: _run(async_client.aclose()))
+        return _namespace_types(sync_client), _namespace_types(async_client)
 
 
 _SYNC_NAMESPACES, _ASYNC_NAMESPACES = _client_namespaces()
 
 
 def _namespace_pairs() -> list[tuple[str, type, type]]:
-    """A pair per namespace the two clients agree on, labelled ``client.<name>``."""
-    return [
-        (f"client.{name}", _SYNC_NAMESPACES[name], _ASYNC_NAMESPACES[name])
-        for name in sorted(_SYNC_NAMESPACES.keys() & _ASYNC_NAMESPACES.keys())
-    ]
+    """A pair per namespace the two clients agree on, labelled ``client.<name>``.
+
+    Two filters keep the parametrization honest. A namespace both clients share
+    *by identity* (one ``WorkflowFactory`` assigned in both ``__init__``\\ s) is
+    skipped: comparing a class against itself is green no matter what it
+    contains, and a vacuous case reads like coverage. So is anything whose type
+    is not one of our own classes — a future ``self.timeout = None`` would
+    otherwise be paired as ``(NoneType, NoneType)`` and fail with a misleading
+    "introspection broke?".
+    """
+    pairs = []
+    for name in sorted(_SYNC_NAMESPACES.keys() & _ASYNC_NAMESPACES.keys()):
+        sync_cls, async_cls = _SYNC_NAMESPACES[name], _ASYNC_NAMESPACES[name]
+        if sync_cls is async_cls or not _ours(sync_cls) or not _ours(async_cls):
+            continue
+        pairs.append((f"client.{name}", sync_cls, async_cls))
+    return pairs
 
 
 def _discover_pairs() -> list[tuple[str, type, type]]:
@@ -190,7 +299,11 @@ def _discover_pairs() -> list[tuple[str, type, type]]:
     pairs = [("Comfy", Comfy, AsyncComfy), *_name_convention_pairs(), *_namespace_pairs()]
     seen: dict[tuple[str, str], tuple[str, type, type]] = {}
     for label, sync_cls, async_cls in pairs:
-        key = (f"{sync_cls.__module__}.{sync_cls.__qualname__}", async_cls.__qualname__)
+        # Both halves module-qualified: two distinct ``AsyncX`` classes in
+        # different modules that resolve to the same sync counterpart must not
+        # collapse onto one key, or ``setdefault`` drops the second pair and
+        # coverage shrinks with nothing failing.
+        key = (_qualified(sync_cls), _qualified(async_cls))
         seen.setdefault(key, (label, sync_cls, async_cls))
     return sorted(seen.values(), key=lambda pair: pair[0])
 
@@ -212,8 +325,28 @@ def _public_members(cls: type) -> dict[str, Any]:
     return members
 
 
-def _canonical(name: str) -> str:
-    return _RENAMES.get(name, name)
+def _members(cls: type, *, rename: bool) -> dict[str, Any]:
+    """Public members of ``cls``, optionally under the async-side rename.
+
+    ``rename=True`` is for the *async* half of a pair only. A collision under
+    the rename (a class carrying both ``close`` and ``aclose``) is a failure
+    rather than an overwrite: silently keeping one of the two would drop the
+    other out of every name, kind and signature comparison below — exactly the
+    divergence this module exists to catch.
+    """
+    out: dict[str, Any] = {}
+    spelling: dict[str, str] = {}  # canonical name -> the member that claimed it
+    for name, member in _public_members(cls).items():
+        key = _RENAMES.get(name, name) if rename else name
+        if key in out:
+            raise AssertionError(
+                f"{_qualified(cls)} exposes both {spelling[key]!r} and {name!r}, which "
+                f"normalise to {key!r} under _RENAMES — one of the two would drop out of the "
+                f"parity comparison unnoticed. Keep a single spelling per operation."
+            )
+        out[key] = member
+        spelling[key] = name
+    return out
 
 
 def _unwrap(member: Any) -> Any:
@@ -239,23 +372,68 @@ def _kind(member: Any) -> str:
     return "attribute"
 
 
-def _params(func: Any) -> list[tuple[str, str]]:
-    """Parameter names, order and kinds — the part of a signature a caller sees."""
-    return [(p.name, p.kind.name) for p in inspect.signature(func).parameters.values()]
+def _call_form(func: Any) -> str:
+    """What calling ``func`` hands back: a value, an awaitable, or an iterator.
+
+    Looked through ``functools.wraps`` with :func:`inspect.unwrap` so the
+    ``@contextmanager`` / ``@asynccontextmanager`` pair (``open``,
+    ``get_asset_content``) is classified by the generator underneath rather
+    than by the plain wrapper both decorators leave on top.
+    """
+    inner = inspect.unwrap(func)
+    for candidate in (func, inner):
+        if inspect.iscoroutinefunction(candidate):
+            return "awaitable"
+        if inspect.isasyncgenfunction(candidate):
+            return "async iterator"
+        if inspect.isgeneratorfunction(candidate):
+            return "iterator"
+    return "plain"
 
 
-def _methods(cls: type) -> dict[str, Any]:
-    """Public callables on ``cls``, keyed by canonical (rename-normalised) name.
+#: The async call form each sync one has to be mirrored by. Anything a caller
+#: iterates stays something they iterate; anything else becomes awaitable.
+_EXPECTED_ASYNC_FORM = {"plain": "awaitable", "iterator": "async iterator"}
+
+
+def _methods(cls: type, *, rename: bool = False) -> dict[str, Any]:
+    """Public callables on ``cls``, keyed by (optionally renamed) name.
 
     Property getters are included: their parameter lists are part of the surface
     too, and ``_kind`` is what keeps a property from silently matching a method.
     """
     out = {}
-    for name, member in _public_members(cls).items():
+    for name, member in _members(cls, rename=rename).items():
         func = _unwrap(member)
         if inspect.isroutine(func):
-            out[_canonical(name)] = func
+            out[name] = func
     return out
+
+
+class _Required:
+    """Sentinel standing in for "no default", so it renders in a diff."""
+
+    def __repr__(self) -> str:
+        return "<required>"
+
+
+_REQUIRED = _Required()
+
+_EMPTY = inspect.Parameter.empty
+
+
+def _params(func: Any) -> list[tuple[str, str, Any]]:
+    """Parameter names, order, kinds and defaults — what a caller sees.
+
+    The default is part of it: ``timeout: float | None = None`` on one client
+    and a required ``timeout`` on the other (or two different default values)
+    breaks a caller at a call site they never touched, which is precisely the
+    silent port failure this module promises cannot happen.
+    """
+    return [
+        (p.name, p.kind.name, _REQUIRED if p.default is _EMPTY else p.default)
+        for p in inspect.signature(func).parameters.values()
+    ]
 
 
 def test_the_two_clients_expose_the_same_namespaces() -> None:
@@ -270,22 +448,20 @@ def test_the_two_clients_expose_the_same_namespaces() -> None:
 @pytest.mark.parametrize("label,sync_cls,async_cls", _PAIRS, ids=_IDS)
 def test_public_surface_names_match(label: str, sync_cls: type, async_cls: type) -> None:
     """A public member on one side of a pair must exist on the other, reached the same way."""
-    sync_members = {_canonical(n): m for n, m in _public_members(sync_cls).items()}
-    async_members = {_canonical(n): m for n, m in _public_members(async_cls).items()}
+    key = _pair_key(sync_cls)
+    sync_members = _members(sync_cls, rename=False)
+    async_members = _members(async_cls, rename=True)
     sync_only = {
-        n
-        for n in sync_members.keys() - async_members.keys()
-        if (label, n) not in _ALLOWED_ASYMMETRY
+        n for n in sync_members.keys() - async_members.keys() if (key, n) not in _ALLOWED_ASYMMETRY
     }
     async_only = {
-        n
-        for n in async_members.keys() - sync_members.keys()
-        if (label, n) not in _ALLOWED_ASYMMETRY
+        n for n in async_members.keys() - sync_members.keys() if (key, n) not in _ALLOWED_ASYMMETRY
     }
     assert not sync_only and not async_only, (
         f"{sync_cls.__name__}/{async_cls.__name__} public surface diverges: "
         f"sync-only={sorted(sync_only)} async-only={sorted(async_only)} — add the member to "
-        "the other class, or declare the asymmetry in _ALLOWED_ASYMMETRY with a reason"
+        f"the other class, or declare the asymmetry in _ALLOWED_ASYMMETRY under the key "
+        f"{key!r} with a reason"
     )
     kind_clashes = [
         f"{n}: sync is a {_kind(sync_members[n])}, async is a {_kind(async_members[n])}"
@@ -302,14 +478,15 @@ def test_public_surface_names_match(label: str, sync_cls: type, async_cls: type)
 def test_paired_methods_take_the_same_parameters(
     label: str, sync_cls: type, async_cls: type
 ) -> None:
-    """Same parameter names, in the same order, with the same kinds.
+    """Same parameter names, in the same order, with the same kinds and defaults.
 
     Only ``await`` is supposed to differ between the two calls, so a parameter
-    renamed, reordered, or moved between positional and keyword-only on one side
-    breaks anyone porting code across the swap — silently, at their call site.
+    renamed, reordered, moved between positional and keyword-only, or made
+    optional on one side breaks anyone porting code across the swap — silently,
+    at their call site.
     """
     sync_methods = _methods(sync_cls)
-    async_methods = _methods(async_cls)
+    async_methods = _methods(async_cls, rename=True)
     mismatches = []
     for name in sorted(set(sync_methods) & set(async_methods)):
         sync_params = _params(sync_methods[name])
@@ -322,11 +499,64 @@ def test_paired_methods_take_the_same_parameters(
 
 
 @pytest.mark.parametrize("label,sync_cls,async_cls", _PAIRS, ids=_IDS)
-def test_no_suffixed_async_spellings(label: str, sync_cls: type, async_cls: type) -> None:
-    """No public name encodes sync-vs-async; the client it hangs off does that."""
+def test_the_async_side_is_the_awaitable_one(label: str, sync_cls: type, async_cls: type) -> None:
+    """The half of the promise the names alone cannot check.
+
+    "Swap the import and add ``await``" is a claim about *how a call behaves*,
+    not just about what it is spelled. Comparing names and signatures leaves it
+    entirely unasserted: dropping ``async`` from ``AsyncModels.run`` — or
+    adding it to ``Models.run`` — changes no name, no kind and no signature.
+    So the sync side must never hand back something to await, and the async
+    side must, unless ``_SYNC_ON_BOTH`` says why it does no I/O.
+    """
+    key = _pair_key(sync_cls)
+    sync_members = _members(sync_cls, rename=False)
+    async_members = _members(async_cls, rename=True)
+    problems = []
+    for name in sorted(sync_members.keys() & async_members.keys()):
+        if _kind(sync_members[name]) != "method" or _kind(async_members[name]) != "method":
+            continue  # properties are values on both sides; kind parity covers them
+        sync_form = _call_form(_unwrap(sync_members[name]))
+        async_form = _call_form(_unwrap(async_members[name]))
+        if sync_form not in _EXPECTED_ASYNC_FORM:
+            problems.append(
+                f"{name}: the sync member is {sync_form} — a sync client must not hand back "
+                f"something the caller has to await"
+            )
+            continue
+        allowed = (key, name) in _SYNC_ON_BOTH
+        expected = "plain" if allowed else _EXPECTED_ASYNC_FORM[sync_form]
+        if async_form != expected:
+            why = (
+                f" (_SYNC_ON_BOTH declares it plain: {_SYNC_ON_BOTH[(key, name)]} — drop the "
+                f"entry if that is no longer true)"
+                if allowed
+                else ""
+            )
+            problems.append(
+                f"{name}: sync is {sync_form}, so async should be {expected}, but it is "
+                f"{async_form}{why}"
+            )
+    assert not problems, (
+        f"{sync_cls.__name__}/{async_cls.__name__} breaks the add-`await` contract: "
+        + "; ".join(problems)
+        + f" — make the async member awaitable, or declare it under the key {key!r} in "
+        "_SYNC_ON_BOTH with the reason it does no I/O"
+    )
+
+
+def test_no_suffixed_async_spellings() -> None:
+    """No public name encodes sync-vs-async; the client it hangs off does that.
+
+    Swept over every public class in the two packages rather than over the
+    discovered pairs: the ban is on the spelling *anywhere on the surface*, and
+    a pair-scoped sweep would never look at an unpaired class (``Workflow``,
+    ``WorkflowFactory``, the exception types), so a ``save_async`` landing on
+    one of those would pass.
+    """
     offenders = sorted(
-        f"{cls.__name__}.{name}"
-        for cls in (sync_cls, async_cls)
+        f"{cls.__module__}.{cls.__qualname__}.{name}"
+        for cls in _public_classes()
         for name in _public_members(cls)
         if _SUFFIXED.search(name)
     )
@@ -363,7 +593,39 @@ def test_introspection_is_not_vacuous() -> None:
     found something.
     """
     assert _PAIRS, "introspection discovered no sync/async class pairs at all"
+    assert not [label for label, s, a in _PAIRS if s is a], (
+        "a pair was discovered comparing a class against itself, which cannot fail"
+    )
     empty = [label for label, sync_cls, _ in _PAIRS if not _methods(sync_cls)]
     assert not empty, f"pairs discovered with zero public methods (introspection broke?): {empty}"
-    compared = sum(len(set(_methods(s)) & set(_methods(a))) for _, s, a in _PAIRS)
+    compared = sum(len(set(_methods(s)) & set(_methods(a, rename=True))) for _, s, a in _PAIRS)
     assert compared > 0, "no paired public methods were compared at all"
+
+
+def test_the_asymmetry_tables_stay_current() -> None:
+    """An allowance for something that no longer exists is a stale exemption.
+
+    Both tables are escape hatches keyed on ``module.Class``; an entry that
+    matches nothing is worse than no entry, because it reads like a live
+    exception to a rule it has stopped touching — and it would silently
+    re-arm as an exemption if that name ever came back for another reason.
+    """
+    pairs = {_pair_key(sync_cls): (sync_cls, async_cls) for _, sync_cls, async_cls in _PAIRS}
+    stale = []
+    for table, must_be_shared in ((_ALLOWED_ASYMMETRY, False), (_SYNC_ON_BOTH, True)):
+        for key, name in table:
+            if key not in pairs:
+                stale.append(f"{key}.{name} (no such pair is discovered)")
+                continue
+            sync_cls, async_cls = pairs[key]
+            on_sync = name in _members(sync_cls, rename=False)
+            on_async = name in _members(async_cls, rename=True)
+            if must_be_shared and not (on_sync and on_async):
+                stale.append(f"{key}.{name} (not a member of both sides)")
+            elif not must_be_shared and not (on_sync or on_async):
+                stale.append(f"{key}.{name} (not a member of either side)")
+    assert stale == [], (
+        f"asymmetry declared for something introspection never sees: {sorted(stale)} — the "
+        "class or member was renamed or removed, so drop the entry (keys are "
+        "module-qualified sync class names)"
+    )
