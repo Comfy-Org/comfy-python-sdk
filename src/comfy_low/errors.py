@@ -25,6 +25,7 @@ class ApiError(Exception):
         http_status: int,
         details: dict[str, Any] | None = None,
         retry_after: int | None = None,
+        request_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -33,6 +34,12 @@ class ApiError(Exception):
         self.http_status = http_status
         self.details = details
         self.retry_after = retry_after
+        #: Server-minted id for the call, read off ``X-Comfy-Request-Id``.
+        #: ``None`` when the response carried no such header. Surfaced the same
+        #: way ``retry_after`` is — a response header kept on the exception,
+        #: because it is the id a user quotes in a support request and it is
+        #: unreachable once the response object is gone.
+        self.request_id = request_id
 
 
 class InvalidWorkflow(ApiError):
@@ -103,6 +110,7 @@ def error_from_envelope(
     body: dict[str, Any] | None,
     *,
     retry_after: int | None = None,
+    request_id: str | None = None,
 ) -> ApiError:
     """Build the typed exception for an error response.
 
@@ -127,6 +135,7 @@ def error_from_envelope(
         http_status=http_status,
         details=details if isinstance(details, dict) else None,
         retry_after=retry_after,
+        request_id=request_id,
     )
 
 

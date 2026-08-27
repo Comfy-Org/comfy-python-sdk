@@ -4,8 +4,9 @@ Covers the whole contract of the headline model API on both clients: the sync
 call blocks and returns the finished result, the async call awaits to the same
 shape, the awaitable form is the *async client* rather than a suffixed method
 (asserted, not merely absent), the wait is sized for a server that polls
-upstream inside the call, an ``Idempotency-Key`` is plumbed onto the wire, and
-the result handed back is the provider's own payload rather than a wrapper.
+upstream inside the call, an ``Idempotency-Key`` is plumbed onto the wire and rides
+out on whatever the call raises, and the result handed back is the provider's
+own payload rather than a wrapper.
 
 Everything here runs against the stubbed server in ``conftest.py``.
 """
@@ -14,14 +15,22 @@ from __future__ import annotations
 
 import inspect
 import re
+from collections.abc import Mapping
+from typing import Any, cast
 
 import httpx
 import pytest
 
 from comfy_low.transport import MODEL_RUN_TIMEOUT, AsyncComfyLow, ComfyLow, model_run_request
-from comfy_sdk import NO_RETRY, AsyncComfy, Comfy
+from comfy_sdk import NO_RETRY, AsyncComfy, Comfy, RetryPolicy
 from comfy_sdk.exceptions import ComfyError, NotFound, Unauthorized
 from comfy_sdk.models import AsyncModels, Models
+from comfy_sdk.router_exceptions import (
+    ERROR_TYPE_HEADER,
+    DeadlineExceeded,
+    RouterError,
+    error_from_response,
+)
 
 MODEL = "acme/flux/dev"
 ARGS = {"prompt": "a cat", "steps": 4}
@@ -243,3 +252,220 @@ def test_an_unmapped_failure_still_lands_as_a_comfy_error(server) -> None:
             client.models.run(MODEL, ARGS)
     assert excinfo.value.code == "model_unavailable"
     assert excinfo.value.http_status == 503
+
+
+# --- the key survives the failure ----------------------------------------
+#
+# The router's replay contract lets a caller who lost a response resend the
+# same request under the same `Idempotency-Key` and collect the generation
+# they were already billed for. `run` mints that key itself, so unless the
+# exception carries it the key dies with the call and a paid-for generation is
+# uncollectable — the only callers who could replay were the ones who had
+# passed `idempotency_key=` and stored it themselves.
+
+
+class _RaisingLow:
+    """A transport whose every attempt raises ``exc``, recording the key sent.
+
+    A stub HTTP server that is listening cannot produce a connect failure, and
+    ``post_model_run`` does not raise ``RouterError`` today — so the two cases
+    that never reach the wire are asserted against a transport that can make
+    them.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+        self.keys: list[str | None] = []
+
+    def post_model_run(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = None,
+    ) -> dict[str, Any]:
+        self.keys.append(idempotency_key)
+        raise self._exc
+
+
+class _AsyncRaisingLow(_RaisingLow):
+    async def post_model_run(  # type: ignore[override]
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = None,
+    ) -> dict[str, Any]:
+        self.keys.append(idempotency_key)
+        raise self._exc
+
+
+def _models_over(exc: BaseException) -> tuple[Models, _RaisingLow]:
+    low = _RaisingLow(exc)
+    return Models(cast(Any, low), NO_RETRY), low
+
+
+def _async_models_over(exc: BaseException) -> tuple[AsyncModels, _RaisingLow]:
+    low = _AsyncRaisingLow(exc)
+    return AsyncModels(cast(Any, low), NO_RETRY), low
+
+
+def test_a_deadline_exceeded_504_exposes_the_exact_auto_minted_key(server) -> None:
+    # The headline case: Comfy stopped holding the connection at its own bound,
+    # the generation may well have completed and been billed, and this
+    # attribute is the caller's only route back to it.
+    server.state.model_run_error = (504, "deadline_exceeded")
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    (sent,) = server.state.model_run_idempotency_keys
+    assert sent is not None
+    # The exact key, not merely "a key": asserting truthiness would pass on a
+    # freshly minted one, which is precisely the value that cannot collect the
+    # generation.
+    assert excinfo.value.idempotency_key == sent
+
+
+async def test_an_async_deadline_exceeded_504_exposes_the_key_too(server) -> None:
+    server.state.model_run_error = (504, "deadline_exceeded")
+    async with AsyncComfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            await client.models.run(MODEL, ARGS)
+    (sent,) = server.state.model_run_idempotency_keys
+    assert sent is not None
+    assert excinfo.value.idempotency_key == sent
+
+
+def test_a_caller_supplied_key_round_trips_onto_the_exception(server) -> None:
+    server.state.model_run_error = (504, "deadline_exceeded")
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS, idempotency_key="caller-chosen-03")
+    assert excinfo.value.idempotency_key == "caller-chosen-03"
+    assert server.state.model_run_idempotency_keys == ["caller-chosen-03"]
+
+
+async def test_a_caller_supplied_key_round_trips_on_the_async_client(server) -> None:
+    server.state.model_run_error = (504, "deadline_exceeded")
+    async with AsyncComfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            await client.models.run(MODEL, ARGS, idempotency_key="caller-chosen-04")
+    assert excinfo.value.idempotency_key == "caller-chosen-04"
+
+
+def test_the_replay_idiom_from_the_docstring_collects_the_generation(server) -> None:
+    # End to end, against a deployment that replays a claimed key: the 504
+    # raises, the caller reads the key off the exception and re-runs under it,
+    # and the result of the generation they were already billed for comes back.
+    server.state.model_run_error = (504, "deadline_exceeded")
+    server.state.model_run_replays_idempotency_key = True
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+        server.state.model_run_error = None
+        replayed = client.models.run(MODEL, ARGS, idempotency_key=excinfo.value.idempotency_key)
+    assert replayed == server.state.model_run_result
+    first, second = server.state.model_run_idempotency_keys
+    assert first == second
+
+
+def test_a_transport_level_failure_carries_the_key() -> None:
+    # No response at all, so nothing to translate — and the case the replay
+    # contract names alongside the 504, since a connection dropped mid-run says
+    # nothing about whether the generation ran.
+    models, low = _models_over(httpx.ConnectError("connection refused"))
+    with pytest.raises(httpx.ConnectError) as excinfo:
+        models.run(MODEL, ARGS)
+    assert low.keys == [excinfo.value.idempotency_key]  # type: ignore[attr-defined]
+    assert excinfo.value.idempotency_key is not None  # type: ignore[attr-defined]
+
+
+async def test_an_async_transport_level_failure_carries_the_key() -> None:
+    models, low = _async_models_over(httpx.ReadTimeout("no answer"))
+    with pytest.raises(httpx.ReadTimeout) as excinfo:
+        await models.run(MODEL, ARGS)
+    assert low.keys == [excinfo.value.idempotency_key]  # type: ignore[attr-defined]
+
+
+def test_a_client_side_timeout_against_a_live_server_carries_the_key(server) -> None:
+    # The read timeout the retry module calls the important member of the
+    # unknown-outcome class: the server is most likely still generating.
+    server.state.model_run_delay = 0.4
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(httpx.TimeoutException) as excinfo:
+            client.models.run(MODEL, ARGS, timeout=0.05)
+    (sent,) = server.state.model_run_idempotency_keys
+    assert excinfo.value.idempotency_key == sent  # type: ignore[attr-defined]
+
+
+def test_an_unknown_error_type_lands_on_the_base_router_error_with_the_key() -> None:
+    # The reason the stamp lives at the translation boundary rather than in
+    # each subclass's constructor: a bucket this SDK version has never heard of
+    # falls through to `RouterError` itself, and it has to carry the key too.
+    unknown = error_from_response(
+        503, {ERROR_TYPE_HEADER: "a_bucket_from_the_future"}, {"detail": "nope"}
+    )
+    assert type(unknown) is RouterError
+    models, low = _models_over(unknown)
+    with pytest.raises(RouterError) as excinfo:
+        models.run(MODEL, ARGS)
+    assert excinfo.value.error_type == "a_bucket_from_the_future"
+    assert low.keys == [excinfo.value.idempotency_key]
+    assert excinfo.value.idempotency_key is not None
+
+
+def test_a_typed_router_subclass_carries_the_key_as_well() -> None:
+    models, low = _models_over(DeadlineExceeded("we stopped waiting", http_status=504))
+    with pytest.raises(DeadlineExceeded) as excinfo:
+        models.run(MODEL, ARGS)
+    assert low.keys == [excinfo.value.idempotency_key]
+
+
+def test_the_key_on_the_exception_is_the_one_every_retry_reused(server) -> None:
+    # One key across the attempts, and that same key on the exception the
+    # exhausted retry finally raises — not the first attempt's, not a fresh one.
+    server.state.model_run_error = (504, "deadline_exceeded")
+    server.state.model_run_replays_idempotency_key = True
+    policy = RetryPolicy(
+        max_elapsed=0.5, initial_backoff=0.01, max_backoff=0.02, retry_possibly_in_flight=True
+    )
+    with Comfy(retry=policy) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    sent = server.state.model_run_idempotency_keys
+    assert len(sent) > 1
+    assert set(sent) == {excinfo.value.idempotency_key}
+
+
+# --- request_id, from the server's own header ----------------------------
+
+
+def test_a_failed_run_carries_the_servers_request_id(server) -> None:
+    server.state.model_run_error = (504, "deadline_exceeded")
+    server.state.model_run_request_id = "req_abc123"
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert excinfo.value.request_id == "req_abc123"
+
+
+async def test_an_async_failed_run_carries_the_servers_request_id(server) -> None:
+    server.state.model_run_error = (500, "internal_error")
+    server.state.model_run_request_id = "req_def456"
+    async with AsyncComfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            await client.models.run(MODEL, ARGS)
+    assert excinfo.value.request_id == "req_def456"
+
+
+def test_request_id_is_none_when_the_response_named_none(server) -> None:
+    server.state.model_run_error = (504, "deadline_exceeded")
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert excinfo.value.request_id is None
+    # The key is still there — the two are independent, and the one that
+    # enables the replay is minted client-side.
+    assert excinfo.value.idempotency_key is not None

@@ -468,6 +468,47 @@ you just asked for.
 `retry` governs `client.models` only. `submit()`/`run()` on the client keep
 their own 429 handling, which follows the server's `Retry-After`.
 
+### Collecting a generation after a lost response
+
+Everything above is about the retry the SDK makes *for* you. When it gives up —
+or when you turned it off — the failure that reaches you may still be a
+generation that ran and was billed: a `504` where the server stopped holding the
+connection at its own deadline, or a connection that dropped while it was
+generating. Recovering that generation means asking again under the **same**
+`Idempotency-Key`, and if `run` minted the key for you then that key is the one
+thing you need and the one thing you never saw.
+
+So every exception `models.run` raises carries it:
+
+```python
+from comfy_sdk import Comfy, ComfyError
+
+with Comfy() as client:
+    try:
+        result = client.models.run("acme/flux/dev", {"prompt": "a cat"})
+    except ComfyError as exc:
+        # Later — after the Retry-After the server named, if it named one.
+        result = client.models.run(
+            "acme/flux/dev", {"prompt": "a cat"}, idempotency_key=exc.idempotency_key
+        )
+```
+
+Against a deployment that replays a claimed key, the second call returns the
+original generation's result rather than starting a new one; while that
+generation is still running it is refused instead, with a `Retry-After` saying
+when to ask. Send the same arguments you sent the first time — a repeated key
+with a *different* body is rejected outright.
+
+Two attributes carry this:
+
+| Attribute | Value |
+|---|---|
+| `exc.idempotency_key` | the key that call was made under — the one `run` minted, or the one you passed. Present on every exception `models.run` raises, including a transport failure with no response at all (`httpx.ConnectError`, a read timeout) and a `RouterError` whose `error_type` this SDK version does not recognise |
+| `exc.request_id` | the server's `X-Comfy-Request-Id` for the call, when the response carried one — the id to quote in a support request. `None` when there was no response, or none of that header |
+
+Both are `None` rather than absent on an error from a surface that sends no
+key, so `exc.idempotency_key` is always safe to read on a `ComfyError`.
+
 ## Sync and async
 
 `Comfy` and `AsyncComfy` expose the identical surface — swap the import and

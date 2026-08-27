@@ -147,6 +147,18 @@ class Models(_ModelsBase):
         with it the key claimed, so those need
         ``RetryPolicy(retry_possibly_in_flight=True)``. See
         :mod:`comfy_sdk.retry`, and ``Comfy(retry=NO_RETRY)`` to switch it off.
+
+        **Every exception this raises carries the key it sent** on
+        ``.idempotency_key`` (and the server's ``.request_id`` when the response
+        named one), so a caller who lost the response — a ``deadline_exceeded``
+        ``504``, a dropped connection — can still collect a generation they were
+        already billed for: ``client.models.run(model, arguments,
+        idempotency_key=exc.idempotency_key)`` returns the original result
+        (``200`` + ``Idempotent-Replayed``) against a deployment that replays a
+        claimed key, or is refused ``409`` "still in progress" with a
+        ``Retry-After`` saying when to ask again. Without that attribute an
+        auto-minted key died with the call and the paid-for generation was
+        uncollectable.
         """
         low = cast(ComfyLow, self._low)
         # Minted once, outside the loop: reusing this exact value on every
@@ -158,7 +170,10 @@ class Models(_ModelsBase):
         # same-key-different-body case the contract rejects outright.
         payload = dict(arguments)
         retrier = Retrier(self._retry, now=_now)
-        with translating():
+        # The key is stamped onto whatever this raises: it is a local of this
+        # frame, so an exception that propagates past it would otherwise take
+        # the caller's only route back to an already-billed generation with it.
+        with translating(idempotency_key=key):
             while True:
                 try:
                     return low.post_model_run(model, payload, idempotency_key=key, timeout=timeout)
@@ -187,8 +202,9 @@ class AsyncModels(_ModelsBase):
         """Awaitable :meth:`Models.run` — same arguments, same result shape.
 
         This *is* the async form of ``run``: awaiting it on ``AsyncComfy`` is
-        the whole difference from the sync client — including the retry policy
-        and the one-key-per-call rule. See :meth:`Models.run`.
+        the whole difference from the sync client — including the retry policy,
+        the one-key-per-call rule, and the ``.idempotency_key`` every exception
+        it raises carries for the replay. See :meth:`Models.run`.
         """
         low = cast(AsyncComfyLow, self._low)
         key = idempotency_key or new_idempotency_key()
@@ -197,7 +213,10 @@ class AsyncModels(_ModelsBase):
         # while the retry sleeps.
         payload = dict(arguments)
         retrier = Retrier(self._retry, now=_now)
-        with translating():
+        # The key is stamped onto whatever this raises: it is a local of this
+        # frame, so an exception that propagates past it would otherwise take
+        # the caller's only route back to an already-billed generation with it.
+        with translating(idempotency_key=key):
             while True:
                 try:
                     return await low.post_model_run(

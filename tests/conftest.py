@@ -118,6 +118,9 @@ class ServerState:
     # is the 429 the policy is allowed to pace itself against. `None` sends no
     # header at all, which is the 429 the policy must *not* retry.
     model_run_retry_after: str | None = None
+    # Sent as X-Comfy-Request-Id alongside a failed run. `None` sends no header,
+    # which is the response an intermediary that never reached the router gives.
+    model_run_request_id: str | None = None
 
     # --- counters the tests assert on ---
     upload_count: int = 0
@@ -474,12 +477,16 @@ def _make_handler(state: ServerState):
 
             def fail(status: int, code: str, message: str) -> None:
                 claim_if_outcome_unknown(status)
-                headers = (
-                    {"Retry-After": state.model_run_retry_after}
-                    if state.model_run_retry_after is not None
-                    else None
+                headers: dict[str, str] = {}
+                if state.model_run_retry_after is not None:
+                    headers["Retry-After"] = state.model_run_retry_after
+                if state.model_run_request_id is not None:
+                    headers["X-Comfy-Request-Id"] = state.model_run_request_id
+                self._json(
+                    status,
+                    {"error": {"code": code, "message": message}},
+                    headers=headers or None,
                 )
-                self._json(status, {"error": {"code": code, "message": message}}, headers=headers)
 
             if state.model_run_fail_times > 0:
                 state.model_run_fail_times -= 1

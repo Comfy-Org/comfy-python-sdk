@@ -127,6 +127,23 @@ def _retry_after(resp: httpx.Response) -> int | None:
         return None
 
 
+#: Response header carrying the server-minted id for the call. Spelled here as
+#: well as in :data:`comfy_sdk.router_exceptions.REQUEST_ID_HEADER` because the
+#: two layers read it independently — the router surface off its own error
+#: response, this one off the shared error envelope — and ``comfy_low`` never
+#: imports from ``comfy_sdk``. ``tests/test_error_contract.py`` asserts the two
+#: spellings agree, so they cannot drift apart.
+REQUEST_ID_HEADER = "X-Comfy-Request-Id"
+
+
+def _request_id(resp: httpx.Response) -> str | None:
+    """``X-Comfy-Request-Id`` as a non-empty string, or ``None``."""
+    raw = resp.headers.get(REQUEST_ID_HEADER)
+    if raw is None:
+        return None
+    return raw.strip() or None
+
+
 def origin(url: str) -> tuple[str, str, int | None]:
     """Normalized ``(scheme, host, port)`` — the parts that define same-origin.
 
@@ -220,7 +237,12 @@ class _Prepared:
             body = resp.json()
         except Exception:
             body = None
-        raise error_from_envelope(resp.status_code, body, retry_after=_retry_after(resp))
+        raise error_from_envelope(
+            resp.status_code,
+            body,
+            retry_after=_retry_after(resp),
+            request_id=_request_id(resp),
+        )
 
 
 def parse_expiry(url: str) -> datetime | None:
