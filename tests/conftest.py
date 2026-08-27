@@ -114,10 +114,26 @@ class ServerState:
     # is the vendored contract (reject-on-duplicate, no replay), under which a
     # same-key retry after a 5xx can only come back 422.
     model_run_replays_idempotency_key: bool = False
-    # Seconds sent as Retry-After alongside `model_run_error`, when that error
-    # is the 429 the policy is allowed to pace itself against. `None` sends no
-    # header at all, which is the 429 the policy must *not* retry.
+    # The narrower carry the router contract describes for `deadline_exceeded`:
+    # the reservation survives the 504 with a handle to the generation stamped
+    # on it, so the SAME key presented again *collects* that generation instead
+    # of being rejected 422. Only the 504 behaves that way — every other 5xx
+    # still claims the key — which is what makes this distinct from
+    # `model_run_replays_idempotency_key`, the whole-deployment replay the
+    # `retry_possibly_in_flight` opt-in exists for.
+    model_run_collects_after_deadline: bool = False
+    # Seconds sent as Retry-After alongside `model_run_error` /
+    # `model_run_transient_error`, for the failures the policy is allowed to
+    # pace itself against (a 429, a `deadline_exceeded` 504, an in-progress
+    # 409). `None` sends no header at all, which is the same failure the policy
+    # must *not* retry.
     model_run_retry_after: str | None = None
+    # Answer model-run failures in Router's own error shape -- the coarse bucket
+    # on `X-Comfy-Error-Type` plus a `{detail, error_type}` body -- instead of
+    # the v2 `{error: {code, message}}` envelope. `POST /api/v2/models/run` is
+    # fronted by Router, so this is the shape a real deployment's 504 arrives
+    # in, and the bucket-keyed collect rule has to read it.
+    model_run_router_error_shape: bool = False
 
     # --- counters the tests assert on ---
     upload_count: int = 0
@@ -464,22 +480,55 @@ def _make_handler(state: ServerState):
                 # The server holding the connection while it polls upstream.
                 time.sleep(state.model_run_delay)
 
-            def claim_if_outcome_unknown(status: int) -> None:
+            def claim_if_outcome_unknown(status: int, code: str) -> None:
                 # The contract releases a key for a request that definitively
                 # failed without starting work (a 4xx) and keeps it claimed
-                # when the outcome is unknown (a 5xx). A replaying deployment
-                # is the exception, and is what the opt-in is for.
-                if key and status >= 500 and not state.model_run_replays_idempotency_key:
-                    state.model_run_idempotency[key] = "claimed"
+                # when the outcome is unknown (a 5xx). Two exceptions: a
+                # replaying deployment (what the opt-in is for), and the
+                # router's `deadline_exceeded` 504, whose reservation survives
+                # so the same key can collect the generation still running.
+                #
+                # The bucket is part of that second exception and not an
+                # afterthought: the carve-out the router documents is for
+                # `deadline_exceeded` specifically, not for the status, which it
+                # shares with `provider_timeout`. Keying on the status alone
+                # would make the stub more permissive than the contract it
+                # stands in for, and an SDK regression that resent a
+                # `provider_timeout` 504 would pass here while meeting a 422 on
+                # a real server.
+                if not key or status < 500:
+                    return
+                if state.model_run_replays_idempotency_key:
+                    return
+                if (
+                    state.model_run_collects_after_deadline
+                    and status == 504
+                    and code == "deadline_exceeded"
+                ):
+                    return
+                state.model_run_idempotency[key] = "claimed"
 
             def fail(status: int, code: str, message: str) -> None:
-                claim_if_outcome_unknown(status)
-                headers = (
-                    {"Retry-After": state.model_run_retry_after}
-                    if state.model_run_retry_after is not None
-                    else None
+                claim_if_outcome_unknown(status, code)
+                headers = {}
+                if state.model_run_retry_after is not None:
+                    headers["Retry-After"] = state.model_run_retry_after
+                if state.model_run_router_error_shape:
+                    # What a real Router failure looks like: the coarse bucket
+                    # on `X-Comfy-Error-Type` and a `{detail, error_type}` body,
+                    # with no v2 `error.code` anywhere. The SDK's bucket-keyed
+                    # retry rules have to survive this shape too, and nothing
+                    # exercised it while the stub only ever spoke the envelope.
+                    headers["X-Comfy-Error-Type"] = code
+                    self._json(
+                        status, {"detail": message, "error_type": code}, headers=headers or None
+                    )
+                    return
+                self._json(
+                    status,
+                    {"error": {"code": code, "message": message}},
+                    headers=headers or None,
                 )
-                self._json(status, {"error": {"code": code, "message": message}}, headers=headers)
 
             if state.model_run_fail_times > 0:
                 state.model_run_fail_times -= 1

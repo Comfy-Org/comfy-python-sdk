@@ -220,7 +220,16 @@ class _Prepared:
             body = resp.json()
         except Exception:
             body = None
-        raise error_from_envelope(resp.status_code, body, retry_after=_retry_after(resp))
+        raise error_from_envelope(
+            resp.status_code,
+            body,
+            retry_after=_retry_after(resp),
+            # Router repeats its coarse bucket on this header, and the model-run
+            # route answers in Router's body shape rather than the envelope's.
+            # Passing it here is what keeps the bucket alive across the layer
+            # boundary; see `error_from_envelope`.
+            error_type=resp.headers.get("X-Comfy-Error-Type"),
+        )
 
 
 def parse_expiry(url: str) -> datetime | None:
