@@ -413,15 +413,19 @@ sends the same `Idempotency-Key`**, and a new call mints a new one — that is
 what lets a server tell a retry apart from a second order, on a surface where
 one call is a billed generation.
 
-That one key is also what decides *which* failures are worth retrying. The API
-contract makes `Idempotency-Key` **single-use, reject-on-duplicate, with no
-response replay**: the first request to present a key is processed, and a later
-one presenting the same key is rejected `422 idempotency_key_reuse` rather than
-re-run. The contract also says when the key is released instead of claimed — a
-request that definitively failed without starting work frees its key, while one
-whose outcome the server could not characterise (a 5xx, an upstream timeout)
-keeps it. Retrying under one key is only safe where that key is still unspent,
-so that is exactly what the default policy retries.
+That one key is also what decides *which* failures are worth retrying. The v2
+jobs contract makes its `Idempotency-Key` **single-use, reject-on-duplicate,
+with no response replay**: the first request to present a key is processed, and
+a later one presenting the same key is rejected `422 idempotency_key_reuse`
+rather than re-run. (That rule governs `submit()`. On the router surface a
+resend of the same key with the same body *collects* the generation the first
+request started instead of dispatching another; a resend with a different body
+is the one that is rejected `422`.) The contract also says when the key is
+released instead of claimed — a request that definitively failed without
+starting work frees its key, while one whose outcome the server could not
+characterise (a 5xx, an upstream timeout) keeps it. Retrying under one key is
+only safe where that key is still spendable, so that is exactly what the default
+policy retries.
 
 The default policy:
 
@@ -429,10 +433,11 @@ The default policy:
 |---|---|
 | Retried | connect-phase transport failures (connection refused, connect timeout, no pooled connection, proxy error) — the request never reached the server, so the key was never claimed |
 | Retried, at the server's pace | a `429` carrying `Retry-After` (queue full, out of credits, a concurrency limit) — a reject that started no work, so the key is released. The delay is the one the server named, not a guess |
-| Not retried | every other 4xx — `400`/`content_policy_violation`, `404`, `409`, `422`, `401`, `402` — because asking again cannot change a deterministic refusal. A `429` with no `Retry-After` is not asking to be asked again either |
-| Not retried by default | anything whose outcome is unknown: a **5xx response** (including the router's `service_unavailable` `503`, which asks a caller to retry with backoff but says nothing about the key), and a client-side timeout where the server may still be generating. The key stays claimed for these, so a same-key retry comes back `422 idempotency_key_reuse` and hides the real error — while a fresh-key retry is the second billed generation the one-key rule exists to prevent |
-| Budget | 60 seconds of **total elapsed time** from the first attempt, not a number of attempts |
-| Backoff | 0.5s doubling to a 15s ceiling, with full jitter (each wait is drawn from `[0, ceiling]`), clamped to whatever is left of the budget |
+| Retried, at the server's pace | the answers that pace a resend of the *same* key for work already running: a `deadline_exceeded` `504` carrying `Retry-After` (Comfy stopped holding the connection at its own bound; the contract says to retry with the same key, which collects that generation rather than dispatching another), and a `generation_in_progress` `409` carrying `Retry-After` (the same key, asked for again before the generation finished). One `run()` rides that loop to the finished result |
+| Not retried | every other 4xx — `400`/`content_policy_violation`, `404`, any `409` that is not the paced `generation_in_progress` one above (`hash_mismatch` carries a `Retry-After` and is still deterministic), `422`, `401`, `402` — because asking again cannot change a deterministic refusal. A `429` with no `Retry-After` is not asking to be asked again either |
+| Not retried by default | anything whose outcome is unknown: any **other 5xx response** — including the router's `service_unavailable` `503` (which asks a caller to retry with backoff but says nothing about the key), a `504` carrying no `Retry-After` (the router sends it only when it holds a generation to collect), and a `504` that is `provider_timeout` rather than `deadline_exceeded` — and a client-side timeout where the server may still be generating. The key stays claimed for these, so a same-key retry comes back `422 idempotency_key_reuse` and hides the real error — while a fresh-key retry is the second billed generation the one-key rule exists to prevent |
+| Budget | 60 seconds of **total elapsed time** from the first attempt, not a number of attempts. The collect loop gets its own, longer budget: 1200 seconds, two server deadline windows, so it can outlast the deadline that started it |
+| Backoff | 0.5s doubling to a 15s ceiling, with full jitter (each wait is drawn from `[0, ceiling]`), clamped to whatever is left of the budget. A `Retry-After` the server named is used as given instead |
 
 The budget bounds when the *last* attempt may **start**; an attempt already
 running is never interrupted by it, so a slow generation is never abandoned
@@ -444,29 +449,107 @@ Tune or disable it per client:
 ```python
 from comfy_sdk import Comfy, NO_RETRY, RetryPolicy
 
-Comfy(retry=NO_RETRY)                          # exactly one attempt, ever
-Comfy(retry=RetryPolicy(max_elapsed=300.0))    # keep trying for five minutes
+Comfy(retry=NO_RETRY)                              # exactly one attempt, ever
+Comfy(retry=RetryPolicy(max_elapsed=300.0))        # fast classes: five minutes
+Comfy(retry=RetryPolicy(collect_max_elapsed=60.0)) # bound the collect loop
+Comfy(retry=RetryPolicy(retry_collectable=False))  # raise the 504/409 instead
 
-client.models.retry                            # the policy in force, read-only
+client.models.retry                                # the policy in force, read-only
 ```
 
-5xx responses and client-side timeouts are the cases left out by default, and
-for the same reason. `run` holds the connection open while the server
-generates, so neither one tells you whether the generation happened — retrying
-either starts a second generation unless the server replays the repeated key
-rather than re-running it, and against a server that *rejects* it instead the
-retry simply cannot succeed. Against a deployment that does replay, opt in:
+There are two budgets because the classes have two shapes. `max_elapsed` governs
+the fast ones — a connect failure, a paced `429` — which resolve in seconds or
+not at all, so an unreachable host gives up in a minute rather than pinning a
+caller (a whole thread, on the sync client) for longer. `collect_max_elapsed`
+governs the collect loop alone, and is twenty minutes because that is the one
+class that has to outlast a *server-side* bound: a `deadline_exceeded` `504`
+arrives at Comfy's own ten-minute deadline, so a single-window budget would
+already be spent when it lands and the collect attempt it exists for would never
+start. Nothing else pays for that room.
+
+A note on what the default trades: `POST /models/run` is in neither vendored
+spec, so a deployment may apply the v2 rule instead and keep the key claimed
+across the `504`. There the collect resend comes back `422
+idempotency_key_reuse` in place of the real `504`. Set
+`retry_collectable=False` on such a deployment.
+
+Other 5xx responses and client-side timeouts are the cases left out by default,
+and for the same reason. `run` holds the connection open while the server
+generates, so neither one tells you whether the generation happened, and no
+contract says the key survives them — retrying either starts a second generation
+unless the server replays the repeated key rather than re-running it, and
+against a server that *rejects* it instead the retry simply cannot succeed.
+Against a deployment that does replay, opt in:
 
 ```python
 Comfy(retry=RetryPolicy(max_elapsed=1200.0, retry_possibly_in_flight=True))
 ```
 
-Raise `max_elapsed` when you do: one full-length client timeout on a run can
-spend the default 60-second budget on its own, leaving no room for the retry
-you just asked for.
+Raise `max_elapsed` when you do: one full-length client timeout on a run spends
+many times the default 60-second budget on its own, leaving no room for the
+retry you just asked for. `collect_max_elapsed` does not help here — that budget
+is the collect class's alone.
 
 `retry` governs `client.models` only. `submit()`/`run()` on the client keep
 their own 429 handling, which follows the server's `Retry-After`.
+
+### Collecting a generation after a lost response
+
+Everything above is about the retry the SDK makes *for* you. When it gives up —
+or when you turned it off — the failure that reaches you may still be a
+generation that ran and was billed: a `504` where the server stopped holding the
+connection at its own deadline, or a connection that dropped while it was
+generating. Recovering that generation means asking again under the **same**
+`Idempotency-Key`, and if `run` minted the key for you then that key is the one
+thing you need and the one thing you never saw.
+
+So every exception `models.run` raises carries it:
+
+```python
+import httpx
+from comfy_sdk import Comfy, ComfyError
+
+with Comfy() as client:
+    try:
+        result = client.models.run("acme/flux/dev", {"prompt": "a cat"})
+    # Both, and the second is not optional: a dropped connection or a read
+    # timeout — one of the two cases this section is about — never reached a
+    # response to translate, so it arrives as the `httpx` error it was, not as
+    # a `ComfyError`. Catching only `ComfyError` misses exactly the failure the
+    # replay exists for.
+    except (ComfyError, httpx.HTTPError) as exc:
+        key = exc.idempotency_key
+        if key is None:
+            raise  # Nothing to replay under; a fresh key would re-run and re-bill.
+        # Later — after `exc.retry_after` seconds, if the server named a pace.
+        result = client.models.run(
+            "acme/flux/dev", {"prompt": "a cat"}, idempotency_key=key
+        )
+```
+
+Against a deployment that replays a claimed key, the second call returns the
+original generation's result rather than starting a new one; while that
+generation is still running it is refused instead, with a `Retry-After` saying
+when to ask. Send the same arguments you sent the first time — a repeated key
+with a *different* body is rejected outright.
+
+Three attributes carry this:
+
+| Attribute | Value |
+|---|---|
+| `exc.idempotency_key` | the key that call was made under — the one `run` minted, or the one you passed. Present on every exception `models.run` raises, including a transport failure with no response at all (`httpx.ConnectError`, a read timeout), a cancelled `await`, and a `RouterError` whose `error_type` this SDK version does not recognise |
+| `exc.request_id` | the server's `X-Comfy-Request-Id` for the call, when the response carried one — the id to quote in a support request. `None` when there was no response, or none of that header |
+| `exc.retry_after` | seconds the server asked you to wait before asking again, from `Retry-After`. `None` when it named no pace |
+
+All three read as `None` rather than raising on any exception `models.run`
+raises, so a handler never has to guard the attribute access itself.
+
+`idempotency_key` is `None` on errors from *other* surfaces, though — it is
+`models.run` that records it, and `submit()` sends a key without stamping one.
+So `None` means "this SDK did not record a key for you", **not** "no key was
+sent, resend freely": check for it before replaying, as the snippet above does,
+rather than passing it straight back into `idempotency_key=` where `None` means
+"mint a fresh one" and starts a second billed generation.
 
 ## Sync and async
 

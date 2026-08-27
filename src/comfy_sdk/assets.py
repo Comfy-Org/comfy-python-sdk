@@ -42,6 +42,7 @@ class _Source:
     file_path: str
     hasher: Hasher
     opener: Opener
+    expires_in: int | None = None
 
 
 def _guess_content_type(name: str | None) -> str:
@@ -60,6 +61,7 @@ class _AssetBase:
         self._file_path = source.file_path
         self._hasher = source.hasher
         self._opener = source.opener
+        self._expires_in = source.expires_in
         self._hash: str | None = None
         self._id: str | None = None
         self._created_new: bool | None = None
@@ -127,7 +129,9 @@ class Asset(_AssetBase):
         digest = self.hash
         with translating():
             if self._low.head_asset_by_hash(digest):
-                asset = self._low.asset_from_hash(digest, file_path=self._file_path)
+                asset = self._low.asset_from_hash(
+                    digest, file_path=self._file_path, expires_in=self._expires_in
+                )
             else:
                 fh, size = self._opener()
                 try:
@@ -138,6 +142,7 @@ class Asset(_AssetBase):
                         expected_hash=digest,
                         idempotency_key=self._idempotency_key,
                         file_size=size,
+                        expires_in=self._expires_in,
                     )
                 finally:
                     fh.close()
@@ -173,7 +178,9 @@ class AsyncAsset(_AssetBase):
         digest = self.hash
         with translating():
             if await self._low.head_asset_by_hash(digest):
-                asset = await self._low.asset_from_hash(digest, file_path=self._file_path)
+                asset = await self._low.asset_from_hash(
+                    digest, file_path=self._file_path, expires_in=self._expires_in
+                )
             else:
                 fh, size = self._opener()
                 try:
@@ -184,6 +191,7 @@ class AsyncAsset(_AssetBase):
                         expected_hash=digest,
                         idempotency_key=self._idempotency_key,
                         file_size=size,
+                        expires_in=self._expires_in,
                     )
                 finally:
                     fh.close()
@@ -208,7 +216,7 @@ class AsyncAsset(_AssetBase):
 # ---- source builders (shared, sans-IO except explicit reads) ------------
 
 
-def _file_source(path: str | PathLike[str]) -> _Source:
+def _file_source(path: str | PathLike[str], *, expires_in: int | None = None) -> _Source:
     p = str(path)
     name = basename(p)
     return _Source(
@@ -216,6 +224,7 @@ def _file_source(path: str | PathLike[str]) -> _Source:
         file_path=name,
         hasher=lambda: _hashing.hash_file(p),
         opener=lambda: (open(p, "rb"), getsize(p)),
+        expires_in=expires_in,
     )
 
 
@@ -235,8 +244,8 @@ class AssetFactory:
     def __init__(self, low: ComfyLow) -> None:
         self._low = low
 
-    def from_file(self, path: str | PathLike[str]) -> Asset:
-        return Asset(self._low, _file_source(path))
+    def from_file(self, path: str | PathLike[str], *, expires_in: int | None = None) -> Asset:
+        return Asset(self._low, _file_source(path, expires_in=expires_in))
 
     def from_bytes(
         self,
@@ -288,8 +297,8 @@ class AsyncAssetFactory:
     def __init__(self, low: AsyncComfyLow) -> None:
         self._low = low
 
-    def from_file(self, path: str | PathLike[str]) -> AsyncAsset:
-        return AsyncAsset(self._low, _file_source(path))
+    def from_file(self, path: str | PathLike[str], *, expires_in: int | None = None) -> AsyncAsset:
+        return AsyncAsset(self._low, _file_source(path, expires_in=expires_in))
 
     def from_bytes(
         self,
