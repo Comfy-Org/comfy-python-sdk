@@ -131,18 +131,51 @@ _BY_CODE: dict[str, type[ApiError]] = {
 }
 
 
+def _clean(value: Any) -> str | None:
+    """``value`` as a non-empty string, or ``None``.
+
+    Anything else — a missing key, a number, Router's ``detail[]`` list form —
+    reads as absent rather than being coerced, so a malformed body degrades to
+    the status-derived default instead of producing a nonsense code.
+    """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def error_from_envelope(
     http_status: int,
     body: dict[str, Any] | None,
     *,
     retry_after: int | None = None,
     request_id: str | None = None,
+    error_type: str | None = None,
 ) -> ApiError:
     """Build the typed exception for an error response.
 
     Falls back to a status-derived code when the body is missing or not a
     well-formed envelope (so a bare ``401`` with no JSON still maps to
     ``Unauthorized``).
+
+    Not every route answers in the envelope shape. ``POST /api/v2/models/run``
+    is fronted by Router, whose error body is ``{detail, error_type}`` and which
+    repeats the same coarse bucket on the ``X-Comfy-Error-Type`` header
+    (``spec/router-openapi.yaml``). Reading only ``error["code"]`` would collapse
+    every one of those to the status-derived default — for a ``504`` that
+    default is the meaningless ``"error"``, and ``comfy_sdk.retry`` keys its
+    default-on collect rule on the bucket, so the rule would be a silent no-op
+    against every real Router ``504``. ``error_type`` (the header, passed by the
+    caller) and the body's own top-level ``error_type`` are read to prevent that.
+
+    They are consulted in one narrow place, though: *after* the envelope's
+    ``code``, which always wins, and *after* :data:`_CODE_BY_STATUS`, which
+    already determines a code for every status where this API has a documented
+    one. So a Router ``429`` still maps to ``queue_full`` and a Router ``401``
+    still to ``unauthorized`` — reordering those would silently retype
+    exceptions that integrators already catch. What is left is exactly the 5xx
+    range, where the status determines nothing and the bucket is the only name
+    the response has.
     """
     err = (body or {}).get("error") if isinstance(body, dict) else None
     code = (err or {}).get("code") if isinstance(err, dict) else None
@@ -150,7 +183,16 @@ def error_from_envelope(
     details = (err or {}).get("details") if isinstance(err, dict) else None
 
     if code is None:
-        code = _CODE_BY_STATUS.get(http_status, "error")
+        code = _CODE_BY_STATUS.get(http_status)
+    if code is None:
+        code = _clean(error_type) or _clean(
+            (body or {}).get("error_type") if isinstance(body, dict) else None
+        )
+    if code is None:
+        code = "error"
+    if not message:
+        # Router names its human-readable string `detail`, not `error.message`.
+        message = _clean((body or {}).get("detail") if isinstance(body, dict) else None)
     if not message:
         message = f"HTTP {http_status}"
 

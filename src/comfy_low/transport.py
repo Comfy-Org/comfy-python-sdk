@@ -259,6 +259,11 @@ class _Prepared:
             body,
             retry_after=_retry_after(resp),
             request_id=_request_id(resp),
+            # Router repeats its coarse bucket on this header, and the model-run
+            # route answers in Router's body shape rather than the envelope's.
+            # Passing it here is what keeps the bucket alive across the layer
+            # boundary; see `error_from_envelope`.
+            error_type=resp.headers.get("X-Comfy-Error-Type"),
         )
 
 

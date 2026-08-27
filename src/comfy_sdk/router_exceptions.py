@@ -94,8 +94,9 @@ REQUEST_ID_HEADER = "X-Comfy-Request-Id"
 #: :class:`ConcurrencyLimitExceeded`) and on a ``deadline_exceeded`` ``504``.
 #: It is read here rather than dropped because
 #: :func:`comfy_sdk.retry.retry_after_of` is what
-#: :meth:`~comfy_sdk.retry.RetryPolicy.should_retry` keys its ``429`` branch on:
-#: a router error that arrived without this attribute would make that branch
+#: :meth:`~comfy_sdk.retry.RetryPolicy.should_retry` keys both of its
+#: default-on branches on -- the ``429`` and the collectable ``504``/``409``:
+#: a router error that arrived without this attribute would make those branches
 #: unreachable and turn the retry the default policy is built to make into a
 #: silent no-op.
 RETRY_AFTER_HEADER = "Retry-After"
@@ -283,18 +284,22 @@ class DeadlineExceeded(RouterError):
     generation, the retry collects that generation rather than dispatching
     another, and a ``Retry-After`` on the ``504`` says when to ask.
 
-    That is the *contract's* advice, and as with :class:`ServiceUnavailable` the
-    SDK does **not** follow it by default. The bucket arrives on a ``504``, so
-    :func:`comfy_sdk.retry.is_unknown_outcome_status` sorts it with every other
-    5xx and the default policy declines the retry;
-    ``RetryPolicy(retry_possibly_in_flight=True)`` opts in, and does keep the
-    one key across it. The policy cannot special-case this bucket on the status
-    alone, either -- a ``504`` reaching the SDK without a bucket header is read
-    as :class:`ProviderTimeout`, where a same-key retry is *not* blessed. What
-    the opt-in does honour is the pace: ``error_from_response`` preserves the
-    ``Retry-After`` on the exception, and
+    That is the *contract's* advice, and unlike :class:`ServiceUnavailable` the
+    SDK **does** follow it by default -- this is the one bucket a contract says
+    the same key survives, so ``client.models.run`` makes the retry rather than
+    describing it. :func:`comfy_sdk.retry.is_collectable` is the gate and it
+    keys on this bucket, never on the status alone: a ``504`` reaching the SDK
+    without a bucket header is read as :class:`ProviderTimeout`, where a
+    same-key retry is *not* blessed. It also requires the ``Retry-After``, which
+    the router sends only when it holds a handle to a generation still running
+    -- without one there is nothing to collect, so a bare
+    ``deadline_exceeded`` ``504`` is raised to the caller like any other 5xx.
+    The pace is honoured as given: ``error_from_response`` preserves the header
+    on the exception, and
     :meth:`~comfy_sdk.retry.Retrier.delay_before_retry` prefers a named pace
-    over its own jittered backoff.
+    over its own jittered backoff. ``RetryPolicy(retry_collectable=False)``
+    switches the behaviour off; ``Comfy(retry=NO_RETRY)`` switches off retrying
+    entirely.
     """
 
     error_type = "deadline_exceeded"
