@@ -44,7 +44,7 @@ from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 import httpx
 
 from . import _multipart
-from .errors import ApiError, error_from_envelope
+from .errors import ApiError, clean_request_id, error_from_envelope
 from .models import Asset, Job, JobWorkflowResponse
 from .sse import RawEvent, SSEDecoder
 
@@ -204,6 +204,25 @@ def _retry_after(resp: httpx.Response) -> int | None:
         return None
 
 
+#: Response header carrying the server-minted id for the call. Spelled here as
+#: well as in :data:`comfy_sdk.router_exceptions.REQUEST_ID_HEADER` because the
+#: two layers read it independently — the router surface off its own error
+#: response, this one off the shared error envelope — and ``comfy_low`` never
+#: imports from ``comfy_sdk``. ``tests/test_error_contract.py`` asserts the two
+#: spellings agree, so they cannot drift apart.
+REQUEST_ID_HEADER = "X-Comfy-Request-Id"
+
+
+def _request_id(resp: httpx.Response) -> str | None:
+    """``X-Comfy-Request-Id`` as a bounded, printable string, or ``None``.
+
+    Filtered rather than kept verbatim — see
+    :func:`comfy_low.errors.clean_request_id`, which both error surfaces share
+    so the id cannot be safe to display on one and not the other.
+    """
+    return clean_request_id(resp.headers.get(REQUEST_ID_HEADER))
+
+
 def origin(url: str) -> tuple[str, str, int | None]:
     """Normalized ``(scheme, host, port)`` — the parts that define same-origin.
 
@@ -319,9 +338,24 @@ class _Prepared:
 
     def parse_or_raise(self, resp: httpx.Response, ok: tuple[int, ...]) -> dict[str, Any]:
         if resp.status_code in ok:
-            if resp.content:
+            if not resp.content:
+                return {}
+            try:
                 return resp.json()
-            return {}
+            except ValueError as exc:
+                # A success status whose body will not decode — a proxy
+                # interstitial served as 200, a response truncated mid-stream.
+                # Raised as an ApiError rather than escaping as the raw
+                # `json.JSONDecodeError` so it lands on the surface the SDK
+                # translates and stamps: on `models.run` this is a generation
+                # that ran and was billed with the result lost, which is
+                # exactly the failure the Idempotency-Key has to ride out on.
+                raise ApiError(
+                    f"Could not decode the {resp.status_code} response body as JSON",
+                    code="invalid_response",
+                    http_status=resp.status_code,
+                    request_id=_request_id(resp),
+                ) from exc
         body: dict[str, Any] | None
         try:
             body = resp.json()
@@ -331,6 +365,7 @@ class _Prepared:
             resp.status_code,
             body,
             retry_after=_retry_after(resp),
+            request_id=_request_id(resp),
             # Router repeats its coarse bucket on this header, and the model-run
             # route answers in Router's body shape rather than the envelope's.
             # Passing it here is what keeps the bucket alive across the layer
@@ -523,6 +558,7 @@ class ComfyLow:
         tags: list[str] | None = None,
         idempotency_key: str | None = None,
         file_size: int | None = None,
+        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         """POST /api/v2/assets — streaming multipart upload."""
@@ -538,6 +574,8 @@ class ComfyLow:
             # One part per tag — repeating the field name is the multipart/form
             # convention for a list, and a dict would silently drop all but one.
             fields.extend(("tags", t) for t in tags)
+        if expires_in is not None:
+            fields.append(("expires_in", str(expires_in)))
         boundary = _new_boundary()
         body, length = _multipart.build_multipart(
             boundary,
@@ -562,6 +600,7 @@ class ComfyLow:
         *,
         file_path: str | None = None,
         tags: list[str] | None = None,
+        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         """POST /api/v2/assets/from-hash — dedup mint over existing bytes."""
@@ -570,6 +609,8 @@ class ComfyLow:
             payload["file_path"] = file_path
         if tags is not None:
             payload["tags"] = tags
+        if expires_in is not None:
+            payload["expires_in"] = expires_in
         resp = self.raw_request("POST", "/assets/from-hash", json=payload, timeout=timeout)
         data = self._p.parse_or_raise(resp, (200, 201))
         return Asset.model_validate(data)
@@ -882,6 +923,7 @@ class AsyncComfyLow:
         tags: list[str] | None = None,
         idempotency_key: str | None = None,
         file_size: int | None = None,
+        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         if file_size is None:
@@ -895,6 +937,8 @@ class AsyncComfyLow:
         if tags:
             # One part per tag — see the sync ``post_assets`` for why a dict is wrong.
             fields.extend(("tags", t) for t in tags)
+        if expires_in is not None:
+            fields.append(("expires_in", str(expires_in)))
         boundary = _new_boundary()
         body, length = _multipart.build_multipart(
             boundary,
@@ -929,6 +973,7 @@ class AsyncComfyLow:
         *,
         file_path: str | None = None,
         tags: list[str] | None = None,
+        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         payload: dict[str, Any] = {"hash": hash}
@@ -936,6 +981,8 @@ class AsyncComfyLow:
             payload["file_path"] = file_path
         if tags is not None:
             payload["tags"] = tags
+        if expires_in is not None:
+            payload["expires_in"] = expires_in
         resp = await self.raw_request("POST", "/assets/from-hash", json=payload, timeout=timeout)
         data = self._p.parse_or_raise(resp, (200, 201))
         return Asset.model_validate(data)
