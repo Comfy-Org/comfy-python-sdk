@@ -10,6 +10,12 @@ escape hatches the hand-written ``comfy_sdk`` layer builds on:
 * **per-request timeout / abort** — every method takes ``timeout`` and the raw
   httpx cancellation applies.
 
+One binding is *not* backed by an ``operationId``: ``post_model_run``. The
+vendored contract declares no model routes yet, so it is hand-written against
+the agreed wire shape, kept out of ``comfy_low.OPERATION_IDS``, and confined to
+``model_run_request`` / ``_MODEL_RUN_PATH`` so vendoring the real route later is
+a one-place change.
+
 This layer contains no orchestration, retries, hashing, or reconnection — those
 live in ``comfy_sdk``.
 """
@@ -20,18 +26,18 @@ import asyncio
 import platform
 import secrets
 import sys
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any, BinaryIO
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
 from . import _multipart
-from .errors import ApiError, error_from_envelope
+from .errors import ApiError, clean_request_id, error_from_envelope
 from .models import Asset, Job, JobWorkflowResponse
 from .sse import RawEvent, SSEDecoder
 
@@ -46,7 +52,45 @@ _UNSET = object()
 # blocking iter_lines() forever. (Pass timeout=None to opt out of the timeout.)
 _SSE_IDLE_TIMEOUT = httpx.Timeout(10.0, read=45.0)
 
+#: Default timeout for a model run. A run is *awaited server-side*: the server
+#: holds the connection until the generation is complete, polling the upstream
+#: provider itself when that provider is submit/poll. So the client has to be
+#: willing to wait minutes, not the tens of seconds a normal API call gets —
+#: the client's own default (30s) would abort a perfectly healthy generation.
+#: ``connect`` stays short: an unreachable host is not a slow generation.
+MODEL_RUN_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
+
+#: Route for a model run. NOT an ``operationId`` from ``spec/openapi.yaml`` —
+#: the vendored v2 contract declares no model routes, so this binding is
+#: hand-written and is deliberately absent from ``comfy_low.OPERATION_IDS``
+#: (the spec-coverage test asserts that set equals the spec's, exactly).
+#: Everything about the wire shape is confined to this constant and
+#: :func:`model_run_request` so it is one place to reconcile when the route is
+#: vendored into the spec and the models are regenerated from it.
+_MODEL_RUN_PATH = "/models/run"
+
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def model_run_request(
+    model: str,
+    arguments: Mapping[str, Any],
+    idempotency_key: str | None,
+) -> tuple[str, dict[str, Any], dict[str, str]]:
+    """Sans-IO ``(path, json_body, headers)`` for one model run.
+
+    The model id travels in the *body*, not the path: ids are commonly
+    provider-namespaced and contain ``/`` (``vendor/family/variant``), which in
+    a path segment needs percent-encoding that intermediaries normalize
+    inconsistently. A named body field also leaves room for sibling fields
+    later without moving the route.
+
+    ``arguments`` is copied into a plain dict so any ``Mapping`` is accepted and
+    the caller's object is never handed to the JSON encoder directly.
+    """
+    body: dict[str, Any] = {"model": model, "arguments": dict(arguments)}
+    headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
+    return _MODEL_RUN_PATH, body, headers
 
 
 def _build_user_agent(client_info: str | None) -> str:
@@ -83,8 +127,34 @@ def _retry_after(resp: httpx.Response) -> int | None:
         return None
 
 
-def _origin(url: str) -> tuple[str, str, int | None]:
-    """Normalized ``(scheme, host, port)`` — the parts that define same-origin."""
+#: Response header carrying the server-minted id for the call. Spelled here as
+#: well as in :data:`comfy_sdk.router_exceptions.REQUEST_ID_HEADER` because the
+#: two layers read it independently — the router surface off its own error
+#: response, this one off the shared error envelope — and ``comfy_low`` never
+#: imports from ``comfy_sdk``. ``tests/test_error_contract.py`` asserts the two
+#: spellings agree, so they cannot drift apart.
+REQUEST_ID_HEADER = "X-Comfy-Request-Id"
+
+
+def _request_id(resp: httpx.Response) -> str | None:
+    """``X-Comfy-Request-Id`` as a bounded, printable string, or ``None``.
+
+    Filtered rather than kept verbatim — see
+    :func:`comfy_low.errors.clean_request_id`, which both error surfaces share
+    so the id cannot be safe to display on one and not the other.
+    """
+    return clean_request_id(resp.headers.get(REQUEST_ID_HEADER))
+
+
+def origin(url: str) -> tuple[str, str, int | None]:
+    """Normalized ``(scheme, host, port)`` — the parts that define same-origin.
+
+    Public because it is the single definition of "same target" in the SDK: the
+    transport decides here whether a URL may carry the bearer token, and
+    ``comfy_sdk.client`` compares against it to recognize Comfy Cloud however
+    the caller spelled it. Two spellings that differ only in case or in an
+    explicitly written default port are the same origin.
+    """
     parts = urlsplit(url)
     scheme = (parts.scheme or "").lower()
     port = parts.port
@@ -93,16 +163,45 @@ def _origin(url: str) -> tuple[str, str, int | None]:
     return (scheme, (parts.hostname or "").lower(), port)
 
 
+def redact_userinfo(url: str) -> str:
+    """``url`` with any userinfo replaced by ``***`` — the form safe to render.
+
+    A base URL may legitimately carry credentials in its netloc
+    (``https://user:token@proxy.example`` for an authenticating proxy), and a
+    client is exactly the object that ends up in a traceback, a debugger frame
+    or a CI log. So every ``repr`` renders this form while the URL the
+    transport actually requests against keeps the userinfo intact — the
+    credential is hidden from display, not taken away from the caller.
+    """
+    parts = urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    host = parts.netloc.rsplit("@", 1)[1]
+    return urlunsplit((parts.scheme, f"***@{host}", parts.path, parts.query, parts.fragment))
+
+
 class _Prepared:
     """Sans-IO request building shared by both transports."""
 
     def __init__(self, base_url: str, api_key: str | None, client_info: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self._base_origin = _origin(self.base_url)
+        #: ``base_url`` with any userinfo redacted — what every ``repr`` shows.
+        self.safe_base_url = redact_userinfo(self.base_url)
+        self._base_origin = origin(self.base_url)
         parts = urlsplit(self.base_url)
         self._origin_url = f"{parts.scheme}://{parts.netloc}"
         self._user_agent = _build_user_agent(client_info)
+
+    def __repr__(self) -> str:
+        # This object holds the bearer token, so its repr is written out rather
+        # than inherited: `authenticated` reports only whether one is set, and
+        # the base URL is the redacted form so a credential embedded *in it*
+        # does not leak either.
+        return (
+            f"{type(self).__name__}(base_url={self.safe_base_url!r}, "
+            f"authenticated={bool(self.api_key)})"
+        )
 
     def url(self, path: str) -> str:
         # A server link (job.urls.*, marked by containing /api/) already carries
@@ -124,7 +223,7 @@ class _Prepared:
         # server-returned absolute follow-up links (job.urls.self/cancel/events)
         # must not carry the key to a different scheme/host/port. Relative paths
         # are always resolved under base_url, so they are unaffected.
-        if self.api_key and _origin(url) == self._base_origin:
+        if self.api_key and origin(url) == self._base_origin:
             h["Authorization"] = f"Bearer {self.api_key}"
         if extra:
             h.update(extra)
@@ -132,15 +231,40 @@ class _Prepared:
 
     def parse_or_raise(self, resp: httpx.Response, ok: tuple[int, ...]) -> dict[str, Any]:
         if resp.status_code in ok:
-            if resp.content:
+            if not resp.content:
+                return {}
+            try:
                 return resp.json()
-            return {}
+            except ValueError as exc:
+                # A success status whose body will not decode — a proxy
+                # interstitial served as 200, a response truncated mid-stream.
+                # Raised as an ApiError rather than escaping as the raw
+                # `json.JSONDecodeError` so it lands on the surface the SDK
+                # translates and stamps: on `models.run` this is a generation
+                # that ran and was billed with the result lost, which is
+                # exactly the failure the Idempotency-Key has to ride out on.
+                raise ApiError(
+                    f"Could not decode the {resp.status_code} response body as JSON",
+                    code="invalid_response",
+                    http_status=resp.status_code,
+                    request_id=_request_id(resp),
+                ) from exc
         body: dict[str, Any] | None
         try:
             body = resp.json()
         except Exception:
             body = None
-        raise error_from_envelope(resp.status_code, body, retry_after=_retry_after(resp))
+        raise error_from_envelope(
+            resp.status_code,
+            body,
+            retry_after=_retry_after(resp),
+            request_id=_request_id(resp),
+            # Router repeats its coarse bucket on this header, and the model-run
+            # route answers in Router's body shape rather than the envelope's.
+            # Passing it here is what keeps the bucket alive across the layer
+            # boundary; see `error_from_envelope`.
+            error_type=resp.headers.get("X-Comfy-Error-Type"),
+        )
 
 
 def parse_expiry(url: str) -> datetime | None:
@@ -214,9 +338,29 @@ class ComfyLow:
         return self._p.base_url
 
     @property
+    def safe_base_url(self) -> str:
+        """:attr:`base_url` with any userinfo redacted — the form safe to log."""
+        return self._p.safe_base_url
+
+    @property
     def timeout(self) -> httpx.Timeout:
         """The httpx client's default timeout. A per-request ``timeout=`` still wins."""
         return self._client.timeout
+
+    @property
+    def authenticated(self) -> bool:
+        """Whether a credential is attached to same-origin requests.
+
+        The key itself is deliberately not exposed here: this is the read a
+        layer above (or a ``repr``) needs, and it cannot leak the credential.
+        """
+        return bool(self._p.api_key)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(base_url={self.safe_base_url!r}, "
+            f"authenticated={self.authenticated})"
+        )
 
     # -- lifecycle --------------------------------------------------------
     def close(self) -> None:
@@ -291,6 +435,7 @@ class ComfyLow:
         tags: list[str] | None = None,
         idempotency_key: str | None = None,
         file_size: int | None = None,
+        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         """POST /api/v2/assets — streaming multipart upload."""
@@ -306,6 +451,8 @@ class ComfyLow:
             # One part per tag — repeating the field name is the multipart/form
             # convention for a list, and a dict would silently drop all but one.
             fields.extend(("tags", t) for t in tags)
+        if expires_in is not None:
+            fields.append(("expires_in", str(expires_in)))
         boundary = _new_boundary()
         body, length = _multipart.build_multipart(
             boundary,
@@ -330,6 +477,7 @@ class ComfyLow:
         *,
         file_path: str | None = None,
         tags: list[str] | None = None,
+        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         """POST /api/v2/assets/from-hash — dedup mint over existing bytes."""
@@ -338,6 +486,8 @@ class ComfyLow:
             payload["file_path"] = file_path
         if tags is not None:
             payload["tags"] = tags
+        if expires_in is not None:
+            payload["expires_in"] = expires_in
         resp = self.raw_request("POST", "/assets/from-hash", json=payload, timeout=timeout)
         data = self._p.parse_or_raise(resp, (200, 201))
         return Asset.model_validate(data)
@@ -490,6 +640,31 @@ class ComfyLow:
         resp = self.raw_request("GET", path, timeout=timeout)
         return JobWorkflowResponse.model_validate(self._p.parse_or_raise(resp, (200,)))
 
+    # -- models -----------------------------------------------------------
+    def post_model_run(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = MODEL_RUN_TIMEOUT,
+    ) -> dict[str, Any]:
+        """POST /api/v2/models/run — run a model, awaited server-side.
+
+        One request, one response: the server does not answer until the
+        generation is complete, so the decoded body *is* the finished result.
+        That holds for a submit/poll provider too — the polling happens server
+        side, inside this call, which is why the default ``timeout`` is
+        :data:`MODEL_RUN_TIMEOUT` rather than the client's own.
+
+        The body is returned verbatim — the provider's native payload, with no
+        model class layered over it. This is not a spec operation; see
+        :data:`_MODEL_RUN_PATH`.
+        """
+        path, body, headers = model_run_request(model, arguments, idempotency_key)
+        resp = self.raw_request("POST", path, headers=headers, json=body, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 201))
+
 
 class AsyncComfyLow:
     """Asynchronous protocol bindings — mirrors :class:`ComfyLow`."""
@@ -514,9 +689,25 @@ class AsyncComfyLow:
         return self._p.base_url
 
     @property
+    def safe_base_url(self) -> str:
+        """:attr:`base_url` with any userinfo redacted — the form safe to log."""
+        return self._p.safe_base_url
+
+    @property
     def timeout(self) -> httpx.Timeout:
         """The httpx client's default timeout. A per-request ``timeout=`` still wins."""
         return self._client.timeout
+
+    @property
+    def authenticated(self) -> bool:
+        """Whether a credential is attached — mirrors :attr:`ComfyLow.authenticated`."""
+        return bool(self._p.api_key)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(base_url={self.safe_base_url!r}, "
+            f"authenticated={self.authenticated})"
+        )
 
     async def aclose(self) -> None:
         if self._own_client:
@@ -586,6 +777,7 @@ class AsyncComfyLow:
         tags: list[str] | None = None,
         idempotency_key: str | None = None,
         file_size: int | None = None,
+        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         if file_size is None:
@@ -599,6 +791,8 @@ class AsyncComfyLow:
         if tags:
             # One part per tag — see the sync ``post_assets`` for why a dict is wrong.
             fields.extend(("tags", t) for t in tags)
+        if expires_in is not None:
+            fields.append(("expires_in", str(expires_in)))
         boundary = _new_boundary()
         body, length = _multipart.build_multipart(
             boundary,
@@ -633,6 +827,7 @@ class AsyncComfyLow:
         *,
         file_path: str | None = None,
         tags: list[str] | None = None,
+        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         payload: dict[str, Any] = {"hash": hash}
@@ -640,6 +835,8 @@ class AsyncComfyLow:
             payload["file_path"] = file_path
         if tags is not None:
             payload["tags"] = tags
+        if expires_in is not None:
+            payload["expires_in"] = expires_in
         resp = await self.raw_request("POST", "/assets/from-hash", json=payload, timeout=timeout)
         data = self._p.parse_or_raise(resp, (200, 201))
         return Asset.model_validate(data)
@@ -762,6 +959,20 @@ class AsyncComfyLow:
         )
         resp = await self.raw_request("GET", path, timeout=timeout)
         return JobWorkflowResponse.model_validate(self._p.parse_or_raise(resp, (200,)))
+
+    # -- models -----------------------------------------------------------
+    async def post_model_run(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = MODEL_RUN_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Async :meth:`ComfyLow.post_model_run`."""
+        path, body, headers = model_run_request(model, arguments, idempotency_key)
+        resp = await self.raw_request("POST", path, headers=headers, json=body, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 201))
 
 
 def _looks_like_path(s: str) -> bool:

@@ -35,7 +35,9 @@ def test_env_var_selects_the_deployment(monkeypatch) -> None:
 
 def test_env_var_is_read_per_construction(monkeypatch) -> None:
     """A later client picks up a changed target — the value is not import-time."""
-    with Comfy() as first:
+    # The Cloud default requires a key, so the first client is built with one;
+    # the second targets a keyless self-hosted deployment. See test_api_key.py.
+    with Comfy(api_key="comfyui-test") as first:
         assert job_url(first) == CLOUD_JOB_URL
     monkeypatch.setenv(BASE_URL_ENV_VAR, LOCAL)
     with Comfy() as second:
@@ -45,7 +47,7 @@ def test_env_var_is_read_per_construction(monkeypatch) -> None:
 @pytest.mark.parametrize("blank", ["", "   "])
 def test_blank_env_var_means_comfy_cloud(monkeypatch, blank: str) -> None:
     monkeypatch.setenv(BASE_URL_ENV_VAR, blank)
-    with Comfy() as client:
+    with Comfy(api_key="comfyui-test") as client:
         assert job_url(client) == CLOUD_JOB_URL
 
 

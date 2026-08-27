@@ -11,13 +11,21 @@ Both clients target Comfy Cloud. Another deployment — a self-hosted proxy or a
 serverless one — is selected through the ``COMFY_BASE_URL`` environment
 variable; there is no base-URL constructor parameter.
 
-Per-surface key behavior is inherited from ``comfy_low``: pass ``api_key`` to
-the constructor for Comfy Cloud / serverless; leave it unset for a self-hosted
-proxy that has no auth (no credentials are then sent). That constructor key is
-this client's own credential (sent as the ``Authorization`` bearer token) and
-is unrelated to the ``api_key`` accepted by ``submit``/``run``, which
-authenticates partner (API) nodes embedded in a workflow (e.g. Gemini) and is
-sent in the request body instead.
+Credentials resolve in a fixed order at construction: the explicit ``api_key``
+argument, then the ``COMFY_API_KEY`` environment variable, then — targeting
+Comfy Cloud, which always requires a key — a local :class:`MissingApiKey`
+naming that variable, raised before any request rather than surfacing as a
+server 401 on the first call. A deployment named by ``COMFY_BASE_URL`` may
+have no auth at all (a self-hosted ComfyUI behind the API proxy), so there an
+unresolved key stays valid and means "send no credentials". That constructor
+key is this client's own credential (sent as the ``Authorization`` bearer
+token) and is unrelated to the ``api_key`` accepted by ``submit``/``run``,
+which authenticates partner (API) nodes embedded in a workflow (e.g. Gemini)
+and is sent in the request body instead.
+
+The key itself is write-only from the outside: it is never logged, never
+rendered by a client's ``repr``/``str`` (which report only *whether* one is
+attached), and never placed in an exception message.
 """
 
 from __future__ import annotations
@@ -28,13 +36,14 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from comfy_low.errors import ApiError
-from comfy_low.transport import AsyncComfyLow, ComfyLow
+from comfy_low.transport import AsyncComfyLow, ComfyLow, origin
 
 from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
-from .exceptions import WorkflowFormatUi, to_sdk_error
+from .exceptions import MissingApiKey, WorkflowFormatUi, to_sdk_error
 from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory
 from .models import AsyncModels, Models
+from .retry import DEFAULT_RETRY, RetryPolicy
 from .workflows import Workflow, WorkflowFactory
 
 # How long to keep retrying a full queue before giving up (seconds).
@@ -43,6 +52,8 @@ _QUEUE_RETRY_BUDGET = 60.0
 COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"
 #: Environment variable that redirects a client at another deployment.
 BASE_URL_ENV_VAR = "COMFY_BASE_URL"
+#: Environment variable read when no ``api_key`` is passed to the constructor.
+API_KEY_ENV_VAR = "COMFY_API_KEY"
 
 _DEFAULT_RETRY_AFTER = 2
 _now = time.monotonic
@@ -101,6 +112,56 @@ def _resolve_base_url() -> str:
     return raw
 
 
+def _same_deployment(url: str, other: str) -> bool:
+    """Whether two base URLs name the same deployment.
+
+    Compared by normalized origin (scheme, host, effective port — shared with
+    the transport's same-origin credential rule) plus path, rather than by
+    string. ``https://cloud.comfy.org:443/`` is Comfy Cloud with its default
+    port written out, and reading it as *some other* deployment would hand the
+    caller a keyless client and a server 401 on the first request instead of
+    the local error this module promises.
+
+    The path is part of the comparison because a deployment mounted under the
+    same host (``https://cloud.comfy.org/self-hosted``) is a different target,
+    and the keyless carve-out has to keep applying to it.
+    """
+    return (origin(url), urlsplit(url).path.rstrip("/")) == (
+        origin(other),
+        urlsplit(other).path.rstrip("/"),
+    )
+
+
+def _resolve_api_key(explicit: str | None, base_url: str) -> str | None:
+    """The explicit argument, then ``COMFY_API_KEY``, then a clear local error.
+
+    Read per construction (like the base URL) so one process can build
+    successive clients under different credentials. Surrounding whitespace is
+    stripped and a blank value counts as unset at either source, so
+    ``COMFY_API_KEY=`` in a shell profile — or a key read out of a file with a
+    trailing newline — behaves the way it looks.
+
+    Comfy Cloud always requires a key, so exhausting both sources there raises
+    :class:`~comfy_sdk.exceptions.MissingApiKey` *here*, with no network call
+    attempted: a missing credential reported as a server 401 sends the caller
+    looking at their key's validity instead of its absence. A deployment named
+    by ``COMFY_BASE_URL`` may legitimately have none (a self-hosted ComfyUI
+    behind the API proxy), so there an unresolved key is not an error and keeps
+    its documented meaning — send no credentials at all.
+    """
+    for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR)):
+        if candidate and candidate.strip():
+            return candidate.strip()
+    if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):
+        raise MissingApiKey(
+            f"no API key: pass api_key=... to the client, or set {API_KEY_ENV_VAR} in the "
+            f"environment. Comfy Cloud ({COMFY_CLOUD_BASE_URL}) requires one; set "
+            f"{BASE_URL_ENV_VAR} to target a deployment that does not.",
+            code="missing_api_key",
+        )
+    return None
+
+
 def _guard_ui_format(workflow: Workflow) -> None:
     if _core.looks_like_ui_format(workflow.json):
         raise WorkflowFormatUi(
@@ -116,7 +177,15 @@ class Comfy:
 
     Targets Comfy Cloud, or whatever deployment ``COMFY_BASE_URL`` names.
     ``api_key`` is keyword-only so a pre-``COMFY_BASE_URL`` positional URL
-    fails loudly instead of being read as a key.
+    fails loudly instead of being read as a key. Omit it to fall back to
+    ``COMFY_API_KEY``; against Comfy Cloud, neither raises
+    :class:`~comfy_sdk.exceptions.MissingApiKey` at construction.
+
+    ``retry`` is the policy ``client.models`` calls fail under —
+    :data:`~comfy_sdk.retry.DEFAULT_RETRY` unless replaced, and
+    :data:`~comfy_sdk.retry.NO_RETRY` to make every call exactly one attempt.
+    It does not govern ``submit``/``run``, whose 429 handling follows the
+    server's own ``Retry-After`` instead.
     """
 
     def __init__(
@@ -125,14 +194,18 @@ class Comfy:
         api_key: str | None = None,
         timeout: float | None = 30.0,
         client_info: str | None = None,
+        retry: RetryPolicy = DEFAULT_RETRY,
     ) -> None:
-        self._low = ComfyLow(_resolve_base_url(), api_key, timeout=timeout, client_info=client_info)
+        base_url = _resolve_base_url()
+        key = _resolve_api_key(api_key, base_url)
+        self._low = ComfyLow(base_url, key, timeout=timeout, client_info=client_info)
         self.assets = AssetFactory(self._low)
         self.workflows = WorkflowFactory()
         self.jobs = JobFactory(self._low)
         #: ``client.models`` — the model namespace, sharing this client's
-        #: transport (credentials, base URL, connection pool, timeout).
-        self.models = Models(self._low)
+        #: transport (credentials, base URL, connection pool, timeout) and its
+        #: retry policy.
+        self.models = Models(self._low, retry)
 
     def close(self) -> None:
         """Release the underlying HTTP connection pool.
@@ -148,6 +221,19 @@ class Comfy:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    def __repr__(self) -> str:
+        """Target and *whether* a key is attached — never the key itself.
+
+        Explicit rather than inherited: the default ``object`` repr happens not
+        to leak, but a client is exactly the object that ends up in a traceback,
+        a debugger frame, or a CI log, so what it renders is stated here on
+        purpose instead of left to whoever edits this class next.
+        """
+        return (
+            f"{type(self).__name__}(base_url={self._low.safe_base_url!r}, "
+            f"authenticated={self._low.authenticated})"
+        )
 
     def _materialize(self, workflow: Workflow) -> dict[str, Any]:
         """Commit every embedded asset handle and substitute ``core/ASSET`` refs."""
@@ -221,7 +307,12 @@ def _run_with_timeout(job: Job, timeout: float) -> Job:
 
 
 class AsyncComfy:
-    """Asynchronous Comfy API v2 client — mirrors :class:`Comfy`."""
+    """Asynchronous Comfy API v2 client — mirrors :class:`Comfy`.
+
+    Same credential resolution (explicit ``api_key`` → ``COMFY_API_KEY`` →
+    :class:`~comfy_sdk.exceptions.MissingApiKey` on Comfy Cloud) and the same
+    key-free ``repr``.
+    """
 
     def __init__(
         self,
@@ -229,15 +320,16 @@ class AsyncComfy:
         api_key: str | None = None,
         timeout: float | None = 30.0,
         client_info: str | None = None,
+        retry: RetryPolicy = DEFAULT_RETRY,
     ) -> None:
-        self._low = AsyncComfyLow(
-            _resolve_base_url(), api_key, timeout=timeout, client_info=client_info
-        )
+        base_url = _resolve_base_url()
+        key = _resolve_api_key(api_key, base_url)
+        self._low = AsyncComfyLow(base_url, key, timeout=timeout, client_info=client_info)
         self.assets = AsyncAssetFactory(self._low)
         self.workflows = WorkflowFactory()
         self.jobs = AsyncJobFactory(self._low)
         #: Async counterpart of :attr:`Comfy.models`, on this client's transport.
-        self.models = AsyncModels(self._low)
+        self.models = AsyncModels(self._low, retry)
 
     async def aclose(self) -> None:
         """Async :meth:`Comfy.close`. Prefer ``async with AsyncComfy(...)``."""
@@ -248,6 +340,13 @@ class AsyncComfy:
 
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
+
+    def __repr__(self) -> str:
+        """Key-free, exactly as :meth:`Comfy.__repr__`."""
+        return (
+            f"{type(self).__name__}(base_url={self._low.safe_base_url!r}, "
+            f"authenticated={self._low.authenticated})"
+        )
 
     async def _materialize(self, workflow: Workflow) -> dict[str, Any]:
         handles = _core.find_asset_handles(workflow.json)

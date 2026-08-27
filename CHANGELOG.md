@@ -12,7 +12,112 @@ notes for each version.
 
 ## [Unreleased]
 
-_Nothing yet — add an entry here when your change lands._
+### Added
+
+- Every exception `client.models.run()` raises **for a failed call** now
+  carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the
+  typed `RouterError` buckets, a `RouterError` whose `error_type` this version
+  does not recognise, any other `ComfyError`, and a transport failure with no
+  response at all (a dropped connection, a read timeout), and a cancelled
+  `await` of `AsyncModels.run` — the `asyncio.wait_for` a caller wraps a
+  ten-minute call in abandons a generation that may already be dispatched and
+  billed, and the cancellation still propagates unchanged. "Failed call" is the
+  boundary, not "every exception": a programming error escaping the call is not
+  a failed request, a key means nothing on it, and it reaches you untouched —
+  as does `KeyboardInterrupt`. `run` mints that key itself unless you pass
+  `idempotency_key=`, and it used to be a local of the call: when the call
+  raised, the key went with it. Since collecting a generation you were already
+  billed for after a lost response means asking again under the *same* key,
+  that made the auto-minted case uncollectable — only callers who chose and
+  stored their own key could recover. The recovery idiom is now
+  `client.models.run(model, arguments, idempotency_key=exc.idempotency_key)`;
+  see the README. Nothing about what is retried, or what goes on the wire,
+  changed.
+- `ComfyError.request_id` — the server's `X-Comfy-Request-Id` for the failed
+  call, when the response carried that header, on every SDK exception rather
+  than only on `RouterError`. It is the id to quote in a support request, and it
+  was previously unreachable once the response object was gone. `None` when the
+  response named none, or when there was no response — including on a transport
+  failure, where the attribute now reads as `None` rather than being absent, so
+  a handler never has to guard the access. The header is bounded and filtered
+  before it is stored (it is server-controlled and the id is meant to be
+  displayed and pasted into support tickets), identically on both error
+  surfaces.
+- `ComfyError.retry_after` — seconds the server asked the caller to wait, from
+  `Retry-After`, now forwarded for every error code rather than only for
+  `queue_full`. The replay documented above tells a caller to ask again "after
+  the `Retry-After` the server named", and a `deadline_exceeded` `504` that
+  carried one had nowhere to surface it, so the caller had nothing to wait on.
+  `None` when the server named no pace.
+
+### Fixed
+
+- A success status whose body will not decode (a proxy interstitial served
+  under a `200`, a response truncated mid-stream) now raises a translated SDK
+  error instead of letting `json.JSONDecodeError` escape from outside the
+  translated surface. On `models.run` that is a generation that ran and was
+  billed with the result lost — precisely the failure the `Idempotency-Key`
+  has to ride out on, and it previously carried no key.
+- Automatic retry for `client.models.run`, on by default, with the
+  `Idempotency-Key` sent unconditionally on **every** attempt of one logical
+  call — a new call mints a new key. That is what keeps a retry from being
+  billed as a second generation, and it is also what decides which failures are
+  retried at all: the key is single-use and reject-on-duplicate with no
+  response replay, so only failures that leave it unclaimed are worth another
+  attempt. Retried by default: connect-phase transport failures (the request
+  never reached the server), and a `429` carrying `Retry-After` (a reject that
+  started no work, so the key is released) — paced by the `Retry-After` the
+  server sent rather than a blind backoff. Not retried: every other 4xx, since
+  a deterministic refusal such as `content_policy_violation`, `404`, `409` or
+  `422` cannot change on the second ask. Not retried unless
+  `retry_possibly_in_flight=True`: anything whose outcome is unknown — a 5xx
+  response, or a client-side timeout on a run the server may still be
+  generating — because the key stays claimed across those and a same-key retry
+  would come back `422 idempotency_key_reuse` in place of the real error. Turn
+  the opt-in on for a deployment that replays a repeated key. The budget is 60
+  seconds of **total elapsed time** from the first attempt rather than an
+  attempt count, and it bounds when the last attempt may *start*: an attempt
+  already running is never interrupted, so a slow generation is never abandoned
+  half-way. Backoff is 0.5s doubling to a 15s ceiling with full jitter, clamped
+  to whatever is left of the budget. Configure with
+  `Comfy(retry=RetryPolicy(...))` or switch it off with
+  `Comfy(retry=NO_RETRY)`; `client.models.retry` reads back the policy in
+  force. `RetryPolicy`, `DEFAULT_RETRY` and `NO_RETRY` are exported from
+  `comfy_sdk`.
+- `client.models.run(model, arguments)` on both `Comfy` and `AsyncComfy` — one
+  call that returns the completed generation. Where the platform has to
+  submit-and-poll an upstream provider, that polling happens server side inside
+  the call, so the client contract stays a single request. The result is the
+  provider's native payload, returned as-is rather than wrapped. The awaitable
+  form is `AsyncComfy`, not a `run_async()` suffix — there is deliberately no
+  suffixed variant, and a test asserts its absence. Runs use their own
+  10-minute timeout (the client's default is sized for ordinary API calls) and
+  send an `Idempotency-Key` on every call.
+- Credential resolution with a documented order: the explicit `api_key=`
+  argument first, then the `COMFY_API_KEY` environment variable. Against Comfy
+  Cloud, which always requires a key, neither raises the new `MissingApiKey`
+  locally at construction — naming `COMFY_API_KEY` in the message — instead of
+  costing a round trip to be told `401`. Both sources are trimmed, and a blank
+  value counts as unset. Comfy Cloud is recognized by normalized origin (scheme,
+  host, effective port) and path rather than by string, so a `COMFY_BASE_URL`
+  that spells it differently — `https://cloud.comfy.org:443/`, or with a
+  mixed-case host — gets the same local error rather than a server `401`.
+- `MissingApiKey` (a `ComfyError`, `code="missing_api_key"`) and
+  `API_KEY_ENV_VAR` are exported from `comfy_sdk`.
+- `Comfy`/`AsyncComfy` now have an explicit `repr()` reporting the base URL and
+  `authenticated=True|False`. The key is never rendered, logged, or included in
+  an exception message. A credential embedded in the base URL itself
+  (`COMFY_BASE_URL=https://user:token@proxy.example`, for a deployment behind an
+  authenticating proxy) is redacted to `***@host` in every `repr()` — the
+  client, its transport and its `models` namespace — while requests still go out
+  against the URL exactly as given.
+
+### Changed
+
+- A client targeting a deployment named by `COMFY_BASE_URL` is unchanged: with
+  no key resolved it is still built without one and still sends no credentials,
+  which is what a self-hosted ComfyUI behind the API proxy needs. Only the Comfy
+  Cloud default gained the local error.
 
 ## [0.1.8] - 2026-08-13
 
