@@ -39,14 +39,19 @@ async def test_async_models_holds_the_host_clients_transport(server) -> None:
         assert client.models._low is client._low
 
 
-def test_models_reports_the_host_clients_base_url(server) -> None:
+def test_models_reports_the_routers_base_url(server) -> None:
+    # The namespace's own target, read live off the shared transport — Router,
+    # not the client's `/api/v2` deployment. The `server` fixture points both
+    # at the one stub, so `client._low.router_base_url` is what is asserted
+    # rather than the coincidence of the two being equal here; the separate-host
+    # case lives in tests/test_models_run.py.
     with Comfy() as client:
-        assert client.models.base_url == client._low.base_url == server.base_url
+        assert client.models.base_url == client._low.router_base_url == server.base_url
 
 
-async def test_async_models_reports_the_host_clients_base_url(server) -> None:
+async def test_async_models_reports_the_routers_base_url(server) -> None:
     async with AsyncComfy() as client:
-        assert client.models.base_url == client._low.base_url == server.base_url
+        assert client.models.base_url == client._low.router_base_url == server.base_url
 
 
 def test_a_timeout_change_on_the_client_is_visible_through_models(server) -> None:
@@ -92,7 +97,7 @@ def test_two_clients_get_independent_namespaces(server) -> None:
         assert one.models._low is not two.models._low
 
 
-def test_models_repr_names_the_shared_base_url(server) -> None:
+def test_models_repr_names_the_routers_base_url(server) -> None:
     with Comfy() as client:
         assert repr(client.models) == f"Models(base_url={server.base_url!r})"
 

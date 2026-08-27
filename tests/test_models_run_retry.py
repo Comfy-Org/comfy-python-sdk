@@ -124,7 +124,8 @@ class _AsyncFlakyLow(_FlakyLow):
         return self._attempt(arguments, idempotency_key)
 
 
-MODEL = "acme/flux/dev"
+#: The canonical two-segment `{provider}/{model}` id the route is addressed by.
+MODEL = "acme/flux-dev"
 ARGS = {"prompt": "a cat", "steps": 4}
 
 #: Retries the suite can afford to sit through: the schedule is asserted
@@ -1078,7 +1079,7 @@ def test_a_paced_hash_mismatch_409_is_still_a_refusal(server) -> None:
 
 
 def test_a_deadline_504_in_routers_own_error_shape_is_still_collected(server) -> None:
-    # `POST /api/v2/models/run` is fronted by Router, whose error body is
+    # The model-run route is served by Router, whose error body is
     # `{detail, error_type}` with the bucket repeated on `X-Comfy-Error-Type` --
     # not the v2 `{error: {code}}` envelope. Reading only the envelope would
     # collapse every real 504 to the status-derived default, and the whole
@@ -1126,10 +1127,11 @@ def test_a_router_error_body_keeps_its_detail_as_the_message(server) -> None:
 
 
 def test_the_default_collect_loop_against_a_non_collecting_deployment(server) -> None:
-    # The cost of defaulting this on, asserted rather than assumed. `POST
-    # /models/run` is in neither vendored spec, so a deployment may well apply
-    # the v2 rule instead -- key stays claimed across an unknown-outcome 5xx,
-    # and the resend is rejected. The caller then sees `422
+    # The cost of defaulting this on, asserted rather than assumed. The collect
+    # rule is `spec/router-openapi.yaml`'s, so it binds Comfy Router -- but
+    # `COMFY_ROUTER_BASE_URL` can name a deployment that applies the v2 rule
+    # instead: key stays claimed across an unknown-outcome 5xx, and the resend
+    # is rejected. The caller then sees `422
     # idempotency_key_reuse` in place of the real 504. That is the trade the
     # default makes; `retry_collectable=False` is the way out of it, and this
     # pins both halves so neither can change silently.
@@ -1189,4 +1191,6 @@ def test_the_body_is_snapshotted_deeply_before_the_first_attempt(server) -> None
         models = Models(cast(Any, _MutatingLow(client._low)), FAST)
         assert models.run(MODEL, arguments) == server.state.model_run_result
     assert server.state.model_run_count == 2
-    assert server.state.last_model_run_body["arguments"]["config"] == {"steps": 4}
+    # The body is the model's native input, unwrapped — the nested value the
+    # caller mutated between attempts is *not* what the resend carried.
+    assert server.state.last_model_run_body["config"] == {"steps": 4}

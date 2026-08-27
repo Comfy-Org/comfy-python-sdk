@@ -2,9 +2,17 @@
 
 Reached from a client you already constructed (``Comfy().models`` /
 ``AsyncComfy().models``) rather than built on its own, so it uses that client's
-credentials, base URL, transport and timeout: one connection pool, one
-credential, one place to configure both. A separate client object for model
-operations would fork all of that, which is what namespacing avoids.
+credentials, transport and timeout: one connection pool, one credential, one
+place to configure both. A separate client object for model operations would
+fork all of that, which is what namespacing avoids.
+
+The one setting it does *not* share is the target host. Model runs go to Comfy
+Router — ``POST {router_base_url}/v1/models/{provider}/{model}``, the partner
+model's native JSON straight through — while the client's ``base_url`` names
+the ``/api/v2`` deployment serving jobs and assets. So ``models.base_url``
+reports ``COMFY_ROUTER_BASE_URL`` (default ``https://api.comfy.org``), and a
+``model`` argument is the canonical two-segment ``{provider}/{model}`` id that
+addresses the route.
 
 The namespace holds the host client's transport itself — not a copy of its
 settings — so a change made on the client after construction (a rotated key, a
@@ -75,8 +83,15 @@ class _ModelsBase:
 
     @property
     def base_url(self) -> str:
-        """The host client's base URL — where model requests are sent."""
-        return self._low.base_url
+        """Comfy Router's base URL — where model requests are sent.
+
+        Not the host client's ``base_url``: a model run is a model-ID-addressed
+        route on Comfy Router (``https://api.comfy.org`` by default, redirected
+        by ``COMFY_ROUTER_BASE_URL``), while the client's own ``base_url`` names
+        the ``/api/v2`` deployment that serves jobs and assets. Read live off
+        the shared transport, exactly as :attr:`timeout` is.
+        """
+        return self._low.router_base_url
 
     @property
     def timeout(self) -> httpx.Timeout:
@@ -91,8 +106,11 @@ class _ModelsBase:
     def __repr__(self) -> str:
         # Redacted like the host client's repr: a base URL may carry proxy
         # credentials in its userinfo, and this namespace lands in the same
-        # tracebacks and CI logs the client does.
-        return f"{type(self).__name__}(base_url={self._low.safe_base_url!r})"
+        # tracebacks and CI logs the client does. It renders the *router* base
+        # URL because that is the target this namespace actually talks to —
+        # showing the client's `/api/v2` base URL here would name a host no
+        # `models` call ever reaches.
+        return f"{type(self).__name__}(base_url={self._low.safe_router_base_url!r})"
 
 
 class Models(_ModelsBase):
@@ -115,6 +133,20 @@ class Models(_ModelsBase):
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any]:
         """Run ``model`` with ``arguments`` and return the completed result.
+
+        ``model`` is the canonical ``{provider}/{model}`` id — exactly the two
+        path segments that address the run on Comfy Router
+        (``POST {router_base_url}/v1/models/{provider}/{model}``), and exactly
+        what the model catalog lists. It must be two non-empty segments: a
+        one-segment id, the three-segment ``{provider}/{model}/{variant}`` form
+        (not addressable on this route yet), and any ``.``/``..`` segment each
+        raise ``ValueError`` locally, before any request is made; a non-string
+        raises ``TypeError``.
+
+        ``arguments`` is the partner model's **own native JSON input**,
+        forwarded to the provider unchanged — there is no Comfy-shaped envelope
+        around it, so whatever the partner documents as its request body is
+        what goes here.
 
         One call, one result. It blocks until the generation is finished —
         including for a provider the platform has to submit-and-poll, where the
@@ -206,8 +238,9 @@ class AsyncModels(_ModelsBase):
         """Awaitable :meth:`Models.run` — same arguments, same result shape.
 
         This *is* the async form of ``run``: awaiting it on ``AsyncComfy`` is
-        the whole difference from the sync client — including the retry policy
-        and the one-key-per-call rule. See :meth:`Models.run`.
+        the whole difference from the sync client — including the model-id
+        rule, the retry policy and the one-key-per-call rule. See
+        :meth:`Models.run`.
         """
         low = cast(AsyncComfyLow, self._low)
         key = idempotency_key or new_idempotency_key()

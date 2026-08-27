@@ -1,11 +1,22 @@
-"""The router exception table is the vendored contract's, not this repo's.
+"""The router binding is the vendored contract's, not this repo's.
 
-``spec/router-openapi.yaml`` declares the closed error set as
-``x-comfy-error-types`` -- one entry per wire value, each with the ``meaning``
-prose the exception docstrings reproduce. Everything here reads that list and
-compares it against :mod:`comfy_sdk.router_exceptions`, so the two cannot drift:
-the failure this guards against is a Router spec sync landing a new bucket that
-then reaches callers as an untyped ``RouterError`` with nothing going red.
+Two things are read straight out of ``spec/router-openapi.yaml`` rather than
+restated here:
+
+* the closed error set it declares as ``x-comfy-error-types`` -- one entry per
+  wire value, each with the ``meaning`` prose the exception docstrings
+  reproduce -- compared against :mod:`comfy_sdk.router_exceptions`;
+* the **route** ``post_model_run`` is bound to -- the path whose
+  ``post.operationId`` is ``runRouterModel``, and the ``servers[0].url`` it is
+  addressed against -- compared against
+  :data:`comfy_low.transport._MODEL_RUN_PATH_TEMPLATE` and
+  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL`.
+
+Neither is generated, so a Router spec sync is the moment they can drift. The
+failures guarded against are a sync landing a new bucket that then reaches
+callers as an untyped ``RouterError``, and a sync **moving the path** (the
+``/v1`` -> ``/v2`` move already on the roadmap) while the constant the SDK
+posts to stays where it was -- with nothing going red either time.
 
 That is also why the assertions are written against the file rather than
 against a list copied out of it. A test that restated the set would pass a sync
@@ -23,6 +34,8 @@ from typing import Any
 import pytest
 import yaml
 
+from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE
+from comfy_sdk import COMFY_ROUTER_BASE_URL
 from comfy_sdk.router_exceptions import (
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
@@ -142,3 +155,42 @@ def test_the_spec_states_a_meaning_and_a_tier_for_every_bucket() -> None:
         assert isinstance(entry, dict), f"x-comfy-error-types entry is not a mapping: {entry!r}"
         assert entry.get("tier") in {"request", "transport"}, entry
         assert isinstance(entry.get("meaning"), str) and entry["meaning"].strip(), entry
+
+
+# --- the route the SDK posts a model run to -----------------------------
+
+
+def test_run_path_matches_vendored_spec() -> None:
+    """The bound path and host are the spec's, read out of it rather than restated.
+
+    Written as a search for the ``operationId`` rather than a lookup of the
+    path we expect: looking the path up by name would pass vacuously the day a
+    sync moves it, which is the one day this test exists for.
+    """
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    declared = [
+        path
+        for path, item in (doc.get("paths") or {}).items()
+        if isinstance(item, dict)
+        and isinstance(item.get("post"), dict)
+        and item["post"].get("operationId") == "runRouterModel"
+    ]
+    assert declared == [_MODEL_RUN_PATH_TEMPLATE], (
+        f"the vendored spec declares runRouterModel at {declared} and the SDK posts to "
+        f"{_MODEL_RUN_PATH_TEMPLATE!r} -- update comfy_low.transport._MODEL_RUN_PATH_TEMPLATE"
+    )
+    servers = doc.get("servers") or []
+    declared_host = servers[0].get("url") if servers else None
+    assert declared_host == COMFY_ROUTER_BASE_URL, (
+        f"the vendored spec's servers[0].url is {declared_host!r} and the SDK defaults to "
+        f"{COMFY_ROUTER_BASE_URL!r} -- update comfy_low.transport.ROUTER_BASE_URL"
+    )
+
+
+def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None:
+    # `model_run_request` fills `{provider}` and `{model}` by name; a sync that
+    # renamed or added a template variable would silently KeyError at call time
+    # rather than here.
+    assert _MODEL_RUN_PATH_TEMPLATE.count("{") == 2
+    assert "{provider}" in _MODEL_RUN_PATH_TEMPLATE
+    assert "{model}" in _MODEL_RUN_PATH_TEMPLATE

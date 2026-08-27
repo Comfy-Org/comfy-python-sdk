@@ -70,6 +70,43 @@ notes for each version.
 
 ### Changed
 
+- **Breaking (wire): `client.models.run` now posts to Comfy Router.** It sends
+  `POST {COMFY_ROUTER_BASE_URL}/v1/models/{provider}/{model}` — the route
+  `spec/router-openapi.yaml` declares as `runRouterModel` — with the partner
+  model's **own native JSON input** as the body, forwarded to the provider
+  unchanged. It previously posted `{COMFY_BASE_URL}/api/v2/models/run` with a
+  `{"model": ..., "arguments": {...}}` envelope, which nothing serves: the
+  `/api/v2` surface is jobs and assets, and the model-ID-addressed invocation
+  routes are Router's. The Python method signature is unchanged
+  (`run(model, arguments, *, idempotency_key=None, timeout=...)`), the result is
+  still the provider's payload returned as-is, and the `Idempotency-Key` and
+  retry behaviour are unchanged — what moved is the URL and the body shape.
+  **Anyone who pointed `COMFY_BASE_URL` at a Router host to make model runs work
+  must now point `COMFY_ROUTER_BASE_URL` there instead**, and set
+  `COMFY_BASE_URL` back at their v2 deployment (or unset it for Comfy Cloud).
+- The `model` argument to `client.models.run` is now the canonical
+  `{provider}/{model}` id, because it *is* the two path segments the route is
+  addressed by. Exactly two non-empty segments are accepted; a one-segment id, a
+  three-segment `{provider}/{model}/{variant}` id (that form is not addressable
+  on this route yet), and any `.`/`..` segment now raise `ValueError` locally
+  before a request is made, and a non-string raises `TypeError`. Each segment is
+  percent-encoded into exactly one path segment. Previously any string was
+  accepted and travelled in the body. Mirrors the TypeScript SDK's
+  `parseModelId`, so the two SDKs accept and reject the same ids.
+- `COMFY_ROUTER_BASE_URL` (default `https://api.comfy.org`) selects the Router
+  deployment, deliberately separate from `COMFY_BASE_URL` — one variable
+  pointed at both surfaces would send jobs to Router or model runs to the v2
+  API. Same validation and read-per-construction rules as `COMFY_BASE_URL`, and
+  the same name as the TypeScript SDK's. `COMFY_ROUTER_BASE_URL` and
+  `ROUTER_BASE_URL_ENV_VAR` are exported from `comfy_sdk`.
+- `client.models.base_url` (and the namespace's `repr`) now reports the Router
+  base URL rather than the client's `COMFY_BASE_URL`, since that is the host
+  model runs actually reach. The client's own `base_url` is unchanged.
+- The client's API key is attached to *both* of its configured origins — the
+  `COMFY_BASE_URL` deployment and the `COMFY_ROUTER_BASE_URL` Router — and to no
+  third origin. Both are set by the caller (a constant or an environment
+  variable), never by a server response, so a server-returned absolute
+  follow-up link pointing anywhere else still receives no credential.
 - A client targeting a deployment named by `COMFY_BASE_URL` is unchanged: with
   no key resolved it is still built without one and still sends no credentials,
   which is what a self-hosted ComfyUI behind the API proxy needs. Only the Comfy
