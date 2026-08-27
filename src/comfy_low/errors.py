@@ -9,7 +9,33 @@ stable, typed error surface.
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+#: The leading run of characters a request id may consist of, bounded in the
+#: pattern itself. ``X-Comfy-Request-Id`` is server-controlled and the id is
+#: meant to be *displayed* — rendered in a traceback, written to a log, pasted
+#: into a support ticket — so it is reduced to something safe to display rather
+#: than kept verbatim. Matching a leading run (rather than deleting the
+#: offending bytes) also gives the right answer for the one case a well-behaved
+#: server can still produce: ``httpx.Headers.get`` joins duplicate headers with
+#: ``", "``, and a comma is not in the class, so ``"a1, a2"`` yields ``"a1"``
+#: instead of a spliced ``"a1a2"`` that identifies no call at all.
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._:+/=@-]{1,200}")
+
+
+def clean_request_id(raw: Any) -> str | None:
+    """``raw`` reduced to a bounded, printable request id, or ``None``.
+
+    Defined here rather than beside either reader because both error surfaces
+    parse the same header off their own response — ``comfy_low.transport`` off
+    the shared envelope, ``comfy_sdk.router_exceptions`` off the router's — and
+    an id that is safe to display on one of them has to be safe on the other.
+    """
+    if not isinstance(raw, str):
+        return None
+    match = _REQUEST_ID_RE.match(raw.strip())
+    return match.group(0) if match else None
 
 
 class ApiError(Exception):
@@ -25,6 +51,7 @@ class ApiError(Exception):
         http_status: int,
         details: dict[str, Any] | None = None,
         retry_after: int | None = None,
+        request_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -33,6 +60,12 @@ class ApiError(Exception):
         self.http_status = http_status
         self.details = details
         self.retry_after = retry_after
+        #: Server-minted id for the call, read off ``X-Comfy-Request-Id``.
+        #: ``None`` when the response carried no such header. Surfaced the same
+        #: way ``retry_after`` is — a response header kept on the exception,
+        #: because it is the id a user quotes in a support request and it is
+        #: unreachable once the response object is gone.
+        self.request_id = request_id
 
 
 class InvalidWorkflow(ApiError):
@@ -98,17 +131,51 @@ _BY_CODE: dict[str, type[ApiError]] = {
 }
 
 
+def _clean(value: Any) -> str | None:
+    """``value`` as a non-empty string, or ``None``.
+
+    Anything else — a missing key, a number, Router's ``detail[]`` list form —
+    reads as absent rather than being coerced, so a malformed body degrades to
+    the status-derived default instead of producing a nonsense code.
+    """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def error_from_envelope(
     http_status: int,
     body: dict[str, Any] | None,
     *,
     retry_after: int | None = None,
+    request_id: str | None = None,
+    error_type: str | None = None,
 ) -> ApiError:
     """Build the typed exception for an error response.
 
     Falls back to a status-derived code when the body is missing or not a
     well-formed envelope (so a bare ``401`` with no JSON still maps to
     ``Unauthorized``).
+
+    Not every route answers in the envelope shape. ``POST /api/v2/models/run``
+    is fronted by Router, whose error body is ``{detail, error_type}`` and which
+    repeats the same coarse bucket on the ``X-Comfy-Error-Type`` header
+    (``spec/router-openapi.yaml``). Reading only ``error["code"]`` would collapse
+    every one of those to the status-derived default — for a ``504`` that
+    default is the meaningless ``"error"``, and ``comfy_sdk.retry`` keys its
+    default-on collect rule on the bucket, so the rule would be a silent no-op
+    against every real Router ``504``. ``error_type`` (the header, passed by the
+    caller) and the body's own top-level ``error_type`` are read to prevent that.
+
+    They are consulted in one narrow place, though: *after* the envelope's
+    ``code``, which always wins, and *after* :data:`_CODE_BY_STATUS`, which
+    already determines a code for every status where this API has a documented
+    one. So a Router ``429`` still maps to ``queue_full`` and a Router ``401``
+    still to ``unauthorized`` — reordering those would silently retype
+    exceptions that integrators already catch. What is left is exactly the 5xx
+    range, where the status determines nothing and the bucket is the only name
+    the response has.
     """
     err = (body or {}).get("error") if isinstance(body, dict) else None
     code = (err or {}).get("code") if isinstance(err, dict) else None
@@ -116,7 +183,16 @@ def error_from_envelope(
     details = (err or {}).get("details") if isinstance(err, dict) else None
 
     if code is None:
-        code = _CODE_BY_STATUS.get(http_status, "error")
+        code = _CODE_BY_STATUS.get(http_status)
+    if code is None:
+        code = _clean(error_type) or _clean(
+            (body or {}).get("error_type") if isinstance(body, dict) else None
+        )
+    if code is None:
+        code = "error"
+    if not message:
+        # Router names its human-readable string `detail`, not `error.message`.
+        message = _clean((body or {}).get("detail") if isinstance(body, dict) else None)
     if not message:
         message = f"HTTP {http_status}"
 
@@ -127,6 +203,7 @@ def error_from_envelope(
         http_status=http_status,
         details=details if isinstance(details, dict) else None,
         retry_after=retry_after,
+        request_id=request_id,
     )
 
 
