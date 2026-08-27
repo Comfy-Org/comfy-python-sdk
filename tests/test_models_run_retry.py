@@ -650,7 +650,12 @@ def test_service_unavailable_is_retried_under_the_replay_opt_in_on_one_key() -> 
     low = _UnavailableThenFine(fail_times=1)
     assert _models(low, FAST_OPTED_IN).run(MODEL, ARGS) == low.result
     assert len(low.keys) == 2
-    assert len(set(low.keys)) == 1
+    # Spelled out rather than `len(set(low.keys)) == 1`, which is also true of
+    # `[None, None]` -- i.e. of a run that sent no `Idempotency-Key` at all.
+    # The property under test is that a key was sent AND that the retry reused
+    # it; a set-size check alone would still pass if the header vanished.
+    assert low.keys[0] is not None
+    assert low.keys[1] == low.keys[0]
 
 
 def test_a_router_error_reaches_the_retry_loop_at_all() -> None:

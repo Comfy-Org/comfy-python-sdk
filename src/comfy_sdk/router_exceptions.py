@@ -297,7 +297,15 @@ class ServiceUnavailable(RouterError):
     in either vendored contract says a ``503`` *releases* the
     ``Idempotency-Key``, and the default policy retries only failures the one
     key provably survives. ``RetryPolicy(retry_possibly_in_flight=True)`` opts
-    in, and catching this class and retrying by hand is the other way.
+    in, and is the route to take: it keeps the one key across the retry.
+
+    Catching this class and calling ``models.run()`` again is **not** an
+    equivalent way to do it. A run mints a *fresh* ``Idempotency-Key`` per call,
+    so a bare re-run after a ``503`` presents a new key for a generation the
+    server may already have started, and the two can both be billed. A
+    hand-written retry has to pass the *same* explicit ``idempotency_key=`` both
+    times, and is only useful against a deployment documented to replay a
+    repeated key rather than reject it ``422``.
     """
 
     error_type = "service_unavailable"

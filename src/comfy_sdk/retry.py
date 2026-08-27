@@ -71,9 +71,30 @@ documents a same-key retry for exactly one bucket, ``deadline_exceeded``, and is
 silent about this one. Retrying it by default would therefore trade a
 diagnosable ``503`` for a ``422 idempotency_key_reuse`` on every deployment that
 rejects a repeated key. So it stays in class 3 above, where
-:attr:`RetryPolicy.retry_possibly_in_flight` opts in — and where a caller who
-wants the contract's advice verbatim can also catch
-:class:`~comfy_sdk.router_exceptions.ServiceUnavailable` and retry it by hand.
+:attr:`RetryPolicy.retry_possibly_in_flight` opts in — and that opt-in is the
+route to the contract's advice, because it keeps the one key across the retry.
+
+Catching :class:`~comfy_sdk.router_exceptions.ServiceUnavailable` and retrying
+by hand is *not* the same thing, and the difference is billable: ``models.run()``
+mints a **fresh** ``Idempotency-Key`` per call, so a bare ``run(...)`` again
+after a ``503`` presents a new key for a request the server may already be
+generating — the second billed generation the one-key rule exists to prevent. A
+hand-written retry is only safe when it passes the *same* explicit
+``idempotency_key=`` it used the first time **and** the deployment is documented
+to replay a repeated key rather than reject it::
+
+    import uuid
+    from comfy_sdk.router_exceptions import ServiceUnavailable
+
+    key = str(uuid.uuid4())
+    try:
+        result = client.models.run(model, args, idempotency_key=key)
+    except ServiceUnavailable:
+        result = client.models.run(model, args, idempotency_key=key)  # same key
+
+Against a deployment that rejects a repeated key that retry comes back
+``422 idempotency_key_reuse`` — which is the honest failure, not a double
+charge. When in doubt, prefer ``RetryPolicy(retry_possibly_in_flight=True)``.
 Revisit this the moment the router contract states what a ``503`` does to the
 key.
 
