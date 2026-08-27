@@ -141,11 +141,16 @@ to ship means adding it there, or it silently will not be packaged.
   generated from the Router spec, but `scripts/check_drift.py` (and
   `tests/test_router_spec_contract.py`) compare its
   `RouterErrorType.x-comfy-error-types` list against
-  `comfy_sdk.router_exceptions.ROUTER_ERROR_TYPES` — same values, same order. A
-  sync that adds a bucket therefore also needs one `RouterError` subclass per
-  new value, named as the PascalCase of the wire value, with that entry's
-  `meaning` as its docstring. Without it the bucket reaches callers as an
-  untyped `RouterError` — which is the drift this gate exists to catch.
+  `comfy_sdk.router_exceptions.ROUTER_ERROR_TYPES` — same values, same order,
+  so an addition, a removal *and* a reorder each fail it. A sync therefore also
+  needs the matching edit to the class table: one `RouterError` subclass per new
+  value (PascalCase of the wire value, that entry's `meaning` as its docstring),
+  the tuple reordered if the spec reordered, and a removal treated as the
+  breaking change it is rather than a mechanical delete. Without it a new bucket
+  reaches callers as an untyped `RouterError` — the drift this gate exists to
+  catch. The one thing it does **not** catch is a changed `meaning`: the gate
+  compares values and order, not prose, because the docstrings reword the spec
+  rather than quoting it. `spec/README.md` has the full reconcile procedure.
 - **Adding an operation to the contract is a four-file change.**
   `tests/test_spec_coverage.py` asserts that every non-internal `operationId`
   in `spec/openapi.yaml` appears in `comfy_low.OPERATION_IDS`, that
