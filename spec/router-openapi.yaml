@@ -75,7 +75,7 @@ paths:
           $ref: '#/components/responses/RouterRequestError'
     post:
       summary: Run a partner model synchronously by canonical model ID.
-      description: 'Comfy Router''s canonical, model-ID-addressed entry point. The request body is the partner model''s OWN native JSON input and the success response is that model''s OWN native JSON output: Router forwards both unchanged instead of imposing a Comfy-shaped envelope, so a caller can move between the partner''s API and Router by changing the host. This is the SYNCHRONOUS path, mirroring `POST https://fal.run/{id}` - the response carries the finished result. A queued counterpart, `/v1/queue/models/{provider}/{model}`, is planned and would put fal''s `fal.run` / `queue.fal.run` split onto a single host; it is not part of this contract yet.'
+      description: 'Comfy Router''s canonical, model-ID-addressed entry point. The request body is the partner model''s OWN native JSON input and the success response is that model''s OWN native JSON output: Router forwards both unchanged instead of imposing a Comfy-shaped envelope, so a caller can move between the partner''s API and Router by changing the host. This is the SYNCHRONOUS path: the response carries the finished result.'
       operationId: runRouterModel
       tags:
       - Comfy Router
@@ -116,7 +116,7 @@ paths:
   /v1/models/{provider}/{model}/openapi.json:
     get:
       summary: Read one partner model's input schema as an OpenAPI document.
-      description: The per-model input schema for a single Comfy Router model, served as a standalone OpenAPI document, so a caller - an SDK, a codegen tool, or an agent - can discover a model's arguments without reading Comfy's prose docs. It mirrors fal's per-model schema endpoint, and it is the discovery mechanism the SDK quickstart depends on.
+      description: The per-model input schema for a single Comfy Router model, served as a standalone OpenAPI document, so a caller - an SDK, a codegen tool, or an agent - can discover a model's arguments without reading Comfy's prose docs. It is the discovery mechanism the SDK quickstart depends on.
       operationId: getRouterModelInputSchema
       tags:
       - Comfy Router
@@ -340,7 +340,7 @@ components:
       additionalProperties: true
     RouterValidationErrorDetail:
       type: object
-      description: 'One model-level validation failure, in the fal/FastAPI form. `type` carries the SPECIFIC provider reason - `value_error`, `missing`, `image_too_small`, `unsupported_audio_format`, `greater_than`, `file_too_large` and the rest - which is the granularity `RouterErrorType`''s coarse bucket cannot express. It is an open string and not an `enum` for the same reason: the provider vocabulary runs to roughly 48 values across two tiers and grows on the provider''s release cycle, not ours, and an unmodelled value must reach the caller rather than fail deserialization.'
+      description: 'One model-level validation failure, in the FastAPI form. `type` carries the SPECIFIC provider reason - `value_error`, `missing`, `image_too_small`, `unsupported_audio_format`, `greater_than`, `file_too_large` and the rest - which is the granularity `RouterErrorType`''s coarse bucket cannot express. It is an open string and not an `enum` for the same reason: the provider vocabulary runs to roughly 48 values across two tiers and grows on the provider''s release cycle, not ours, and an unmodelled value must reach the caller rather than fail deserialization.'
       properties:
         loc:
           type: array
@@ -368,7 +368,7 @@ components:
       description: The offending input value, echoed back verbatim so a caller can see what was rejected without re-deriving it from `loc`. Any JSON type - string, number, boolean, array, object or null - so this schema is deliberately left untyped rather than narrowed to an object. Absent when the provider does not echo the input back.
     RouterValidationErrorResponse:
       type: object
-      description: 'Router''s model-level `422` body, in the fal/FastAPI form: the request was well-formed enough to reach the model and the model rejected its contents. Note it carries no `error_type` of its own - that is what `X-Comfy-Error-Type` on the response is for, so a client can read the coarse bucket off the header without first deciding which of the two Router error bodies it received.'
+      description: 'Router''s model-level `422` body, in the FastAPI form: the request was well-formed enough to reach the model and the model rejected its contents. Note it carries no `error_type` of its own - that is what `X-Comfy-Error-Type` on the response is for, so a client can read the coarse bucket off the header without first deciding which of the two Router error bodies it received.'
       properties:
         detail:
           type: array
@@ -409,7 +409,7 @@ components:
           schema:
             $ref: '#/components/schemas/RouterErrorResponse'
     RouterModelValidationError:
-      description: The request reached the model and the model rejected its contents. The body is `RouterValidationErrorResponse`, the fal/FastAPI `detail[]` shape, so each offending field keeps its own specific `type` and `ctx`. `X-Comfy-Error-Type` carries the coarse bucket for the whole response.
+      description: The request reached the model and the model rejected its contents. The body is `RouterValidationErrorResponse`, the FastAPI `detail[]` shape, so each offending field keeps its own specific `type` and `ctx`. `X-Comfy-Error-Type` carries the coarse bucket for the whole response.
       headers:
         X-Comfy-Error-Type:
           $ref: '#/components/headers/RouterErrorTypeHeader'
@@ -487,7 +487,7 @@ components:
         minimum: 0
         example: 400
     RouterErrorTypeHeader:
-      description: Coarse, machine-readable bucket for the failure, set by Router on every error response. It carries the same value as `RouterErrorResponse.error_type`, and on the `422` it is the ONLY machine-readable bucket, because that body is the fal/FastAPI `detail[]` shape and has no `error_type` field of its own. A client can therefore branch on this header alone, before deciding which of the two Router error bodies it received.
+      description: Coarse, machine-readable bucket for the failure, set by Router on every error response. It carries the same value as `RouterErrorResponse.error_type`, and on the `422` it is the ONLY machine-readable bucket, because that body is the FastAPI `detail[]` shape and has no `error_type` field of its own. A client can therefore branch on this header alone, before deciding which of the two Router error bodies it received.
       required: true
       schema:
         $ref: '#/components/schemas/RouterErrorType'
