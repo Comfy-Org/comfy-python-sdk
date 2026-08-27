@@ -9,7 +9,33 @@ stable, typed error surface.
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+#: The leading run of characters a request id may consist of, bounded in the
+#: pattern itself. ``X-Comfy-Request-Id`` is server-controlled and the id is
+#: meant to be *displayed* — rendered in a traceback, written to a log, pasted
+#: into a support ticket — so it is reduced to something safe to display rather
+#: than kept verbatim. Matching a leading run (rather than deleting the
+#: offending bytes) also gives the right answer for the one case a well-behaved
+#: server can still produce: ``httpx.Headers.get`` joins duplicate headers with
+#: ``", "``, and a comma is not in the class, so ``"a1, a2"`` yields ``"a1"``
+#: instead of a spliced ``"a1a2"`` that identifies no call at all.
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._:+/=@-]{1,200}")
+
+
+def clean_request_id(raw: Any) -> str | None:
+    """``raw`` reduced to a bounded, printable request id, or ``None``.
+
+    Defined here rather than beside either reader because both error surfaces
+    parse the same header off their own response — ``comfy_low.transport`` off
+    the shared envelope, ``comfy_sdk.router_exceptions`` off the router's — and
+    an id that is safe to display on one of them has to be safe on the other.
+    """
+    if not isinstance(raw, str):
+        return None
+    match = _REQUEST_ID_RE.match(raw.strip())
+    return match.group(0) if match else None
 
 
 class ApiError(Exception):

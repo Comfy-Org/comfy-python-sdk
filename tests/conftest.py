@@ -108,12 +108,25 @@ class ServerState:
     model_run_transient_error: tuple[int, str] = (503, "internal_error")
     # Status code for a successful run (201 exercises the created-shaped path).
     model_run_status: int = 200
+    # Answer a successful run with a body that is not JSON at all — a proxy
+    # interstitial served under a 200, a response truncated mid-stream. The
+    # generation ran and was billed; only the result is unreadable.
+    model_run_undecodable_body: bool = False
     # Model the deployment `retry_possibly_in_flight` exists for: one that
     # *replays* a repeated Idempotency-Key rather than rejecting it, so a key
     # is released rather than claimed when a request fails 5xx. Default False
     # is the vendored contract (reject-on-duplicate, no replay), under which a
     # same-key retry after a 5xx can only come back 422.
     model_run_replays_idempotency_key: bool = False
+    # The stronger property the flag above does *not* model: the generation ran
+    # to completion server side and only the *response* was lost (the
+    # `deadline_exceeded` 504 the replay contract is written for). With this on,
+    # a failed run whose outcome is unknown records its result against the key,
+    # and a later request presenting that key is answered with the recorded
+    # result — without running the model again. Kept separate because the flag
+    # above only releases the key: on its own it lets a same-key resend *re-run*
+    # the model, which is the double charge, not the replay.
+    model_run_replays_lost_result: bool = False
     # Seconds sent as Retry-After alongside `model_run_error`, when that error
     # is the 429 the policy is allowed to pace itself against. `None` sends no
     # header at all, which is the 429 the policy must *not* retry.
@@ -154,6 +167,15 @@ class ServerState:
     # as POST /jobs rejects one. Kept apart from `idempotency` only so a model
     # test cannot perturb a workflow test's bookkeeping.
     model_run_idempotency: dict[str, str] = field(default_factory=dict)
+    # Idempotency-Key -> the result recorded for it under
+    # `model_run_replays_lost_result`, served verbatim to a later request
+    # presenting the same key.
+    model_run_replay_store: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # How many times the model actually *ran*, as distinct from how many
+    # requests arrived (`model_run_count`). A replay serves a recorded result
+    # and does not increment this, which is what lets a test tell a real replay
+    # apart from a second generation that merely returns an equal payload.
+    model_run_generations: int = 0
 
 
 def _asset_json(asset_id: str, hash_: str, created_new: bool, size: int) -> dict:
@@ -235,6 +257,15 @@ def _make_handler(state: ServerState):
             self.send_header("Content-Length", str(len(body)))
             for k, v in (headers or {}).items():
                 self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _raw(self, status: int, body: bytes, content_type: str) -> None:
+            """A response whose body is *not* JSON — the case a client that
+            calls ``.json()`` unguarded on a success status falls over on."""
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
@@ -456,6 +487,18 @@ def _make_handler(state: ServerState):
             key = self.headers.get("Idempotency-Key")
             state.model_run_idempotency_keys.append(key)
 
+            # Checked before the reject-on-duplicate rule below: a deployment
+            # that replays a claimed key answers with the recorded result
+            # rather than rejecting the resend, and the model does not run
+            # again — which is the whole point of asking under the same key.
+            if key and key in state.model_run_replay_store:
+                self._json(
+                    200,
+                    state.model_run_replay_store[key],
+                    headers={"Idempotent-Replayed": "true"},
+                )
+                return
+
             # The same reject-on-duplicate rule `_post_jobs` implements, for
             # the same reason: a stub more permissive than the contract would
             # let a retry design that the real server rejects pass its tests.
@@ -477,6 +520,11 @@ def _make_handler(state: ServerState):
 
             def fail(status: int, code: str, message: str) -> None:
                 claim_if_outcome_unknown(status)
+                if state.model_run_replays_lost_result and key and status >= 500:
+                    # The generation completed; only the answer was lost. Bill
+                    # it once and record it, so the same key collects it.
+                    state.model_run_generations += 1
+                    state.model_run_replay_store[key] = state.model_run_result
                 headers: dict[str, str] = {}
                 if state.model_run_retry_after is not None:
                     headers["Retry-After"] = state.model_run_retry_after
@@ -499,6 +547,14 @@ def _make_handler(state: ServerState):
                 return
             if key:
                 state.model_run_idempotency[key] = "done"
+            state.model_run_generations += 1
+            if state.model_run_undecodable_body:
+                self._raw(
+                    state.model_run_status,
+                    b"<html><body>502 from an intermediary</body></html>",
+                    "text/html",
+                )
+                return
             self._json(state.model_run_status, state.model_run_result)
 
         def _post_jobs(self) -> None:

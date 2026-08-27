@@ -16,17 +16,25 @@ on some errors and missing on others forces every caller into ``getattr``.
 
 from __future__ import annotations
 
+import asyncio
 import io
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import httpx
 import pytest
 
 import comfy_low.transport as low_transport
 from comfy_low.errors import ApiError as LowApiError
+from comfy_low.errors import clean_request_id
 from comfy_sdk import AsyncComfy, Comfy, Forbidden, NotFound
-from comfy_sdk.exceptions import ComfyError, translating
-from comfy_sdk.router_exceptions import REQUEST_ID_HEADER, ROUTER_EXCEPTIONS, RouterError
+from comfy_sdk.exceptions import _STAMPED_ATTRIBUTES, ComfyError, translating
+from comfy_sdk.router_exceptions import (
+    REQUEST_ID_HEADER,
+    ROUTER_EXCEPTIONS,
+    RouterError,
+    error_from_response,
+)
 
 
 def _wf(client: Comfy | AsyncComfy):
@@ -166,6 +174,7 @@ _BASE_ATTRIBUTES = (
     "details",
     "request_id",
     "idempotency_key",
+    "retry_after",
 )
 
 
@@ -174,7 +183,7 @@ def test_the_base_error_answers_to_its_whole_attribute_surface(name: str) -> Non
     assert hasattr(ComfyError("boom"), name)
 
 
-@pytest.mark.parametrize("name", ("request_id", "idempotency_key"))
+@pytest.mark.parametrize("name", ("request_id", "idempotency_key", "retry_after"))
 def test_those_attributes_default_to_none_rather_than_being_absent(name: str) -> None:
     # An operation that sends no Idempotency-Key, and a response that named no
     # request id, both leave the attribute readable as `None`. A caller writes
@@ -221,6 +230,96 @@ def test_a_bug_in_the_sdk_is_not_stamped_and_not_swallowed() -> None:
         with translating(idempotency_key="k-03"):
             raise ZeroDivisionError("a bug, not a failed request")
     assert not hasattr(excinfo.value, "idempotency_key")
+
+
+def test_a_keyboard_interrupt_is_never_touched() -> None:
+    # `_STAMPABLE` gained one BaseException (`asyncio.CancelledError`), which
+    # makes this the assertion that the widening stopped there: an interrupt is
+    # the user asking the process to stop, not a failed call.
+    with pytest.raises(KeyboardInterrupt) as excinfo:
+        with translating(idempotency_key="k-04"):
+            raise KeyboardInterrupt
+    assert not hasattr(excinfo.value, "idempotency_key")
+
+
+def test_a_cancelled_call_is_stamped_and_still_cancelled() -> None:
+    # Cancelling an in-flight run abandons a generation that may already be
+    # dispatched and billed, so the key rides out on it — but the cancellation
+    # itself is re-raised bare, never converted into an ordinary error.
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        with translating(idempotency_key="k-05"):
+            raise asyncio.CancelledError
+    assert excinfo.value.idempotency_key == "k-05"  # type: ignore[attr-defined]
+    assert excinfo.value.request_id is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("name", _STAMPED_ATTRIBUTES)
+def test_a_stamped_transport_error_reads_every_attribute_as_none(name: str) -> None:
+    # httpx's classes declare none of these; the stamp defaults them so the
+    # documented surface is uniform on the no-response failures it matters most
+    # on, rather than uniform everywhere except there.
+    with pytest.raises(httpx.ConnectError) as excinfo:
+        with translating(idempotency_key="k-06"):
+            raise httpx.ConnectError("refused")
+    assert getattr(excinfo.value, name) is None
+
+
+def test_every_readable_base_attribute_is_defaulted_onto_a_stamped_error() -> None:
+    # The pairing that keeps the two lists honest: an attribute added to
+    # `ComfyError` for a caller to read inside an `except` block has to be
+    # defaulted onto the exceptions this SDK does not build, or it is readable
+    # on some errors and an AttributeError on others.
+    readable = set(_BASE_ATTRIBUTES) - {"message", "code", "http_status", "details"}
+    assert readable == {"idempotency_key", *_STAMPED_ATTRIBUTES}
+
+
+def test_the_stamp_never_overwrites_an_attribute_that_is_already_set() -> None:
+    err = LowApiError("slow down", code="queue_full", http_status=429, retry_after=7)
+    with pytest.raises(ComfyError) as excinfo:
+        with translating(idempotency_key="k-07"):
+            raise err
+    assert excinfo.value.retry_after == 7
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    (
+        ("req_abc123", "req_abc123"),
+        ("  req_abc123  ", "req_abc123"),
+        # `httpx.Headers.get` joins duplicate headers with ", " — take the
+        # first id rather than splicing two into one that identifies no call.
+        ("req_a, req_b", "req_a"),
+        # A terminal escape truncates at the first character outside the class
+        # rather than being written into somebody's log verbatim.
+        ("req_a[31mred", "req_a"),
+        ("[31mreq_a", None),
+        ("", None),
+        ("   ", None),
+        (None, None),
+        (b"req_bytes", None),
+    ),
+)
+def test_a_request_id_is_bounded_and_printable_before_it_is_stored(
+    raw: Any, expected: str | None
+) -> None:
+    assert clean_request_id(raw) == expected
+
+
+def test_a_request_id_is_length_bounded() -> None:
+    # No length bound at all meant a server (or anything between) could put an
+    # arbitrarily long string into every traceback and log line.
+    assert clean_request_id("x" * 5000) == "x" * 200
+
+
+def test_both_layers_clean_the_request_id_through_the_same_function() -> None:
+    # Not merely "both sanitise": the same function, so an id that is safe to
+    # display on one surface cannot be unsafe on the other.
+    hostile = "req_ok[31m" + "x" * 500
+    from_envelope = low_transport._request_id(
+        httpx.Response(500, headers={REQUEST_ID_HEADER: hostile})
+    )
+    from_router = error_from_response(500, {REQUEST_ID_HEADER: hostile}).request_id
+    assert from_envelope == from_router == "req_ok"
 
 
 def test_the_two_layers_spell_the_request_id_header_the_same_way() -> None:

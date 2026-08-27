@@ -13,6 +13,7 @@ Everything here runs against the stubbed server in ``conftest.py``.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 from collections.abc import Mapping
@@ -360,15 +361,42 @@ def test_the_replay_idiom_from_the_docstring_collects_the_generation(server) -> 
     # raises, the caller reads the key off the exception and re-runs under it,
     # and the result of the generation they were already billed for comes back.
     server.state.model_run_error = (504, "deadline_exceeded")
-    server.state.model_run_replays_idempotency_key = True
+    # The generation completed server side and only the answer was lost, so the
+    # stub records the result against the key and serves it back without
+    # running the model again. Asserting on the payload alone would not
+    # distinguish that from a *second* generation returning an equal payload —
+    # which is the double charge this feature exists to avoid — so the run
+    # counter below is the assertion that actually holds the contract.
+    server.state.model_run_replays_lost_result = True
     with Comfy(retry=NO_RETRY) as client:
         with pytest.raises(ComfyError) as excinfo:
             client.models.run(MODEL, ARGS)
-        server.state.model_run_error = None
         replayed = client.models.run(MODEL, ARGS, idempotency_key=excinfo.value.idempotency_key)
     assert replayed == server.state.model_run_result
     first, second = server.state.model_run_idempotency_keys
     assert first == second
+    # Two requests arrived, one generation happened. The `model_run_error` knob
+    # is deliberately left set: the second call succeeds because the key
+    # collected the recorded result, not because the failure was turned off.
+    assert server.state.model_run_count == 2
+    assert server.state.model_run_generations == 1
+
+
+def test_replaying_without_the_key_would_start_a_second_generation(server) -> None:
+    # The negative of the test above, and the reason both the README snippet
+    # and the docstring tell a caller to check `idempotency_key` for None: a
+    # resend that does not carry the key is a new call, mints a new one, and
+    # bills a second generation. Asserted so the guard is not quietly dropped.
+    server.state.model_run_error = (504, "deadline_exceeded")
+    server.state.model_run_replays_lost_result = True
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError):
+            client.models.run(MODEL, ARGS)
+        server.state.model_run_error = None
+        client.models.run(MODEL, ARGS)
+    first, second = server.state.model_run_idempotency_keys
+    assert first != second
+    assert server.state.model_run_generations == 2
 
 
 def test_a_transport_level_failure_carries_the_key() -> None:
@@ -469,3 +497,100 @@ def test_request_id_is_none_when_the_response_named_none(server) -> None:
     # The key is still there — the two are independent, and the one that
     # enables the replay is minted client-side.
     assert excinfo.value.idempotency_key is not None
+
+
+def test_request_id_reads_as_none_on_a_failure_with_no_response_at_all() -> None:
+    # The documented pair has to be uniform on exactly the failures it is most
+    # needed on. `httpx.ConnectError` is not one of this SDK's classes and
+    # declares no `request_id`, so without the stamp defaulting it, the
+    # attribute access the docs invite would raise AttributeError here.
+    models, _ = _models_over(httpx.ConnectError("connection refused"))
+    with pytest.raises(httpx.ConnectError) as excinfo:
+        models.run(MODEL, ARGS)
+    assert excinfo.value.request_id is None  # type: ignore[attr-defined]
+    assert excinfo.value.idempotency_key is not None  # type: ignore[attr-defined]
+
+
+async def test_an_async_transport_failure_reads_request_id_as_none() -> None:
+    models, _ = _async_models_over(httpx.ReadTimeout("no answer"))
+    with pytest.raises(httpx.ReadTimeout) as excinfo:
+        await models.run(MODEL, ARGS)
+    assert excinfo.value.request_id is None  # type: ignore[attr-defined]
+
+
+def test_a_stamped_error_that_already_has_a_request_id_keeps_it(server) -> None:
+    # The default must never overwrite a real id — that would erase the one
+    # thing a user quotes in a support request.
+    server.state.model_run_error = (504, "deadline_exceeded")
+    server.state.model_run_request_id = "req_keepme"
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert excinfo.value.request_id == "req_keepme"
+
+
+# --- retry_after, the pace the replay is meant to wait for ----------------
+
+
+def test_a_504_forwards_the_retry_after_the_server_named(server) -> None:
+    # The docs tell a caller to replay "after the Retry-After the server
+    # named". `deadline_exceeded` is not a throttled bucket, so before this was
+    # forwarded for every code the caller was told to wait with nothing to read
+    # the wait off.
+    server.state.model_run_error = (504, "deadline_exceeded")
+    server.state.model_run_retry_after = "2"
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert excinfo.value.retry_after == 2
+
+
+def test_retry_after_is_none_when_the_server_named_no_pace(server) -> None:
+    server.state.model_run_error = (504, "deadline_exceeded")
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert excinfo.value.retry_after is None
+
+
+def test_retry_after_reads_as_none_on_a_failure_with_no_response() -> None:
+    # The README's table promises all three attributes read rather than raise
+    # on anything `models.run` raises, and a transport failure is the case that
+    # is neither one of this SDK's classes nor a response.
+    models, _ = _models_over(httpx.ConnectError("connection refused"))
+    with pytest.raises(httpx.ConnectError) as excinfo:
+        models.run(MODEL, ARGS)
+    assert excinfo.value.retry_after is None  # type: ignore[attr-defined]
+
+
+# --- cancellation, the one BaseException the key rides out on -------------
+
+
+async def test_cancelling_an_in_flight_run_still_yields_the_key() -> None:
+    # `asyncio.wait_for` around a ten-minute run is the ordinary way this
+    # happens: the request may already be dispatched and billed, so the key is
+    # the caller's route back to it. The cancellation itself must still
+    # propagate — it is re-raised bare, not converted.
+    models, low = _async_models_over(asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await models.run(MODEL, ARGS)
+    assert low.keys == [excinfo.value.idempotency_key]  # type: ignore[attr-defined]
+    assert excinfo.value.idempotency_key is not None  # type: ignore[attr-defined]
+    assert excinfo.value.request_id is None  # type: ignore[attr-defined]
+
+
+# --- a success status whose body will not decode --------------------------
+
+
+def test_an_undecodable_success_body_is_a_stamped_sdk_error(server) -> None:
+    # A 200 whose body is not JSON — a proxy interstitial, a truncated
+    # response. The generation ran and was billed with the result lost, which
+    # is exactly the case the key has to ride out on, so it must not escape as
+    # the raw json.JSONDecodeError from outside the translated surface.
+    server.state.model_run_undecodable_body = True
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert excinfo.value.idempotency_key is not None
+    assert excinfo.value.http_status == 200
+    assert excinfo.value.code == "invalid_response"

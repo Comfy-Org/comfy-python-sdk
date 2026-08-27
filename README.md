@@ -481,15 +481,24 @@ thing you need and the one thing you never saw.
 So every exception `models.run` raises carries it:
 
 ```python
+import httpx
 from comfy_sdk import Comfy, ComfyError
 
 with Comfy() as client:
     try:
         result = client.models.run("acme/flux/dev", {"prompt": "a cat"})
-    except ComfyError as exc:
-        # Later — after the Retry-After the server named, if it named one.
+    # Both, and the second is not optional: a dropped connection or a read
+    # timeout — one of the two cases this section is about — never reached a
+    # response to translate, so it arrives as the `httpx` error it was, not as
+    # a `ComfyError`. Catching only `ComfyError` misses exactly the failure the
+    # replay exists for.
+    except (ComfyError, httpx.HTTPError) as exc:
+        key = exc.idempotency_key
+        if key is None:
+            raise  # Nothing to replay under; a fresh key would re-run and re-bill.
+        # Later — after `exc.retry_after` seconds, if the server named a pace.
         result = client.models.run(
-            "acme/flux/dev", {"prompt": "a cat"}, idempotency_key=exc.idempotency_key
+            "acme/flux/dev", {"prompt": "a cat"}, idempotency_key=key
         )
 ```
 
@@ -499,15 +508,23 @@ generation is still running it is refused instead, with a `Retry-After` saying
 when to ask. Send the same arguments you sent the first time — a repeated key
 with a *different* body is rejected outright.
 
-Two attributes carry this:
+Three attributes carry this:
 
 | Attribute | Value |
 |---|---|
-| `exc.idempotency_key` | the key that call was made under — the one `run` minted, or the one you passed. Present on every exception `models.run` raises, including a transport failure with no response at all (`httpx.ConnectError`, a read timeout) and a `RouterError` whose `error_type` this SDK version does not recognise |
+| `exc.idempotency_key` | the key that call was made under — the one `run` minted, or the one you passed. Present on every exception `models.run` raises, including a transport failure with no response at all (`httpx.ConnectError`, a read timeout), a cancelled `await`, and a `RouterError` whose `error_type` this SDK version does not recognise |
 | `exc.request_id` | the server's `X-Comfy-Request-Id` for the call, when the response carried one — the id to quote in a support request. `None` when there was no response, or none of that header |
+| `exc.retry_after` | seconds the server asked you to wait before asking again, from `Retry-After`. `None` when it named no pace |
 
-Both are `None` rather than absent on an error from a surface that sends no
-key, so `exc.idempotency_key` is always safe to read on a `ComfyError`.
+All three read as `None` rather than raising on any exception `models.run`
+raises, so a handler never has to guard the attribute access itself.
+
+`idempotency_key` is `None` on errors from *other* surfaces, though — it is
+`models.run` that records it, and `submit()` sends a key without stamping one.
+So `None` means "this SDK did not record a key for you", **not** "no key was
+sent, resend freely": check for it before replaying, as the snippet above does,
+rather than passing it straight back into `idempotency_key=` where `None` means
+"mint a fresh one" and starts a second billed generation.
 
 ## Sync and async
 

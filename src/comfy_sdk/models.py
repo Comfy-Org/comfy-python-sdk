@@ -155,10 +155,22 @@ class Models(_ModelsBase):
         already billed for: ``client.models.run(model, arguments,
         idempotency_key=exc.idempotency_key)`` returns the original result
         (``200`` + ``Idempotent-Replayed``) against a deployment that replays a
-        claimed key, or is refused ``409`` "still in progress" with a
-        ``Retry-After`` saying when to ask again. Without that attribute an
-        auto-minted key died with the call and the paid-for generation was
-        uncollectable.
+        claimed key, or is refused while that generation is still running, with
+        ``exc.retry_after`` naming when to ask again when the server sent a
+        ``Retry-After``. Without that attribute an auto-minted key died with the
+        call and the paid-for generation was uncollectable.
+
+        Note that a dropped connection surfaces as an ``httpx`` error rather
+        than a :class:`~comfy_sdk.ComfyError` — it never reached a response to
+        translate — so a handler written for the replay has to catch both; see
+        the README's "Collecting a generation after a lost response".
+
+        Pass ``exc.idempotency_key`` back only after checking it is not
+        ``None``. This parameter treats ``None`` as "mint one", so replaying
+        with a key that was never recorded silently starts a *second* billed
+        generation instead of collecting the first. Every exception *this*
+        method raises carries a real key, but an ``except ComfyError`` that also
+        catches errors from other surfaces can hand you one that does not.
         """
         low = cast(ComfyLow, self._low)
         # Minted once, outside the loop: reusing this exact value on every

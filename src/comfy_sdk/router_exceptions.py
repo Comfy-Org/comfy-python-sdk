@@ -75,6 +75,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from comfy_low.errors import clean_request_id
+
 from .exceptions import ComfyError
 
 #: Response header carrying the coarse failure bucket. Set on every router error
@@ -460,7 +462,10 @@ def error_from_response(
     response would replace a diagnosable failure with an undiagnosable one.
     """
     lowered = _lowercase_headers(headers)
-    request_id = _clean(lowered.get(REQUEST_ID_HEADER.lower()))
+    # Bounded and filtered rather than merely stripped: the id is displayed
+    # and pasted into support tickets, and this header is server-controlled.
+    # Shared with `comfy_low.transport` so both surfaces clean it identically.
+    request_id = clean_request_id(lowered.get(REQUEST_ID_HEADER.lower()))
     error_type = _clean(lowered.get(ERROR_TYPE_HEADER.lower()))
     retry_after = _retry_after(lowered.get(RETRY_AFTER_HEADER.lower()))
 
