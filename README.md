@@ -185,6 +185,21 @@ export COMFY_BASE_URL="http://127.0.0.1:8189"               # self-hosted proxy
 It is read each time a client is constructed, must be an `http(s)` URL, and an
 unset or blank value (including whitespace-only) means Comfy Cloud.
 
+`COMFY_BASE_URL` selects the **jobs and assets** surface. `client.models` talks
+to a different one — Comfy Router, `https://api.comfy.org` — and follows its own
+variable, `COMFY_ROUTER_BASE_URL`, with the same rules (read per construction,
+`http(s)` only, blank means the default):
+
+```bash
+export COMFY_ROUTER_BASE_URL="https://api.comfy.org"  # the default; set it to redirect model runs
+```
+
+Two variables rather than one because they are genuinely two hosts: the v2
+surface serves `/api/v2/jobs` and `/api/v2/assets`, Router serves
+`/v1/models/{provider}/{model}`, and neither serves the other's routes. Your
+`COMFY_API_KEY` is the credential for both — the SDK attaches it to those two
+configured origins and to no third one.
+
 Upgrading from an earlier version: `Comfy("<url>", "<key>")` becomes
 `Comfy(api_key="<key>")` with `COMFY_BASE_URL` set. `api_key` is keyword-only,
 so the old positional call raises `TypeError` rather than reading a URL as a
@@ -362,26 +377,50 @@ Model operations live in a namespace on the client you already constructed —
 ```python
 client = Comfy(api_key="comfyui-...")
 
-client.models.base_url   # the client's own base URL, where model requests go
+client.models.base_url   # Comfy Router's base URL, where model runs go
 client.models.timeout    # the client's own HTTP timeout
 ```
 
 The namespace is bound to that client's transport, so it uses the client's
-credentials, base URL, connection pool and timeout, and a configuration change
-made on the client afterwards applies through `models` as well — there is no
-second set of settings to keep in sync. `AsyncComfy` carries the same `models`
-namespace, and nothing extra is imported or constructed for it:
+credentials, connection pool and timeout, and a configuration change made on
+the client afterwards applies through `models` as well — there is no second set
+of settings to keep in sync. `AsyncComfy` carries the same `models` namespace,
+and nothing extra is imported or constructed for it:
 `from comfy_sdk import Comfy` stays the only entry point.
 
-`base_url` and `timeout` are a read-only view of that shared configuration;
-model operations are added to this namespace as they land.
+The one setting it does **not** share is the target host: `client.models.base_url`
+reports `COMFY_ROUTER_BASE_URL` (`https://api.comfy.org` by default), not the
+client's `COMFY_BASE_URL`. See
+[Targeting another deployment](#targeting-another-deployment) for why they are
+two variables.
+
+`base_url` and `timeout` are a read-only view of that configuration; model
+operations are added to this namespace as they land.
 
 ### `models.run` — one call, one result
 
 ```python
-result = client.models.run("acme/flux/dev", {"prompt": "a cat", "steps": 4})
+result = client.models.run("fal-ai/flux-pro", {"prompt": "a cat", "steps": 4})
 result["images"][0]["url"]
 ```
+
+That call is `POST https://api.comfy.org/v1/models/fal-ai/flux-pro` with
+`{"prompt": "a cat", "steps": 4}` as the body.
+
+Three things follow from that, and they are the whole contract of this method:
+
+- **It targets Comfy Router** — `https://api.comfy.org`, redirected by
+  `COMFY_ROUTER_BASE_URL`, not by `COMFY_BASE_URL`. Your API key goes with it.
+- **The first argument is the model's canonical id**, `{provider}/{model}` —
+  exactly the two segments that address the route, and exactly what Router's
+  model catalog lists. It must be two non-empty segments: `"fal-ai"` alone,
+  `"fal-ai/flux-pro/fp8"` (the three-segment variant form, which this route does
+  not take yet), and anything containing a `.` or `..` segment all raise
+  `ValueError` locally, before any request. A non-string raises `TypeError`.
+- **The second argument is the model's own native input**, forwarded to the
+  provider unchanged. There is no Comfy-shaped envelope around it: whatever the
+  partner's own API documents as the request body is what you pass here, so you
+  can move between the partner's API and Router by changing the host.
 
 `run` returns when the generation is **complete**. There is no submit step and
 nothing to poll: where the platform has to submit-and-poll an upstream
@@ -393,7 +432,7 @@ The awaitable form is the **async client**, not a differently-named method:
 
 ```python
 async with AsyncComfy(api_key="comfyui-...") as client:
-    result = await client.models.run("acme/flux/dev", {"prompt": "a cat"})
+    result = await client.models.run("fal-ai/flux-pro", {"prompt": "a cat"})
 ```
 
 There is no `run_async()`, and there will not be one — one operation, one name,
@@ -467,10 +506,11 @@ arrives at Comfy's own ten-minute deadline, so a single-window budget would
 already be spent when it lands and the collect attempt it exists for would never
 start. Nothing else pays for that room.
 
-A note on what the default trades: `POST /models/run` is in neither vendored
-spec, so a deployment may apply the v2 rule instead and keep the key claimed
-across the `504`. There the collect resend comes back `422
-idempotency_key_reuse` in place of the real `504`. Set
+A note on what the default trades: the collect rule is
+`spec/router-openapi.yaml`'s, so it binds Comfy Router — but
+`COMFY_ROUTER_BASE_URL` can name a deployment that applies the v2 rule instead
+and keeps the key claimed across the `504`. There the collect resend comes back
+`422 idempotency_key_reuse` in place of the real `504`. Set
 `retry_collectable=False` on such a deployment.
 
 Other 5xx responses and client-side timeouts are the cases left out by default,

@@ -54,7 +54,7 @@ import pytest
 import comfy_low
 import comfy_sdk
 from comfy_sdk import AsyncComfy, Comfy
-from comfy_sdk.client import BASE_URL_ENV_VAR
+from comfy_sdk.client import BASE_URL_ENV_VAR, ROUTER_BASE_URL_ENV_VAR
 
 #: The packages whose public classes make up the surface under test.
 _PACKAGES = (comfy_sdk, comfy_low)
@@ -207,13 +207,19 @@ def _default_deployment() -> Iterator[None]:
     fixture could adjust the environment. Inheriting an ambient value would let
     a stray export in a developer's shell turn this whole module into a
     collection error that has nothing to do with parity.
+
+    Both target variables, for exactly the same reason:
+    ``_resolve_router_base_url()`` raises the same way on a malformed
+    ``COMFY_ROUTER_BASE_URL``, and a client construction reads both.
     """
-    saved = os.environ.pop(BASE_URL_ENV_VAR, None)
+    names = (BASE_URL_ENV_VAR, ROUTER_BASE_URL_ENV_VAR)
+    saved = {name: os.environ.pop(name, None) for name in names}
     try:
         yield
     finally:
-        if saved is not None:
-            os.environ[BASE_URL_ENV_VAR] = saved
+        for name, value in saved.items():
+            if value is not None:
+                os.environ[name] = value
 
 
 def _run(coro: Any) -> None:

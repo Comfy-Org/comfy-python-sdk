@@ -3,7 +3,14 @@
 Keeps the SDK's own test suite independent of a real v2 server or proxy. Each
 test configures ``server.state`` to drive a specific scenario (dedup hit, hash
 mismatch, queue-full-then-ok, SSE reconnect, ...); the ``server`` fixture points
-the SDK at the stub by setting ``COMFY_BASE_URL``.
+the SDK at the stub by setting ``COMFY_BASE_URL`` *and*
+``COMFY_ROUTER_BASE_URL``.
+
+Both, because the SDK speaks to two surfaces: the ``/api/v2`` deployment (jobs,
+assets) and Comfy Router (``/v1/models/{provider}/{model}``), which is a
+different host in production. This one stub answers both route families, so a
+test that exercises either gets a single server — while a test that is *about*
+the two being separate points ``COMFY_ROUTER_BASE_URL`` at ``second_server``.
 """
 
 from __future__ import annotations
@@ -15,10 +22,11 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import unquote
 
 import pytest
 
-from comfy_sdk import API_KEY_ENV_VAR, BASE_URL_ENV_VAR
+from comfy_sdk import API_KEY_ENV_VAR, BASE_URL_ENV_VAR, ROUTER_BASE_URL_ENV_VAR
 
 
 @dataclass
@@ -83,7 +91,7 @@ class ServerState:
     job_workflow_format: str = "api"
     job_workflow_not_found: bool = False
 
-    # --- POST /models/run (the awaited model run) ---
+    # --- POST /v1/models/{provider}/{model} (the awaited model run) ---
     # The provider's native payload the run resolves to. Deliberately not a
     # Comfy-shaped envelope: the SDK must hand it back untouched.
     model_run_result: dict[str, Any] = field(
@@ -99,7 +107,7 @@ class ServerState:
     model_run_delay: float = 0.0
     # (status, code) answered instead of the result.
     model_run_error: tuple[int, str] | None = None
-    # POST /models/run fails this many times before serving the result — the
+    # A model run fails this many times before serving the result — the
     # transient-failure-then-success path a retry policy exists for. Decremented
     # per request, and checked *before* `model_run_error`, which is the
     # permanent-failure knob.
@@ -146,7 +154,7 @@ class ServerState:
     model_run_request_id: str | None = None
     # Answer model-run failures in Router's own error shape -- the coarse bucket
     # on `X-Comfy-Error-Type` plus a `{detail, error_type}` body -- instead of
-    # the v2 `{error: {code, message}}` envelope. `POST /api/v2/models/run` is
+    # the v2 `{error: {code, message}}` envelope. The model-run route is
     # fronted by Router, so this is the shape a real deployment's 504 arrives
     # in, and the bucket-keyed collect rule has to read it.
     model_run_router_error_shape: bool = False
@@ -175,12 +183,22 @@ class ServerState:
     last_auth_header: str | None = None
     last_user_agent: str | None = None
     model_run_count: int = 0
+    # The raw JSON body of the last model run — the partner model's *native*
+    # input, with no `{model, arguments}` envelope around it, exactly as Router
+    # forwards it upstream.
     last_model_run_body: dict[str, Any] | None = None
-    # Every Idempotency-Key seen on POST /models/run, in arrival order (`None`
+    # The two path segments of the last model run, percent-DECODED, so a test
+    # asserts the id the caller passed rather than a particular encoding of it.
+    last_model_run_provider: str | None = None
+    last_model_run_model: str | None = None
+    # ...and the raw, still-encoded request path, for the tests that are about
+    # the encoding itself.
+    last_model_run_path: str | None = None
+    # Every Idempotency-Key seen on a model run, in arrival order (`None`
     # records a run that arrived without the header at all).
     model_run_idempotency_keys: list[str | None] = field(default_factory=list)
-    # Keys POST /models/run has *claimed*, so a reuse can be rejected exactly
-    # as POST /jobs rejects one. Kept apart from `idempotency` only so a model
+    # Keys a model run has *claimed*, so a reuse can be rejected exactly as
+    # POST /jobs rejects one. Kept apart from `idempotency` only so a model
     # test cannot perturb a workflow test's bookkeeping.
     model_run_idempotency: dict[str, str] = field(default_factory=dict)
     # Idempotency-Key -> the result recorded for it under
@@ -470,8 +488,14 @@ def _make_handler(state: ServerState):
             if self.path == "/api/v2/jobs":
                 self._post_jobs()
                 return
-            if self.path == "/api/v2/models/run":
-                self._post_model_run()
+            # Comfy Router's invocation route — a different surface from the
+            # `/api/v2` paths above (a different host in production; the same
+            # stub here, with `COMFY_ROUTER_BASE_URL` pointed at it). The two
+            # segments are the model id, so they are matched rather than
+            # compared to a fixed string.
+            m = re.match(r"/v1/models/([^/]+)/([^/]+)$", self.path)
+            if m:
+                self._post_model_run(m.group(1), m.group(2))
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
@@ -497,8 +521,16 @@ def _make_handler(state: ServerState):
             else:
                 self._err(404, "blob_not_found", "no such blob")
 
-        def _post_model_run(self) -> None:
+        def _post_model_run(self, provider: str, model: str) -> None:
             state.model_run_count += 1
+            # Decoded, because the SDK percent-encodes each segment and a real
+            # origin server decodes it before routing — asserting the encoded
+            # form everywhere would pin tests to an encoding rather than to the
+            # id the caller passed. `last_model_run_path` keeps the raw form
+            # for the tests that are about the encoding.
+            state.last_model_run_provider = unquote(provider)
+            state.last_model_run_model = unquote(model)
+            state.last_model_run_path = self.path
             state.last_model_run_body = json.loads(self._read_body() or b"{}")
             key = self.headers.get("Idempotency-Key")
             state.model_run_idempotency_keys.append(key)
@@ -697,6 +729,10 @@ def _no_ambient_base_url(request, monkeypatch):
     if "integration" in request.path.parts:
         return
     monkeypatch.delenv(BASE_URL_ENV_VAR, raising=False)
+    # The Router target too: a developer with `COMFY_ROUTER_BASE_URL` exported
+    # would otherwise send every `models.run` test at their own host — and the
+    # default-value assertions would pass or fail on their shell, not the code.
+    monkeypatch.delenv(ROUTER_BASE_URL_ENV_VAR, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -719,6 +755,12 @@ def server(monkeypatch):
     # Clients read their target from the environment, so pointing them at the
     # stub is part of standing it up: tests just construct ``Comfy()``.
     monkeypatch.setenv(BASE_URL_ENV_VAR, srv.base_url)
+    # Both targets, because the SDK has two: jobs and assets resolve under
+    # `COMFY_BASE_URL`, model runs under `COMFY_ROUTER_BASE_URL`. The one stub
+    # serves both route families, so pointing both here keeps a `models.run`
+    # test a single-server test — the *separate*-origin cases point this second
+    # variable at `second_server` themselves.
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, srv.base_url)
     try:
         yield srv
     finally:

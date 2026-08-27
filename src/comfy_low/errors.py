@@ -158,7 +158,7 @@ def error_from_envelope(
     well-formed envelope (so a bare ``401`` with no JSON still maps to
     ``Unauthorized``).
 
-    Not every route answers in the envelope shape. ``POST /api/v2/models/run``
+    Not every route answers in the envelope shape. ``POST {router}/v1/models/{provider}/{model}``
     is fronted by Router, whose error body is ``{detail, error_type}`` and which
     repeats the same coarse bucket on the ``X-Comfy-Error-Type`` header
     (``spec/router-openapi.yaml``). Reading only ``error["code"]`` would collapse

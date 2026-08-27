@@ -32,7 +32,15 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
 from .assets import Asset, AssetFactory, AsyncAsset, AsyncAssetFactory
-from .client import API_KEY_ENV_VAR, BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL, AsyncComfy, Comfy
+from .client import (
+    API_KEY_ENV_VAR,
+    BASE_URL_ENV_VAR,
+    COMFY_CLOUD_BASE_URL,
+    COMFY_ROUTER_BASE_URL,
+    ROUTER_BASE_URL_ENV_VAR,
+    AsyncComfy,
+    Comfy,
+)
 from .events import (
     Event,
     Log,
@@ -75,6 +83,8 @@ __all__ = [
     "Comfy",
     "COMFY_CLOUD_BASE_URL",
     "BASE_URL_ENV_VAR",
+    "COMFY_ROUTER_BASE_URL",
+    "ROUTER_BASE_URL_ENV_VAR",
     "API_KEY_ENV_VAR",
     "AsyncComfy",
     # assets / workflows / jobs / outputs

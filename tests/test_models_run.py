@@ -3,7 +3,9 @@
 Covers the whole contract of the headline model API on both clients: the sync
 call blocks and returns the finished result, the async call awaits to the same
 shape, the awaitable form is the *async client* rather than a suffixed method
-(asserted, not merely absent), the wait is sized for a server that polls
+(asserted, not merely absent), the run is addressed to Comfy Router by the
+model's two id segments with the model's own native JSON as the body, the
+result is that model's native output, the wait is sized for a server that polls
 upstream inside the call, an ``Idempotency-Key`` is plumbed onto the wire and rides
 out on whatever the call raises, and the result handed back is the provider's
 own payload rather than a wrapper.
@@ -22,8 +24,22 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from comfy_low.transport import MODEL_RUN_TIMEOUT, AsyncComfyLow, ComfyLow, model_run_request
-from comfy_sdk import NO_RETRY, AsyncComfy, Comfy, RetryPolicy
+from comfy_low.transport import (
+    MODEL_RUN_TIMEOUT,
+    ROUTER_BASE_URL,
+    AsyncComfyLow,
+    ComfyLow,
+    model_run_request,
+    parse_model_id,
+)
+from comfy_sdk import (
+    COMFY_ROUTER_BASE_URL,
+    NO_RETRY,
+    ROUTER_BASE_URL_ENV_VAR,
+    AsyncComfy,
+    Comfy,
+    RetryPolicy,
+)
 from comfy_sdk.exceptions import ComfyError, NotFound, Unauthorized
 from comfy_sdk.models import AsyncModels, Models
 from comfy_sdk.router_exceptions import (
@@ -33,7 +49,10 @@ from comfy_sdk.router_exceptions import (
     error_from_response,
 )
 
-MODEL = "acme/flux/dev"
+#: The canonical two-segment ``{provider}/{model}`` id the route is addressed
+#: by — the same shape ``spec/router-openapi.yaml``'s ``RouterModelId`` pattern
+#: declares, and the id the catalog lists.
+MODEL = "acme/flux-dev"
 ARGS = {"prompt": "a cat", "steps": 4}
 
 
@@ -78,10 +97,111 @@ def test_a_created_shaped_success_is_also_a_result(server) -> None:
         assert client.models.run(MODEL, ARGS) == server.state.model_run_result
 
 
-def test_run_sends_the_model_and_arguments(server) -> None:
+# --- the model id addresses the route; the body is the model's own input ----
+
+
+def test_run_addresses_the_model_by_path_and_sends_the_native_body(server) -> None:
+    # The wire shape Router declares: the id is the two path segments of
+    # `/v1/models/{provider}/{model}`, and the body is the partner model's OWN
+    # native JSON input, forwarded unchanged — no `{model, arguments}` envelope.
     with Comfy() as client:
         client.models.run(MODEL, ARGS)
-    assert server.state.last_model_run_body == {"model": MODEL, "arguments": ARGS}
+    assert server.state.last_model_run_path == "/v1/models/acme/flux-dev"
+    assert server.state.last_model_run_provider == "acme"
+    assert server.state.last_model_run_model == "flux-dev"
+    assert server.state.last_model_run_body == ARGS
+    assert "model" not in server.state.last_model_run_body
+    assert "arguments" not in server.state.last_model_run_body
+
+
+async def test_the_async_client_addresses_the_route_the_same_way(server) -> None:
+    async with AsyncComfy() as client:
+        await client.models.run(MODEL, ARGS)
+    assert server.state.last_model_run_path == "/v1/models/acme/flux-dev"
+    assert server.state.last_model_run_body == ARGS
+
+
+def test_the_sans_io_request_builder_agrees_with_the_wire() -> None:
+    # The one place the wire shape is decided, asserted directly so a change to
+    # it cannot hide behind the stub's own routing.
+    path, body, headers = model_run_request(MODEL, ARGS, "k-1")
+    assert path == "/v1/models/acme/flux-dev"
+    assert body == ARGS
+    assert headers == {"Idempotency-Key": "k-1"}
+
+
+@pytest.mark.parametrize(
+    "model, path",
+    [
+        # `.`, `_` and `-` are all legal *inside* a segment per the spec's
+        # `RouterModelSegment` pattern, and none of them is percent-encoded:
+        # they are unreserved (or sub-delims) in a path segment, so the URL the
+        # caller reads in a log is the id they passed.
+        ("fal-ai/flux-pro", "/v1/models/fal-ai/flux-pro"),
+        ("acme/sd_xl.turbo", "/v1/models/acme/sd_xl.turbo"),
+        ("acme_labs/v1.5", "/v1/models/acme_labs/v1.5"),
+        # ...while anything that would change the *structure* of the path is
+        # encoded rather than passed through.
+        ("acme/a b", "/v1/models/acme/a%20b"),
+        ("acme/a?b", "/v1/models/acme/a%3Fb"),
+        ("acme/a#b", "/v1/models/acme/a%23b"),
+    ],
+)
+def test_each_segment_is_percent_encoded_into_exactly_one_path_segment(
+    model: str, path: str
+) -> None:
+    assert model_run_request(model, {}, None)[0] == path
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "flux-dev",  # one segment — no provider
+        "acme/flux/dev",  # three — the variant form, not addressable here
+        "acme/flux/dev/fp8",  # four
+        "acme/..",  # traversal
+        "../flux-dev",
+        "./flux-dev",
+        "acme/.",
+        "a//b",  # an empty middle segment
+        "/flux-dev",  # empty provider
+        "acme/",  # empty model
+        "",
+        "/",
+    ],
+)
+def test_a_malformed_model_id_is_refused_locally(bad: str) -> None:
+    # Refused before any request: the id *is* the path, so a malformed one
+    # would otherwise be pasted into a URL and answered by whatever route it
+    # landed on — a 404 that looks like "no such model" rather than "you passed
+    # a bad id".
+    with pytest.raises(ValueError):
+        model_run_request(bad, {}, None)
+    with pytest.raises(ValueError):
+        parse_model_id(bad)
+
+
+def test_a_three_segment_id_says_the_variant_is_not_addressable_yet() -> None:
+    # The message matters: a `{provider}/{model}/{variant}` id is a real id
+    # shape, just not one this route takes, and "invalid model id" would send
+    # the caller looking for a typo.
+    with pytest.raises(ValueError, match="variant"):
+        parse_model_id("acme/flux/dev")
+
+
+def test_a_non_string_model_id_is_a_type_error_not_a_value_error() -> None:
+    # Python's own split: a wrong *type* is a programming error, and folding it
+    # into ValueError would let `except ValueError` around user input swallow it.
+    for bad in (None, 3, ["acme", "flux-dev"]):
+        with pytest.raises(TypeError):
+            parse_model_id(bad)  # type: ignore[arg-type]
+
+
+def test_a_malformed_id_never_reaches_the_server(server) -> None:
+    with Comfy() as client:
+        with pytest.raises(ValueError):
+            client.models.run("acme/flux/dev", ARGS)
+    assert server.state.model_run_count == 0
 
 
 def test_run_accepts_any_mapping_and_does_not_alias_the_callers_object(server) -> None:
@@ -90,10 +210,74 @@ def test_run_accepts_any_mapping_and_does_not_alias_the_callers_object(server) -
     caller_args = {"prompt": "a dog"}
     with Comfy() as client:
         client.models.run(MODEL, MappingProxyType(caller_args))
-    assert server.state.last_model_run_body == {"model": MODEL, "arguments": {"prompt": "a dog"}}
+    assert server.state.last_model_run_body == {"prompt": "a dog"}
     _path, body, _headers = model_run_request(MODEL, caller_args, None)
-    body["arguments"]["prompt"] = "mutated"
+    body["prompt"] = "mutated"
     assert caller_args == {"prompt": "a dog"}
+
+
+# --- which host the run is addressed to ---------------------------------
+
+
+def test_the_default_router_base_url_is_the_public_one() -> None:
+    assert COMFY_ROUTER_BASE_URL == ROUTER_BASE_URL == "https://api.comfy.org"
+    assert ROUTER_BASE_URL_ENV_VAR == "COMFY_ROUTER_BASE_URL"
+
+
+def test_a_client_defaults_to_the_public_router(monkeypatch) -> None:
+    # No `server` fixture here on purpose: that fixture is what points the
+    # router at the stub, so this asserts the *unconfigured* default.
+    monkeypatch.delenv(ROUTER_BASE_URL_ENV_VAR, raising=False)
+    with Comfy(api_key="comfyui-test") as client:
+        assert client.models.base_url == "https://api.comfy.org"
+        assert client._low.router_base_url == "https://api.comfy.org"
+
+
+def test_the_router_env_var_redirects_model_runs(monkeypatch, server) -> None:
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "http://127.0.0.1:9/router")
+    with Comfy() as client:
+        assert client.models.base_url == "http://127.0.0.1:9/router"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_router_env_var_means_the_default(monkeypatch, blank: str) -> None:
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, blank)
+    with Comfy(api_key="comfyui-test") as client:
+        assert client.models.base_url == COMFY_ROUTER_BASE_URL
+
+
+def test_a_trailing_slash_on_the_router_env_var_is_stripped(monkeypatch) -> None:
+    # It is concatenated with a path that already starts with `/`, so a kept
+    # slash would request `//v1/models/...` — a different path to an origin
+    # server than the one the vendored spec declares.
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "https://router.example/")
+    with Comfy(api_key="comfyui-test") as client:
+        assert client.models.base_url == "https://router.example"
+
+
+@pytest.mark.parametrize("bad", ["not-a-url", "ftp://h", "https://h?x=1", "https://h#f"])
+def test_a_malformed_router_env_var_is_rejected(monkeypatch, bad: str) -> None:
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, bad)
+    with pytest.raises(ValueError, match=ROUTER_BASE_URL_ENV_VAR):
+        Comfy(api_key="comfyui-test")
+
+
+def test_the_models_namespace_reports_the_router_not_the_v2_deployment(monkeypatch, server) -> None:
+    # The distinction this whole binding rests on: jobs and assets resolve
+    # under COMFY_BASE_URL, model runs under COMFY_ROUTER_BASE_URL, and they
+    # are different hosts by default.
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "https://router.example")
+    with Comfy() as client:
+        assert client.models.base_url == "https://router.example"
+        assert client._low.base_url == server.base_url
+        assert repr(client.models) == "Models(base_url='https://router.example')"
+
+
+async def test_the_async_namespace_reports_the_router_too(monkeypatch, server) -> None:
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "https://router.example")
+    async with AsyncComfy() as client:
+        assert client.models.base_url == "https://router.example"
+        assert repr(client.models) == "AsyncModels(base_url='https://router.example')"
 
 
 # --- the awaitable form is AsyncClient, not a run_async() suffix ---------
@@ -223,6 +407,32 @@ def test_run_carries_the_host_clients_credentials(server) -> None:
     with Comfy(api_key="k-run") as client:
         client.models.run(MODEL, ARGS)
     assert server.state.last_auth_header == "Bearer k-run"
+
+
+def test_the_key_reaches_the_router_when_it_is_a_separate_origin(
+    monkeypatch, server, second_server
+) -> None:
+    # The production shape: `COMFY_BASE_URL` and `COMFY_ROUTER_BASE_URL` are
+    # different hosts. The client's own credential goes to *both* of its
+    # configured targets — otherwise every real model run would be a 401.
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, second_server.base_url)
+    with Comfy(api_key="k-router") as client:
+        client.models.run(MODEL, ARGS)
+    assert second_server.state.last_auth_header == "Bearer k-router"
+    assert second_server.state.model_run_count == 1
+    # ...and the run went to the router, not to the v2 deployment.
+    assert server.state.model_run_count == 0
+
+
+def test_the_key_is_not_sent_to_a_third_origin(monkeypatch, server, second_server) -> None:
+    # Neither configured target: a server-returned absolute follow-up link
+    # pointing at `second_server` must still get nothing, and widening the
+    # credential rule to cover the router origin must not have widened it to
+    # "any absolute URL".
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "https://router.example")
+    with Comfy(api_key="k-not-yours") as client:
+        client._low.get_job(f"{second_server.base_url}/api/v2/jobs/whatever")
+    assert second_server.state.last_auth_header == ""
 
 
 # --- errors stay on the SDK's own surface --------------------------------

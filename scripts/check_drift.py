@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail if the committed tree drifts from the vendored specs.
 
-Two checks, one job:
+Three checks, one job:
 
 1. **Models vs ``spec/openapi.yaml``.** Regenerates the models into a temp file
    and diffs against the committed one, so a spec edit without a regen (or a
@@ -14,8 +14,16 @@ Two checks, one job:
    for, which would reach callers as an untyped ``RouterError``. This compares
    the spec's ``x-comfy-error-types`` list against ``ROUTER_ERROR_TYPES``,
    which is what makes the next vendored Router sync a real diff review.
+3. **The bound model-run route vs ``spec/router-openapi.yaml``.** Same reason,
+   different artifact: ``comfy_low.transport`` posts a model run to a
+   hand-written path constant and a hand-written host constant. The spec
+   declares both -- the path whose ``post.operationId`` is ``runRouterModel``,
+   and ``servers[0].url``. A sync that *moves* the route (the ``/v1`` -> ``/v2``
+   move already on the roadmap) while those constants stay put would leave the
+   SDK posting to a route the contract no longer declares, with nothing else in
+   CI noticing.
 
-``tests/test_router_spec_contract.py`` asserts the same thing from the test
+``tests/test_router_spec_contract.py`` asserts the same things from the test
 suite. Both exist on purpose: the suite is where a contributor sees it, and
 this script is the job that fails a spec-only PR that never ran pytest.
 """
@@ -117,6 +125,99 @@ def _declared_router_error_types() -> list[str]:
     return values
 
 
+def _declared_run_route() -> tuple[str, str]:
+    """The spec's ``(runRouterModel path, servers[0].url)``.
+
+    Same failure policy as :func:`_declared_router_error_types`: every way the
+    file can be unusable becomes a ``ValueError`` with a sentence someone can
+    act on, rather than a traceback that reads like a bug in the checker.
+    """
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - depends on the install extra
+        raise ValueError(
+            f"PyYAML is not installed, so {ROUTER_SPEC.name} cannot be read "
+            "(pip install -e '.[dev]')"
+        ) from exc
+
+    try:
+        doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"{ROUTER_SPEC.name} could not be read: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{ROUTER_SPEC.name} is not valid YAML: {exc}") from exc
+
+    if not isinstance(doc, dict):
+        raise ValueError(f"{ROUTER_SPEC.name} is not a mapping at the top level")
+    paths = doc.get("paths")
+    if not isinstance(paths, dict):
+        raise ValueError(f"{ROUTER_SPEC.name} has no paths object")
+    # Searched by operationId rather than looked up by the path we expect: a
+    # lookup would silently find nothing the day the path moves, which is the
+    # one day this check exists for.
+    declared = [
+        path
+        for path, item in paths.items()
+        if isinstance(item, dict)
+        and isinstance(item.get("post"), dict)
+        and item["post"].get("operationId") == "runRouterModel"
+    ]
+    if len(declared) != 1:
+        raise ValueError(
+            f"{ROUTER_SPEC.name} declares {len(declared)} paths with "
+            f"post.operationId 'runRouterModel' (expected exactly 1): {declared}"
+        )
+    servers = doc.get("servers")
+    if not isinstance(servers, list) or not servers or not isinstance(servers[0], dict):
+        raise ValueError(f"{ROUTER_SPEC.name} has no servers[0]")
+    host = servers[0].get("url")
+    if not isinstance(host, str) or not host:
+        raise ValueError(f"{ROUTER_SPEC.name}'s servers[0].url is not a non-empty string")
+    return declared[0], host
+
+
+def _check_router_run_route() -> int:
+    if not ROUTER_SPEC.exists():
+        print(f"ERROR: {ROUTER_SPEC.name} is missing from spec/", file=sys.stderr)
+        return 1
+    sys.path.insert(0, str(ROOT / "src"))
+    try:
+        from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE, ROUTER_BASE_URL
+    except Exception as exc:
+        print(f"ERROR: comfy_low.transport does not import: {exc!r}", file=sys.stderr)
+        return 1
+
+    try:
+        declared_path, declared_host = _declared_run_route()
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    failed = False
+    if declared_path != _MODEL_RUN_PATH_TEMPLATE:
+        print(
+            f"ERROR: the bound model-run route has drifted from {ROUTER_SPEC.name}.\n"
+            f"  spec (runRouterModel): {declared_path}\n"
+            f"  sdk  (_MODEL_RUN_PATH_TEMPLATE): {_MODEL_RUN_PATH_TEMPLATE}\n"
+            "  Update comfy_low.transport._MODEL_RUN_PATH_TEMPLATE to the spec's path.",
+            file=sys.stderr,
+        )
+        failed = True
+    if declared_host != ROUTER_BASE_URL:
+        print(
+            f"ERROR: the default router host has drifted from {ROUTER_SPEC.name}.\n"
+            f"  spec (servers[0].url): {declared_host}\n"
+            f"  sdk  (ROUTER_BASE_URL): {ROUTER_BASE_URL}\n"
+            "  Update comfy_low.transport.ROUTER_BASE_URL to the spec's server URL.",
+            file=sys.stderr,
+        )
+        failed = True
+    if failed:
+        return 1
+    print(f"OK: the SDK posts a model run to {declared_host}{declared_path}, as the spec declares")
+    return 0
+
+
 def _check_models() -> int:
     if not COMMITTED.exists():
         print("ERROR: committed models missing; run scripts/gen_models.sh", file=sys.stderr)
@@ -208,12 +309,13 @@ def _run(name: str, check: Callable[[], int]) -> int:
 
 
 def main() -> int:
-    # Both run every time: reporting only the first failure would hide the
-    # second one behind a fix for the first. `max` over both results rather
-    # than a short-circuit for the same reason.
+    # All three run every time: reporting only the first failure would hide the
+    # others behind a fix for it. `max` over the results rather than a
+    # short-circuit for the same reason.
     return max(
         _run("models", _check_models),
         _run("router error types", _check_router_error_types),
+        _run("router run route", _check_router_run_route),
     )
 
 
