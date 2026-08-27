@@ -487,12 +487,19 @@ def test_retry_after_is_preserved_on_the_throttled_buckets(error_type: str) -> N
 
 
 def test_retry_after_is_preserved_on_a_deadline_exceeded_504() -> None:
-    # The bucket whose docstring tells the caller a Retry-After says when to
-    # ask. Under `retry_possibly_in_flight=True` the policy honours it.
+    # The bucket whose contract tells the caller to retry with the SAME key and
+    # whose Retry-After says when. The default policy makes that retry, so the
+    # header being dropped here would silently disable it.
+    from comfy_sdk.retry import RetryPolicy
+
     status, headers, body = stub_error_response("deadline_exceeded", 504)
     exc = error_from_response(status, {**headers, "Retry-After": "5"}, body)
     assert isinstance(exc, DeadlineExceeded)
     assert exc.retry_after == 5
+    assert RetryPolicy().should_retry(exc) is True
+    # ...and without the pace there is no generation to collect, so it is not.
+    unpaced = error_from_response(status, headers, body)
+    assert RetryPolicy().should_retry(unpaced) is False
 
 
 def test_the_retry_after_header_is_matched_case_insensitively() -> None:

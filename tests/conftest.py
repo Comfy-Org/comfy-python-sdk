@@ -114,9 +114,19 @@ class ServerState:
     # is the vendored contract (reject-on-duplicate, no replay), under which a
     # same-key retry after a 5xx can only come back 422.
     model_run_replays_idempotency_key: bool = False
-    # Seconds sent as Retry-After alongside `model_run_error`, when that error
-    # is the 429 the policy is allowed to pace itself against. `None` sends no
-    # header at all, which is the 429 the policy must *not* retry.
+    # The narrower carry the router contract describes for `deadline_exceeded`:
+    # the reservation survives the 504 with a handle to the generation stamped
+    # on it, so the SAME key presented again *collects* that generation instead
+    # of being rejected 422. Only the 504 behaves that way — every other 5xx
+    # still claims the key — which is what makes this distinct from
+    # `model_run_replays_idempotency_key`, the whole-deployment replay the
+    # `retry_possibly_in_flight` opt-in exists for.
+    model_run_collects_after_deadline: bool = False
+    # Seconds sent as Retry-After alongside `model_run_error` /
+    # `model_run_transient_error`, for the failures the policy is allowed to
+    # pace itself against (a 429, a `deadline_exceeded` 504, an in-progress
+    # 409). `None` sends no header at all, which is the same failure the policy
+    # must *not* retry.
     model_run_retry_after: str | None = None
 
     # --- counters the tests assert on ---
@@ -467,10 +477,17 @@ def _make_handler(state: ServerState):
             def claim_if_outcome_unknown(status: int) -> None:
                 # The contract releases a key for a request that definitively
                 # failed without starting work (a 4xx) and keeps it claimed
-                # when the outcome is unknown (a 5xx). A replaying deployment
-                # is the exception, and is what the opt-in is for.
-                if key and status >= 500 and not state.model_run_replays_idempotency_key:
-                    state.model_run_idempotency[key] = "claimed"
+                # when the outcome is unknown (a 5xx). Two exceptions: a
+                # replaying deployment (what the opt-in is for), and the
+                # router's `deadline_exceeded` 504, whose reservation survives
+                # so the same key can collect the generation still running.
+                if not key or status < 500:
+                    return
+                if state.model_run_replays_idempotency_key:
+                    return
+                if state.model_run_collects_after_deadline and status == 504:
+                    return
+                state.model_run_idempotency[key] = "claimed"
 
             def fail(status: int, code: str, message: str) -> None:
                 claim_if_outcome_unknown(status)

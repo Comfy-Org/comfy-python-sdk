@@ -15,24 +15,28 @@ retry as the same request rather than a second order. The key is sent
 unconditionally — there is no configuration that turns it off — because a retry
 without it is exactly the double-charge above.
 
-**Only failures the key survives are retried by default.** Every documented
-statement this repo makes about ``Idempotency-Key`` says it is *single-use,
-reject-on-duplicate, with no response replay* — ``spec/openapi.yaml``'s shared
-``IdempotencyKey`` parameter, :class:`~comfy_sdk.exceptions.IdempotencyKeyReuse`
-and the README all agree that a later request presenting the same key is
-rejected ``422`` ``idempotency_key_reuse`` rather than re-run or replayed. The
-spec is equally explicit about when a key is *released* instead of claimed: a
-request that "definitively fails without creating a job (a validation error, or
-an upstream reject such as out-of-credits or queue-full)" frees it, while one
-whose outcome the server cannot characterise ("an upstream timeout or 5xx where
-the job may or may not have been created") keeps it claimed.
+**Only failures the key survives are retried by default.** The v2 jobs contract
+in ``spec/openapi.yaml`` makes its shared ``IdempotencyKey`` parameter
+*single-use, reject-on-duplicate, with no response replay*: the first request to
+present a key is processed and any later one presenting it is rejected ``422``
+``idempotency_key_reuse`` rather than re-run or replayed (see
+:class:`~comfy_sdk.exceptions.IdempotencyKeyReuse`). That spec is equally
+explicit about when a key is *released* instead of claimed: a request that
+"definitively fails without creating a job (a validation error, or an upstream
+reject such as out-of-credits or queue-full)" frees it, while one whose outcome
+the server cannot characterise ("an upstream timeout or 5xx where the job may or
+may not have been created") keeps it claimed.
 
-``POST /models/run`` is not itself in that spec, so its key semantics are
-undocumented — which is the point. Retrying under one key is only safe against a
-server that *replays* a claimed key, and nothing here says this route does; the
-alternatives are a ``422`` that replaces the real error, or a second billed
-generation. So the SDK retries by default only where the key is provably still
-unspent, and leaves the rest to an explicit opt-in.
+``POST /models/run`` is not itself in that spec, so its key semantics are not
+that spec's to state — and for one failure the *router* contract states them
+directly. ``spec/router-openapi.yaml``'s ``deadline_exceeded`` bucket says to
+"retry it with the SAME ``Idempotency-Key``: when the provider had already
+accepted the generation, the retry collects that generation rather than
+dispatching another", and pins the ``Retry-After`` it carries to "seconds to
+wait before retrying the SAME request with the SAME ``Idempotency-Key``". So
+the sorting rule is unchanged — retry where the one key is documented to be
+spendable again — and one class is added to it, for the case where the server
+has already said so on the wire.
 
 That, not a guess about the network, is what sorts the failures:
 
@@ -46,16 +50,33 @@ That, not a guess about the network, is what sorts the failures:
    out-of-credits, a concurrency limit) and tells clients to treat "429 +
    ``Retry-After``" as back-off-and-retry, so it is retried by default at the
    pace the server asked for rather than a blind backoff of our own.
-3. **Outcome unknown** — a completed 5xx, or a transport failure that may have
-   delivered the request in full (a read timeout on a run is the important
-   member: the generation-sized client timeout expired with no answer, which is
-   precisely when the server is most likely still generating). This is the
-   class the spec keeps the key claimed for, so a same-key retry here is a
-   ``422`` that replaces the real error — and a *fresh*-key retry is the second
-   billed generation this module exists to prevent. Not retried by default.
-   :attr:`RetryPolicy.retry_possibly_in_flight` opts in, and it is correct
-   exactly when a deployment replays a repeated key instead of rejecting it.
-4. **Everything else** — every other 4xx is the server's considered answer
+3. **Collectable** — the server answered that the work it already holds is not
+   finished, *and* named the pace at which to ask the same key again for it: a
+   router ``deadline_exceeded`` ``504`` carrying ``Retry-After``, and a ``409``
+   carrying ``Retry-After`` ("still in progress") from the idempotency layer on
+   the retry that follows it. This is the one class where the *server* has
+   stated the same-key resend is safe, and the pace it names is its own poll
+   interval — so it is retried by default, at that pace, and one ``run()`` call
+   rides the collect loop to the finished generation instead of handing the
+   caller a ``504`` for work that is still running.
+   :func:`is_collectable` is the predicate and
+   :attr:`RetryPolicy.retry_collectable` switches it off. Two gates keep it
+   narrow: the ``504`` must name the ``deadline_exceeded`` bucket (a bucket-less
+   ``504`` reads as ``provider_timeout``, where no contract blesses the resend),
+   and the ``Retry-After`` must be there (the router sends it only when it holds
+   a handle to a generation to collect — absent it, there is nothing to collect
+   and the ``504`` falls back to class 4).
+4. **Outcome unknown** — a completed 5xx that named no collectable pace, or a
+   transport failure that may have delivered the request in full (a read timeout
+   on a run is the important member: the generation-sized client timeout expired
+   with no answer, which is precisely when the server is most likely still
+   generating). Nothing on the wire says the key survives this, so a same-key
+   retry may be a ``422`` that replaces the real error — and a *fresh*-key retry
+   is the second billed generation this module exists to prevent. Not retried by
+   default. :attr:`RetryPolicy.retry_possibly_in_flight` opts in, and it is
+   correct exactly when a deployment replays a repeated key instead of rejecting
+   it.
+5. **Everything else** — every other 4xx is the server's considered answer
    about *this* request, and asking again spends money to be refused again.
    Never retried.
 
@@ -67,16 +88,17 @@ a ``503``, and the question this module answers before retrying anything is not
 Neither vendored contract says a ``503`` releases the key; the v2 contract says
 the opposite for the whole 5xx class ("an upstream timeout or 5xx where the job
 may or may not have been created" keeps it claimed), and the router spec
-documents a same-key retry for exactly one bucket, ``deadline_exceeded``, and is
-silent about this one. Retrying it by default would therefore trade a
+documents a same-key retry for exactly one bucket, ``deadline_exceeded`` — which
+is why that one is class 3 above and this one is not. The spec is silent about
+what a ``503`` does to the key. Retrying it by default would therefore trade a
 diagnosable ``503`` for a ``422 idempotency_key_reuse`` on every deployment that
-rejects a repeated key. So it stays in class 3 above, where
+rejects a repeated key. So it stays in class 4 above, where
 :attr:`RetryPolicy.retry_possibly_in_flight` opts in — and that opt-in is the
 route to the contract's advice, because it keeps the one key across the retry.
 
 Know what the opt-in costs, though: it is a property of the *policy*, not of one
 bucket, so switching it on to get the blessed ``503`` retry also opts into
-retrying every other completed 5xx and the client-side read timeout — class 3
+retrying every other completed 5xx and the client-side read timeout — class 4
 entire, including the case this module calls the dangerous one. There is no
 per-bucket switch, deliberately: which failures a deployment's key survives is a
 fact about the deployment, not about the bucket, and a policy that claimed
@@ -124,13 +146,28 @@ a wait far longer than anything anybody chose. ``max_elapsed`` bounds when the
 *last* attempt may start, so the worst case is that bound plus one per-attempt
 timeout, and the number of attempts falls out of the backoff schedule.
 
+**The default budget is one server deadline window**, ten minutes — the same
+number as :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT`, deliberately, because
+that is how long this surface is already willing to wait for one attempt. A
+collect loop that outlives the deadline it is collecting after is the whole
+point of class 3: the ``504`` says the server stopped holding *this* connection
+at its own bound while the generation ran on, so a budget shorter than that bound
+gives up mid-generation and hands the caller an error for work it will still be
+charged for. The old 60-second budget was sized for the fast classes alone (a
+connect failure, a paced ``429``) and could not outlast a single deadline
+window. The cost of the larger default is paid in the *other* classes, and it is
+worth naming: a genuinely unreachable server now spends up to ten minutes in
+connect-and-back-off before it raises, where before it spent one. Pass
+``RetryPolicy(max_elapsed=60.0)`` to get the old bound back.
+
 Retry is on by default. ``Comfy(retry=NO_RETRY)`` turns it off; any other
 policy is a :class:`RetryPolicy` you construct::
 
     from comfy_sdk import Comfy, NO_RETRY, RetryPolicy
 
     Comfy(retry=NO_RETRY)                              # exactly one attempt
-    Comfy(retry=RetryPolicy(max_elapsed=300.0))        # keep trying for 5 min
+    Comfy(retry=RetryPolicy(max_elapsed=60.0))         # give up after a minute
+    Comfy(retry=RetryPolicy(retry_collectable=False))  # no 504/409 collect loop
 """
 
 from __future__ import annotations
@@ -168,8 +205,23 @@ _POSSIBLY_IN_FLIGHT: tuple[type[BaseException], ...] = (
     httpx.RemoteProtocolError,
 )
 
-#: The one 4xx another attempt can change, and only when it carries a pace.
+#: The one 4xx another attempt can change on its own, and only when it carries
+#: a pace.
 _TOO_MANY_REQUESTS = 429
+
+#: The 4xx the idempotency layer answers while the work the key already names is
+#: still running. Retryable only when it carries a pace — see :func:`is_collectable`.
+_CONFLICT = 409
+
+#: Shared by the router's ``deadline_exceeded`` and ``provider_timeout`` buckets,
+#: which is why the collect rule keys on the bucket and not on this.
+_GATEWAY_TIMEOUT = 504
+
+#: The one router bucket whose contract blesses a same-key resend: "retry it with
+#: the SAME ``Idempotency-Key``: when the provider had already accepted the
+#: generation, the retry collects that generation rather than dispatching
+#: another" (``spec/router-openapi.yaml``).
+_DEADLINE_EXCEEDED = "deadline_exceeded"
 
 #: Policy fields that must be real numbers for the arithmetic below to mean
 #: anything. Kept beside the fields themselves so a numeric one added later is
@@ -193,6 +245,13 @@ def is_unknown_outcome_status(status: int) -> bool:
     A ``502``/``504`` from an intermediary belongs here for the same reason:
     the proxy's response completed, which says nothing about whether the origin
     behind it stopped generating.
+
+    This answers the *status* only, so it is still true of the one 5xx the
+    router contract does characterise — a ``deadline_exceeded`` ``504`` naming a
+    pace. :meth:`RetryPolicy.should_retry` consults :func:`is_collectable`
+    first, which is where that response stops being "unknown"; the outcome of
+    the *request* is genuinely still unknown there, and what the contract adds
+    is that asking again with the same key is how you find it out.
     """
     return 500 <= status <= 599
 
@@ -218,6 +277,62 @@ def retry_after_of(exc: BaseException) -> float | None:
     return seconds
 
 
+def error_bucket_of(exc: BaseException) -> str | None:
+    """The failure bucket the server named, or ``None`` if it named none.
+
+    Read by attribute rather than by type, for the same reason
+    :func:`retry_after_of` is: one failure reaches this module modelled by two
+    different layers. A typed router error carries the wire ``error_type``
+    (``RouterError.error_type``), while ``POST /models/run`` today raises the
+    protocol :class:`~comfy_low.errors.ApiError`, whose envelope names the same
+    thing ``code``. Reading only ``error_type`` would make every bucket-keyed
+    rule below unreachable on the route those rules were written for — a retry
+    that is a silent no-op with no test failing, which is the failure mode this
+    module has already been bitten by twice.
+
+    Both attribute names are namespaced enough for that to be safe: the buckets
+    the rules below key on do not exist as v2 envelope codes, so a ``code`` that
+    reads as a router bucket *is* one.
+    """
+    for attribute in ("error_type", "code"):
+        raw = getattr(exc, attribute, None)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
+
+
+def is_collectable(exc: BaseException) -> bool:
+    """Whether the server said this failure's own work can be collected.
+
+    True for the two answers that mean "the work your key already names is not
+    finished; ask again for it", each of which the server pairs with the pace to
+    ask at:
+
+    * a router ``deadline_exceeded`` ``504`` carrying ``Retry-After`` — Comfy
+      stopped holding the connection at its own bound while the generation ran
+      on, and the contract says to "retry it with the SAME ``Idempotency-Key``",
+      which "collects that generation rather than dispatching another";
+    * a ``409`` carrying ``Retry-After`` — the idempotency layer's answer that
+      the request under this key is still in progress, which is what the collect
+      retry above meets when it arrives before the generation finishes.
+
+    Both gates are load-bearing. The ``504`` must name its bucket because
+    ``deadline_exceeded`` shares that status with ``provider_timeout``, where no
+    contract blesses the resend and a header-less ``504`` from an intermediary is
+    read as exactly that. The ``Retry-After`` must be present because the router
+    sends it on a ``deadline_exceeded`` "only when Comfy holds a handle to a
+    generation the provider is still running" — without it there is nothing to
+    collect, and a resend would be dispatching new work rather than gathering
+    old. A ``409`` with no pace is an ordinary conflict and stays a refusal.
+    """
+    status = getattr(exc, "http_status", None)
+    if not isinstance(status, int) or retry_after_of(exc) is None:
+        return False
+    if status == _CONFLICT:
+        return True
+    return status == _GATEWAY_TIMEOUT and error_bucket_of(exc) == _DEADLINE_EXCEEDED
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     """When and how often to retry one logical call.
@@ -230,8 +345,12 @@ class RetryPolicy:
     #: Seconds from the first attempt after which no *new* attempt is started.
     #: An attempt already running is never interrupted by it, so the worst-case
     #: wall clock for a call is this plus one per-attempt ``timeout``. Zero
-    #: disables retrying entirely (see :data:`NO_RETRY`).
-    max_elapsed: float = 60.0
+    #: disables retrying entirely (see :data:`NO_RETRY`). The default is one
+    #: server deadline window — the same ten minutes as
+    #: :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT` — so that a collect loop
+    #: after a ``deadline_exceeded`` ``504`` can outlast the bound that produced
+    #: it; see this module's docstring for what that costs the other classes.
+    max_elapsed: float = 600.0
     #: Ceiling on the delay before the first retry. With ``jitter`` on — the
     #: default — the actual delay is drawn from ``[0, this]``.
     initial_backoff: float = 0.5
@@ -247,18 +366,31 @@ class RetryPolicy:
     #: together would otherwise retry together, converting one outage into a
     #: synchronised thundering herd on the recovering server.
     jitter: bool = True
-    #: Also retry when the request's outcome is unknown — a completed 5xx, or a
-    #: transport failure that may have delivered the request, so the server may
-    #: still be generating. Off by default, and the reason is the contract
-    #: rather than caution: every documented statement about
-    #: ``Idempotency-Key`` makes it single-use with no replay, and the spec
-    #: keeps it *claimed* across exactly this class of failure — so a same-key
-    #: retry here comes back ``422`` ``idempotency_key_reuse`` and hides the
-    #: real error. Turn it on for a deployment that replays a repeated key
-    #: instead of rejecting it — and raise ``max_elapsed`` when you do, since
-    #: one full-length client timeout on a run can spend the default budget on
+    #: Also retry when the request's outcome is *unknown* — a completed 5xx that
+    #: named no collectable pace, or a transport failure that may have delivered
+    #: the request, so the server may still be generating. This is the class no
+    #: contract characterises, which is what keeps it distinct from
+    #: :attr:`retry_collectable`: there the server named the resend safe, here
+    #: nothing did. Off by default, and the reason is the contract rather than
+    #: caution: the v2 jobs contract makes ``Idempotency-Key`` single-use with no
+    #: replay and keeps it *claimed* across exactly this class of failure — so a
+    #: same-key retry here can come back ``422`` ``idempotency_key_reuse`` and
+    #: hide the real error. Turn it on for a deployment that replays a repeated
+    #: key instead of rejecting it — and raise ``max_elapsed`` when you do, since
+    #: one full-length client timeout on a run spends the whole default budget on
     #: its own.
     retry_possibly_in_flight: bool = False
+    #: Retry the failures the server itself paced for a same-key resend — a
+    #: router ``deadline_exceeded`` ``504`` and an in-progress ``409``, each
+    #: carrying ``Retry-After``. See :func:`is_collectable` for the exact gates.
+    #: **On by default**, because this is the one class where the contract says
+    #: the resend collects the generation already running rather than
+    #: dispatching a second one, and the ``Retry-After`` is the server's own
+    #: poll interval. Switch it off to have those answers raised to the caller
+    #: instead — the whole retry surface goes away with ``NO_RETRY``. It is
+    #: declared last, out of reading order, so that inserting it cannot change
+    #: what an existing positional ``RetryPolicy(...)`` means.
+    retry_collectable: bool = True
 
     def __post_init__(self) -> None:
         for name in _NUMERIC_FIELDS:
@@ -289,10 +421,12 @@ class RetryPolicy:
 
         An exception carrying an ``http_status`` is a response the server
         actually sent, whatever layer modelled it (the protocol ``ApiError``,
-        an SDK exception, a router one) — so the status decides. Everything
-        else is a transport failure, decided by whether the request can still
-        be executing server-side. See this module's docstring for the four
-        classes and why the key's contract, not the network, sorts them.
+        an SDK exception, a router one) — so the status decides, with the
+        failure bucket breaking the one tie a status cannot (the two ``504``
+        buckets). Everything else is a transport failure, decided by whether the
+        request can still be executing server-side. See this module's docstring
+        for the five classes and why the key's contract, not the network, sorts
+        them.
         """
         status = getattr(exc, "http_status", None)
         if isinstance(status, int):
@@ -302,14 +436,24 @@ class RetryPolicy:
                 # attached: the spec's retry signal is "429 + Retry-After",
                 # and a 429 without one is not asking to be asked again.
                 return retry_after_of(exc) is not None
+            if self.retry_collectable and is_collectable(exc):
+                # Checked before both branches below, because it overrides
+                # both: a `deadline_exceeded` 504 is a 5xx the router contract
+                # nevertheless blesses a same-key resend for, and an
+                # in-progress 409 is a 4xx that does become true on a later
+                # ask. Everything narrowing it to those two answers lives in
+                # `is_collectable`.
+                return True
             if is_unknown_outcome_status(status):
-                # Every 5xx, including the router's `service_unavailable` 503:
-                # the bucket says the condition clears on its own, but nothing
-                # says the Idempotency-Key does. See this module's docstring.
+                # Every other 5xx, including the router's `service_unavailable`
+                # 503: the bucket says the condition clears on its own, but
+                # nothing says the Idempotency-Key does. See this module's
+                # docstring.
                 return self.retry_possibly_in_flight
-            # Every other 4xx is deterministic — 404 (no such model), 409, 422
-            # (invalid input), a content-policy refusal — and none of them
-            # become true on the second ask.
+            # Every other 4xx is deterministic — 404 (no such model), a
+            # conflict that named no pace, 422 (invalid input), a
+            # content-policy refusal — and none of them become true on the
+            # second ask.
             return False
         if isinstance(exc, _NEVER_DELIVERED):
             return True
@@ -418,6 +562,8 @@ __all__ = [
     "NO_RETRY",
     "Retrier",
     "RetryPolicy",
+    "error_bucket_of",
+    "is_collectable",
     "is_unknown_outcome_status",
     "retry_after_of",
 ]

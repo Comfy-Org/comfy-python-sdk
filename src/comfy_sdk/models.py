@@ -134,18 +134,29 @@ class Models(_ModelsBase):
 
         An ``Idempotency-Key`` is sent on every run; a fresh one is minted per
         call unless ``idempotency_key`` is given, so an accidental exact resend
-        is the server's to reject rather than a second charged generation.
+        is the server's to deduplicate rather than a second charged generation.
 
         A failed attempt is retried under the client's policy, backed off with
         jitter and bounded by total elapsed time. **Every attempt of this one
         call reuses the one key**, which is what stops a retry from being
         billed as a second generation; calling ``run`` again is a new call and
-        mints a new key. Because the key is single-use and reject-on-duplicate,
-        only failures that leave it unclaimed are retried by default —
-        connect-phase failures, and a ``429`` that names a ``Retry-After``. A
-        completed 5xx or a client-side timeout leaves the outcome unknown, and
-        with it the key claimed, so those need
-        ``RetryPolicy(retry_possibly_in_flight=True)``. See
+        mints a new key. A key presented twice is *not* re-run: on the router
+        surface a resend of the same key with the same body collects the
+        generation the first request started rather than dispatching another,
+        and a resend with a *different* body is rejected ``422``
+        ``idempotency_key_reuse`` — which is why the body is snapshotted before
+        the first attempt. (The single-use, reject-on-duplicate rule
+        ``spec/openapi.yaml`` states is the **v2 jobs API**'s, and governs
+        ``submit()``, not this route.)
+
+        Retried by default: connect-phase failures, a ``429`` that names a
+        ``Retry-After``, and the answers that name a pace for collecting work
+        already running — a ``deadline_exceeded`` ``504`` and an in-progress
+        ``409``, each carrying ``Retry-After``. One ``run()`` can therefore ride
+        the collect loop through a server-side deadline to the finished
+        generation. Not retried by default: a completed 5xx that named no such
+        pace, and a client-side timeout — those leave the outcome genuinely
+        unknown and need ``RetryPolicy(retry_possibly_in_flight=True)``. See
         :mod:`comfy_sdk.retry`, and ``Comfy(retry=NO_RETRY)`` to switch it off.
         """
         low = cast(ComfyLow, self._low)
