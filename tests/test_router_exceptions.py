@@ -468,3 +468,64 @@ def test_the_shared_names_are_not_the_workflow_surface_classes() -> None:
         assert router_cls is not workflow_cls
         assert not issubclass(router_cls, workflow_cls)
         assert issubclass(router_cls, RouterError)
+
+
+# -- Retry-After survives onto the exception ---------------------------------
+#
+# Not a cosmetic attribute: `RetryPolicy.should_retry` decides a 429 with
+# `retry_after_of(exc) is not None`, so a router error that dropped the header
+# would make the 429 branch permanently False -- and the throttled buckets are
+# the ones the default policy exists to retry. These assert the wiring end to
+# end rather than just the parse.
+
+
+@pytest.mark.parametrize("error_type", ["rate_limited", "concurrency_limit_exceeded"])
+def test_retry_after_is_preserved_on_the_throttled_buckets(error_type: str) -> None:
+    status, headers, body = stub_error_response(error_type, 429)
+    exc = error_from_response(status, {**headers, "Retry-After": "30"}, body)
+    assert exc.retry_after == 30
+
+
+def test_retry_after_is_preserved_on_a_deadline_exceeded_504() -> None:
+    # The bucket whose docstring tells the caller a Retry-After says when to
+    # ask. Under `retry_possibly_in_flight=True` the policy honours it.
+    status, headers, body = stub_error_response("deadline_exceeded", 504)
+    exc = error_from_response(status, {**headers, "Retry-After": "5"}, body)
+    assert isinstance(exc, DeadlineExceeded)
+    assert exc.retry_after == 5
+
+
+def test_the_retry_after_header_is_matched_case_insensitively() -> None:
+    exc = error_from_response(
+        429, {"retry-after": "12", "x-comfy-error-type": "rate_limited"}, None
+    )
+    assert isinstance(exc, RateLimited)
+    assert exc.retry_after == 12
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "soon", "Wed, 21 Oct 2015 07:28:00 GMT", "1.5", "-3"])
+def test_an_unusable_retry_after_is_absent_rather_than_trusted(raw: str) -> None:
+    # Including the HTTP-date form the RFC permits: it is deliberately not
+    # parsed here (guessing at clock skew is worse than the local backoff
+    # schedule), and a negative value would otherwise be waited on.
+    exc = error_from_response(429, {ERROR_TYPE_HEADER: "rate_limited", "Retry-After": raw}, None)
+    assert exc.retry_after is None
+
+
+def test_no_retry_after_header_is_none() -> None:
+    status, headers, body = stub_error_response("rate_limited", 429)
+    assert error_from_response(status, headers, body).retry_after is None
+
+
+def test_the_default_policy_retries_a_throttled_bucket_that_named_a_pace() -> None:
+    # The end-to-end property the parse exists for. Without the header the 429
+    # is not asking to be asked again, so the same policy declines it.
+    from comfy_sdk.retry import RetryPolicy
+
+    policy = RetryPolicy()
+    paced = error_from_response(429, {ERROR_TYPE_HEADER: "rate_limited", "Retry-After": "7"}, None)
+    unpaced = error_from_response(429, {ERROR_TYPE_HEADER: "rate_limited"}, None)
+
+    assert isinstance(paced, RateLimited)
+    assert policy.should_retry(paced) is True
+    assert policy.should_retry(unpaced) is False

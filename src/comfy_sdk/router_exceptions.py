@@ -87,6 +87,17 @@ ERROR_TYPE_HEADER = "X-Comfy-Error-Type"
 #: to every exception this module raises.
 REQUEST_ID_HEADER = "X-Comfy-Request-Id"
 
+#: Response header naming the pace at which to ask again, in seconds. The
+#: contract documents it on the throttled buckets (:class:`RateLimited`,
+#: :class:`ConcurrencyLimitExceeded`) and on a ``deadline_exceeded`` ``504``.
+#: It is read here rather than dropped because
+#: :func:`comfy_sdk.retry.retry_after_of` is what
+#: :meth:`~comfy_sdk.retry.RetryPolicy.should_retry` keys its ``429`` branch on:
+#: a router error that arrived without this attribute would make that branch
+#: unreachable and turn the retry the default policy is built to make into a
+#: silent no-op.
+RETRY_AFTER_HEADER = "Retry-After"
+
 
 @dataclass(frozen=True)
 class ValidationErrorDetail:
@@ -143,6 +154,7 @@ class RouterError(ComfyError):
         error_type: str | None = None,
         http_status: int | None = None,
         request_id: str | None = None,
+        retry_after: int | None = None,
         errors: Sequence[ValidationErrorDetail] = (),
     ) -> None:
         resolved = error_type if error_type is not None else self.error_type
@@ -155,6 +167,12 @@ class RouterError(ComfyError):
         #: Server-minted id for the call, from ``X-Comfy-Request-Id``. ``None``
         #: only when the response carried no such header.
         self.request_id = request_id
+        #: Seconds the server asked the caller to wait, from ``Retry-After``,
+        #: or ``None`` when it named no pace. Named identically to
+        #: ``comfy_low.ApiError.retry_after`` on purpose: the retry policy
+        #: reads it off either with one ``getattr``, so a router error and a
+        #: protocol one are paced the same way.
+        self.retry_after = retry_after
         #: Per-field validation failures, populated whenever the response
         #: carried the ``detail`` *array* -- see :class:`ValidationErrorDetail`.
         #: Empty for every failure that names no field. It lives on the base
@@ -262,6 +280,19 @@ class DeadlineExceeded(RouterError):
     ``Idempotency-Key`` -- when the provider had already accepted the
     generation, the retry collects that generation rather than dispatching
     another, and a ``Retry-After`` on the ``504`` says when to ask.
+
+    That is the *contract's* advice, and as with :class:`ServiceUnavailable` the
+    SDK does **not** follow it by default. The bucket arrives on a ``504``, so
+    :func:`comfy_sdk.retry.is_unknown_outcome_status` sorts it with every other
+    5xx and the default policy declines the retry;
+    ``RetryPolicy(retry_possibly_in_flight=True)`` opts in, and does keep the
+    one key across it. The policy cannot special-case this bucket on the status
+    alone, either -- a ``504`` reaching the SDK without a bucket header is read
+    as :class:`ProviderTimeout`, where a same-key retry is *not* blessed. What
+    the opt-in does honour is the pace: ``error_from_response`` preserves the
+    ``Retry-After`` on the exception, and
+    :meth:`~comfy_sdk.retry.Retrier.delay_before_retry` prefers a named pace
+    over its own jittered backoff.
     """
 
     error_type = "deadline_exceeded"
@@ -372,9 +403,9 @@ ROUTER_ERROR_TYPES: tuple[str, ...] = tuple(_BY_ERROR_TYPE)
 # while the three new buckets are Comfy-specific claims about the router's own
 # rollout, allowance windows and connection bound -- claims a proxy that never
 # reached the router is not in a position to be making. (For `429` the choice is
-# the narrowest one: both candidates are throttling, and the retry policy keys
-# on the status and `Retry-After` rather than on the bucket, so the class a
-# caller catches is the only thing that differs.)
+# the narrowest one: both candidates are throttling, and `RetryPolicy` keys on
+# the status and the `Retry-After` this module now preserves rather than on the
+# bucket, so the class a caller catches is the only thing that differs.)
 #
 # A status stays OUT of the table when the plain HTTP reading does not pick one
 # bucket. `400` is absent because it carries either `invalid_input` or
@@ -431,6 +462,7 @@ def error_from_response(
     lowered = _lowercase_headers(headers)
     request_id = _clean(lowered.get(REQUEST_ID_HEADER.lower()))
     error_type = _clean(lowered.get(ERROR_TYPE_HEADER.lower()))
+    retry_after = _retry_after(lowered.get(RETRY_AFTER_HEADER.lower()))
 
     detail: str | None = None
     errors: tuple[ValidationErrorDetail, ...] = ()
@@ -456,6 +488,7 @@ def error_from_response(
         error_type=error_type,
         http_status=http_status,
         request_id=request_id,
+        retry_after=retry_after,
         errors=errors,
     )
 
@@ -466,6 +499,25 @@ def _lowercase_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
     if not headers:
         return {}
     return {str(name).lower(): value for name, value in headers.items()}
+
+
+def _retry_after(value: Any) -> int | None:
+    """``Retry-After`` as whole seconds, or ``None`` when it named no usable pace.
+
+    Delta-seconds only, matching ``comfy_low.transport._retry_after`` so one
+    header has one reading across the SDK: the HTTP-date form the RFC also
+    permits is treated as absent rather than parsed here, since guessing at a
+    clock skew is worse than falling back to the local backoff schedule. A
+    negative value is absent too -- it would otherwise reach the retry
+    arithmetic as a delay to be waited.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        seconds = int(value.strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
 
 
 def _clean(value: Any) -> str | None:
@@ -517,6 +569,7 @@ def _summarise(errors: Sequence[ValidationErrorDetail]) -> str:
 __all__ = [
     "ERROR_TYPE_HEADER",
     "REQUEST_ID_HEADER",
+    "RETRY_AFTER_HEADER",
     "ROUTER_ERROR_TYPES",
     "ROUTER_EXCEPTIONS",
     "ClientDisconnected",

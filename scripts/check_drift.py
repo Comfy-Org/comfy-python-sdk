@@ -25,6 +25,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -67,11 +68,30 @@ def _declared_router_error_types() -> list[str]:
     Raises :class:`ValueError` rather than letting a ``KeyError``/``TypeError``
     escape: a sync that reshapes or drops the extension should fail this job
     with a sentence someone can act on, not with a traceback that reads like a
-    bug in the checker.
-    """
-    import yaml
+    bug in the checker. The likelier sync mistakes are turned into the same kind
+    of sentence for the same reason -- an unparseable file (``yaml.YAMLError``),
+    an unreadable one (``OSError``), and a checkout without the ``codegen``
+    extra, where ``import yaml`` itself is what fails.
 
-    doc = yaml.safe_load(ROUTER_SPEC.read_text())
+    ``encoding="utf-8"`` is explicit because the spec's ``meaning`` prose is not
+    ASCII: reading it under a non-UTF-8 locale default -- the Windows case --
+    would raise ``UnicodeDecodeError`` from a file that is perfectly fine.
+    """
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - depends on the install extra
+        raise ValueError(
+            f"PyYAML is not installed, so {ROUTER_SPEC.name} cannot be read "
+            "(pip install -e '.[dev]')"
+        ) from exc
+
+    try:
+        doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"{ROUTER_SPEC.name} could not be read: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{ROUTER_SPEC.name} is not valid YAML: {exc}") from exc
+
     node: object = doc
     for key in ("components", "schemas", "RouterErrorType", "x-comfy-error-types"):
         if not isinstance(node, dict) or key not in node:
@@ -83,6 +103,16 @@ def _declared_router_error_types() -> list[str]:
     for entry in node:
         if not isinstance(entry, dict) or not isinstance(entry.get("value"), str):
             raise ValueError(f"{ROUTER_SPEC.name} has an x-comfy-error-types entry with no value")
+        # Rejected here rather than downstream: `ROUTER_ERROR_TYPES` is built
+        # from a dict and so is deduplicated, and a repeated value would make
+        # the two lists differ only in length -- reported below as "same values,
+        # different order", sending the operator hunting for an ordering diff
+        # that does not exist.
+        if entry["value"] in values:
+            raise ValueError(
+                f"{ROUTER_SPEC.name} declares x-comfy-error-types value "
+                f"{entry['value']!r} more than once"
+            )
         values.append(entry["value"])
     return values
 
@@ -112,7 +142,13 @@ def _check_router_error_types() -> int:
     # Imported here rather than at module scope so the models check above still
     # runs (and still reports) when the package itself will not import.
     sys.path.insert(0, str(ROOT / "src"))
-    from comfy_sdk.router_exceptions import ROUTER_ERROR_TYPES
+    try:
+        from comfy_sdk.router_exceptions import ROUTER_ERROR_TYPES
+    except Exception as exc:
+        # This check supervises that very module, so a syntax or import error
+        # in it is the failure to report, not a traceback to leak.
+        print(f"ERROR: comfy_sdk.router_exceptions does not import: {exc!r}", file=sys.stderr)
+        return 1
 
     try:
         declared = _declared_router_error_types()
@@ -154,10 +190,31 @@ def _check_router_error_types() -> int:
     return 1
 
 
+def _run(name: str, check: Callable[[], int]) -> int:
+    """One check's exit code, with a raised exception counted as a failure.
+
+    Without this a check that *raises* rather than returns takes the whole job
+    down with it -- ``_check_models`` runs ``datamodel-codegen`` under
+    ``check=True``, so a codegen failure is a ``CalledProcessError`` and a
+    missing binary a ``FileNotFoundError``. Either would abort ``main`` before
+    the router check ran, which is exactly the hiding both checks exist to
+    prevent.
+    """
+    try:
+        return check()
+    except Exception as exc:
+        print(f"ERROR: the {name} check failed to run: {exc!r}", file=sys.stderr)
+        return 1
+
+
 def main() -> int:
     # Both run every time: reporting only the first failure would hide the
-    # second one behind a fix for the first.
-    return max(_check_models(), _check_router_error_types())
+    # second one behind a fix for the first. `max` over both results rather
+    # than a short-circuit for the same reason.
+    return max(
+        _run("models", _check_models),
+        _run("router error types", _check_router_error_types),
+    )
 
 
 if __name__ == "__main__":

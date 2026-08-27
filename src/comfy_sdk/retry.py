@@ -74,6 +74,15 @@ rejects a repeated key. So it stays in class 3 above, where
 :attr:`RetryPolicy.retry_possibly_in_flight` opts in — and that opt-in is the
 route to the contract's advice, because it keeps the one key across the retry.
 
+Know what the opt-in costs, though: it is a property of the *policy*, not of one
+bucket, so switching it on to get the blessed ``503`` retry also opts into
+retrying every other completed 5xx and the client-side read timeout — class 3
+entire, including the case this module calls the dangerous one. There is no
+per-bucket switch, deliberately: which failures a deployment's key survives is a
+fact about the deployment, not about the bucket, and a policy that claimed
+otherwise would be guessing. Set it for a deployment documented to replay a
+claimed key, not to reach a single bucket.
+
 Catching :class:`~comfy_sdk.router_exceptions.ServiceUnavailable` and retrying
 by hand is *not* the same thing, and the difference is billable: ``models.run()``
 mints a **fresh** ``Idempotency-Key`` per call, so a bare ``run(...)`` again
@@ -191,10 +200,14 @@ def is_unknown_outcome_status(status: int) -> bool:
 def retry_after_of(exc: BaseException) -> float | None:
     """The pace the server named, in seconds, or ``None`` if it named none.
 
-    Read off whatever exception carries it — the transport parses
-    ``Retry-After`` into ``ApiError.retry_after`` for any status. A value that
-    is not a usable number of seconds is treated as absent rather than trusted
-    into the arithmetic below.
+    Read off whatever exception carries it, by attribute rather than by type:
+    the transport parses ``Retry-After`` into ``ApiError.retry_after`` for any
+    status, and
+    :func:`comfy_sdk.router_exceptions.error_from_response` puts the same header
+    on ``RouterError.retry_after`` under the same name — so the throttled router
+    buckets reach the ``429`` branch below rather than falling out of it for
+    want of a pace. A value that is not a usable number of seconds is treated as
+    absent rather than trusted into the arithmetic below.
     """
     raw = getattr(exc, "retry_after", None)
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
