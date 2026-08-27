@@ -59,6 +59,54 @@ That, not a guess about the network, is what sorts the failures:
    about *this* request, and asking again spends money to be refused again.
    Never retried.
 
+**The router's ``service_unavailable`` is not retried by default.** The vendored
+router contract tells a *caller* to "retry it with backoff: it is the one bucket
+whose condition clears on its own", and that advice is sound — but it arrives on
+a ``503``, and the question this module answers before retrying anything is not
+"will the condition clear" but "is the one ``Idempotency-Key`` still spendable".
+Neither vendored contract says a ``503`` releases the key; the v2 contract says
+the opposite for the whole 5xx class ("an upstream timeout or 5xx where the job
+may or may not have been created" keeps it claimed), and the router spec
+documents a same-key retry for exactly one bucket, ``deadline_exceeded``, and is
+silent about this one. Retrying it by default would therefore trade a
+diagnosable ``503`` for a ``422 idempotency_key_reuse`` on every deployment that
+rejects a repeated key. So it stays in class 3 above, where
+:attr:`RetryPolicy.retry_possibly_in_flight` opts in — and that opt-in is the
+route to the contract's advice, because it keeps the one key across the retry.
+
+Know what the opt-in costs, though: it is a property of the *policy*, not of one
+bucket, so switching it on to get the blessed ``503`` retry also opts into
+retrying every other completed 5xx and the client-side read timeout — class 3
+entire, including the case this module calls the dangerous one. There is no
+per-bucket switch, deliberately: which failures a deployment's key survives is a
+fact about the deployment, not about the bucket, and a policy that claimed
+otherwise would be guessing. Set it for a deployment documented to replay a
+claimed key, not to reach a single bucket.
+
+Catching :class:`~comfy_sdk.router_exceptions.ServiceUnavailable` and retrying
+by hand is *not* the same thing, and the difference is billable: ``models.run()``
+mints a **fresh** ``Idempotency-Key`` per call, so a bare ``run(...)`` again
+after a ``503`` presents a new key for a request the server may already be
+generating — the second billed generation the one-key rule exists to prevent. A
+hand-written retry is only safe when it passes the *same* explicit
+``idempotency_key=`` it used the first time **and** the deployment is documented
+to replay a repeated key rather than reject it::
+
+    import uuid
+    from comfy_sdk.router_exceptions import ServiceUnavailable
+
+    key = str(uuid.uuid4())
+    try:
+        result = client.models.run(model, args, idempotency_key=key)
+    except ServiceUnavailable:
+        result = client.models.run(model, args, idempotency_key=key)  # same key
+
+Against a deployment that rejects a repeated key that retry comes back
+``422 idempotency_key_reuse`` — which is the honest failure, not a double
+charge. When in doubt, prefer ``RetryPolicy(retry_possibly_in_flight=True)``.
+Revisit this the moment the router contract states what a ``503`` does to the
+key.
+
 **A retry never begins while the original attempt might still be running on the
 server.** Beyond the classification above this is also enforced structurally:
 
@@ -152,10 +200,14 @@ def is_unknown_outcome_status(status: int) -> bool:
 def retry_after_of(exc: BaseException) -> float | None:
     """The pace the server named, in seconds, or ``None`` if it named none.
 
-    Read off whatever exception carries it — the transport parses
-    ``Retry-After`` into ``ApiError.retry_after`` for any status. A value that
-    is not a usable number of seconds is treated as absent rather than trusted
-    into the arithmetic below.
+    Read off whatever exception carries it, by attribute rather than by type:
+    the transport parses ``Retry-After`` into ``ApiError.retry_after`` for any
+    status, and
+    :func:`comfy_sdk.router_exceptions.error_from_response` puts the same header
+    on ``RouterError.retry_after`` under the same name — so the throttled router
+    buckets reach the ``429`` branch below rather than falling out of it for
+    want of a pace. A value that is not a usable number of seconds is treated as
+    absent rather than trusted into the arithmetic below.
     """
     raw = getattr(exc, "retry_after", None)
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
@@ -251,6 +303,9 @@ class RetryPolicy:
                 # and a 429 without one is not asking to be asked again.
                 return retry_after_of(exc) is not None
             if is_unknown_outcome_status(status):
+                # Every 5xx, including the router's `service_unavailable` 503:
+                # the bucket says the condition clears on its own, but nothing
+                # says the Idempotency-Key does. See this module's docstring.
                 return self.retry_possibly_in_flight
             # Every other 4xx is deterministic — 404 (no such model), 409, 422
             # (invalid input), a content-policy refusal — and none of them

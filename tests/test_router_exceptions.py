@@ -21,14 +21,18 @@ from comfy_sdk.router_exceptions import (
     ClientDisconnected,
     ConcurrencyLimitExceeded,
     ContentPolicyViolation,
+    DeadlineExceeded,
     Forbidden,
     InsufficientCredits,
     InternalError,
     InvalidInput,
     ModelNotFound,
+    NotEnabled,
     ProviderError,
     ProviderTimeout,
+    RateLimited,
     RouterError,
+    ServiceUnavailable,
     Unauthorized,
     ValidationErrorDetail,
     error_from_response,
@@ -39,7 +43,11 @@ REQUEST_ID = "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21"
 
 # (error_type, the status the router returns with it, the class it must raise).
 # The statuses are part of the case on purpose: they document the pairing a
-# retry policy keys on (502 provider_error vs 504 provider_timeout).
+# retry policy keys on (502 provider_error vs 504 provider_timeout), and the
+# four status collisions the widened set introduced -- 403 forbidden vs
+# not_enabled, 429 concurrency_limit_exceeded vs rate_limited, 504
+# provider_timeout vs deadline_exceeded, 500 internal_error vs the 503
+# service_unavailable it is deliberately NOT merged with.
 CASES: list[tuple[str, int, type[RouterError]]] = [
     ("invalid_input", 400, InvalidInput),
     ("content_policy_violation", 400, ContentPolicyViolation),
@@ -52,6 +60,10 @@ CASES: list[tuple[str, int, type[RouterError]]] = [
     ("concurrency_limit_exceeded", 429, ConcurrencyLimitExceeded),
     ("client_disconnected", 499, ClientDisconnected),
     ("internal_error", 500, InternalError),
+    ("deadline_exceeded", 504, DeadlineExceeded),
+    ("not_enabled", 403, NotEnabled),
+    ("service_unavailable", 503, ServiceUnavailable),
+    ("rate_limited", 429, RateLimited),
 ]
 
 # Deliberately not in the set this SDK version knows: later milestones add them,
@@ -303,14 +315,85 @@ def test_a_response_with_no_bucket_falls_back_to_the_status(
     assert exc.detail == f"HTTP {status}"
 
 
-@pytest.mark.parametrize("status", [400, 422])
+@pytest.mark.parametrize("status", [400, 422, 503])
 def test_an_ambiguous_status_with_no_bucket_stays_the_base_class(status: int) -> None:
     # 400 is either invalid_input or content_policy_violation, and those differ
     # in whether a retry can ever succeed -- guessing would tell a caller to
-    # retry a deterministic refusal. 422 is pinned to no bucket at all.
+    # retry a deterministic refusal. 422 is pinned to no bucket at all. 503 is
+    # the same shape of problem one layer out: an intermediary's bare 503 says
+    # nothing about whether the request ever reached the router, and only the
+    # router's own `service_unavailable` is the bucket the contract says clears
+    # on its own.
     exc = error_from_response(status, {}, None)
     assert type(exc) is RouterError
     assert exc.error_type == ""
+
+
+# -- the buckets that share a status with an older one -----------------------
+
+
+def test_a_not_enabled_403_is_not_the_forbidden_403() -> None:
+    # The refusal every caller sees until the rollout reaches them. `forbidden`
+    # is an entitlement decision about the caller; this is a state of the
+    # rollout, and a caller that cannot tell them apart cannot tell "ask for
+    # access" from "wait".
+    exc = error_from_response(
+        403,
+        {ERROR_TYPE_HEADER: "not_enabled", REQUEST_ID_HEADER: REQUEST_ID},
+        {
+            "detail": "Comfy Router is not switched on for this caller yet.",
+            "error_type": "not_enabled",
+        },
+    )
+    assert type(exc) is NotEnabled
+    assert not isinstance(exc, Forbidden)
+    assert exc.detail == "Comfy Router is not switched on for this caller yet."
+    assert exc.request_id == REQUEST_ID
+    assert exc.http_status == 403
+
+
+def test_a_header_less_403_is_still_the_forbidden_403() -> None:
+    # Adding `not_enabled` must not make the status fallback ambiguous: the
+    # router repeats the bucket on the header on every error it sends, so a
+    # 403 without one is an intermediary's, and `forbidden` stays the reading.
+    exc = error_from_response(403, {}, None)
+    assert type(exc) is Forbidden
+
+
+def test_a_service_unavailable_503_is_its_own_bucket_not_internal_error() -> None:
+    exc = error_from_response(
+        503,
+        {ERROR_TYPE_HEADER: "service_unavailable", REQUEST_ID_HEADER: REQUEST_ID},
+        {"detail": "A dependency is briefly unavailable.", "error_type": "service_unavailable"},
+    )
+    assert type(exc) is ServiceUnavailable
+    assert not isinstance(exc, InternalError)
+    assert exc.detail == "A dependency is briefly unavailable."
+    assert exc.request_id == REQUEST_ID
+
+
+def test_a_deadline_exceeded_504_is_not_the_provider_timeout_504() -> None:
+    # Same status, opposite cause: one says the partner ran out of time, the
+    # other says Comfy stopped holding the connection.
+    exc = error_from_response(
+        504,
+        {ERROR_TYPE_HEADER: "deadline_exceeded"},
+        {"detail": "Comfy stopped waiting.", "error_type": "deadline_exceeded"},
+    )
+    assert type(exc) is DeadlineExceeded
+    assert type(error_from_response(504, {}, None)) is ProviderTimeout
+
+
+def test_a_rate_limited_429_is_not_the_concurrency_429() -> None:
+    # One clears when the caller's own in-flight call finishes; nothing the
+    # caller does drains the other early.
+    exc = error_from_response(
+        429,
+        {ERROR_TYPE_HEADER: "rate_limited"},
+        {"detail": "10 requests per minute.", "error_type": "rate_limited"},
+    )
+    assert type(exc) is RateLimited
+    assert type(error_from_response(429, {}, None)) is ConcurrencyLimitExceeded
 
 
 # -- never crash the client on a malformed response --------------------------
@@ -385,3 +468,64 @@ def test_the_shared_names_are_not_the_workflow_surface_classes() -> None:
         assert router_cls is not workflow_cls
         assert not issubclass(router_cls, workflow_cls)
         assert issubclass(router_cls, RouterError)
+
+
+# -- Retry-After survives onto the exception ---------------------------------
+#
+# Not a cosmetic attribute: `RetryPolicy.should_retry` decides a 429 with
+# `retry_after_of(exc) is not None`, so a router error that dropped the header
+# would make the 429 branch permanently False -- and the throttled buckets are
+# the ones the default policy exists to retry. These assert the wiring end to
+# end rather than just the parse.
+
+
+@pytest.mark.parametrize("error_type", ["rate_limited", "concurrency_limit_exceeded"])
+def test_retry_after_is_preserved_on_the_throttled_buckets(error_type: str) -> None:
+    status, headers, body = stub_error_response(error_type, 429)
+    exc = error_from_response(status, {**headers, "Retry-After": "30"}, body)
+    assert exc.retry_after == 30
+
+
+def test_retry_after_is_preserved_on_a_deadline_exceeded_504() -> None:
+    # The bucket whose docstring tells the caller a Retry-After says when to
+    # ask. Under `retry_possibly_in_flight=True` the policy honours it.
+    status, headers, body = stub_error_response("deadline_exceeded", 504)
+    exc = error_from_response(status, {**headers, "Retry-After": "5"}, body)
+    assert isinstance(exc, DeadlineExceeded)
+    assert exc.retry_after == 5
+
+
+def test_the_retry_after_header_is_matched_case_insensitively() -> None:
+    exc = error_from_response(
+        429, {"retry-after": "12", "x-comfy-error-type": "rate_limited"}, None
+    )
+    assert isinstance(exc, RateLimited)
+    assert exc.retry_after == 12
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "soon", "Wed, 21 Oct 2015 07:28:00 GMT", "1.5", "-3"])
+def test_an_unusable_retry_after_is_absent_rather_than_trusted(raw: str) -> None:
+    # Including the HTTP-date form the RFC permits: it is deliberately not
+    # parsed here (guessing at clock skew is worse than the local backoff
+    # schedule), and a negative value would otherwise be waited on.
+    exc = error_from_response(429, {ERROR_TYPE_HEADER: "rate_limited", "Retry-After": raw}, None)
+    assert exc.retry_after is None
+
+
+def test_no_retry_after_header_is_none() -> None:
+    status, headers, body = stub_error_response("rate_limited", 429)
+    assert error_from_response(status, headers, body).retry_after is None
+
+
+def test_the_default_policy_retries_a_throttled_bucket_that_named_a_pace() -> None:
+    # The end-to-end property the parse exists for. Without the header the 429
+    # is not asking to be asked again, so the same policy declines it.
+    from comfy_sdk.retry import RetryPolicy
+
+    policy = RetryPolicy()
+    paced = error_from_response(429, {ERROR_TYPE_HEADER: "rate_limited", "Retry-After": "7"}, None)
+    unpaced = error_from_response(429, {ERROR_TYPE_HEADER: "rate_limited"}, None)
+
+    assert isinstance(paced, RateLimited)
+    assert policy.should_retry(paced) is True
+    assert policy.should_retry(unpaced) is False
