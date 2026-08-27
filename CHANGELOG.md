@@ -14,22 +14,25 @@ notes for each version.
 
 ### Added
 
-- Every exception `client.models.run()` raises now carries the
-  `Idempotency-Key` the call was made under, on `.idempotency_key` — the typed
-  `RouterError` buckets, a `RouterError` whose `error_type` this version does
-  not recognise, any other `ComfyError`, and a transport failure with no
+- Every exception `client.models.run()` raises **for a failed call** now
+  carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the
+  typed `RouterError` buckets, a `RouterError` whose `error_type` this version
+  does not recognise, any other `ComfyError`, and a transport failure with no
   response at all (a dropped connection, a read timeout), and a cancelled
   `await` of `AsyncModels.run` — the `asyncio.wait_for` a caller wraps a
   ten-minute call in abandons a generation that may already be dispatched and
-  billed, and the cancellation still propagates unchanged. `run` mints that key
-  itself unless you pass `idempotency_key=`, and it used to be a local of the
-  call: when the call raised, the key went with it. Since collecting a
-  generation you were already billed for after a lost response means asking
-  again under the *same* key, that made the auto-minted case uncollectable —
-  only callers who chose and stored their own key could recover. The recovery
-  idiom is now `client.models.run(model, arguments,
-  idempotency_key=exc.idempotency_key)`; see the README. Nothing about what is
-  retried, or what goes on the wire, changed.
+  billed, and the cancellation still propagates unchanged. "Failed call" is the
+  boundary, not "every exception": a programming error escaping the call is not
+  a failed request, a key means nothing on it, and it reaches you untouched —
+  as does `KeyboardInterrupt`. `run` mints that key itself unless you pass
+  `idempotency_key=`, and it used to be a local of the call: when the call
+  raised, the key went with it. Since collecting a generation you were already
+  billed for after a lost response means asking again under the *same* key,
+  that made the auto-minted case uncollectable — only callers who chose and
+  stored their own key could recover. The recovery idiom is now
+  `client.models.run(model, arguments, idempotency_key=exc.idempotency_key)`;
+  see the README. Nothing about what is retried, or what goes on the wire,
+  changed.
 - `ComfyError.request_id` — the server's `X-Comfy-Request-Id` for the failed
   call, when the response carried that header, on every SDK exception rather
   than only on `RouterError`. It is the id to quote in a support request, and it
