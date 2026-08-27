@@ -52,20 +52,23 @@ That, not a guess about the network, is what sorts the failures:
    pace the server asked for rather than a blind backoff of our own.
 3. **Collectable** — the server answered that the work it already holds is not
    finished, *and* named the pace at which to ask the same key again for it: a
-   router ``deadline_exceeded`` ``504`` carrying ``Retry-After``, and a ``409``
-   carrying ``Retry-After`` ("still in progress") from the idempotency layer on
-   the retry that follows it. This is the one class where the *server* has
+   router ``deadline_exceeded`` ``504`` carrying ``Retry-After``, and a
+   ``generation_in_progress`` ``409`` carrying ``Retry-After`` from the
+   idempotency layer on the retry that follows it. This is the one class where the *server* has
    stated the same-key resend is safe, and the pace it names is its own poll
    interval — so it is retried by default, at that pace, and one ``run()`` call
    rides the collect loop to the finished generation instead of handing the
    caller a ``504`` for work that is still running.
    :func:`is_collectable` is the predicate and
-   :attr:`RetryPolicy.retry_collectable` switches it off. Two gates keep it
-   narrow: the ``504`` must name the ``deadline_exceeded`` bucket (a bucket-less
-   ``504`` reads as ``provider_timeout``, where no contract blesses the resend),
-   and the ``Retry-After`` must be there (the router sends it only when it holds
-   a handle to a generation to collect — absent it, there is nothing to collect
-   and the ``504`` falls back to class 4).
+   :attr:`RetryPolicy.retry_collectable` switches it off, and
+   :attr:`RetryPolicy.collect_max_elapsed` bounds it. Two gates keep it narrow,
+   and both apply to each status: the response must name the bucket (a
+   bucket-less ``504`` reads as ``provider_timeout``, where no contract blesses
+   the resend; a bucket-less or ``hash_mismatch`` ``409`` is a deterministic
+   refusal that a pace does not soften), and the ``Retry-After`` must be there
+   (the router sends it only when it holds a handle to a generation to collect —
+   absent it, there is nothing to collect and the ``504`` falls back to class
+   4).
 4. **Outcome unknown** — a completed 5xx that named no collectable pace, or a
    transport failure that may have delivered the request in full (a read timeout
    on a run is the important member: the generation-sized client timeout expired
@@ -142,23 +145,23 @@ server.** Beyond the classification above this is also enforced structurally:
 
 The budget is **total elapsed time**, never an attempt count: a per-attempt
 budget multiplies out, and N attempts each allowed their own timeout stack into
-a wait far longer than anything anybody chose. ``max_elapsed`` bounds when the
-*last* attempt may start, so the worst case is that bound plus one per-attempt
-timeout, and the number of attempts falls out of the backoff schedule.
+a wait far longer than anything anybody chose. It bounds when the *last* attempt
+may start, so the worst case is that bound plus one per-attempt timeout, and the
+number of attempts falls out of the backoff schedule.
 
-**The default budget is one server deadline window**, ten minutes — the same
-number as :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT`, deliberately, because
-that is how long this surface is already willing to wait for one attempt. A
-collect loop that outlives the deadline it is collecting after is the whole
-point of class 3: the ``504`` says the server stopped holding *this* connection
-at its own bound while the generation ran on, so a budget shorter than that bound
-gives up mid-generation and hands the caller an error for work it will still be
-charged for. The old 60-second budget was sized for the fast classes alone (a
-connect failure, a paced ``429``) and could not outlast a single deadline
-window. The cost of the larger default is paid in the *other* classes, and it is
-worth naming: a genuinely unreachable server now spends up to ten minutes in
-connect-and-back-off before it raises, where before it spent one. Pass
-``RetryPolicy(max_elapsed=60.0)`` to get the old bound back.
+**There are two budgets, because the classes above have two different shapes.**
+``max_elapsed`` stays at one minute and governs the fast classes — a connect
+failure, a paced ``429`` — which resolve in seconds or not at all; a blackholed
+host has no business pinning a caller (a whole thread, on the sync client) for
+longer than that. ``collect_max_elapsed`` is twenty minutes and governs class 3
+alone, because it is the one class whose budget has to outlast a *server-side*
+bound: a ``deadline_exceeded`` ``504`` arrives at Comfy's own deadline, the same
+ten minutes as :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT`, so a budget of one
+deadline window is already spent when the ``504`` lands and the collect attempt
+it exists for never starts. Two windows is one to reach the ``504`` and one to
+collect what it left running — and nothing else pays for it. Both are measured
+from the same origin, the construction of the :class:`Retrier`; which one applies
+is decided per failure, by :func:`is_collectable`.
 
 Retry is on by default. ``Comfy(retry=NO_RETRY)`` turns it off; any other
 policy is a :class:`RetryPolicy` you construct::
@@ -166,7 +169,8 @@ policy is a :class:`RetryPolicy` you construct::
     from comfy_sdk import Comfy, NO_RETRY, RetryPolicy
 
     Comfy(retry=NO_RETRY)                              # exactly one attempt
-    Comfy(retry=RetryPolicy(max_elapsed=60.0))         # give up after a minute
+    Comfy(retry=RetryPolicy(max_elapsed=300.0))        # fast classes: 5 minutes
+    Comfy(retry=RetryPolicy(collect_max_elapsed=60.0)) # bound the collect loop
     Comfy(retry=RetryPolicy(retry_collectable=False))  # no 504/409 collect loop
 """
 
@@ -223,10 +227,25 @@ _GATEWAY_TIMEOUT = 504
 #: another" (``spec/router-openapi.yaml``).
 _DEADLINE_EXCEEDED = "deadline_exceeded"
 
+#: The bucket the idempotency layer answers a mid-collect ``409`` with: the key
+#: is recognised and the generation it names has not finished. Neither vendored
+#: spec contracts this bucket, which is exactly why the gate names it rather
+#: than accepting any paced ``409``: the ``409`` s the specs *do* document are
+#: deterministic refusals (``hash_mismatch``, which ``spec/openapi.yaml`` gives a
+#: ``Retry-After``, and ``asset_in_use``), and a proxy or WAF conflict carries no
+#: bucket at all. Fail closed — an unrecognised ``409`` stays a refusal.
+_GENERATION_IN_PROGRESS = "generation_in_progress"
+
 #: Policy fields that must be real numbers for the arithmetic below to mean
 #: anything. Kept beside the fields themselves so a numeric one added later is
 #: added here too.
-_NUMERIC_FIELDS = ("max_elapsed", "initial_backoff", "backoff_factor", "max_backoff")
+_NUMERIC_FIELDS = (
+    "max_elapsed",
+    "collect_max_elapsed",
+    "initial_backoff",
+    "backoff_factor",
+    "max_backoff",
+)
 
 
 def is_unknown_outcome_status(status: int) -> bool:
@@ -312,25 +331,32 @@ def is_collectable(exc: BaseException) -> bool:
       stopped holding the connection at its own bound while the generation ran
       on, and the contract says to "retry it with the SAME ``Idempotency-Key``",
       which "collects that generation rather than dispatching another";
-    * a ``409`` carrying ``Retry-After`` — the idempotency layer's answer that
-      the request under this key is still in progress, which is what the collect
-      retry above meets when it arrives before the generation finishes.
+    * a ``generation_in_progress`` ``409`` carrying ``Retry-After`` — the
+      idempotency layer's answer that the request under this key is still in
+      progress, which is what the collect retry above meets when it arrives
+      before the generation finishes.
 
-    Both gates are load-bearing. The ``504`` must name its bucket because
+    Every gate is load-bearing, and each status is gated on *both* its bucket
+    and its pace for the same reason. The ``504`` must name its bucket because
     ``deadline_exceeded`` shares that status with ``provider_timeout``, where no
     contract blesses the resend and a header-less ``504`` from an intermediary is
-    read as exactly that. The ``Retry-After`` must be present because the router
-    sends it on a ``deadline_exceeded`` "only when Comfy holds a handle to a
-    generation the provider is still running" — without it there is nothing to
-    collect, and a resend would be dispatching new work rather than gathering
-    old. A ``409`` with no pace is an ordinary conflict and stays a refusal.
+    read as exactly that. The ``409`` must name its bucket because every ``409``
+    either vendored spec documents is a *deterministic* refusal that a pace does
+    not soften — ``spec/openapi.yaml`` gives its ``hash_mismatch`` ``409`` a
+    ``Retry-After`` outright — so accepting the status plus a pace alone would
+    resend a permanent refusal, or a bucket-less proxy conflict, for the whole
+    budget. The ``Retry-After`` must be present because the router sends it on a
+    ``deadline_exceeded`` "only when Comfy holds a handle to a generation the
+    provider is still running" — without it there is nothing to collect, and a
+    resend would be dispatching new work rather than gathering old.
     """
     status = getattr(exc, "http_status", None)
     if not isinstance(status, int) or retry_after_of(exc) is None:
         return False
+    bucket = error_bucket_of(exc)
     if status == _CONFLICT:
-        return True
-    return status == _GATEWAY_TIMEOUT and error_bucket_of(exc) == _DEADLINE_EXCEEDED
+        return bucket == _GENERATION_IN_PROGRESS
+    return status == _GATEWAY_TIMEOUT and bucket == _DEADLINE_EXCEEDED
 
 
 @dataclass(frozen=True)
@@ -345,12 +371,14 @@ class RetryPolicy:
     #: Seconds from the first attempt after which no *new* attempt is started.
     #: An attempt already running is never interrupted by it, so the worst-case
     #: wall clock for a call is this plus one per-attempt ``timeout``. Zero
-    #: disables retrying entirely (see :data:`NO_RETRY`). The default is one
-    #: server deadline window — the same ten minutes as
-    #: :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT` — so that a collect loop
-    #: after a ``deadline_exceeded`` ``504`` can outlast the bound that produced
-    #: it; see this module's docstring for what that costs the other classes.
-    max_elapsed: float = 600.0
+    #: disables retrying entirely (see :data:`NO_RETRY`), collect included.
+    #: This is the budget for the *fast* classes — a connect failure, a paced
+    #: ``429`` — which is why it stays at a minute: those resolve in seconds or
+    #: not at all, and a blackholed host should not pin a caller for longer than
+    #: the failure needs. The collect class gets its own, longer budget in
+    #: :attr:`collect_max_elapsed`, because it is the one class that has to
+    #: outlast a server-side deadline.
+    max_elapsed: float = 60.0
     #: Ceiling on the delay before the first retry. With ``jitter`` on — the
     #: default — the actual delay is drawn from ``[0, this]``.
     initial_backoff: float = 0.5
@@ -381,8 +409,8 @@ class RetryPolicy:
     #: its own.
     retry_possibly_in_flight: bool = False
     #: Retry the failures the server itself paced for a same-key resend — a
-    #: router ``deadline_exceeded`` ``504`` and an in-progress ``409``, each
-    #: carrying ``Retry-After``. See :func:`is_collectable` for the exact gates.
+    #: router ``deadline_exceeded`` ``504`` and a ``generation_in_progress``
+    #: ``409``, each carrying ``Retry-After``. See :func:`is_collectable` for the exact gates.
     #: **On by default**, because this is the one class where the contract says
     #: the resend collects the generation already running rather than
     #: dispatching a second one, and the ``Retry-After`` is the server's own
@@ -391,6 +419,23 @@ class RetryPolicy:
     #: declared last, out of reading order, so that inserting it cannot change
     #: what an existing positional ``RetryPolicy(...)`` means.
     retry_collectable: bool = True
+    #: Seconds from the first attempt for the *collect* class specifically — the
+    #: failures :func:`is_collectable` recognises. Measured from the same origin
+    #: as :attr:`max_elapsed` and used in its place once the server has said the
+    #: work is still running.
+    #:
+    #: It is separate, and twenty minutes, because the collect loop is the one
+    #: class whose budget has to outlast a server-side bound. A
+    #: ``deadline_exceeded`` ``504`` arrives *at* Comfy's own deadline — the same
+    #: ten minutes as :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT` — so a
+    #: budget of one deadline window is already spent by the time the ``504``
+    #: lands and the collect attempt it was sized for never starts. Two windows
+    #: is one to reach the ``504`` and one to collect what it left running. The
+    #: cost is not charged to anything else: a refused connection still gives up
+    #: at :attr:`max_elapsed`. Ignored entirely when ``max_elapsed`` is zero, so
+    #: :data:`NO_RETRY` is still exactly one attempt. Declared last for the same
+    #: positional-compatibility reason as :attr:`retry_collectable`.
+    collect_max_elapsed: float = 1200.0
 
     def __post_init__(self) -> None:
         for name in _NUMERIC_FIELDS:
@@ -404,6 +449,8 @@ class RetryPolicy:
                 raise ValueError(f"{name} must be a finite number")
         if self.max_elapsed < 0:
             raise ValueError("max_elapsed must not be negative")
+        if self.collect_max_elapsed < 0:
+            raise ValueError("collect_max_elapsed must not be negative")
         if self.initial_backoff <= 0:
             raise ValueError("initial_backoff must be positive")
         if self.backoff_factor < 1:
@@ -436,14 +483,23 @@ class RetryPolicy:
                 # attached: the spec's retry signal is "429 + Retry-After",
                 # and a 429 without one is not asking to be asked again.
                 return retry_after_of(exc) is not None
-            if self.retry_collectable and is_collectable(exc):
-                # Checked before both branches below, because it overrides
+            if is_collectable(exc):
+                # Classified before both branches below, because it overrides
                 # both: a `deadline_exceeded` 504 is a 5xx the router contract
                 # nevertheless blesses a same-key resend for, and an
                 # in-progress 409 is a 4xx that does become true on a later
                 # ask. Everything narrowing it to those two answers lives in
                 # `is_collectable`.
-                return True
+                #
+                # The answer is `retry_collectable` rather than `True`, and the
+                # switch is read *after* the classification rather than as part
+                # of it, so that turning the collect loop off is an answer and
+                # not a fall-through: gated the other way round, a paced
+                # `deadline_exceeded` 504 with `retry_collectable=False` would
+                # drop into `is_unknown_outcome_status` below and be retried
+                # anyway under `retry_possibly_in_flight=True` — an opt-out that
+                # silently did nothing for the very status it is named for.
+                return self.retry_collectable
             if is_unknown_outcome_status(status):
                 # Every other 5xx, including the router's `service_unavailable`
                 # 503: the bucket says the condition clears on its own, but
@@ -499,7 +555,7 @@ DEFAULT_RETRY = RetryPolicy()
 #: Retrying turned off: one logical call is exactly one attempt. Pass it as
 #: ``Comfy(retry=NO_RETRY)``. The ``Idempotency-Key`` is still sent — it is not
 #: part of the retry policy, and a caller who retries by hand needs it.
-NO_RETRY = RetryPolicy(max_elapsed=0.0)
+NO_RETRY = RetryPolicy(max_elapsed=0.0, collect_max_elapsed=0.0)
 
 
 class Retrier:
@@ -522,10 +578,11 @@ class Retrier:
         self._now = now
         self._rng = rng
         self._attempts = 0
-        # The whole call's budget, fixed here so every later decision measures
-        # against one origin — elapsed time across all attempts, not time
-        # granted afresh to each of them.
-        self._deadline = now() + policy.max_elapsed
+        # The one origin every later decision measures against — elapsed time
+        # across all attempts, not time granted afresh to each of them. The
+        # *budget* laid over it depends on which class the failure turns out to
+        # be (see `delay_before_retry`); the origin never does.
+        self._started = now()
 
     @property
     def attempts(self) -> int:
@@ -541,19 +598,43 @@ class Retrier:
         refusal — with full jitter one unlucky draw would otherwise end a call
         that still had seconds of budget, making identical calls take a
         randomly varying number of attempts. ``client.py::_retry_delay`` bounds
-        the workflow surface's 429 wait the same way. So ``max_elapsed`` is
-        when the last attempt may *start*, inclusive.
+        the workflow surface's 429 wait the same way. So the budget is when the
+        last attempt may *start*, inclusive.
+
+        *Which* budget depends on the class: a collectable failure is measured
+        against :attr:`RetryPolicy.collect_max_elapsed` and everything else
+        against :attr:`RetryPolicy.max_elapsed`, both from this ``Retrier``'s
+        construction. See ``collect_max_elapsed`` for why the collect class
+        needs its own -- and why the other classes must not pay for it.
         """
         failed_at = self._now()
         self._attempts += 1
         if not self._policy.enabled or not self._policy.should_retry(exc):
             return None
-        remaining = self._deadline - failed_at
+        budget = (
+            self._policy.collect_max_elapsed
+            if self._policy.retry_collectable and is_collectable(exc)
+            else self._policy.max_elapsed
+        )
+        remaining = self._started + budget - failed_at
         if remaining <= 0:
             return None
-        # A pace the server named beats the schedule guessed here.
+        # A pace the server named beats the schedule guessed here -- but only a
+        # usable one. `Retry-After: 0` is outside what the router contract can
+        # send (`RouterRetryAfterHeader` is pinned to `minimum: 1`), and taking
+        # it verbatim would turn a server or intermediary that keeps answering
+        # it into a zero-delay resend loop of full model-run POSTs, bounded only
+        # by the budget. A pace of zero names no pace: fall back to the jittered
+        # backoff, which is also what stops such a loop synchronising across
+        # clients. Whether the header was *present* still decides collectability
+        # over in `is_collectable` -- that is the server saying it holds a handle
+        # to a generation, which a nonsense value does not retract.
         named = retry_after_of(exc)
-        delay = named if named is not None else self._policy.backoff(self._attempts, rng=self._rng)
+        delay = (
+            named
+            if named is not None and named > 0
+            else self._policy.backoff(self._attempts, rng=self._rng)
+        )
         return min(delay, remaining)
 
 

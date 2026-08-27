@@ -563,12 +563,20 @@ def test_jitter_can_be_turned_off_for_a_deterministic_schedule() -> None:
     "kwargs",
     [
         {"max_elapsed": -1.0},
+        {"collect_max_elapsed": -1.0},
         {"initial_backoff": 0.0},
         {"initial_backoff": -1.0},
         {"backoff_factor": 0.5},
         {"max_backoff": 0.1},
     ],
-    ids=["negative-budget", "zero-backoff", "negative-backoff", "shrinking", "ceiling-below-floor"],
+    ids=[
+        "negative-budget",
+        "negative-collect-budget",
+        "zero-backoff",
+        "negative-backoff",
+        "shrinking",
+        "ceiling-below-floor",
+    ],
 )
 def test_an_incoherent_policy_is_rejected_at_construction(kwargs: dict) -> None:
     with pytest.raises(ValueError):
@@ -585,6 +593,8 @@ def test_an_incoherent_policy_is_rejected_at_construction(kwargs: dict) -> None:
         # a NaN budget reads as "retrying disabled", a NaN backoff makes the
         # caller's `sleep` raise in place of the real error.
         {"max_elapsed": float("nan")},
+        {"collect_max_elapsed": float("inf")},
+        {"collect_max_elapsed": float("nan")},
         {"initial_backoff": float("nan")},
         {"backoff_factor": float("nan")},
         {"max_backoff": float("nan")},
@@ -872,7 +882,11 @@ def test_the_collect_loop_gives_up_at_the_elapsed_budget(server) -> None:
     server.state.model_run_collects_after_deadline = True
     server.state.model_run_error = (504, "deadline_exceeded")
     server.state.model_run_retry_after = "1"
-    policy = RetryPolicy(max_elapsed=0.4, initial_backoff=0.01, max_backoff=0.02)
+    # `collect_max_elapsed`, not `max_elapsed`: the collect class has its own
+    # budget, and this is the bound that ends this loop.
+    policy = RetryPolicy(
+        max_elapsed=0.4, collect_max_elapsed=0.4, initial_backoff=0.01, max_backoff=0.02
+    )
     started = time.monotonic()
     with Comfy(retry=policy) as client:
         with pytest.raises(ComfyError) as excinfo:
@@ -888,7 +902,7 @@ def test_the_budget_bounds_the_loop_even_at_the_server_named_pace() -> None:
     # in a 100s budget and the fourth is clamped to the 10s left rather than
     # overshooting it, after which no further attempt starts.
     clock = _FakeClock()
-    retrier = Retrier(RetryPolicy(max_elapsed=100.0), now=clock, rng=lambda: 1.0)
+    retrier = Retrier(RetryPolicy(collect_max_elapsed=100.0), now=clock, rng=lambda: 1.0)
     failure = DeadlineExceeded("still generating", http_status=504, retry_after=30)
     delays = []
     while (delay := retrier.delay_before_retry(failure)) is not None:
@@ -897,14 +911,48 @@ def test_the_budget_bounds_the_loop_even_at_the_server_named_pace() -> None:
     assert delays == [30.0, 30.0, 30.0, 10.0]
 
 
-def test_the_default_budget_is_one_server_deadline_window() -> None:
-    # The decision this asserts, so it cannot drift silently: the budget is the
-    # same ten minutes `run` is already willing to spend on ONE attempt. A
-    # shorter one cannot outlast the deadline it is collecting after -- the 504
-    # says the server stopped holding this connection at its own bound while
-    # the generation ran on, and the caller is billed for that generation
-    # whether or not the SDK waits to collect it.
-    assert DEFAULT_RETRY.max_elapsed == MODEL_RUN_TIMEOUT.read == 600.0
+def test_the_collect_budget_outlasts_a_server_deadline_window() -> None:
+    # The decision this asserts, so it cannot drift silently. A `deadline_exceeded`
+    # 504 arrives AT the server's own bound -- the same ten minutes `run` is
+    # already willing to spend on one attempt -- so a collect budget of exactly
+    # one window is spent by the time the 504 lands and the collect attempt it
+    # was sized for never starts. It has to be strictly more than one window,
+    # with room for a collect attempt of its own.
+    deadline_window = MODEL_RUN_TIMEOUT.read
+    assert deadline_window == 600.0
+    assert DEFAULT_RETRY.collect_max_elapsed >= 2 * deadline_window
+
+    # And the fast classes do not pay for it: a refused connection still gives
+    # up in a minute rather than sitting on a caller's thread for twenty.
+    assert DEFAULT_RETRY.max_elapsed == 60.0
+
+
+def test_the_collect_budget_applies_only_to_the_collect_class() -> None:
+    # Two budgets, one origin. The same `Retrier` answers a collectable failure
+    # against the long budget and everything else against the short one, so the
+    # collect loop's room is not a policy-wide regression for the fast classes.
+    policy = RetryPolicy(max_elapsed=10.0, collect_max_elapsed=100.0, jitter=False)
+    collectable = DeadlineExceeded("still generating", http_status=504, retry_after=5)
+    refused = httpx.ConnectError("refused")
+
+    clock = _FakeClock()
+    retrier = Retrier(policy, now=clock, rng=lambda: 1.0)
+    # 40s in: past `max_elapsed`, well inside `collect_max_elapsed`.
+    clock.advance(40.0)
+    assert retrier.delay_before_retry(collectable) == 5.0
+    assert retrier.delay_before_retry(refused) is None
+
+
+def test_a_deadline_504_at_the_server_bound_still_gets_a_collect_attempt() -> None:
+    # The regression the split budget exists for, end to end against a fake
+    # clock: the 504 arrives after a full ten-minute attempt, which a
+    # one-window budget would have spent entirely. The collect attempt has to
+    # start anyway, because that generation is running and billed either way.
+    clock = _FakeClock()
+    retrier = Retrier(DEFAULT_RETRY, now=clock, rng=lambda: 1.0)
+    clock.advance(600.0)  # one full server deadline window; see the test above
+    failure = DeadlineExceeded("still generating", http_status=504, retry_after=2)
+    assert retrier.delay_before_retry(failure) == 2.0
 
 
 @pytest.mark.parametrize(
@@ -913,7 +961,20 @@ def test_the_default_budget_is_one_server_deadline_window() -> None:
         (DeadlineExceeded("deadline", http_status=504, retry_after=3), True),
         (DeadlineExceeded("deadline", http_status=504), False),
         (ProviderTimeout("upstream", http_status=504, retry_after=3), False),
-        (RouterError("in progress", http_status=409, retry_after=3), True),
+        (RouterError("in progress", http_status=409, retry_after=3), False),
+        (
+            ApiError(
+                "in progress",
+                code="generation_in_progress",
+                http_status=409,
+                retry_after=3,
+            ),
+            True,
+        ),
+        # `spec/openapi.yaml` gives its `hash_mismatch` 409 a `Retry-After`, and
+        # it is still a deterministic refusal: the pace does not make asking
+        # again change the answer. The bucket gate is what keeps it one.
+        (ApiError("bad hash", code="hash_mismatch", http_status=409, retry_after=3), False),
         (RouterError("conflict", http_status=409), False),
         (ServiceUnavailable("later", http_status=503, retry_after=3), False),
         (InternalError("boom", http_status=500, retry_after=3), False),
@@ -947,3 +1008,185 @@ def test_a_deadline_504_raised_as_a_protocol_error_is_still_collected() -> None:
     # for the same class of silent no-op.
     exc = ApiError("deadline", code="deadline_exceeded", http_status=504, retry_after=2)
     assert DEFAULT_RETRY.should_retry(exc)
+
+
+# --- the gates the collect loop is only safe behind ---
+
+
+def test_a_zero_retry_after_does_not_become_a_zero_delay_resend_loop() -> None:
+    # `RouterRetryAfterHeader` is pinned to `minimum: 1`, so `Retry-After: 0` is
+    # a server or intermediary answering outside its own contract -- and taking
+    # it verbatim would resend a full model-run POST with no wait at all, for
+    # the whole budget, entirely under that server's control. Zero names no
+    # usable pace: the local backoff schedule answers instead.
+    clock = _FakeClock()
+    policy = RetryPolicy(initial_backoff=1.0, max_backoff=8.0, jitter=False)
+    retrier = Retrier(policy, now=clock, rng=lambda: 1.0)
+    failure = DeadlineExceeded("still generating", http_status=504, retry_after=0)
+    delays = [retrier.delay_before_retry(failure) for _ in range(3)]
+    assert delays == [1.0, 2.0, 4.0]
+
+
+def test_a_zero_retry_after_still_counts_as_the_server_holding_a_handle() -> None:
+    # The value is unusable; the header's *presence* is not. It is the router
+    # saying it holds a generation to collect, which a nonsense number does not
+    # retract -- so the response stays collectable and only its pace is ignored.
+    failure = DeadlineExceeded("still generating", http_status=504, retry_after=0)
+    assert is_collectable(failure)
+    assert DEFAULT_RETRY.should_retry(failure)
+
+
+def test_turning_the_collect_loop_off_holds_even_with_the_in_flight_opt_in() -> None:
+    # `retry_collectable=False` has to be an answer, not a fall-through. A
+    # paced `deadline_exceeded` 504 is also a 5xx, so classified the other way
+    # round it would drop into the unknown-outcome branch and be retried anyway
+    # under `retry_possibly_in_flight=True` -- an opt-out that silently did
+    # nothing for the one status it is named for.
+    policy = RetryPolicy(retry_collectable=False, retry_possibly_in_flight=True)
+    failure = DeadlineExceeded("still generating", http_status=504, retry_after=2)
+    assert is_collectable(failure)
+    assert not policy.should_retry(failure)
+    # And the 409 half of the class, which the fall-through happened to get
+    # right (a 4xx has no unknown-outcome branch to fall into) -- pinned so it
+    # stays right for the stated reason rather than by accident.
+    in_progress = ApiError(
+        "in progress", code="generation_in_progress", http_status=409, retry_after=2
+    )
+    assert is_collectable(in_progress)
+    assert not policy.should_retry(in_progress)
+    # The rest of the policy is untouched: this is one knob, not a kill switch.
+    assert policy.should_retry(InternalError("boom", http_status=500))
+
+
+def test_a_paced_hash_mismatch_409_is_still_a_refusal(server) -> None:
+    # The 409 the vendored spec actually documents, and it documents a
+    # `Retry-After` on it. It is a deterministic refusal all the same: the
+    # client-computed hash will not match on the second ask either. Without the
+    # bucket gate the collect loop would resend it for the whole budget -- and
+    # under the v2 rule that releases the key for a 4xx that started no work,
+    # each resend is a fresh billed dispatch rather than a collection.
+    server.state.model_run_error = (409, "hash_mismatch")
+    server.state.model_run_retry_after = "0"
+    with Comfy(retry=FAST) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert server.state.model_run_count == 1
+    assert excinfo.value.http_status == 409
+
+
+# --- the wire shape a real Router failure arrives in ---
+
+
+def test_a_deadline_504_in_routers_own_error_shape_is_still_collected(server) -> None:
+    # `POST /api/v2/models/run` is fronted by Router, whose error body is
+    # `{detail, error_type}` with the bucket repeated on `X-Comfy-Error-Type` --
+    # not the v2 `{error: {code}}` envelope. Reading only the envelope would
+    # collapse every real 504 to the status-derived default, and the whole
+    # bucket-keyed collect rule would be a silent no-op in production while
+    # every test above passed.
+    server.state.model_run_router_error_shape = True
+    server.state.model_run_collects_after_deadline = True
+    server.state.model_run_transient_error = (504, "deadline_exceeded")
+    server.state.model_run_retry_after = "0"
+    server.state.model_run_fail_times = 1
+    with Comfy(retry=FAST) as client:
+        assert client.models.run(MODEL, ARGS) == server.state.model_run_result
+    assert server.state.model_run_count == 2
+    first, second = server.state.model_run_idempotency_keys
+    assert first is not None
+    assert second == first
+
+
+def test_the_bucket_gate_holds_in_routers_own_error_shape_too(server) -> None:
+    # The gate has to survive the shape change in both directions: reading the
+    # header must not turn every Router 504 into a collectable one.
+    server.state.model_run_router_error_shape = True
+    server.state.model_run_error = (504, "provider_timeout")
+    server.state.model_run_retry_after = "0"
+    with Comfy(retry=FAST) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert server.state.model_run_count == 1
+    assert excinfo.value.http_status == 504
+
+
+def test_a_router_error_body_keeps_its_detail_as_the_message(server) -> None:
+    # Router names its human-readable string `detail`; dropping it for a bare
+    # "HTTP 504" would make the shape that reaches real callers the least
+    # diagnosable one.
+    server.state.model_run_router_error_shape = True
+    server.state.model_run_error = (500, "internal_error")
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert "internal_error" in str(excinfo.value)
+
+
+# --- the deployment that does NOT collect ---
+
+
+def test_the_default_collect_loop_against_a_non_collecting_deployment(server) -> None:
+    # The cost of defaulting this on, asserted rather than assumed. `POST
+    # /models/run` is in neither vendored spec, so a deployment may well apply
+    # the v2 rule instead -- key stays claimed across an unknown-outcome 5xx,
+    # and the resend is rejected. The caller then sees `422
+    # idempotency_key_reuse` in place of the real 504. That is the trade the
+    # default makes; `retry_collectable=False` is the way out of it, and this
+    # pins both halves so neither can change silently.
+    server.state.model_run_collects_after_deadline = False
+    server.state.model_run_error = (504, "deadline_exceeded")
+    server.state.model_run_retry_after = "0"
+    with Comfy(retry=FAST) as client:
+        with pytest.raises(IdempotencyKeyReuse):
+            client.models.run(MODEL, ARGS)
+    assert server.state.model_run_count == 2
+
+    server.state.model_run_count = 0
+    server.state.model_run_idempotency.clear()
+    policy = RetryPolicy(
+        max_elapsed=5.0, initial_backoff=0.01, max_backoff=0.02, retry_collectable=False
+    )
+    with Comfy(retry=policy) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert server.state.model_run_count == 1
+    assert excinfo.value.http_status == 504
+
+
+# --- the body snapshot the same-key rule rests on ---
+
+
+def test_the_body_is_snapshotted_deeply_before_the_first_attempt(server) -> None:
+    # Same key, same body is what makes the resend a collection. A shallow copy
+    # leaves nested values shared with the caller, so a mutation during the
+    # retry window -- up to twenty minutes on the collect path -- would send a
+    # different body under the one key and earn the 422 the snapshot exists to
+    # prevent.
+    server.state.model_run_collects_after_deadline = True
+    server.state.model_run_transient_error = (504, "deadline_exceeded")
+    server.state.model_run_retry_after = "0"
+    server.state.model_run_fail_times = 1
+    arguments: dict[str, Any] = {"prompt": "a cat", "config": {"steps": 4}}
+
+    class _MutatingLow:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def post_model_run(self, model: str, args: Mapping[str, Any], **kw: Any) -> Any:
+            try:
+                return self._inner.post_model_run(model, args, **kw)
+            except BaseException:
+                # The caller mutating its own nested dict *between* attempts,
+                # which is the only window that matters: the collect resend is
+                # what has to carry the same body as the first attempt.
+                arguments["config"]["steps"] = 999
+                raise
+
+    with Comfy(retry=FAST) as client:
+        models = Models(cast(Any, _MutatingLow(client._low)), FAST)
+        assert models.run(MODEL, arguments) == server.state.model_run_result
+    assert server.state.model_run_count == 2
+    assert server.state.last_model_run_body["arguments"]["config"] == {"steps": 4}

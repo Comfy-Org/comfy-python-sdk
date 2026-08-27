@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any, cast
 
 import httpx
@@ -151,12 +152,13 @@ class Models(_ModelsBase):
 
         Retried by default: connect-phase failures, a ``429`` that names a
         ``Retry-After``, and the answers that name a pace for collecting work
-        already running — a ``deadline_exceeded`` ``504`` and an in-progress
-        ``409``, each carrying ``Retry-After``. One ``run()`` can therefore ride
-        the collect loop through a server-side deadline to the finished
-        generation. Not retried by default: a completed 5xx that named no such
-        pace, and a client-side timeout — those leave the outcome genuinely
-        unknown and need ``RetryPolicy(retry_possibly_in_flight=True)``. See
+        already running — a ``deadline_exceeded`` ``504`` and a
+        ``generation_in_progress`` ``409``, each carrying ``Retry-After``. One
+        ``run()`` can therefore ride the collect loop through a server-side
+        deadline to the finished generation. Not retried by default: a completed
+        5xx that named no such pace, and a client-side timeout — those leave the
+        outcome genuinely unknown and need
+        ``RetryPolicy(retry_possibly_in_flight=True)``. See
         :mod:`comfy_sdk.retry`, and ``Comfy(retry=NO_RETRY)`` to switch it off.
         """
         low = cast(ComfyLow, self._low)
@@ -167,7 +169,13 @@ class Models(_ModelsBase):
         # mapping inside each attempt would let a mutation between attempts
         # send a different body under the *same* key, which is precisely the
         # same-key-different-body case the contract rejects outright.
-        payload = dict(arguments)
+        #
+        # Deep, not shallow: a shallow copy leaves every nested list and dict
+        # shared with the caller, so mutating `arguments["config"]["steps"]`
+        # during the retry window would still change the body under the one key
+        # and earn the 422 this snapshot exists to prevent. The body is JSON on
+        # the wire, so everything legal in it is deep-copyable.
+        payload = deepcopy(dict(arguments))
         retrier = Retrier(self._retry, now=_now)
         with translating():
             while True:
@@ -203,10 +211,11 @@ class AsyncModels(_ModelsBase):
         """
         low = cast(AsyncComfyLow, self._low)
         key = idempotency_key or new_idempotency_key()
-        # Snapshotted before the first attempt — see :meth:`Models.run`. The
-        # window is wider here: the caller's coroutine can mutate `arguments`
-        # while the retry sleeps.
-        payload = dict(arguments)
+        # Snapshotted deeply before the first attempt — see :meth:`Models.run`.
+        # The window is wider here: the retry sleeps inside the caller's own
+        # event loop, so another task is free to run and mutate `arguments`,
+        # nested values included.
+        payload = deepcopy(dict(arguments))
         retrier = Retrier(self._retry, now=_now)
         with translating():
             while True:
