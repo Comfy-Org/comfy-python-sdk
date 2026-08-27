@@ -160,6 +160,30 @@ class Models(_ModelsBase):
         outcome genuinely unknown and need
         ``RetryPolicy(retry_possibly_in_flight=True)``. See
         :mod:`comfy_sdk.retry`, and ``Comfy(retry=NO_RETRY)`` to switch it off.
+
+        **Every exception this raises carries the key it sent** on
+        ``.idempotency_key`` (and the server's ``.request_id`` when the response
+        named one), so a caller who lost the response — a ``deadline_exceeded``
+        ``504``, a dropped connection — can still collect a generation they were
+        already billed for: ``client.models.run(model, arguments,
+        idempotency_key=exc.idempotency_key)`` returns the original result
+        (``200`` + ``Idempotent-Replayed``) against a deployment that replays a
+        claimed key, or is refused while that generation is still running, with
+        ``exc.retry_after`` naming when to ask again when the server sent a
+        ``Retry-After``. Without that attribute an auto-minted key died with the
+        call and the paid-for generation was uncollectable.
+
+        Note that a dropped connection surfaces as an ``httpx`` error rather
+        than a :class:`~comfy_sdk.ComfyError` — it never reached a response to
+        translate — so a handler written for the replay has to catch both; see
+        the README's "Collecting a generation after a lost response".
+
+        Pass ``exc.idempotency_key`` back only after checking it is not
+        ``None``. This parameter treats ``None`` as "mint one", so replaying
+        with a key that was never recorded silently starts a *second* billed
+        generation instead of collecting the first. Every exception *this*
+        method raises carries a real key, but an ``except ComfyError`` that also
+        catches errors from other surfaces can hand you one that does not.
         """
         low = cast(ComfyLow, self._low)
         # Minted once, outside the loop: reusing this exact value on every
@@ -177,7 +201,10 @@ class Models(_ModelsBase):
         # the wire, so everything legal in it is deep-copyable.
         payload = deepcopy(dict(arguments))
         retrier = Retrier(self._retry, now=_now)
-        with translating():
+        # The key is stamped onto whatever this raises: it is a local of this
+        # frame, so an exception that propagates past it would otherwise take
+        # the caller's only route back to an already-billed generation with it.
+        with translating(idempotency_key=key):
             while True:
                 try:
                     return low.post_model_run(model, payload, idempotency_key=key, timeout=timeout)
@@ -206,8 +233,9 @@ class AsyncModels(_ModelsBase):
         """Awaitable :meth:`Models.run` — same arguments, same result shape.
 
         This *is* the async form of ``run``: awaiting it on ``AsyncComfy`` is
-        the whole difference from the sync client — including the retry policy
-        and the one-key-per-call rule. See :meth:`Models.run`.
+        the whole difference from the sync client — including the retry policy,
+        the one-key-per-call rule, and the ``.idempotency_key`` every exception
+        it raises carries for the replay. See :meth:`Models.run`.
         """
         low = cast(AsyncComfyLow, self._low)
         key = idempotency_key or new_idempotency_key()
@@ -217,7 +245,10 @@ class AsyncModels(_ModelsBase):
         # nested values included.
         payload = deepcopy(dict(arguments))
         retrier = Retrier(self._retry, now=_now)
-        with translating():
+        # The key is stamped onto whatever this raises: it is a local of this
+        # frame, so an exception that propagates past it would otherwise take
+        # the caller's only route back to an already-billed generation with it.
+        with translating(idempotency_key=key):
             while True:
                 try:
                     return await low.post_model_run(
