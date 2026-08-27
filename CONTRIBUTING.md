@@ -59,7 +59,8 @@ CI runs two more jobs beyond the four above:
 - **`public-repo-hygiene`** — a thin caller into the shared reusable workflow
   in `Comfy-Org/github-workflows`, which scans for internal-only references.
   This is a public repo; the check is a permanent gate, not a one-time
-  cleanup. See AGENTS.md for details.
+  cleanup. It lives in its own workflow file rather than `ci.yml`, so it
+  reports as `hygiene / public-repo-hygiene`. See AGENTS.md for details.
 
 ## The codegen trap: `src/comfy_low/models/_generated.py`
 
