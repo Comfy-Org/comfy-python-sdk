@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
-"""Fail if the committed comfy_low models drift from spec/openapi.yaml.
+"""Fail if the committed tree drifts from the vendored specs.
 
-Regenerates the models into a temp file and diffs against the committed one. CI
-runs this so a spec edit without a regen (or a hand-edit of the generated file)
-is caught. Mirrors the codegen-freshness gate other repos enforce.
+Two checks, one job:
+
+1. **Models vs ``spec/openapi.yaml``.** Regenerates the models into a temp file
+   and diffs against the committed one, so a spec edit without a regen (or a
+   hand-edit of the generated file) is caught. Mirrors the codegen-freshness
+   gate other repos enforce.
+2. **Router exception classes vs ``spec/router-openapi.yaml``.** The router
+   surface has no generated artifact -- its contract lands in the SDK as the
+   hand-written class table in ``comfy_sdk.router_exceptions``. So the drift
+   that matters there is a bucket the spec declares and the SDK has no class
+   for, which would reach callers as an untyped ``RouterError``. This compares
+   the spec's ``x-comfy-error-types`` list against ``ROUTER_ERROR_TYPES``,
+   which is what makes the next vendored Router sync a real diff review.
+
+``tests/test_router_spec_contract.py`` asserts the same thing from the test
+suite. Both exist on purpose: the suite is where a contributor sees it, and
+this script is the job that fails a spec-only PR that never ran pytest.
 """
 
 from __future__ import annotations
@@ -15,6 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 COMMITTED = ROOT / "src" / "comfy_low" / "models" / "_generated.py"
+ROUTER_SPEC = ROOT / "spec" / "router-openapi.yaml"
 
 
 def _generate(out: Path) -> None:
@@ -46,7 +61,33 @@ def _generate(out: Path) -> None:
     )
 
 
-def main() -> int:
+def _declared_router_error_types() -> list[str]:
+    """The router spec's ``x-comfy-error-types`` values, in declaration order.
+
+    Raises :class:`ValueError` rather than letting a ``KeyError``/``TypeError``
+    escape: a sync that reshapes or drops the extension should fail this job
+    with a sentence someone can act on, not with a traceback that reads like a
+    bug in the checker.
+    """
+    import yaml
+
+    doc = yaml.safe_load(ROUTER_SPEC.read_text())
+    node: object = doc
+    for key in ("components", "schemas", "RouterErrorType", "x-comfy-error-types"):
+        if not isinstance(node, dict) or key not in node:
+            raise ValueError(f"{ROUTER_SPEC.name} has no components.schemas.RouterErrorType.{key}")
+        node = node[key]
+    if not isinstance(node, list) or not node:
+        raise ValueError(f"{ROUTER_SPEC.name}'s x-comfy-error-types is not a non-empty list")
+    values: list[str] = []
+    for entry in node:
+        if not isinstance(entry, dict) or not isinstance(entry.get("value"), str):
+            raise ValueError(f"{ROUTER_SPEC.name} has an x-comfy-error-types entry with no value")
+        values.append(entry["value"])
+    return values
+
+
+def _check_models() -> int:
     if not COMMITTED.exists():
         print("ERROR: committed models missing; run scripts/gen_models.sh", file=sys.stderr)
         return 1
@@ -62,6 +103,61 @@ def main() -> int:
             return 1
     print("OK: comfy_low models are in sync with spec/openapi.yaml")
     return 0
+
+
+def _check_router_error_types() -> int:
+    if not ROUTER_SPEC.exists():
+        print(f"ERROR: {ROUTER_SPEC.name} is missing from spec/", file=sys.stderr)
+        return 1
+    # Imported here rather than at module scope so the models check above still
+    # runs (and still reports) when the package itself will not import.
+    sys.path.insert(0, str(ROOT / "src"))
+    from comfy_sdk.router_exceptions import ROUTER_ERROR_TYPES
+
+    try:
+        declared = _declared_router_error_types()
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    known = list(ROUTER_ERROR_TYPES)
+    if declared == known:
+        print(
+            f"OK: comfy_sdk.router_exceptions covers all {len(declared)} error types "
+            "in spec/router-openapi.yaml"
+        )
+        return 0
+
+    missing = [value for value in declared if value not in known]
+    extra = [value for value in known if value not in declared]
+    print(
+        "ERROR: the router exception table has drifted from spec/router-openapi.yaml.",
+        file=sys.stderr,
+    )
+    if missing:
+        print(
+            f"  declared in the spec, no class in the SDK: {', '.join(missing)}\n"
+            "  Add one RouterError subclass per value to src/comfy_sdk/router_exceptions.py,\n"
+            "  named as the PascalCase of the wire value, with the spec's `meaning`\n"
+            "  as its docstring.",
+            file=sys.stderr,
+        )
+    if extra:
+        print(
+            f"  a class in the SDK, not declared in the spec: {', '.join(extra)}",
+            file=sys.stderr,
+        )
+    if not missing and not extra:
+        print(
+            f"  same values, different order.\n    spec: {declared}\n    sdk:  {known}",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def main() -> int:
+    # Both run every time: reporting only the first failure would hide the
+    # second one behind a fix for the first.
+    return max(_check_models(), _check_router_error_types())
 
 
 if __name__ == "__main__":

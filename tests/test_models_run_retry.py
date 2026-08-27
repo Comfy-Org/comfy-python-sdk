@@ -40,7 +40,7 @@ from comfy_sdk import DEFAULT_RETRY, NO_RETRY, AsyncComfy, Comfy, RetryPolicy
 from comfy_sdk.exceptions import ComfyError, IdempotencyKeyReuse
 from comfy_sdk.models import AsyncModels, Models
 from comfy_sdk.retry import Retrier, is_unknown_outcome_status, retry_after_of
-from comfy_sdk.router_exceptions import ContentPolicyViolation, InternalError
+from comfy_sdk.router_exceptions import ContentPolicyViolation, InternalError, ServiceUnavailable
 
 
 class _FakeClock:
@@ -618,6 +618,39 @@ def test_a_typed_router_refusal_is_classified_by_its_status() -> None:
     assert not DEFAULT_RETRY.should_retry(ContentPolicyViolation("refused", http_status=400))
     opted_in = RetryPolicy(retry_possibly_in_flight=True)
     assert opted_in.should_retry(InternalError("boom", http_status=500))
+
+
+# --- the router bucket that asks to be retried ---------------------------
+
+
+def test_service_unavailable_is_not_retried_by_default() -> None:
+    # The DECISION this asserts, so it cannot be changed silently: the router
+    # contract tells a caller to retry `service_unavailable` with backoff, and
+    # the SDK does not make that retry for them. It arrives on a 503, and the
+    # question the default policy answers first is whether the one
+    # Idempotency-Key is still spendable -- which no contract says a 503 leaves
+    # it. See comfy_sdk.retry's module docstring.
+    exc = ServiceUnavailable("a dependency is briefly unavailable", http_status=503)
+    assert not DEFAULT_RETRY.should_retry(exc)
+    assert not FAST.should_retry(exc)
+
+
+def test_service_unavailable_is_retried_under_the_replay_opt_in_on_one_key() -> None:
+    # The opt-in is the caller's route to the contract's advice, and it stays
+    # subject to the rule the whole module exists for: the second attempt
+    # carries the SAME key, so a retry cannot be billed as a second generation.
+    class _UnavailableThenFine(_FlakyLow):
+        def _attempt(self, args: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+            self.keys.append(key)
+            if self.fail_times > 0:
+                self.fail_times -= 1
+                raise ServiceUnavailable("try again shortly", http_status=503)
+            return self.result
+
+    low = _UnavailableThenFine(fail_times=1)
+    assert _models(low, FAST_OPTED_IN).run(MODEL, ARGS) == low.result
+    assert len(low.keys) == 2
+    assert len(set(low.keys)) == 1
 
 
 def test_a_router_error_reaches_the_retry_loop_at_all() -> None:

@@ -21,14 +21,18 @@ from comfy_sdk.router_exceptions import (
     ClientDisconnected,
     ConcurrencyLimitExceeded,
     ContentPolicyViolation,
+    DeadlineExceeded,
     Forbidden,
     InsufficientCredits,
     InternalError,
     InvalidInput,
     ModelNotFound,
+    NotEnabled,
     ProviderError,
     ProviderTimeout,
+    RateLimited,
     RouterError,
+    ServiceUnavailable,
     Unauthorized,
     ValidationErrorDetail,
     error_from_response,
@@ -39,7 +43,11 @@ REQUEST_ID = "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21"
 
 # (error_type, the status the router returns with it, the class it must raise).
 # The statuses are part of the case on purpose: they document the pairing a
-# retry policy keys on (502 provider_error vs 504 provider_timeout).
+# retry policy keys on (502 provider_error vs 504 provider_timeout), and the
+# four status collisions the widened set introduced -- 403 forbidden vs
+# not_enabled, 429 concurrency_limit_exceeded vs rate_limited, 504
+# provider_timeout vs deadline_exceeded, 500 internal_error vs the 503
+# service_unavailable it is deliberately NOT merged with.
 CASES: list[tuple[str, int, type[RouterError]]] = [
     ("invalid_input", 400, InvalidInput),
     ("content_policy_violation", 400, ContentPolicyViolation),
@@ -52,6 +60,10 @@ CASES: list[tuple[str, int, type[RouterError]]] = [
     ("concurrency_limit_exceeded", 429, ConcurrencyLimitExceeded),
     ("client_disconnected", 499, ClientDisconnected),
     ("internal_error", 500, InternalError),
+    ("deadline_exceeded", 504, DeadlineExceeded),
+    ("not_enabled", 403, NotEnabled),
+    ("service_unavailable", 503, ServiceUnavailable),
+    ("rate_limited", 429, RateLimited),
 ]
 
 # Deliberately not in the set this SDK version knows: later milestones add them,
@@ -303,14 +315,85 @@ def test_a_response_with_no_bucket_falls_back_to_the_status(
     assert exc.detail == f"HTTP {status}"
 
 
-@pytest.mark.parametrize("status", [400, 422])
+@pytest.mark.parametrize("status", [400, 422, 503])
 def test_an_ambiguous_status_with_no_bucket_stays_the_base_class(status: int) -> None:
     # 400 is either invalid_input or content_policy_violation, and those differ
     # in whether a retry can ever succeed -- guessing would tell a caller to
-    # retry a deterministic refusal. 422 is pinned to no bucket at all.
+    # retry a deterministic refusal. 422 is pinned to no bucket at all. 503 is
+    # the same shape of problem one layer out: an intermediary's bare 503 says
+    # nothing about whether the request ever reached the router, and only the
+    # router's own `service_unavailable` is the bucket the contract says clears
+    # on its own.
     exc = error_from_response(status, {}, None)
     assert type(exc) is RouterError
     assert exc.error_type == ""
+
+
+# -- the buckets that share a status with an older one -----------------------
+
+
+def test_a_not_enabled_403_is_not_the_forbidden_403() -> None:
+    # The refusal every caller sees until the rollout reaches them. `forbidden`
+    # is an entitlement decision about the caller; this is a state of the
+    # rollout, and a caller that cannot tell them apart cannot tell "ask for
+    # access" from "wait".
+    exc = error_from_response(
+        403,
+        {ERROR_TYPE_HEADER: "not_enabled", REQUEST_ID_HEADER: REQUEST_ID},
+        {
+            "detail": "Comfy Router is not switched on for this caller yet.",
+            "error_type": "not_enabled",
+        },
+    )
+    assert type(exc) is NotEnabled
+    assert not isinstance(exc, Forbidden)
+    assert exc.detail == "Comfy Router is not switched on for this caller yet."
+    assert exc.request_id == REQUEST_ID
+    assert exc.http_status == 403
+
+
+def test_a_header_less_403_is_still_the_forbidden_403() -> None:
+    # Adding `not_enabled` must not make the status fallback ambiguous: the
+    # router repeats the bucket on the header on every error it sends, so a
+    # 403 without one is an intermediary's, and `forbidden` stays the reading.
+    exc = error_from_response(403, {}, None)
+    assert type(exc) is Forbidden
+
+
+def test_a_service_unavailable_503_is_its_own_bucket_not_internal_error() -> None:
+    exc = error_from_response(
+        503,
+        {ERROR_TYPE_HEADER: "service_unavailable", REQUEST_ID_HEADER: REQUEST_ID},
+        {"detail": "A dependency is briefly unavailable.", "error_type": "service_unavailable"},
+    )
+    assert type(exc) is ServiceUnavailable
+    assert not isinstance(exc, InternalError)
+    assert exc.detail == "A dependency is briefly unavailable."
+    assert exc.request_id == REQUEST_ID
+
+
+def test_a_deadline_exceeded_504_is_not_the_provider_timeout_504() -> None:
+    # Same status, opposite cause: one says the partner ran out of time, the
+    # other says Comfy stopped holding the connection.
+    exc = error_from_response(
+        504,
+        {ERROR_TYPE_HEADER: "deadline_exceeded"},
+        {"detail": "Comfy stopped waiting.", "error_type": "deadline_exceeded"},
+    )
+    assert type(exc) is DeadlineExceeded
+    assert type(error_from_response(504, {}, None)) is ProviderTimeout
+
+
+def test_a_rate_limited_429_is_not_the_concurrency_429() -> None:
+    # One clears when the caller's own in-flight call finishes; nothing the
+    # caller does drains the other early.
+    exc = error_from_response(
+        429,
+        {ERROR_TYPE_HEADER: "rate_limited"},
+        {"detail": "10 requests per minute.", "error_type": "rate_limited"},
+    )
+    assert type(exc) is RateLimited
+    assert type(error_from_response(429, {}, None)) is ConcurrencyLimitExceeded
 
 
 # -- never crash the client on a malformed response --------------------------

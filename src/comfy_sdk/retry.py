@@ -59,6 +59,24 @@ That, not a guess about the network, is what sorts the failures:
    about *this* request, and asking again spends money to be refused again.
    Never retried.
 
+**The router's ``service_unavailable`` is not retried by default.** The vendored
+router contract tells a *caller* to "retry it with backoff: it is the one bucket
+whose condition clears on its own", and that advice is sound — but it arrives on
+a ``503``, and the question this module answers before retrying anything is not
+"will the condition clear" but "is the one ``Idempotency-Key`` still spendable".
+Neither vendored contract says a ``503`` releases the key; the v2 contract says
+the opposite for the whole 5xx class ("an upstream timeout or 5xx where the job
+may or may not have been created" keeps it claimed), and the router spec
+documents a same-key retry for exactly one bucket, ``deadline_exceeded``, and is
+silent about this one. Retrying it by default would therefore trade a
+diagnosable ``503`` for a ``422 idempotency_key_reuse`` on every deployment that
+rejects a repeated key. So it stays in class 3 above, where
+:attr:`RetryPolicy.retry_possibly_in_flight` opts in — and where a caller who
+wants the contract's advice verbatim can also catch
+:class:`~comfy_sdk.router_exceptions.ServiceUnavailable` and retry it by hand.
+Revisit this the moment the router contract states what a ``503`` does to the
+key.
+
 **A retry never begins while the original attempt might still be running on the
 server.** Beyond the classification above this is also enforced structurally:
 
@@ -251,6 +269,9 @@ class RetryPolicy:
                 # and a 429 without one is not asking to be asked again.
                 return retry_after_of(exc) is not None
             if is_unknown_outcome_status(status):
+                # Every 5xx, including the router's `service_unavailable` 503:
+                # the bucket says the condition clears on its own, but nothing
+                # says the Idempotency-Key does. See this module's docstring.
                 return self.retry_possibly_in_flight
             # Every other 4xx is deterministic — 404 (no such model), 409, 422
             # (invalid input), a content-policy refusal — and none of them

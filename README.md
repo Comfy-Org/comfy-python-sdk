@@ -430,7 +430,7 @@ The default policy:
 | Retried | connect-phase transport failures (connection refused, connect timeout, no pooled connection, proxy error) — the request never reached the server, so the key was never claimed |
 | Retried, at the server's pace | a `429` carrying `Retry-After` (queue full, out of credits, a concurrency limit) — a reject that started no work, so the key is released. The delay is the one the server named, not a guess |
 | Not retried | every other 4xx — `400`/`content_policy_violation`, `404`, `409`, `422`, `401`, `402` — because asking again cannot change a deterministic refusal. A `429` with no `Retry-After` is not asking to be asked again either |
-| Not retried by default | anything whose outcome is unknown: a **5xx response**, and a client-side timeout where the server may still be generating. The key stays claimed for these, so a same-key retry comes back `422 idempotency_key_reuse` and hides the real error — while a fresh-key retry is the second billed generation the one-key rule exists to prevent |
+| Not retried by default | anything whose outcome is unknown: a **5xx response** (including the router's `service_unavailable` `503`, which asks a caller to retry with backoff but says nothing about the key), and a client-side timeout where the server may still be generating. The key stays claimed for these, so a same-key retry comes back `422 idempotency_key_reuse` and hides the real error — while a fresh-key retry is the second billed generation the one-key rule exists to prevent |
 | Budget | 60 seconds of **total elapsed time** from the first attempt, not a number of attempts |
 | Backoff | 0.5s doubling to a 15s ceiling, with full jitter (each wait is drawn from `[0, ceiling]`), clamped to whatever is left of the budget |
 

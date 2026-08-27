@@ -27,6 +27,16 @@ catch writes ``except RouterError``; one who wants a single failure mode names
 it. ``RouterError`` in turn derives from :class:`~comfy_sdk.exceptions.ComfyError`,
 so ``except ComfyError`` still covers the whole SDK.
 
+**The set comes from the vendored contract, not from this file.**
+``spec/router-openapi.yaml`` carries the closed bucket list as
+``x-comfy-error-types``, one entry per wire value with the ``meaning`` text the
+class docstrings below reproduce. ``tests/test_router_spec_contract.py`` reads
+that list and asserts a class exists for every value, in the same order, so a
+bucket the contract adds cannot land in the SDK as an untyped
+``RouterError`` without a test going red. ``scripts/check_drift.py`` runs the
+same comparison in CI, which is what makes the next vendored Router sync a real
+diff review rather than a silent widening.
+
 **An unrecognised ``error_type`` raises the base class rather than failing.**
 The error set grows on the server's release cycle while an SDK is pinned by its
 users, so a bucket this version has never heard of must still arrive as a
@@ -42,6 +52,15 @@ one name cannot be two classes, and silently making ``comfy_sdk.Unauthorized``
 mean the router one would change what an existing ``except`` clause catches.
 Import the router ones from this module, or catch
 :class:`~comfy_sdk.exceptions.ComfyError` to cover both surfaces at once.
+
+That holds for the buckets whose names collide with *nothing* too --
+:class:`NotEnabled`, :class:`ServiceUnavailable`, :class:`RateLimited`,
+:class:`DeadlineExceeded`. Lifting the non-colliding subset to the package root
+would make ``comfy_sdk.NotEnabled`` importable while ``comfy_sdk.InvalidInput``
+stayed a name that does not exist, and a caller cannot be expected to remember
+which half of one hierarchy lives where. One import path for the whole set is
+the property worth keeping; ``from comfy_sdk.router_exceptions import
+NotEnabled`` is it.
 
 The coarse bucket is not the whole story. A per-field model-validation failure
 carries a ``detail`` *array* whose entries keep the specific, provider-level
@@ -194,7 +213,7 @@ class ModelNotFound(RouterError):
     error_type = "model_not_found"
 
 
-# -- the five transport-level buckets ----------------------------------------
+# -- the nine transport-level buckets ----------------------------------------
 
 
 class Unauthorized(RouterError):
@@ -222,13 +241,86 @@ class ClientDisconnected(RouterError):
 
 
 class InternalError(RouterError):
-    """An internal error occurred."""
+    """An internal error occurred.
+
+    It is also the value a client should treat any *unrecognised* bucket as, so
+    a later addition to the set does not break a client generated before it.
+    """
 
     error_type = "internal_error"
 
 
+class DeadlineExceeded(RouterError):
+    """Comfy stopped holding the connection at its own configured bound before
+    an answer arrived.
+
+    It shares ``504`` with :class:`ProviderTimeout` and the pair says which side
+    ran out of time; this one is Comfy's own bound, so nothing about the request
+    was rejected and the same request may be retried. It says nothing about the
+    charge: a provider generation that completed is billed regardless of whether
+    the caller received the response. Retry it with the *same*
+    ``Idempotency-Key`` -- when the provider had already accepted the
+    generation, the retry collects that generation rather than dispatching
+    another, and a ``Retry-After`` on the ``504`` says when to ask.
+    """
+
+    error_type = "deadline_exceeded"
+
+
+class NotEnabled(RouterError):
+    """Comfy Router is not switched on for this caller yet.
+
+    Nothing about the request is wrong and the model exists, which is why this
+    is not :class:`ModelNotFound`; it shares ``403`` with :class:`Forbidden` and
+    is *not* the same thing, because ``forbidden`` is an entitlement decision
+    about the caller while this is a state of the rollout. It is **terminal**:
+    do not retry, and do not treat it as an outage.
+    """
+
+    error_type = "not_enabled"
+
+
+class ServiceUnavailable(RouterError):
+    """A service Comfy Router depends on is temporarily unavailable and the
+    caller did nothing wrong.
+
+    Retry it with backoff: it is the one bucket here whose condition clears on
+    its own, without the caller changing the request and without a concurrency
+    slot freeing, which is what distinguishes it from the other retryable
+    answers (:class:`ConcurrencyLimitExceeded`, :class:`DeadlineExceeded`). It
+    is separate from :class:`InternalError` -- which is a ``500`` and means
+    Router itself failed -- so a client can tell "come back shortly" from "this
+    call is not going to work".
+
+    On whether the SDK makes that retry for you: it does **not** by default, and
+    :mod:`comfy_sdk.retry` says why -- the bucket arrives on a ``503``, nothing
+    in either vendored contract says a ``503`` *releases* the
+    ``Idempotency-Key``, and the default policy retries only failures the one
+    key provably survives. ``RetryPolicy(retry_possibly_in_flight=True)`` opts
+    in, and catching this class and retrying by hand is the other way.
+    """
+
+    error_type = "service_unavailable"
+
+
+class RateLimited(RouterError):
+    """The caller has spent an allowance measured over a *window* and must wait
+    for that window to roll.
+
+    It shares ``429`` with :class:`ConcurrencyLimitExceeded` and is not the same
+    thing: that one clears the moment one of the caller's own in-flight calls
+    finishes, so retrying in seconds is right, whereas nothing the caller does
+    drains this one early. ``detail`` names the window.
+    """
+
+    error_type = "rate_limited"
+
+
 #: Every class in the closed set, in the order the error set declares it: the
-#: six request-level buckets, then the five transport-level ones.
+#: six request-level buckets, then the nine transport-level ones. The order is
+#: the vendored spec's ``x-comfy-error-types`` order, and
+#: ``tests/test_router_spec_contract.py`` asserts that -- so this tuple cannot
+#: drift from the contract two SDKs generate their surface from.
 ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     InvalidInput,
     ContentPolicyViolation,
@@ -241,6 +333,10 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     ConcurrencyLimitExceeded,
     ClientDisconnected,
     InternalError,
+    DeadlineExceeded,
+    NotEnabled,
+    ServiceUnavailable,
+    RateLimited,
 )
 
 _BY_ERROR_TYPE: dict[str, type[RouterError]] = {cls.error_type: cls for cls in ROUTER_EXCEPTIONS}
@@ -254,12 +350,35 @@ ROUTER_ERROR_TYPES: tuple[str, ...] = tuple(_BY_ERROR_TYPE)
 # answers with a status and no `X-Comfy-Error-Type`, and `except Unauthorized`
 # should still fire for a rejected key.
 #
-# Only statuses the error contract assigns to exactly ONE bucket appear here.
-# `400` is deliberately absent because it carries either `invalid_input` or
+# Read it as "what does an INTERMEDIARY's answer most likely mean", not "which
+# bucket owns this status". Nothing here is ever consulted for a response the
+# router itself sent, because the router repeats the bucket on the header on
+# every error it sends -- so each entry is the plain HTTP reading of the status,
+# and the bucket named is whichever of ours matches that reading.
+#
+# The widened error set gave `403`, `429` and `504` a second router bucket each
+# (`not_enabled`, `rate_limited`, `deadline_exceeded`). The mappings are
+# unchanged anyway, deliberately: `forbidden`, `concurrency_limit_exceeded` and
+# `provider_timeout` are the ones that restate the plain HTTP meaning of a
+# rejected credential, a throttled caller and an upstream that did not answer,
+# while the three new buckets are Comfy-specific claims about the router's own
+# rollout, allowance windows and connection bound -- claims a proxy that never
+# reached the router is not in a position to be making. (For `429` the choice is
+# the narrowest one: both candidates are throttling, and the retry policy keys
+# on the status and `Retry-After` rather than on the bucket, so the class a
+# caller catches is the only thing that differs.)
+#
+# A status stays OUT of the table when the plain HTTP reading does not pick one
+# bucket. `400` is absent because it carries either `invalid_input` or
 # `content_policy_violation`, and those differ in whether a retry can ever
 # succeed -- guessing between them would tell a caller to retry a deterministic
-# refusal. `422` is absent for the same reason: the contract pins no bucket to
-# it. Both fall through to `RouterError`, which is the honest answer.
+# refusal. `422` is absent because the contract pins no bucket to it at all.
+# `503` is absent because an intermediary's bare `503` is not the router's
+# `service_unavailable`: that bucket is the router's own statement that a
+# dependency of ITS is briefly down and the condition clears on its own, and a
+# gateway's `503` says nothing about whether the request ever reached the router
+# to have such a statement made about it. All three fall through to
+# `RouterError`, which is the honest answer.
 _ERROR_TYPE_BY_STATUS: dict[int, str] = {
     401: "unauthorized",
     402: "insufficient_credits",
@@ -395,14 +514,18 @@ __all__ = [
     "ClientDisconnected",
     "ConcurrencyLimitExceeded",
     "ContentPolicyViolation",
+    "DeadlineExceeded",
     "Forbidden",
     "InsufficientCredits",
     "InternalError",
     "InvalidInput",
     "ModelNotFound",
+    "NotEnabled",
     "ProviderError",
     "ProviderTimeout",
+    "RateLimited",
     "RouterError",
+    "ServiceUnavailable",
     "Unauthorized",
     "ValidationErrorDetail",
     "error_from_response",

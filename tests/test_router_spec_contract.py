@@ -1,0 +1,95 @@
+"""The router exception table is the vendored contract's, not this repo's.
+
+``spec/router-openapi.yaml`` declares the closed error set as
+``x-comfy-error-types`` -- one entry per wire value, each with the ``meaning``
+prose the exception docstrings reproduce. Everything here reads that list and
+compares it against :mod:`comfy_sdk.router_exceptions`, so the two cannot drift:
+the failure this guards against is a Router spec sync landing a new bucket that
+then reaches callers as an untyped ``RouterError`` with nothing going red.
+
+That is also why the assertions are written against the file rather than
+against a list copied out of it. A test that restated the set would pass a sync
+it should have failed.
+
+``scripts/check_drift.py`` runs the same comparison in CI's codegen-drift job,
+which is the gate that catches it even for someone who only ran the linters.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+from comfy_sdk.router_exceptions import (
+    ROUTER_ERROR_TYPES,
+    ROUTER_EXCEPTIONS,
+    RouterError,
+    exception_for,
+)
+
+ROUTER_SPEC = Path(__file__).resolve().parent.parent / "spec" / "router-openapi.yaml"
+
+
+def _declared_error_types() -> list[dict[str, Any]]:
+    """The ``x-comfy-error-types`` entries, in the order the spec declares them."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text())
+    entries = doc["components"]["schemas"]["RouterErrorType"]["x-comfy-error-types"]
+    assert isinstance(entries, list) and entries, "the vendored spec declares no error types"
+    return entries
+
+
+DECLARED = _declared_error_types()
+DECLARED_VALUES = [entry["value"] for entry in DECLARED]
+
+
+def test_the_vendored_router_spec_is_present() -> None:
+    # The whole point of vendoring it: the next sync is a diff against this
+    # file rather than a first import nobody reviewed.
+    assert ROUTER_SPEC.is_file()
+
+
+@pytest.mark.parametrize("value", DECLARED_VALUES)
+def test_every_declared_bucket_has_a_class(value: str) -> None:
+    cls = exception_for(value)
+    assert cls is not RouterError, (
+        f"the vendored spec declares {value!r} and the SDK has no class for it -- "
+        "a caller can only reach it as the base class"
+    )
+    assert cls.error_type == value
+
+
+def test_the_closed_set_is_the_spec_s_list_in_the_spec_s_order() -> None:
+    # Order too, not just membership: `ROUTER_EXCEPTIONS` is documented as the
+    # declaration order, and both SDKs present the set in it.
+    assert list(ROUTER_ERROR_TYPES) == DECLARED_VALUES
+
+
+def test_the_class_count_equals_the_spec_s_list_length() -> None:
+    assert len(ROUTER_EXCEPTIONS) == len(DECLARED_VALUES)
+    assert len(ROUTER_ERROR_TYPES) == len(DECLARED_VALUES)
+
+
+def test_no_class_claims_a_bucket_the_spec_does_not_declare() -> None:
+    # The other direction: a hand-added class for a bucket that never made the
+    # contract is a name the TypeScript twin will not have.
+    assert set(ROUTER_ERROR_TYPES) <= set(DECLARED_VALUES)
+
+
+@pytest.mark.parametrize("value", DECLARED_VALUES)
+def test_every_class_documents_its_bucket(value: str) -> None:
+    # The `meaning` prose is the only place the difference between two buckets
+    # that share a status is written down, so a class without a docstring is a
+    # class whose whole reason for existing is missing.
+    doc = exception_for(value).__doc__
+    assert doc and doc.strip(), f"{value!r} has a class with no docstring"
+
+
+def test_the_spec_states_a_meaning_and_a_tier_for_every_bucket() -> None:
+    # Guards the reader of this file as much as the SDK: the assertions above
+    # are only as good as the entries they read.
+    for entry in DECLARED:
+        assert entry.get("tier") in {"request", "transport"}, entry
+        assert isinstance(entry.get("meaning"), str) and entry["meaning"].strip(), entry
