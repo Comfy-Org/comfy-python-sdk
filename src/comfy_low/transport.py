@@ -558,7 +558,6 @@ class ComfyLow:
         tags: list[str] | None = None,
         idempotency_key: str | None = None,
         file_size: int | None = None,
-        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         """POST /api/v2/assets — streaming multipart upload."""
@@ -574,8 +573,6 @@ class ComfyLow:
             # One part per tag — repeating the field name is the multipart/form
             # convention for a list, and a dict would silently drop all but one.
             fields.extend(("tags", t) for t in tags)
-        if expires_in is not None:
-            fields.append(("expires_in", str(expires_in)))
         boundary = _new_boundary()
         body, length = _multipart.build_multipart(
             boundary,
@@ -600,7 +597,6 @@ class ComfyLow:
         *,
         file_path: str | None = None,
         tags: list[str] | None = None,
-        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         """POST /api/v2/assets/from-hash — dedup mint over existing bytes."""
@@ -609,8 +605,6 @@ class ComfyLow:
             payload["file_path"] = file_path
         if tags is not None:
             payload["tags"] = tags
-        if expires_in is not None:
-            payload["expires_in"] = expires_in
         resp = self.raw_request("POST", "/assets/from-hash", json=payload, timeout=timeout)
         data = self._p.parse_or_raise(resp, (200, 201))
         return Asset.model_validate(data)
@@ -923,7 +917,6 @@ class AsyncComfyLow:
         tags: list[str] | None = None,
         idempotency_key: str | None = None,
         file_size: int | None = None,
-        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         if file_size is None:
@@ -937,8 +930,6 @@ class AsyncComfyLow:
         if tags:
             # One part per tag — see the sync ``post_assets`` for why a dict is wrong.
             fields.extend(("tags", t) for t in tags)
-        if expires_in is not None:
-            fields.append(("expires_in", str(expires_in)))
         boundary = _new_boundary()
         body, length = _multipart.build_multipart(
             boundary,
@@ -973,7 +964,6 @@ class AsyncComfyLow:
         *,
         file_path: str | None = None,
         tags: list[str] | None = None,
-        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         payload: dict[str, Any] = {"hash": hash}
@@ -981,8 +971,6 @@ class AsyncComfyLow:
             payload["file_path"] = file_path
         if tags is not None:
             payload["tags"] = tags
-        if expires_in is not None:
-            payload["expires_in"] = expires_in
         resp = await self.raw_request("POST", "/assets/from-hash", json=payload, timeout=timeout)
         data = self._p.parse_or_raise(resp, (200, 201))
         return Asset.model_validate(data)
