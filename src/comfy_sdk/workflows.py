@@ -174,6 +174,104 @@ class Workflow:
 
         return node_id
 
+    def remove_node(self, node_id: str) -> None:
+        """Remove a node and redirect links through it back to their sources.
+
+        Deletes the node identified by ``node_id`` from the graph. Any input
+        connections (links) in other nodes that reference this node's outputs
+        are redirected to the source that fed into the removed node, effectively
+        unwinding any insertion point.
+
+        If the removed node has exactly one input that is a link, all downstream
+        consumers of its outputs are redirected to that source. Otherwise (zero
+        or multiple link inputs), downstream links are simply deleted.
+        """
+        removed = self.json.pop(node_id, None)
+        if removed is None:
+            return
+
+        # Collect link inputs from the removed node
+        link_inputs: list[tuple[str, int]] = []
+        removed_inputs = removed.get("inputs") or {}
+        for value in removed_inputs.values():
+            if _is_link(value):
+                link_inputs.append((value[0], int(value[1])))
+
+        if len(link_inputs) == 1:
+            # Single link input: redirect all downstream consumers to that source
+            src_node, src_output = link_inputs[0]
+            for node in self.json.values():
+                inputs = node.get("inputs")
+                if not inputs:
+                    continue
+                for key, value in list(inputs.items()):
+                    if _is_link(value) and value[0] == node_id:
+                        if src_node in self.json:
+                            inputs[key] = [src_node, src_output]
+                        else:
+                            del inputs[key]
+        else:
+            # Zero or multiple link inputs: just delete downstream links
+            for node in self.json.values():
+                inputs = node.get("inputs")
+                if not inputs:
+                    continue
+                to_delete = []
+                for key, value in inputs.items():
+                    if _is_link(value) and value[0] == node_id:
+                        to_delete.append(key)
+                for key in to_delete:
+                    del inputs[key]
+
+    def remove_node(self, node_id: str) -> None:
+        """Remove a node and redirect links through it back to their sources.
+
+        Deletes the node identified by ``node_id`` from the graph. Any input
+        connections (links) in other nodes that reference this node's outputs
+        are redirected to the source that fed into the removed node, effectively
+        unwinding any insertion point.
+
+        If the removed node has exactly one input that is a link, all downstream
+        consumers of its outputs are redirected to that source. Otherwise (zero
+        or multiple link inputs), downstream links are simply deleted.
+        """
+        removed = self.json.pop(node_id, None)
+        if removed is None:
+            return
+
+        # Collect link inputs from the removed node
+        link_inputs: list[tuple[str, int]] = []
+        removed_inputs = removed.get("inputs") or {}
+        for value in removed_inputs.values():
+            if _is_link(value):
+                link_inputs.append((value[0], int(value[1])))
+
+        if len(link_inputs) == 1:
+            # Single link input: redirect all downstream consumers to that source
+            src_node, src_output = link_inputs[0]
+            for node in self.json.values():
+                inputs = node.get("inputs")
+                if not inputs:
+                    continue
+                for key, value in list(inputs.items()):
+                    if _is_link(value) and value[0] == node_id:
+                        if src_node in self.json:
+                            inputs[key] = [src_node, src_output]
+                        else:
+                            del inputs[key]
+        else:
+            # Zero or multiple link inputs: just delete downstream links
+            for node in self.json.values():
+                inputs = node.get("inputs")
+                if not inputs:
+                    continue
+                to_delete = []
+                for key, value in inputs.items():
+                    if _is_link(value) and value[0] == node_id:
+                        to_delete.append(key)
+                for key in to_delete:
+                    del inputs[key]
+
     def __repr__(self) -> str:
         return f"Workflow(nodes={len(self.json)})"
 
