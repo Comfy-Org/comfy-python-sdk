@@ -35,7 +35,7 @@ jobs:
     # SHA-pinned. Bump this SHA to pick up upstream changes; keep
     # `workflows_ref` matching so prompts/scripts load from the same commit as
     # the workflow definition.
-    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@b95f165c716087e74b5bbe36ecd15d8ab34424b2 # github-workflows main (b95f165)
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@e203fbcc66ae92a4d492ca9cf6dc6a3d844a9b4b # github-workflows main (b95f165)
     with:
       # Repo-specific generated/heavy paths. `extra_generated_globs` is the
       # right knob rather than `diff_excludes`: it feeds the shared
