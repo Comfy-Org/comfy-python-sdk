@@ -23,7 +23,7 @@ def test_404_codes_map_to_notfound(code: str) -> None:
 
 # --- the two error shapes one client has to read ---
 #
-# `POST /v1/models/{provider}/{model}` is Router's own route, whose error body is
+# `POST /v2/models/{provider}/{model}` is Router's own route, whose error body is
 # `{detail, error_type}` with the coarse bucket repeated on `X-Comfy-Error-Type`
 # -- not the v2 `{error: {code, message}}` envelope every other route answers in.
 # `error_from_envelope` has to read both, because `comfy_sdk.retry` keys its

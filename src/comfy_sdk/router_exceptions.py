@@ -189,7 +189,15 @@ class RouterError(ComfyError):
 
 
 class InvalidInput(RouterError):
-    """The request was rejected as invalid for this model."""
+    """The request was rejected before it reached the model.
+
+    A malformed body, a malformed or expired pagination cursor, an input the
+    model's own schema does not accept — or, on a ``409``, an
+    ``Idempotency-Key`` that cannot serve this request: already used for a
+    different request, or already consumed by a call whose response cannot be
+    replayed. The key cases are answered by using a NEW key rather than by
+    editing the request; the status says which case you are in.
+    """
 
     error_type = "invalid_input"
 
@@ -250,7 +258,14 @@ class Forbidden(RouterError):
 
 
 class ConcurrencyLimitExceeded(RouterError):
-    """Too many concurrent requests."""
+    """The workspace already has as many calls in flight as it is allowed.
+
+    On a ``429``: plain workspace throttling — retry once one of your own calls
+    finishes. On a ``409`` on the run route it means something more specific:
+    another call is ALREADY in flight for the ``Idempotency-Key`` this request
+    presented. Re-send the SAME key after ``retry_after`` seconds to collect
+    that call's result; :mod:`comfy_sdk.retry` does exactly that by default.
+    """
 
     error_type = "concurrency_limit_exceeded"
 
@@ -331,11 +346,14 @@ class ServiceUnavailable(RouterError):
     call is not going to work".
 
     On whether the SDK makes that retry for you: it does **not** by default, and
-    :mod:`comfy_sdk.retry` says why -- the bucket arrives on a ``503``, nothing
-    in either vendored contract says a ``503`` *releases* the
-    ``Idempotency-Key``, and the default policy retries only failures the one
-    key provably survives. ``RetryPolicy(retry_possibly_in_flight=True)`` opts
-    in, and is the route to take: it keeps the one key across the retry.
+    :mod:`comfy_sdk.retry` says why -- the bucket arrives on a ``503``, whose
+    effect on the ``Idempotency-Key`` the caller cannot observe from the status
+    alone (the contract releases an undispatched refusal but keeps a cut-off
+    dispatch holding the generation), and the default policy retries only
+    failures whose outcome the one key provably characterises.
+    ``RetryPolicy(retry_possibly_in_flight=True)`` opts in, and is the route to
+    take: it keeps the one key across the retry, which is answered from the
+    record -- re-run, collected, or refused ``409 invalid_input``.
 
     Catching this class and calling ``models.run()`` again is **not** an
     equivalent way to do it. A run mints a *fresh* ``Idempotency-Key`` per call,

@@ -102,11 +102,11 @@ def test_a_created_shaped_success_is_also_a_result(server) -> None:
 
 def test_run_addresses_the_model_by_path_and_sends_the_native_body(server) -> None:
     # The wire shape Router declares: the id is the two path segments of
-    # `/v1/models/{provider}/{model}`, and the body is the partner model's OWN
+    # `/v2/models/{provider}/{model}`, and the body is the partner model's OWN
     # native JSON input, forwarded unchanged — no `{model, arguments}` envelope.
     with Comfy() as client:
         client.models.run(MODEL, ARGS)
-    assert server.state.last_model_run_path == "/v1/models/acme/flux-dev"
+    assert server.state.last_model_run_path == "/v2/models/acme/flux-dev"
     assert server.state.last_model_run_provider == "acme"
     assert server.state.last_model_run_model == "flux-dev"
     assert server.state.last_model_run_body == ARGS
@@ -117,7 +117,7 @@ def test_run_addresses_the_model_by_path_and_sends_the_native_body(server) -> No
 async def test_the_async_client_addresses_the_route_the_same_way(server) -> None:
     async with AsyncComfy() as client:
         await client.models.run(MODEL, ARGS)
-    assert server.state.last_model_run_path == "/v1/models/acme/flux-dev"
+    assert server.state.last_model_run_path == "/v2/models/acme/flux-dev"
     assert server.state.last_model_run_body == ARGS
 
 
@@ -125,7 +125,7 @@ def test_the_sans_io_request_builder_agrees_with_the_wire() -> None:
     # The one place the wire shape is decided, asserted directly so a change to
     # it cannot hide behind the stub's own routing.
     path, body, headers = model_run_request(MODEL, ARGS, "k-1")
-    assert path == "/v1/models/acme/flux-dev"
+    assert path == "/v2/models/acme/flux-dev"
     assert body == ARGS
     assert headers == {"Idempotency-Key": "k-1"}
 
@@ -137,14 +137,14 @@ def test_the_sans_io_request_builder_agrees_with_the_wire() -> None:
         # `RouterModelSegment` pattern, and none of them is percent-encoded:
         # they are unreserved (or sub-delims) in a path segment, so the URL the
         # caller reads in a log is the id they passed.
-        ("fal-ai/flux-pro", "/v1/models/fal-ai/flux-pro"),
-        ("acme/sd_xl.turbo", "/v1/models/acme/sd_xl.turbo"),
-        ("acme_labs/v1.5", "/v1/models/acme_labs/v1.5"),
+        ("fal-ai/flux-pro", "/v2/models/fal-ai/flux-pro"),
+        ("acme/sd_xl.turbo", "/v2/models/acme/sd_xl.turbo"),
+        ("acme_labs/v1.5", "/v2/models/acme_labs/v1.5"),
         # ...while anything that would change the *structure* of the path is
         # encoded rather than passed through.
-        ("acme/a b", "/v1/models/acme/a%20b"),
-        ("acme/a?b", "/v1/models/acme/a%3Fb"),
-        ("acme/a#b", "/v1/models/acme/a%23b"),
+        ("acme/a b", "/v2/models/acme/a%20b"),
+        ("acme/a?b", "/v2/models/acme/a%3Fb"),
+        ("acme/a#b", "/v2/models/acme/a%23b"),
     ],
 )
 def test_each_segment_is_percent_encoded_into_exactly_one_path_segment(
@@ -248,7 +248,7 @@ def test_a_blank_router_env_var_means_the_default(monkeypatch, blank: str) -> No
 
 def test_a_trailing_slash_on_the_router_env_var_is_stripped(monkeypatch) -> None:
     # It is concatenated with a path that already starts with `/`, so a kept
-    # slash would request `//v1/models/...` — a different path to an origin
+    # slash would request `//v2/models/...` — a different path to an origin
     # server than the one the vendored spec declares.
     monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "https://router.example/")
     with Comfy(api_key="comfyui-test") as client:

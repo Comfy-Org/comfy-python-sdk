@@ -7,7 +7,7 @@ the SDK at the stub by setting ``COMFY_BASE_URL`` *and*
 ``COMFY_ROUTER_BASE_URL``.
 
 Both, because the SDK speaks to two surfaces: the ``/api/v2`` deployment (jobs,
-assets) and Comfy Router (``/v1/models/{provider}/{model}``), which is a
+assets) and Comfy Router (``/v2/models/{provider}/{model}``), which is a
 different host in production. This one stub answers both route families, so a
 test that exercises either gets a single server — while a test that is *about*
 the two being separate points ``COMFY_ROUTER_BASE_URL`` at ``second_server``.
@@ -91,7 +91,7 @@ class ServerState:
     job_workflow_format: str = "api"
     job_workflow_not_found: bool = False
 
-    # --- POST /v1/models/{provider}/{model} (the awaited model run) ---
+    # --- POST /v2/models/{provider}/{model} (the awaited model run) ---
     # The provider's native payload the run resolves to. Deliberately not a
     # Comfy-shaped envelope: the SDK must hand it back untouched.
     model_run_result: dict[str, Any] = field(
@@ -152,6 +152,12 @@ class ServerState:
     # Sent as X-Comfy-Request-Id alongside a failed run. `None` sends no header,
     # which is the response an intermediary that never reached the router gives.
     model_run_request_id: str | None = None
+    # Answer a repeated model-run key with the v2 jobs rule (422
+    # idempotency_key_reuse) instead of the router contract's replay-or-409.
+    # Default False: the run route's vendored contract answers a consumed,
+    # non-replayable key 409 invalid_input in Router's own shape. True models
+    # the deployment `COMFY_ROUTER_BASE_URL` can name that applies the v2 rule.
+    model_run_v2_key_rule: bool = False
     # Answer model-run failures in Router's own error shape -- the coarse bucket
     # on `X-Comfy-Error-Type` plus a `{detail, error_type}` body -- instead of
     # the v2 `{error: {code, message}}` envelope. The model-run route is
@@ -493,7 +499,7 @@ def _make_handler(state: ServerState):
             # stub here, with `COMFY_ROUTER_BASE_URL` pointed at it). The two
             # segments are the model id, so they are matched rather than
             # compared to a fixed string.
-            m = re.match(r"/v1/models/([^/]+)/([^/]+)$", self.path)
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)$", self.path)
             if m:
                 self._post_model_run(m.group(1), m.group(2))
                 return
@@ -547,11 +553,23 @@ def _make_handler(state: ServerState):
                 )
                 return
 
-            # The same reject-on-duplicate rule `_post_jobs` implements, for
-            # the same reason: a stub more permissive than the contract would
-            # let a retry design that the real server rejects pass its tests.
+            # The run route's own reuse answer (spec/router-openapi.yaml):
+            # a consumed key whose record cannot be replayed is refused 409
+            # invalid_input in Router's shape — never 422. The v2 jobs rule
+            # stays reachable behind `model_run_v2_key_rule` for the test that
+            # models a non-Router deployment.
             if key and key in state.model_run_idempotency:
-                self._err(422, "idempotency_key_reuse", "Idempotency-Key already used")
+                if state.model_run_v2_key_rule:
+                    self._err(422, "idempotency_key_reuse", "Idempotency-Key already used")
+                    return
+                self._json(
+                    409,
+                    {
+                        "detail": "Idempotency-Key already consumed; use a new key",
+                        "error_type": "invalid_input",
+                    },
+                    headers={"X-Comfy-Error-Type": "invalid_input"},
+                )
                 return
 
             if state.model_run_delay:

@@ -336,8 +336,9 @@ async def test_a_deterministic_refusal_is_never_retried_on_the_async_client(serv
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
 def test_a_5xx_is_not_retried_against_a_reject_on_duplicate_server(server, status: int) -> None:
     # The heart of it. The contract keeps the key *claimed* when the outcome is
-    # unknown, so a same-key retry after a 5xx cannot succeed — it comes back
-    # 422 idempotency_key_reuse and replaces the real error with a confusing
+    # unknown, so a same-key retry after a 5xx cannot plainly succeed — it is
+    # answered from the key's record (409 invalid_input on the router surface,
+    # 422 on a v2-rule deployment), replacing the real error with a confusing
     # one. So the default policy does not make it, and the caller sees the 5xx.
     server.state.model_run_error = (status, "internal_error")
     with Comfy(retry=FAST) as client:
@@ -831,7 +832,7 @@ def test_an_in_progress_409_that_names_a_pace_is_waited_out_and_retried(server) 
     # The answer the collect retry meets when it arrives before the generation
     # has finished: the key is recognised, the work is still running, come back
     # in `Retry-After`. One `run()` rides that to the 200.
-    server.state.model_run_transient_error = (409, "generation_in_progress")
+    server.state.model_run_transient_error = (409, "concurrency_limit_exceeded")
     server.state.model_run_retry_after = "0"
     server.state.model_run_fail_times = 2
     with Comfy(retry=FAST) as client:
@@ -845,7 +846,7 @@ def test_an_in_progress_409_that_names_a_pace_is_waited_out_and_retried(server) 
 def test_a_409_that_names_no_pace_is_still_a_refusal(server) -> None:
     # Unchanged: an ordinary conflict is deterministic. The pace is the whole
     # signal that this one is "not yet" rather than "no".
-    server.state.model_run_error = (409, "generation_in_progress")
+    server.state.model_run_error = (409, "concurrency_limit_exceeded")
     with Comfy(retry=FAST) as client:
         with pytest.raises(ComfyError):
             client.models.run(MODEL, ARGS)
@@ -966,7 +967,7 @@ def test_a_deadline_504_at_the_server_bound_still_gets_a_collect_attempt() -> No
         (
             ApiError(
                 "in progress",
-                code="generation_in_progress",
+                code="concurrency_limit_exceeded",
                 http_status=409,
                 retry_after=3,
             ),
@@ -1051,7 +1052,7 @@ def test_turning_the_collect_loop_off_holds_even_with_the_in_flight_opt_in() -> 
     # right (a 4xx has no unknown-outcome branch to fall into) -- pinned so it
     # stays right for the stated reason rather than by accident.
     in_progress = ApiError(
-        "in progress", code="generation_in_progress", http_status=409, retry_after=2
+        "in progress", code="concurrency_limit_exceeded", http_status=409, retry_after=2
     )
     assert is_collectable(in_progress)
     assert not policy.should_retry(in_progress)
@@ -1136,6 +1137,7 @@ def test_the_default_collect_loop_against_a_non_collecting_deployment(server) ->
     # default makes; `retry_collectable=False` is the way out of it, and this
     # pins both halves so neither can change silently.
     server.state.model_run_collects_after_deadline = False
+    server.state.model_run_v2_key_rule = True
     server.state.model_run_error = (504, "deadline_exceeded")
     server.state.model_run_retry_after = "0"
     with Comfy(retry=FAST) as client:
@@ -1194,3 +1196,73 @@ def test_the_body_is_snapshotted_deeply_before_the_first_attempt(server) -> None
     # The body is the model's native input, unwrapped — the nested value the
     # caller mutated between attempts is *not* what the resend carried.
     assert server.state.last_model_run_body["config"] == {"steps": 4}
+
+
+# --- the contract's own 409s (spec/router-openapi.yaml), in Router's own
+# error shape ---
+
+
+def test_a_router_shaped_in_flight_409_is_collected_at_the_named_pace(server) -> None:
+    # The same collect as the envelope-shaped test above, driven through the
+    # shape a real Router 409 arrives in: `{detail, error_type}` plus
+    # `X-Comfy-Error-Type`, no v2 `error.code` anywhere. This is the response
+    # that used to decode to `hash_mismatch` off the status table, which made
+    # the collect gate unreachable on the wire shape it was written for.
+    server.state.model_run_router_error_shape = True
+    server.state.model_run_transient_error = (409, "concurrency_limit_exceeded")
+    server.state.model_run_retry_after = "0"
+    server.state.model_run_fail_times = 2
+    with Comfy(retry=FAST) as client:
+        assert client.models.run(MODEL, ARGS) == server.state.model_run_result
+    assert server.state.model_run_count == 3
+    keys = server.state.model_run_idempotency_keys
+    assert keys[0] is not None
+    assert keys == [keys[0]] * 3
+
+
+def test_a_router_shaped_invalid_input_409_keeps_its_bucket_and_is_not_retried(server) -> None:
+    # The other declared 409: a key that cannot serve this request, answered by
+    # a NEW key — deterministic, so never resent, and never `HashMismatch`.
+    from comfy_low.errors import HashMismatch
+
+    server.state.model_run_router_error_shape = True
+    server.state.model_run_error = (409, "invalid_input")
+    server.state.model_run_retry_after = "1"
+    with Comfy(retry=FAST) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert server.state.model_run_count == 1
+    assert excinfo.value.code == "invalid_input"
+    assert not isinstance(excinfo.value, HashMismatch)
+
+
+def test_a_repeated_key_is_refused_409_invalid_input_not_422(server) -> None:
+    # The stub's default reuse answer is the run route's contract: replay when
+    # the record allows it, 409 invalid_input in Router's shape when it does
+    # not — the 422 the jobs surface answers must not leak onto this route.
+    server.state.model_run_error = (500, "internal_error")
+    with Comfy(retry=FAST) as client:
+        with pytest.raises(ComfyError):
+            client.models.run(MODEL, ARGS, idempotency_key="one-shot-key-1")
+        server.state.model_run_error = None
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS, idempotency_key="one-shot-key-1")
+    assert excinfo.value.http_status == 409
+    assert excinfo.value.code == "invalid_input"
+    assert not isinstance(excinfo.value, IdempotencyKeyReuse)
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    ["", "x" * 256, "crlf\r\ninjected", "beyond-ascii-\u00e9"],
+    ids=["empty", "overlong", "crlf", "non-ascii"],
+)
+def test_a_key_the_contract_cannot_carry_is_refused_locally(server, bad_key: str) -> None:
+    # The contract pins Idempotency-Key to 1-255 characters and the value rides
+    # an HTTP header. The empty string is the load-bearing case: it used to
+    # fall into the mint-one branch, silently dispatching a SECOND billed
+    # generation on what the caller meant as a collect.
+    with Comfy(retry=FAST) as client:
+        with pytest.raises(ValueError):
+            client.models.run(MODEL, ARGS, idempotency_key=bad_key)
+    assert server.state.model_run_count == 0
