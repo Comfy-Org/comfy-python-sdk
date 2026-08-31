@@ -20,7 +20,12 @@ in ``spec/openapi.yaml`` makes its shared ``IdempotencyKey`` parameter
 *single-use, reject-on-duplicate, with no response replay*: the first request to
 present a key is processed and any later one presenting it is rejected ``422``
 ``idempotency_key_reuse`` rather than re-run or replayed (see
-:class:`~comfy_sdk.exceptions.IdempotencyKeyReuse`). That spec is equally
+:class:`~comfy_sdk.exceptions.IdempotencyKeyReuse`). That is the JOBS surface's
+rule. The router run route records-and-replays instead: a repeated key is
+answered from the record, collected while still running (the
+``concurrency_limit_exceeded`` ``409``), or refused ``409`` ``invalid_input``
+when the record cannot be replayed — never ``422`` (``spec/router-openapi.yaml``,
+``Idempotency-Key``). That spec is equally
 explicit about when a key is *released* instead of claimed: a request that
 "definitively fails without creating a job (a validation error, or an upstream
 reject such as out-of-credits or queue-full)" frees it, while one whose outcome
@@ -54,8 +59,8 @@ That, not a guess about the network, is what sorts the failures:
 3. **Collectable** — the server answered that the work it already holds is not
    finished, *and* named the pace at which to ask the same key again for it: a
    router ``deadline_exceeded`` ``504`` carrying ``Retry-After``, and a
-   ``generation_in_progress`` ``409`` carrying ``Retry-After`` from the
-   idempotency layer on the retry that follows it. This is the one class where the *server* has
+   ``concurrency_limit_exceeded`` ``409`` carrying ``Retry-After`` — the
+   contract's in-flight-key answer — on the retry that follows it. This is the one class where the *server* has
    stated the same-key resend is safe, and the pace it names is its own poll
    interval — so it is retried by default, at that pace, and one ``run()`` call
    rides the collect loop to the finished generation instead of handing the
@@ -92,11 +97,15 @@ a ``503``, and the question this module answers before retrying anything is not
 Neither vendored contract says a ``503`` releases the key; the v2 contract says
 the opposite for the whole 5xx class ("an upstream timeout or 5xx where the job
 may or may not have been created" keeps it claimed), and the router spec
-documents a same-key retry for exactly one bucket, ``deadline_exceeded`` — which
-is why that one is class 3 above and this one is not. The spec is silent about
-what a ``503`` does to the key. Retrying it by default would therefore trade a
-diagnosable ``503`` for a ``422 idempotency_key_reuse`` on every deployment that
-rejects a repeated key. So it stays in class 4 above, where
+paces a same-key retry for exactly two answers — the ``deadline_exceeded``
+``504`` and the in-flight ``concurrency_limit_exceeded`` ``409`` — which is why
+those are class 3 above and this one is not. For a bare ``503`` the router
+contract keys release on whether a provider was reached, which the caller
+cannot observe from the status alone: an undispatched refusal frees the key,
+a cut-off dispatch keeps it holding the generation. Retrying it by default
+would therefore sometimes dispatch fresh, sometimes collect, and sometimes be
+refused ``409 invalid_input`` — an outcome the caller should choose, not
+inherit. So it stays in class 4 above, where
 :attr:`RetryPolicy.retry_possibly_in_flight` opts in — and that opt-in is the
 route to the contract's advice, because it keeps the one key across the retry.
 
@@ -127,11 +136,10 @@ to replay a repeated key rather than reject it::
     except ServiceUnavailable:
         result = client.models.run(model, args, idempotency_key=key)  # same key
 
-Against a deployment that rejects a repeated key that retry comes back
-``422 idempotency_key_reuse`` — which is the honest failure, not a double
-charge. When in doubt, prefer ``RetryPolicy(retry_possibly_in_flight=True)``.
-Revisit this the moment the router contract states what a ``503`` does to the
-key.
+On the router surface that retry is answered from the key's record: replayed,
+collected, or — when the record cannot be replayed — refused ``409``
+``invalid_input``, which is the honest failure, not a double charge. When in
+doubt, prefer ``RetryPolicy(retry_possibly_in_flight=True)``.
 
 **A retry never begins while the original attempt might still be running on the
 server.** Beyond the classification above this is also enforced structurally:
@@ -228,14 +236,17 @@ _GATEWAY_TIMEOUT = 504
 #: another" (``spec/router-openapi.yaml``).
 _DEADLINE_EXCEEDED = "deadline_exceeded"
 
-#: The bucket the idempotency layer answers a mid-collect ``409`` with: the key
-#: is recognised and the generation it names has not finished. Neither vendored
-#: spec contracts this bucket, which is exactly why the gate names it rather
-#: than accepting any paced ``409``: the ``409`` s the specs *do* document are
-#: deterministic refusals (``hash_mismatch``, which ``spec/openapi.yaml`` gives a
-#: ``Retry-After``, and ``asset_in_use``), and a proxy or WAF conflict carries no
-#: bucket at all. Fail closed — an unrecognised ``409`` stays a refusal.
-_GENERATION_IN_PROGRESS = "generation_in_progress"
+#: The bucket the router contract answers a mid-collect ``409`` with: "another
+#: call is already in flight for the ``Idempotency-Key`` this request
+#: presented. Re-send the SAME key after ``Retry-After`` seconds to collect
+#: that call's result" (``spec/router-openapi.yaml``,
+#: ``concurrency_limit_exceeded``). The gate keys on status AND bucket because
+#: the same bucket on a ``429`` means plain workspace throttling, and the other
+#: ``409``\s the specs document are deterministic refusals (``hash_mismatch``,
+#: which ``spec/openapi.yaml`` gives a ``Retry-After``; the router's own
+#: ``invalid_input`` key cases, answered by a NEW key). Fail closed — an
+#: unrecognised ``409`` stays a refusal.
+_CONCURRENCY_LIMIT_EXCEEDED = "concurrency_limit_exceeded"
 
 #: Policy fields that must be real numbers for the arithmetic below to mean
 #: anything. Kept beside the fields themselves so a numeric one added later is
@@ -255,8 +266,10 @@ def is_unknown_outcome_status(status: int) -> bool:
     5xx, and "unknown" is the operative word rather than "transient". The
     vendored contract keeps an ``Idempotency-Key`` claimed for a request whose
     outcome the server cannot characterise — "an upstream timeout or 5xx where
-    the job may or may not have been created" — and rejects any later request
-    presenting a claimed key ``422`` ``idempotency_key_reuse``. That is why
+    the job may or may not have been created" — and (on the jobs surface) rejects any later request
+    presenting a claimed key ``422`` ``idempotency_key_reuse``; the router
+    surface answers the retry from the record — replay, collect, or ``409``
+    ``invalid_input``. That is why
     this class sits behind :attr:`RetryPolicy.retry_possibly_in_flight` rather
     than being retried by default: unless the deployment replays a claimed key,
     the same-key retry cannot succeed and *replaces* the genuine 5xx with a
@@ -333,19 +346,21 @@ def is_collectable(exc: BaseException) -> bool:
       stopped holding the connection at its own bound while the generation ran
       on, and the contract says to "retry it with the SAME ``Idempotency-Key``",
       which "collects that generation rather than dispatching another";
-    * a ``generation_in_progress`` ``409`` carrying ``Retry-After`` — the
-      idempotency layer's answer that the request under this key is still in
-      progress, which is what the collect retry above meets when it arrives
-      before the generation finishes.
+    * a ``concurrency_limit_exceeded`` ``409`` carrying ``Retry-After`` — the
+      contract's answer that another call is already in flight for this very
+      key, which is what the collect retry above meets when it arrives before
+      the generation finishes. (The same bucket on a ``429`` is plain workspace
+      throttling and takes the ordinary retry path, not this one.)
 
     Every gate is load-bearing, and each status is gated on *both* its bucket
     and its pace for the same reason. The ``504`` must name its bucket because
     ``deadline_exceeded`` shares that status with ``provider_timeout``, where no
     contract blesses the resend and a header-less ``504`` from an intermediary is
-    read as exactly that. The ``409`` must name its bucket because every ``409``
-    either vendored spec documents is a *deterministic* refusal that a pace does
-    not soften — ``spec/openapi.yaml`` gives its ``hash_mismatch`` ``409`` a
-    ``Retry-After`` outright — so accepting the status plus a pace alone would
+    read as exactly that. The ``409`` must name its bucket because the other ``409``\s the
+    vendored specs document are *deterministic* refusals that a pace does not
+    soften — ``spec/openapi.yaml`` gives its ``hash_mismatch`` ``409`` a
+    ``Retry-After`` outright, and the router's ``invalid_input`` key cases are
+    answered by a NEW key — so accepting the status plus a pace alone would
     resend a permanent refusal, or a bucket-less proxy conflict, for the whole
     budget. The ``Retry-After`` must be present because the router sends it on a
     ``deadline_exceeded`` "only when Comfy holds a handle to a generation the
@@ -357,7 +372,7 @@ def is_collectable(exc: BaseException) -> bool:
         return False
     bucket = error_bucket_of(exc)
     if status == _CONFLICT:
-        return bucket == _GENERATION_IN_PROGRESS
+        return bucket == _CONCURRENCY_LIMIT_EXCEEDED
     return status == _GATEWAY_TIMEOUT and bucket == _DEADLINE_EXCEEDED
 
 
@@ -402,16 +417,17 @@ class RetryPolicy:
     #: contract characterises, which is what keeps it distinct from
     #: :attr:`retry_collectable`: there the server named the resend safe, here
     #: nothing did. Off by default, and the reason is the contract rather than
-    #: caution: the v2 jobs contract makes ``Idempotency-Key`` single-use with no
-    #: replay and keeps it *claimed* across exactly this class of failure — so a
-    #: same-key retry here can come back ``422`` ``idempotency_key_reuse`` and
-    #: hide the real error. Turn it on for a deployment that replays a repeated
+    #: caution: a key whose recorded answer cannot be replayed is answered
+    #: ``409`` ``invalid_input`` on the router surface (use a NEW key), and the
+    #: v2 jobs contract makes ``Idempotency-Key`` single-use outright — so a
+    #: same-key retry here can surface a key refusal that hides the real error.
+    #: Turn it on for a deployment that replays a repeated
     #: key instead of rejecting it — and raise ``max_elapsed`` when you do, since
     #: one full-length client timeout on a run spends the whole default budget on
     #: its own.
     retry_possibly_in_flight: bool = False
     #: Retry the failures the server itself paced for a same-key resend — a
-    #: router ``deadline_exceeded`` ``504`` and a ``generation_in_progress``
+    #: router ``deadline_exceeded`` ``504`` and a ``concurrency_limit_exceeded``
     #: ``409``, each carrying ``Retry-After``. See :func:`is_collectable` for the exact gates.
     #: **On by default**, because this is the one class where the contract says
     #: the resend collects the generation already running rather than

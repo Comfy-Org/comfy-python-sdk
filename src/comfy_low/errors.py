@@ -176,6 +176,18 @@ def error_from_envelope(
     exceptions that integrators already catch. What is left is exactly the 5xx
     range, where the status determines nothing and the bucket is the only name
     the response has.
+
+    ``409`` is the one carve-out from "the status table wins". The table's
+    ``hash_mismatch`` belongs to the v2 jobs/assets surface, but the router
+    contract now declares its own ``409``\\s (``invalid_input`` for a key that
+    cannot serve this request, ``concurrency_limit_exceeded`` for a key whose
+    call is still in flight — ``spec/router-openapi.yaml``), and those arrive
+    with no ``error.code`` at all. Left to the table, both would surface as
+    :class:`HashMismatch` — an asset-upload error — with the real bucket
+    destroyed before ``comfy_sdk.retry.error_bucket_of`` can read it, so the
+    contract's collect rule could never fire. A ``409`` that names a Router
+    bucket therefore keeps it; a bucket-less ``409`` still degrades to the
+    table exactly as before.
     """
     err = (body or {}).get("error") if isinstance(body, dict) else None
     code = (err or {}).get("code") if isinstance(err, dict) else None
@@ -184,6 +196,12 @@ def error_from_envelope(
 
     if code is None:
         code = _CODE_BY_STATUS.get(http_status)
+        if http_status == 409:
+            router_bucket = _clean(error_type) or _clean(
+                (body or {}).get("error_type") if isinstance(body, dict) else None
+            )
+            if router_bucket is not None:
+                code = router_bucket
     if code is None:
         code = _clean(error_type) or _clean(
             (body or {}).get("error_type") if isinstance(body, dict) else None

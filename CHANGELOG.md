@@ -12,16 +12,6 @@ notes for each version.
 
 ## [Unreleased]
 
-### Fixed
-
-- `models.run` now posts to `POST {router_base_url}/v2/models/{provider}/{model}`.
-  The Comfy Router service moved its model routes from `/v1/models` to
-  `/v2/models` and the SDK's hand-written path template was never
-  updated, so every `models.run` call answered a bare 404 against the live
-  service. The vendored `spec/router-openapi.yaml` is synced to the same
-  contract in this change, and `scripts/check_drift.py` re-pins the two
-  together.
-
 ### Added
 
 - Every exception `client.models.run()` raises **for a failed call** now
@@ -61,6 +51,25 @@ notes for each version.
   `None` when the server named no pace.
 
 ### Fixed
+
+- A Router `409` now keeps the bucket the contract names instead of decoding
+  to `HashMismatch` off the status table. The synced contract declares two
+  `409`s on the run route — `invalid_input` for a key that cannot serve this
+  request (use a new key) and `concurrency_limit_exceeded` for a key whose
+  call is still in flight — and the collect retry now fires on the second,
+  paced by `Retry-After`, in both the envelope and the Router wire shape. The
+  never-contracted `generation_in_progress` bucket is gone.
+- An explicit `idempotency_key` is validated locally (1-255 printable ASCII
+  characters) before any bytes move. The empty string is the load-bearing
+  case: it used to fall into the mint-a-fresh-key branch, silently dispatching
+  a second billed generation on what the caller meant as a collect.
+- `models.run` now posts to `POST {router_base_url}/v2/models/{provider}/{model}`.
+  The Comfy Router service moved its model routes from `/v1/models` to
+  `/v2/models` and the SDK's hand-written path template was never
+  updated, so every `models.run` call answered a bare 404 against the live
+  service. The vendored `spec/router-openapi.yaml` is synced to the same
+  contract in this change, and `scripts/check_drift.py` re-pins the two
+  together.
 
 - A success status whose body will not decode (a proxy interstitial served
   under a `200`, a response truncated mid-stream) now raises a translated SDK

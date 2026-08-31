@@ -51,7 +51,7 @@ import httpx
 from comfy_low.errors import ApiError
 from comfy_low.transport import MODEL_RUN_TIMEOUT, AsyncComfyLow, ComfyLow
 
-from ._core import new_idempotency_key
+from ._core import new_idempotency_key, validate_idempotency_key
 from .exceptions import translating
 from .retry import DEFAULT_RETRY, Retrier, RetryPolicy
 from .router_exceptions import RouterError
@@ -176,16 +176,16 @@ class Models(_ModelsBase):
         mints a new key. A key presented twice is *not* re-run: on the router
         surface a resend of the same key with the same body collects the
         generation the first request started rather than dispatching another,
-        and a resend with a *different* body is rejected ``422``
-        ``idempotency_key_reuse`` — which is why the body is snapshotted before
-        the first attempt. (The single-use, reject-on-duplicate rule
+        and a resend with a *different* body is refused ``409``
+        ``invalid_input`` (the contract says to use a NEW key) — which is why
+        the body is snapshotted before the first attempt. (The single-use, reject-on-duplicate rule
         ``spec/openapi.yaml`` states is the **v2 jobs API**'s, and governs
         ``submit()``, not this route.)
 
         Retried by default: connect-phase failures, a ``429`` that names a
         ``Retry-After``, and the answers that name a pace for collecting work
-        already running — a ``deadline_exceeded`` ``504`` and a
-        ``generation_in_progress`` ``409``, each carrying ``Retry-After``. One
+        already running — a ``deadline_exceeded`` ``504`` and an in-flight-key
+        ``concurrency_limit_exceeded`` ``409``, each carrying ``Retry-After``. One
         ``run()`` can therefore ride the collect loop through a server-side
         deadline to the finished generation. Not retried by default: a completed
         5xx that named no such pace, and a client-side timeout — those leave the
@@ -210,6 +210,13 @@ class Models(_ModelsBase):
         translate — so a handler written for the replay has to catch both; see
         the README's "Collecting a generation after a lost response".
 
+        An explicit key must be unique across the WHOLE workspace, not just
+        within your own client: the keyspace is shared by every member of the
+        workspace your credential carries, so a second caller reusing a stable
+        label like ``"retry-1"`` is answered from the first caller's record —
+        or refused ``409`` if the request differs. Mint keys with real entropy
+        (the default does); never derive them from guessable labels.
+
         Pass ``exc.idempotency_key`` back only after checking it is not
         ``None``. This parameter treats ``None`` as "mint one", so replaying
         with a key that was never recorded silently starts a *second* billed
@@ -220,7 +227,11 @@ class Models(_ModelsBase):
         low = cast(ComfyLow, self._low)
         # Minted once, outside the loop: reusing this exact value on every
         # attempt is the whole reason a retry here is not a second charge.
-        key = idempotency_key or new_idempotency_key()
+        key = (
+            validate_idempotency_key(idempotency_key)
+            if idempotency_key is not None
+            else new_idempotency_key()
+        )
         # Snapshotted for the same reason the key is. Re-reading the caller's
         # mapping inside each attempt would let a mutation between attempts
         # send a different body under the *same* key, which is precisely the
@@ -271,7 +282,11 @@ class AsyncModels(_ModelsBase):
         See :meth:`Models.run`.
         """
         low = cast(AsyncComfyLow, self._low)
-        key = idempotency_key or new_idempotency_key()
+        key = (
+            validate_idempotency_key(idempotency_key)
+            if idempotency_key is not None
+            else new_idempotency_key()
+        )
         # Snapshotted deeply before the first attempt — see :meth:`Models.run`.
         # The window is wider here: the retry sleeps inside the caller's own
         # event loop, so another task is free to run and mutate `arguments`,
