@@ -179,7 +179,7 @@ def error_from_envelope(
 
     ``409`` is the one carve-out from "the status table wins". The table's
     ``hash_mismatch`` belongs to the v2 jobs/assets surface, but the router
-    contract now declares its own ``409``\\s (``invalid_input`` for a key that
+    contract now declares its own ``409`` responses (``invalid_input`` for a key that
     cannot serve this request, ``concurrency_limit_exceeded`` for a key whose
     call is still in flight — ``spec/router-openapi.yaml``), and those arrive
     with no ``error.code`` at all. Left to the table, both would surface as

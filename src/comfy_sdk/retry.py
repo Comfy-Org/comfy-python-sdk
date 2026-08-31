@@ -243,7 +243,7 @@ _DEADLINE_EXCEEDED = "deadline_exceeded"
 #: that call's result" (``spec/router-openapi.yaml``,
 #: ``concurrency_limit_exceeded``). The gate keys on status AND bucket because
 #: the same bucket on a ``429`` means plain workspace throttling, and the other
-#: ``409``\s the specs document are deterministic refusals (``hash_mismatch``,
+#: ``409`` responses the specs document are deterministic refusals (``hash_mismatch``,
 #: which ``spec/openapi.yaml`` gives a ``Retry-After``; the router's own
 #: ``invalid_input`` key cases, answered by a NEW key). Fail closed — an
 #: unrecognised ``409`` stays a refusal.
@@ -357,7 +357,7 @@ def is_collectable(exc: BaseException) -> bool:
     and its pace for the same reason. The ``504`` must name its bucket because
     ``deadline_exceeded`` shares that status with ``provider_timeout``, where no
     contract blesses the resend and a header-less ``504`` from an intermediary is
-    read as exactly that. The ``409`` must name its bucket because the other ``409``\s the
+    read as exactly that. The ``409`` must name its bucket because the other ``409`` responses the
     vendored specs document are *deterministic* refusals that a pace does not
     soften — ``spec/openapi.yaml`` gives its ``hash_mismatch`` ``409`` a
     ``Retry-After`` outright, and the router's ``invalid_input`` key cases are
