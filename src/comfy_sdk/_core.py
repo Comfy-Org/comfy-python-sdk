@@ -106,6 +106,7 @@ _UI_KEYS = ("nodes", "links", "last_node_id")
 def looks_like_ui_format(graph: dict[str, Any]) -> bool:
     return isinstance(graph, dict) and all(k in graph for k in _UI_KEYS)
 
+
 def validate_idempotency_key(key: str) -> str:
     """``key`` unchanged, or ``ValueError`` for one the contract cannot carry.
 
@@ -121,13 +122,9 @@ def validate_idempotency_key(key: str) -> str:
     generation instead.
     """
     if not key:
-        raise ValueError(
-            "idempotency_key must not be empty; pass None to have one minted"
-        )
+        raise ValueError("idempotency_key must not be empty; pass None to have one minted")
     if len(key) > 255:
-        raise ValueError(
-            f"idempotency_key is {len(key)} characters; the contract caps it at 255"
-        )
+        raise ValueError(f"idempotency_key is {len(key)} characters; the contract caps it at 255")
     if not key.isascii() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in key):
         raise ValueError(
             "idempotency_key must be printable ASCII: it is sent as an HTTP "
