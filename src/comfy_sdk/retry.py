@@ -60,8 +60,9 @@ That, not a guess about the network, is what sorts the failures:
    finished, *and* named the pace at which to ask the same key again for it: a
    router ``deadline_exceeded`` ``504`` carrying ``Retry-After``, and a
    ``concurrency_limit_exceeded`` ``409`` carrying ``Retry-After`` — the
-   contract's in-flight-key answer — on the retry that follows it. This is the one class where the *server* has
-   stated the same-key resend is safe, and the pace it names is its own poll
+   contract's in-flight-key answer — on the retry that follows it. This is the
+   one class where the *server* has stated the same-key resend is safe, and
+   the pace it names is its own poll
    interval — so it is retried by default, at that pace, and one ``run()`` call
    rides the collect loop to the finished generation instead of handing the
    caller a ``504`` for work that is still running.
