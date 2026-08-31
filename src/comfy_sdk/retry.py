@@ -27,7 +27,7 @@ reject such as out-of-credits or queue-full)" frees it, while one whose outcome
 the server cannot characterise ("an upstream timeout or 5xx where the job may or
 may not have been created") keeps it claimed.
 
-The model-run route (``POST /v1/models/{provider}/{model}``) is not in that
+The model-run route (``POST /v2/models/{provider}/{model}``) is not in that
 spec at all — it is a different surface, declared by ``spec/router-openapi.yaml``
 — so its key semantics are not the v2 spec's to state, and for one failure the
 *router* contract states them directly. That spec's ``deadline_exceeded``
@@ -303,7 +303,7 @@ def error_bucket_of(exc: BaseException) -> str | None:
     Read by attribute rather than by type, for the same reason
     :func:`retry_after_of` is: one failure reaches this module modelled by two
     different layers. A typed router error carries the wire ``error_type``
-    (``RouterError.error_type``), while ``POST /v1/models/{provider}/{model}``
+    (``RouterError.error_type``), while ``POST /v2/models/{provider}/{model}``
     today raises the protocol :class:`~comfy_low.errors.ApiError`, whose
     envelope names the same thing ``code``. Reading only ``error_type`` would
     make every bucket-keyed

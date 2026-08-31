@@ -7,7 +7,7 @@ place to configure both. A separate client object for model operations would
 fork all of that, which is what namespacing avoids.
 
 The one setting it does *not* share is the target host. Model runs go to Comfy
-Router — ``POST {router_base_url}/v1/models/{provider}/{model}``, the partner
+Router — ``POST {router_base_url}/v2/models/{provider}/{model}``, the partner
 model's native JSON straight through — while the client's ``base_url`` names
 the ``/api/v2`` deployment serving jobs and assets. So ``models.base_url``
 reports ``COMFY_ROUTER_BASE_URL`` (default ``https://api.comfy.org``), and a
@@ -136,7 +136,7 @@ class Models(_ModelsBase):
 
         ``model`` is the canonical ``{provider}/{model}`` id — exactly the two
         path segments that address the run on Comfy Router
-        (``POST {router_base_url}/v1/models/{provider}/{model}``), and exactly
+        (``POST {router_base_url}/v2/models/{provider}/{model}``), and exactly
         what the model catalog lists. It must be two non-empty segments: a
         one-segment id, the three-segment ``{provider}/{model}/{variant}`` form
         (not addressable on this route yet), and any ``.``/``..`` segment each

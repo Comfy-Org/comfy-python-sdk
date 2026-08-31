@@ -15,7 +15,7 @@ One binding is *not* backed by an ``operationId`` *in this module's sense*:
 host (:data:`ROUTER_BASE_URL`) — rather than the ``/api/v2`` deployment the rest
 of these methods speak to, and it is declared by a *second* vendored contract,
 ``spec/router-openapi.yaml`` (``operationId: runRouterModel``, path
-``/v1/models/{provider}/{model}``). Nothing is generated from that second file
+``/v2/models/{provider}/{model}``). Nothing is generated from that second file
 yet, so the binding is still hand-written; what changed is that it is no longer
 hand-*invented*. It stays out of ``comfy_low.OPERATION_IDS`` (which is the
 ``spec/openapi.yaml`` set, exactly) and stays confined to ``model_run_request``
@@ -87,7 +87,7 @@ ROUTER_BASE_URL = "https://api.comfy.org"
 #: :func:`model_run_request`, and ``tests/test_router_spec_contract.py`` /
 #: ``scripts/check_drift.py`` fail when the vendored spec's path moves and this
 #: constant does not follow it.
-_MODEL_RUN_PATH_TEMPLATE = "/v1/models/{provider}/{model}"
+_MODEL_RUN_PATH_TEMPLATE = "/v2/models/{provider}/{model}"
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -97,7 +97,7 @@ def parse_model_id(model: str) -> tuple[str, str]:
 
     Mirrors the TypeScript SDK's ``parseModelId`` so the same id is accepted,
     and rejected, identically on both. The id is not an opaque string here: it
-    *is* the tail of the request path (``/v1/models/{provider}/{model}``), so a
+    *is* the tail of the request path (``/v2/models/{provider}/{model}``), so a
     malformed one has to fail locally rather than be pasted into a URL and
     answered by whatever route it happens to land on.
 
@@ -129,7 +129,7 @@ def parse_model_id(model: str) -> tuple[str, str]:
     provider, name = segments
     # Refused rather than encoded: `quote` leaves `.` alone (it is unreserved),
     # so a `.`/`..` segment would survive into the path and let an id walk the
-    # route — `acme/..` resolving to `/v1/models/acme` on any intermediary that
+    # route — `acme/..` resolving to `/v2/models/acme` on any intermediary that
     # normalizes dot segments, which most do.
     if provider in (".", "..") or name in (".", ".."):
         raise ValueError(
@@ -147,7 +147,7 @@ def model_run_request(
     """Sans-IO ``(path, json_body, headers)`` for one model run.
 
     The model id *addresses* the request: it is the two path segments of
-    ``/v1/models/{provider}/{model}``, not a body field. That is Router's
+    ``/v2/models/{provider}/{model}``, not a body field. That is Router's
     contract — the request body is the partner model's OWN native JSON input,
     forwarded to the provider unchanged, so there is no room in it for a
     Comfy-shaped ``{model, arguments}`` envelope. A caller can therefore move
@@ -766,7 +766,7 @@ class ComfyLow:
         idempotency_key: str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any]:
-        """POST ``{router_base_url}/v1/models/{provider}/{model}`` — awaited server-side.
+        """POST ``{router_base_url}/v2/models/{provider}/{model}`` — awaited server-side.
 
         Addressed to Comfy Router, not to the ``/api/v2`` deployment
         :attr:`base_url` names: the URL is built absolute against

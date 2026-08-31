@@ -149,7 +149,7 @@ def _resolve_router_base_url() -> str:
     Same validation as :func:`_resolve_base_url`, and the same
     read-per-construction rule. The trailing slash is stripped here as well as
     in the transport, because this value is *concatenated* with a path that
-    already starts with ``/`` — ``https://api.comfy.org//v1/models/...`` is a
+    already starts with ``/`` — ``https://api.comfy.org//v2/models/...`` is a
     different path to an origin server than the one the spec declares.
     """
     return _resolve_env_url(ROUTER_BASE_URL_ENV_VAR, COMFY_ROUTER_BASE_URL).rstrip("/")

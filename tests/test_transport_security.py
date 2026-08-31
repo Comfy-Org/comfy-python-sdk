@@ -73,7 +73,7 @@ def test_the_router_origin_gets_the_token_even_when_it_is_not_base_url(
     ) as low:
         low.post_model_run(MODEL, {"prompt": "a cat"})
     assert second_server.state.last_auth_header == "Bearer ck_test"
-    assert second_server.state.last_model_run_path == "/v1/models/acme/flux-dev"
+    assert second_server.state.last_model_run_path == "/v2/models/acme/flux-dev"
 
 
 def test_a_third_origin_still_gets_no_token_once_the_router_is_trusted(
@@ -94,7 +94,7 @@ def test_the_run_url_does_not_pick_up_the_v2_prefix(server) -> None:
     # is built absolute against `router_base_url` precisely so it does not.
     with ComfyLow(server.base_url, api_key="ck_test", router_base_url=server.base_url) as low:
         low.post_model_run(MODEL, {"prompt": "a cat"})
-    assert server.state.last_model_run_path == "/v1/models/acme/flux-dev"
+    assert server.state.last_model_run_path == "/v2/models/acme/flux-dev"
 
 
 @pytest.mark.parametrize("bad", ["ftp://h", "router.example", "//router.example", ""])

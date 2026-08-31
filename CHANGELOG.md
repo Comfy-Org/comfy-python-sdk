@@ -12,6 +12,16 @@ notes for each version.
 
 ## [Unreleased]
 
+### Fixed
+
+- `models.run` now posts to `POST {router_base_url}/v2/models/{provider}/{model}`.
+  The Comfy Router service moved its model routes from `/v1/models` to
+  `/v2/models` and the SDK's hand-written path template was never
+  updated, so every `models.run` call answered a bare 404 against the live
+  service. The vendored `spec/router-openapi.yaml` is synced to the same
+  contract in this change, and `scripts/check_drift.py` re-pins the two
+  together.
+
 ### Added
 
 - Every exception `client.models.run()` raises **for a failed call** now

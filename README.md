@@ -196,7 +196,7 @@ export COMFY_ROUTER_BASE_URL="https://api.comfy.org"  # the default; set it to r
 
 Two variables rather than one because they are genuinely two hosts: the v2
 surface serves `/api/v2/jobs` and `/api/v2/assets`, Router serves
-`/v1/models/{provider}/{model}`, and neither serves the other's routes. Your
+`/v2/models/{provider}/{model}`, and neither serves the other's routes. Your
 `COMFY_API_KEY` is the credential for both — the SDK attaches it to those two
 configured origins and to no third one.
 
@@ -404,7 +404,7 @@ result = client.models.run("fal-ai/flux-pro", {"prompt": "a cat", "steps": 4})
 result["images"][0]["url"]
 ```
 
-That call is `POST https://api.comfy.org/v1/models/fal-ai/flux-pro` with
+That call is `POST https://api.comfy.org/v2/models/fal-ai/flux-pro` with
 `{"prompt": "a cat", "steps": 4}` as the body.
 
 Three things follow from that, and they are the whole contract of this method:

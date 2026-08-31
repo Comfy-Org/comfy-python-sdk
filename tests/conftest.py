@@ -7,7 +7,7 @@ the SDK at the stub by setting ``COMFY_BASE_URL`` *and*
 ``COMFY_ROUTER_BASE_URL``.
 
 Both, because the SDK speaks to two surfaces: the ``/api/v2`` deployment (jobs,
-assets) and Comfy Router (``/v1/models/{provider}/{model}``), which is a
+assets) and Comfy Router (``/v2/models/{provider}/{model}``), which is a
 different host in production. This one stub answers both route families, so a
 test that exercises either gets a single server — while a test that is *about*
 the two being separate points ``COMFY_ROUTER_BASE_URL`` at ``second_server``.
@@ -91,7 +91,7 @@ class ServerState:
     job_workflow_format: str = "api"
     job_workflow_not_found: bool = False
 
-    # --- POST /v1/models/{provider}/{model} (the awaited model run) ---
+    # --- POST /v2/models/{provider}/{model} (the awaited model run) ---
     # The provider's native payload the run resolves to. Deliberately not a
     # Comfy-shaped envelope: the SDK must hand it back untouched.
     model_run_result: dict[str, Any] = field(
@@ -493,7 +493,7 @@ def _make_handler(state: ServerState):
             # stub here, with `COMFY_ROUTER_BASE_URL` pointed at it). The two
             # segments are the model id, so they are matched rather than
             # compared to a fixed string.
-            m = re.match(r"/v1/models/([^/]+)/([^/]+)$", self.path)
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)$", self.path)
             if m:
                 self._post_model_run(m.group(1), m.group(2))
                 return
