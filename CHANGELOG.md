@@ -14,6 +14,27 @@ notes for each version.
 
 ### Added
 
+- `Job.get_logs()` / `AsyncJob.get_logs()` fetch a job's execution log — what
+  the run printed — returning a `JobLogs` (`text`, `truncated`, `captured_at`,
+  `complete`) or `None`. Fetched on demand and never cached: submitting and
+  polling a job downloads no log, and each call re-reads rather than replaying
+  the first, so polling for a log that has not landed yet works. `None` is an
+  ordinary answer covering every reason there is nothing to read — the
+  deployment captures no logs at all (Comfy Cloud and self-hosted never do;
+  only serverless deployments have them), the job has not finished, it predates
+  capture, the run was killed before the worker could report an outcome (an
+  out-of-memory kill, a crashed worker, a timeout, a job past its maximum
+  runtime), capture failed, or the job ran on the public demo deployment,
+  which captures a log but withholds it from anonymous callers — and the
+  contract deliberately does not distinguish them. Do not branch on which; a
+  job that has not finished may have a log once it has, so read again after a
+  terminal status. On a surface that offers a logs link a missing job still
+  raises `NotFound`; where there is no link there is no request, so that job
+  raises nothing and returns `None` too.
+- `Output.node_id` is documented as possibly empty — the workflow node that
+  reported a file, or `""` when the worker named none. `Job.get_outputs()`
+  filters on this value, so an output the worker named no node for is not
+  reachable by any real node id.
 - Every exception `client.models.run()` raises **for a failed call** now
   carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the
   typed `RouterError` buckets, a `RouterError` whose `error_type` this version

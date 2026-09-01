@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 import httpx
@@ -46,6 +47,29 @@ class JobWorkflow:
 
     graph: dict[str, Any]
     format: Literal["save", "api"]
+
+
+@dataclass(frozen=True)
+class JobLogs:
+    """What a run printed — see :meth:`Job.get_logs`.
+
+    Untrusted text: a workflow chooses what goes in it, so render it as plain
+    text rather than interpreting it.
+
+    ``truncated`` says the BEGINNING was discarded and this is the tail of a
+    longer run — where a failure normally is. It describes the stored log, not
+    the response, so it never means a caller asked for part of one; a true
+    ``truncated`` with an empty ``text`` means the log was captured and then
+    shed entirely to fit.
+
+    ``complete`` says no more output will be appended. Always true today,
+    because a log is read back off the worker once, when the run ends.
+    """
+
+    text: str
+    truncated: bool
+    captured_at: datetime
+    complete: bool
 
 
 class Job:
@@ -139,6 +163,58 @@ class Job:
         with translating():
             data = self._low.get_job_workflow(self._model.id)
         return JobWorkflow(graph=data.workflow, format=data.format.value)
+
+    def get_logs(self) -> JobLogs | None:
+        """Fetch what this run printed, or None if there is no log to fetch.
+
+        Fetched on demand and never cached: nothing is downloaded until you
+        call this, and a second call re-reads rather than replaying the first,
+        so an early ``None`` on a job that had not finished cannot mask the log
+        it went on to produce.
+
+        ``None`` is every reason there is nothing to read, which the contract
+        deliberately does not distinguish: this deployment does not capture
+        logs at all (Comfy Cloud and self-hosted never do), the job has not
+        finished, it predates log capture, the run was killed before the worker
+        could report an outcome (an out-of-memory kill, a crashed worker, a
+        timeout, a job past its maximum runtime), capture was attempted and
+        failed, or the job ran on the public demo deployment, which captures a
+        log but withholds it from anonymous callers. Do not branch on which —
+        but a job that has not finished may have a log once it has, so a caller
+        that wants one reads again after a terminal status.
+
+        The killed-run case is a known gap rather than an oversight: a log is
+        read back off the worker, so a run the platform killed never produced
+        one. The failures a caller most wants a log for are the ones least
+        likely to have left one.
+
+        On a surface that offers a logs link, a missing job raises the SDK's
+        normal :class:`~comfy_sdk.exceptions.NotFound`, as with any other read.
+        Where there is no link there is no request, so a job that has expired
+        or never existed returns ``None`` too — the answer "this deployment has
+        no logs" is reached without asking about the job.
+        """
+        url = self._model.urls.logs
+        if not url:
+            # No link means the surface serves no logs for any job, so the
+            # answer is known without a request. Never synthesized: the URL is
+            # the surface's to give, and building one here would turn a
+            # deployment that cannot answer into a 404 that looks like a
+            # missing job. Falsy, not `is None`: a server that serializes an
+            # absent optional link as "" rather than omitting it would
+            # otherwise reach the transport and have `/jobs//logs` built for
+            # it, which is that same 404.
+            return None
+        with translating():
+            data = self._low.get_job_logs(url)
+        if data is None:
+            return None
+        return JobLogs(
+            text=data.text,
+            truncated=data.truncated,
+            captured_at=data.captured_at,
+            complete=data.complete,
+        )
 
     # -- live events (best-effort, reconnecting) --------------------------
     def events(self) -> Iterator[Event]:
@@ -254,6 +330,22 @@ class AsyncJob:
         with translating():
             data = await self._low.get_job_workflow(self._model.id)
         return JobWorkflow(graph=data.workflow, format=data.format.value)
+
+    async def get_logs(self) -> JobLogs | None:
+        """Async :meth:`Job.get_logs`."""
+        url = self._model.urls.logs
+        if not url:
+            return None
+        with translating():
+            data = await self._low.get_job_logs(url)
+        if data is None:
+            return None
+        return JobLogs(
+            text=data.text,
+            truncated=data.truncated,
+            captured_at=data.captured_at,
+            complete=data.complete,
+        )
 
     async def events(self) -> AsyncIterator[Event]:
         """Async :meth:`Job.events` — typed live stream, auto-reconnecting with

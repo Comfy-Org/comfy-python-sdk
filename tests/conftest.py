@@ -90,6 +90,23 @@ class ServerState:
     )
     job_workflow_format: str = "api"
     job_workflow_not_found: bool = False
+    # GET /jobs/{id}/logs response body; None answers 204, the contract's normal
+    # "this job has no log". `job_logs_not_found=True` answers 404 instead, for
+    # the missing-job path. `omit_logs_link=True` drops `urls.logs` from every
+    # job, standing in for a surface that serves no logs at all.
+    job_logs: dict[str, Any] | None = None
+    job_logs_not_found: bool = False
+    omit_logs_link: bool = False
+    # Serializes `urls.logs` as "" instead of omitting it, the shape a server
+    # that forgot an omit-empty tag would emit.
+    empty_logs_link: bool = False
+    # Serves `urls.logs` at a path a synthesized `/jobs/{id}/logs` would never
+    # produce, so a test can prove the SDK followed the link rather than built
+    # the path — at the suite's root mount the two otherwise coincide.
+    logs_link_path: str | None = None
+    job_logs_request_count: int = 0
+    # Path of the most recent logs request, so a test can assert WHICH url was used.
+    last_job_logs_path: str | None = None
 
     # --- POST /v2/models/{provider}/{model} (the awaited model run) ---
     # The provider's native payload the run resolves to. Deliberately not a
@@ -235,7 +252,15 @@ def _asset_json(asset_id: str, hash_: str, created_new: bool, size: int) -> dict
     }
 
 
-def _job_json(job_id: str, status: str, outputs: list[dict] | None = None) -> dict:
+def _job_json(
+    job_id: str,
+    status: str,
+    outputs: list[dict] | None = None,
+    *,
+    omit_logs_link: bool = False,
+    empty_logs_link: bool = False,
+    logs_link_path: str | None = None,
+) -> dict:
     return {
         "id": job_id,
         "status": status,
@@ -252,6 +277,15 @@ def _job_json(job_id: str, status: str, outputs: list[dict] | None = None) -> di
             "self": f"/api/v2/jobs/{job_id}",
             "events": f"/api/v2/jobs/{job_id}/events",
             "cancel": f"/api/v2/jobs/{job_id}/cancel",
+            **(
+                {}
+                if omit_logs_link
+                else {
+                    "logs": ""
+                    if empty_logs_link
+                    else (logs_link_path or f"/api/v2/jobs/{job_id}/logs")
+                }
+            ),
         },
     }
 
@@ -379,6 +413,11 @@ def _make_handler(state: ServerState):
             if m:
                 self._serve_events(m.group(1))
                 return
+            m = re.match(r"/api/v2/jobs/([^/]+)/logs$", self.path)
+            if m:
+                state.last_job_logs_path = self.path
+                self._serve_job_logs()
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)/workflow$", self.path)
             if m:
                 self._serve_job_workflow(m.group(1))
@@ -432,7 +471,28 @@ def _make_handler(state: ServerState):
             else:
                 status = "running"
                 outputs = []
-            self._json(200, _job_json(job_id, status, outputs))
+            self._json(
+                200,
+                _job_json(
+                    job_id,
+                    status,
+                    outputs,
+                    omit_logs_link=state.omit_logs_link,
+                    empty_logs_link=state.empty_logs_link,
+                    logs_link_path=state.logs_link_path,
+                ),
+            )
+
+        def _serve_job_logs(self) -> None:
+            state.job_logs_request_count += 1
+            if state.job_logs_not_found:
+                self._err(404, "job_not_found", "no such job")
+                return
+            if state.job_logs is None:
+                self.send_response(204)
+                self.end_headers()
+                return
+            self._json(200, state.job_logs)
 
         def _serve_job_workflow(self, job_id: str) -> None:
             if state.job_workflow_not_found:
@@ -505,7 +565,16 @@ def _make_handler(state: ServerState):
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
-                self._json(200, _job_json(m.group(1), "canceling"))
+                self._json(
+                    200,
+                    _job_json(
+                        m.group(1),
+                        "canceling",
+                        omit_logs_link=state.omit_logs_link,
+                        empty_logs_link=state.empty_logs_link,
+                        logs_link_path=state.logs_link_path,
+                    ),
+                )
                 return
             self._read_body()
             self._err(404, "not_found")
@@ -708,7 +777,16 @@ def _make_handler(state: ServerState):
             job_id = f"job_{state.submit_count:02d}"
             if key:
                 state.idempotency[key] = job_id
-            self._json(201, _job_json(job_id, "queued"))
+            self._json(
+                201,
+                _job_json(
+                    job_id,
+                    "queued",
+                    omit_logs_link=state.omit_logs_link,
+                    empty_logs_link=state.empty_logs_link,
+                    logs_link_path=state.logs_link_path,
+                ),
+            )
 
     return Handler
 

@@ -45,7 +45,7 @@ import httpx
 
 from . import _multipart
 from .errors import ApiError, clean_request_id, error_from_envelope
-from .models import Asset, Job, JobWorkflowResponse
+from .models import Asset, Job, JobLogs, JobWorkflowResponse
 from .sse import RawEvent, SSEDecoder
 
 _API = "/api/v2"
@@ -757,6 +757,19 @@ class ComfyLow:
         resp = self.raw_request("GET", path, timeout=timeout)
         return JobWorkflowResponse.model_validate(self._p.parse_or_raise(resp, (200,)))
 
+    def get_job_logs(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> JobLogs | None:
+        """GET /api/v2/jobs/{id}/logs — what the run printed, or None on 204.
+
+        204 is the contract's normal answer for a job with no log, so it is a
+        value here rather than an error; every other status still raises.
+        """
+        path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/logs"
+        resp = self.raw_request("GET", path, timeout=timeout)
+        payload = self._p.parse_or_raise(resp, (200, 204))
+        if resp.status_code == 204:
+            return None
+        return JobLogs.model_validate(payload)
+
     # -- models -----------------------------------------------------------
     def post_model_run(
         self,
@@ -1093,6 +1106,15 @@ class AsyncComfyLow:
         )
         resp = await self.raw_request("GET", path, timeout=timeout)
         return JobWorkflowResponse.model_validate(self._p.parse_or_raise(resp, (200,)))
+
+    async def get_job_logs(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> JobLogs | None:
+        """Async :meth:`ComfyLow.get_job_logs`."""
+        path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/logs"
+        resp = await self.raw_request("GET", path, timeout=timeout)
+        payload = self._p.parse_or_raise(resp, (200, 204))
+        if resp.status_code == 204:
+            return None
+        return JobLogs.model_validate(payload)
 
     # -- models -----------------------------------------------------------
     async def post_model_run(
