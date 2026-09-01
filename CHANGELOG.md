@@ -12,6 +12,8 @@ notes for each version.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-01
+
 ### Added
 
 - Every exception `client.models.run()` raises **for a failed call** now
@@ -329,7 +331,8 @@ First public release of the Comfy API v2 Python SDK (`comfy-sdk`).
   and download outputs.
 - Sync and async clients. Python 3.10+.
 
-[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.8...HEAD
+[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.5...v0.1.7
 [0.1.5]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.4...v0.1.5
