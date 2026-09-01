@@ -97,7 +97,7 @@ def test_a_bucketless_429_still_means_queue_full() -> None:
 
 
 def test_a_router_validation_body_degrades_rather_than_coercing_its_detail() -> None:
-    # Router's per-field validation body is the fal/FastAPI `detail[]` shape. A
+    # Router's per-field validation body is the FastAPI `detail[]` shape. A
     # list is not a message: stringifying it would put a Python repr in front of
     # a caller, so the status-derived message answers instead.
     err = error_from_envelope(
