@@ -166,6 +166,29 @@ _BY_CODE: dict[str, type[ComfyError]] = {
 }
 
 
+def _router_only_class(code: str) -> type[Any] | None:
+    """The typed RouterError subclass for a code only Router produces, or None.
+
+    The low layer now preserves Router's wire bucket as the ``code`` for every
+    status, so this is what turns a preserved ``not_enabled`` into the
+    :class:`~comfy_sdk.router_exceptions.NotEnabled` a pre-launch caller
+    catches, instead of a bare ``ComfyError``.
+
+    Deliberately scoped to buckets the v2 envelope does NOT also use:
+    ``unauthorized``, ``forbidden`` and ``insufficient_credits`` are spelled
+    identically by both surfaces, and the code string alone cannot say which
+    answered — retyping those would break every jobs-surface ``except
+    Forbidden`` handler to fix none, since their v2 classes fire on the router
+    surface too. Imported lazily because :mod:`comfy_sdk.router_exceptions`
+    subclasses :class:`ComfyError` from this module.
+    """
+    from comfy_sdk.router_exceptions import _BY_ERROR_TYPE as _ROUTER_BY_TYPE
+
+    if code in _BY_CODE or code == "queue_full":
+        return None
+    return _ROUTER_BY_TYPE.get(code)
+
+
 def to_sdk_error(exc: ApiError) -> ComfyError:
     """Translate a protocol ``ApiError`` into the idiomatic SDK exception."""
     if exc.code == "queue_full":
@@ -176,6 +199,15 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
             http_status=exc.http_status,
             details=exc.details,
             request_id=exc.request_id,
+        )
+    router_cls = _router_only_class(exc.code)
+    if router_cls is not None:
+        return router_cls(
+            exc.message,
+            error_type=exc.code,
+            http_status=exc.http_status,
+            request_id=exc.request_id,
+            retry_after=exc.retry_after,
         )
     cls = _BY_CODE.get(exc.code, ComfyError)
     return cls(

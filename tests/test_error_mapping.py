@@ -58,18 +58,41 @@ def test_routers_error_type_header_is_read_when_the_body_carries_none() -> None:
     assert err.message == "HTTP 504"
 
 
-def test_a_documented_status_code_is_not_retyped_by_the_bucket() -> None:
-    # The guard on the fallback's placement. Router's 429 bucket is
-    # `rate_limited` / `concurrency_limit_exceeded`, but this API's 429 has
-    # meant `queue_full` -- and `QueueFull` -- since before Router fronted
-    # anything. Letting the bucket win here would silently retype an exception
-    # integrators already catch, so the status-derived code is consulted first
-    # and only the 5xx range, where the status determines nothing, is left to
-    # the bucket.
-    err = error_from_envelope(429, None, error_type="concurrency_limit_exceeded", retry_after=3)
+@pytest.mark.parametrize(
+    ("status", "bucket"),
+    [
+        (403, "not_enabled"),
+        (404, "model_not_found"),
+        (409, "invalid_input"),
+        (422, "invalid_input"),
+        (429, "rate_limited"),
+        (429, "concurrency_limit_exceeded"),
+        (500, "provider_error"),
+    ],
+)
+def test_a_router_bucket_outranks_the_status_table_on_every_status(
+    status: int, bucket: str
+) -> None:
+    # The status table exists for responses that carry no bucket at all. A
+    # response that names one is Router speaking for itself, and letting the
+    # table win destroyed the bucket three ways on live traffic: 422
+    # `invalid_input` surfaced as `invalid_workflow`, 409s as `hash_mismatch`
+    # (killing the collect rule), and 403 `not_enabled` as `forbidden` -- so
+    # `except NotEnabled`, the one handler every pre-launch caller writes,
+    # never fired.
+    err = error_from_envelope(status, None, error_type=bucket, retry_after=3)
+    assert err.code == bucket
+    # The pace survives regardless of the code: `comfy_sdk.retry` keys the
+    # 429 branch on status + Retry-After, not on `queue_full`.
+    assert err.retry_after == 3
+
+
+def test_a_bucketless_429_still_means_queue_full() -> None:
+    # The workflow surface's own 429 carries no bucket; the status table is
+    # still what names it, exactly as before the generalization.
+    err = error_from_envelope(429, None, retry_after=3)
     assert err.code == "queue_full"
     assert isinstance(err, QueueFull)
-    # And the pace survives, which is what `comfy_sdk.retry` keys the 429 on.
     assert err.retry_after == 3
 
 
@@ -92,3 +115,46 @@ def test_a_body_that_names_no_bucket_still_falls_back_to_the_status(body: object
     # response diagnosable rather than replacing it with a decoding failure.
     err = error_from_envelope(401, body)  # type: ignore[arg-type]
     assert err.code == "unauthorized"
+
+
+# --- a preserved bucket becoming the typed RouterError ---
+#
+# Keeping the bucket as the `code` is only half the fix: `models.run` raises
+# through `to_sdk_error`, so the bucket must also select the RouterError
+# subclass there or `except NotEnabled` still catches nothing.
+
+
+@pytest.mark.parametrize(
+    ("bucket", "status", "cls_name"),
+    [
+        ("not_enabled", 403, "NotEnabled"),
+        ("invalid_input", 422, "InvalidInput"),
+        ("model_not_found", 404, "ModelNotFound"),
+        ("concurrency_limit_exceeded", 409, "ConcurrencyLimitExceeded"),
+        ("rate_limited", 429, "RateLimited"),
+        ("provider_error", 500, "ProviderError"),
+        ("deadline_exceeded", 504, "DeadlineExceeded"),
+    ],
+)
+def test_a_router_only_bucket_raises_its_typed_class(
+    bucket: str, status: int, cls_name: str
+) -> None:
+    import comfy_sdk.router_exceptions as rx
+
+    err = to_sdk_error(ApiError("router said no", code=bucket, http_status=status, retry_after=7))
+    assert type(err) is getattr(rx, cls_name)
+    assert err.code == bucket
+    assert err.http_status == status
+    assert err.retry_after == 7
+
+
+@pytest.mark.parametrize("code", ["unauthorized", "forbidden", "insufficient_credits"])
+def test_a_bucket_both_surfaces_spell_keeps_its_v2_class(code: str) -> None:
+    # These three codes are spelled identically by the v2 envelope and by
+    # Router, and the code string alone cannot say which surface answered.
+    # Retyping them to the RouterError twins would break every jobs-surface
+    # handler to fix none -- the v2 classes fire on the router surface too.
+    import comfy_sdk.exceptions as sdk
+
+    err = to_sdk_error(ApiError("no", code=code, http_status=403))
+    assert type(err) is getattr(sdk, "".join(p.title() for p in code.split("_")))
