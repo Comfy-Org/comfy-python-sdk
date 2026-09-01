@@ -1,5 +1,5 @@
 <div align="center">
-<img src="assets/logo.svg" alt="Comfy" width="130"/>
+<img src="https://raw.githubusercontent.com/Comfy-Org/comfy-python-sdk/main/assets/logo.svg" alt="Comfy" width="130"/>
 <h1>comfy-python-sdk</h1>
 <p>
   <strong>The Python client for the <a href="https://docs.comfy.org">Comfy API v2</a>.</strong><br/>
@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://pypi.org/project/comfy-sdk/"><img src="https://img.shields.io/pypi/v/comfy-sdk?style=for-the-badge&logo=pypi&logoColor=white&label=PyPI" alt="PyPI"></a>
   <a href="#requirements-and-install"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-lightgrey?style=for-the-badge" alt="License: MIT"></a>
+  <a href="https://github.com/Comfy-Org/comfy-python-sdk/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-lightgrey?style=for-the-badge" alt="License: MIT"></a>
   <a href="https://cloud.comfy.org"><img src="https://img.shields.io/badge/Comfy_Cloud-cloud.comfy.org-211927?style=for-the-badge" alt="Comfy Cloud"></a>
 </p>
 
