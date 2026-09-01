@@ -46,7 +46,7 @@ dev = [
     # Pinned (compatible-release) so CI flags the same issues run-to-run, the
     # way datamodel-code-generator already is — an unpinned ruff/mypy bump
     # otherwise silently changes what CI catches between PRs.
-    "ruff~=0.15.22",
+    "ruff>=0.15.22,<0.17.0",
     "mypy~=2.3.0",
     "pytest~=9.1.1",
     "pytest-asyncio~=1.4.0",
