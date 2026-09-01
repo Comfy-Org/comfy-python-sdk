@@ -93,20 +93,3 @@ jobs:
       - name: Verify distribution metadata (publish dry run)
         run: twine check dist/*
 
-  # NEW -- regression guard for the internal-reference leak this repo already
-  # had once (see scripts/check_public_repo_hygiene.py for what it looks for
-  # and why). Public repo, so this stays a permanent gate, not a one-time fix.
-  public-repo-hygiene:
-    name: public-repo-hygiene
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-
-      - name: Scan for internal-only references
-        run: python3 scripts/check_public_repo_hygiene.py

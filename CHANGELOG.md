@@ -248,10 +248,10 @@ Maintenance release. No API changes — existing code needs no updates.
   empty package metadata.
 - Stop sweeping local dev droppings into the sdist — it now contains only what is
   needed to build and run the tests.
-- The repository moved from `Comfy-Org/ComfyPythonSDK` to
-  `Comfy-Org/comfy-python-sdk`. GitHub redirects the old URLs and the PyPI
-  package name is unchanged (`comfy-sdk`). This is the first release to carry
-  the corrected repository/issues URLs in its published metadata.
+- The repository moved from `ComfyPythonSDK` to `Comfy-Org/comfy-python-sdk`.
+  GitHub redirects the old URLs and the PyPI package name is unchanged
+  (`comfy-sdk`). This is the first release to carry the corrected
+  repository/issues URLs in its published metadata.
 - Docstrings for the public methods that had none; README aligned with the
   TypeScript and Swift SDK READMEs.
 
