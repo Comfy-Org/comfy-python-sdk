@@ -175,7 +175,7 @@ def error_from_envelope(
     proxy-shaped responses it was built for.
 
     The bucket outranking the status table is the load-bearing choice, learned
-    three times on live traffic: the table turned Router's ``409``\ s into
+    three times on live traffic: the table turned Router's ``409`` errors into
     ``hash_mismatch`` (killing the contract's collect rule), its ``422``
     ``invalid_input`` into ``invalid_workflow`` (failing every reachability
     probe), and its ``403`` ``not_enabled`` into ``forbidden`` (so ``except
