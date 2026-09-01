@@ -168,26 +168,23 @@ def error_from_envelope(
     against every real Router ``504``. ``error_type`` (the header, passed by the
     caller) and the body's own top-level ``error_type`` are read to prevent that.
 
-    They are consulted in one narrow place, though: *after* the envelope's
-    ``code``, which always wins, and *after* :data:`_CODE_BY_STATUS`, which
-    already determines a code for every status where this API has a documented
-    one. So a Router ``429`` still maps to ``queue_full`` and a Router ``401``
-    still to ``unauthorized`` — reordering those would silently retype
-    exceptions that integrators already catch. What is left is exactly the 5xx
-    range, where the status determines nothing and the bucket is the only name
-    the response has.
+    The precedence is: the envelope's ``code`` always wins; then, when the
+    response identifies itself as Router's — the ``X-Comfy-Error-Type`` header
+    or a top-level body ``error_type`` is present — that bucket wins for EVERY
+    status; only then does :data:`_CODE_BY_STATUS` fill in, for the bare and
+    proxy-shaped responses it was built for.
 
-    ``409`` is the one carve-out from "the status table wins". The table's
-    ``hash_mismatch`` belongs to the v2 jobs/assets surface, but the router
-    contract now declares its own ``409`` responses (``invalid_input`` for a key that
-    cannot serve this request, ``concurrency_limit_exceeded`` for a key whose
-    call is still in flight — ``spec/router-openapi.yaml``), and those arrive
-    with no ``error.code`` at all. Left to the table, both would surface as
-    :class:`HashMismatch` — an asset-upload error — with the real bucket
-    destroyed before ``comfy_sdk.retry.error_bucket_of`` can read it, so the
-    contract's collect rule could never fire. A ``409`` that names a Router
-    bucket therefore keeps it; a bucket-less ``409`` still degrades to the
-    table exactly as before.
+    The bucket outranking the status table is the load-bearing choice, learned
+    three times on live traffic: the table turned Router's ``409`` errors into
+    ``hash_mismatch`` (killing the contract's collect rule), its ``422``
+    ``invalid_input`` into ``invalid_workflow`` (failing every reachability
+    probe), and its ``403`` ``not_enabled`` into ``forbidden`` (so ``except
+    NotEnabled`` — the one handler every pre-launch caller writes — never
+    fired). Retyping only happens on responses that carry a bucket, which only
+    Router sends, and there the bucket IS the truth; a v2 envelope carries
+    ``error.code`` and no top-level ``error_type``, and an intermediary's
+    reject carries neither, so both keep exactly the classes integrators
+    already catch.
     """
     err = (body or {}).get("error") if isinstance(body, dict) else None
     code = (err or {}).get("code") if isinstance(err, dict) else None
@@ -195,17 +192,11 @@ def error_from_envelope(
     details = (err or {}).get("details") if isinstance(err, dict) else None
 
     if code is None:
-        code = _CODE_BY_STATUS.get(http_status)
-        if http_status == 409:
-            router_bucket = _clean(error_type) or _clean(
-                (body or {}).get("error_type") if isinstance(body, dict) else None
-            )
-            if router_bucket is not None:
-                code = router_bucket
-    if code is None:
         code = _clean(error_type) or _clean(
             (body or {}).get("error_type") if isinstance(body, dict) else None
         )
+    if code is None:
+        code = _CODE_BY_STATUS.get(http_status)
     if code is None:
         code = "error"
     if not message:

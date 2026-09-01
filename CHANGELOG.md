@@ -52,6 +52,20 @@ notes for each version.
 
 ### Fixed
 
+- A Router error now keeps its own bucket on **every** status, and
+  `client.models.run()` raises the matching typed `RouterError` subclass for
+  it. Previously the status table won for any status it named, so a `403`
+  `not_enabled` surfaced as `Forbidden` — `except NotEnabled`, the handler
+  every pre-launch caller writes, never fired — a `422` `invalid_input` as
+  `InvalidWorkflow`, and a `404` `model_not_found` as plain `NotFound`. The
+  retype only touches responses that carry a bucket (the `X-Comfy-Error-Type`
+  header or Router's top-level body `error_type`), which only Router sends:
+  the v2 envelope's `error.code` still always wins, a bucket-less response
+  still decodes off the status table (a bare `429` is still `QueueFull`), and
+  the three buckets both surfaces spell identically (`unauthorized`,
+  `forbidden`, `insufficient_credits`) keep their existing classes, which
+  catch on both surfaces. `Retry-After` pacing is keyed on the status and
+  survives unchanged.
 - A Router `409` now keeps the bucket the contract names instead of decoding
   to `HashMismatch` off the status table. The synced contract declares two
   `409`s on the run route — `invalid_input` for a key that cannot serve this
