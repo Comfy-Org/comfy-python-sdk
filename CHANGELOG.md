@@ -79,14 +79,6 @@ notes for each version.
   characters) before any bytes move. The empty string is the load-bearing
   case: it used to fall into the mint-a-fresh-key branch, silently dispatching
   a second billed generation on what the caller meant as a collect.
-- `models.run` now posts to `POST {router_base_url}/v2/models/{provider}/{model}`.
-  The Comfy Router service moved its model routes from `/v1/models` to
-  `/v2/models` and the SDK's hand-written path template was never
-  updated, so every `models.run` call answered a bare 404 against the live
-  service. The vendored `spec/router-openapi.yaml` is synced to the same
-  contract in this change, and `scripts/check_drift.py` re-pins the two
-  together.
-
 - A success status whose body will not decode (a proxy interstitial served
   under a `200`, a response truncated mid-stream) now raises a translated SDK
   error instead of letting `json.JSONDecodeError` escape from outside the
@@ -149,20 +141,20 @@ notes for each version.
 
 ### Changed
 
-- **Breaking (wire): `client.models.run` now posts to Comfy Router.** It sends
+- **`client.models.run` posts to Comfy Router.** It sends
   `POST {COMFY_ROUTER_BASE_URL}/v2/models/{provider}/{model}` — the route
   `spec/router-openapi.yaml` declares as `runRouterModel` — with the partner
   model's **own native JSON input** as the body, forwarded to the provider
-  unchanged. It previously posted `{COMFY_BASE_URL}/api/v2/models/run` with a
-  `{"model": ..., "arguments": {...}}` envelope, which nothing serves: the
-  `/api/v2` surface is jobs and assets, and the model-ID-addressed invocation
-  routes are Router's. The Python method signature is unchanged
-  (`run(model, arguments, *, idempotency_key=None, timeout=...)`), the result is
-  still the provider's payload returned as-is, and the `Idempotency-Key` and
-  retry behaviour are unchanged — what moved is the URL and the body shape.
-  **Anyone who pointed `COMFY_BASE_URL` at a Router host to make model runs work
-  must now point `COMFY_ROUTER_BASE_URL` there instead**, and set
-  `COMFY_BASE_URL` back at their v2 deployment (or unset it for Comfy Cloud).
+  unchanged. The vendored `spec/router-openapi.yaml` is pinned to that contract
+  and `scripts/check_drift.py` keeps the two together. The whole `models`
+  surface is new in this release, so nothing published ever spoke a different
+  shape: during development the call went to `{COMFY_BASE_URL}/api/v2/models/run`
+  with a `{"model": ..., "arguments": {...}}` envelope, and briefly to Router's
+  `/v1/models`, neither of which anything serves — the `/api/v2` surface is jobs
+  and assets, and the model-ID-addressed invocation routes are Router's, now at
+  `/v2`. **If you tracked `main` and pointed `COMFY_BASE_URL` at a Router host to
+  make model runs work, point `COMFY_ROUTER_BASE_URL` there instead**, and set
+  `COMFY_BASE_URL` back at your v2 deployment (or unset it for Comfy Cloud).
 - The `model` argument to `client.models.run` is now the canonical
   `{provider}/{model}` id, because it *is* the two path segments the route is
   addressed by. Exactly two non-empty segments are accepted; a one-segment id, a
