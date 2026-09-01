@@ -150,7 +150,7 @@ notes for each version.
 ### Changed
 
 - **Breaking (wire): `client.models.run` now posts to Comfy Router.** It sends
-  `POST {COMFY_ROUTER_BASE_URL}/v1/models/{provider}/{model}` — the route
+  `POST {COMFY_ROUTER_BASE_URL}/v2/models/{provider}/{model}` — the route
   `spec/router-openapi.yaml` declares as `runRouterModel` — with the partner
   model's **own native JSON input** as the body, forwarded to the provider
   unchanged. It previously posted `{COMFY_BASE_URL}/api/v2/models/run` with a
