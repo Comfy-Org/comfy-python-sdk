@@ -400,11 +400,11 @@ operations are added to this namespace as they land.
 ### `models.run` — one call, one result
 
 ```python
-result = client.models.run("fal-ai/flux-pro", {"prompt": "a cat", "steps": 4})
+result = client.models.run("bfl/flux-2-pro", {"prompt": "a cat", "steps": 4})
 result["images"][0]["url"]
 ```
 
-That call is `POST https://api.comfy.org/v2/models/fal-ai/flux-pro` with
+That call is `POST https://api.comfy.org/v2/models/bfl/flux-2-pro` with
 `{"prompt": "a cat", "steps": 4}` as the body.
 
 Three things follow from that, and they are the whole contract of this method:
@@ -413,8 +413,8 @@ Three things follow from that, and they are the whole contract of this method:
   `COMFY_ROUTER_BASE_URL`, not by `COMFY_BASE_URL`. Your API key goes with it.
 - **The first argument is the model's canonical id**, `{provider}/{model}` —
   exactly the two segments that address the route, and exactly what Router's
-  model catalog lists. It must be two non-empty segments: `"fal-ai"` alone,
-  `"fal-ai/flux-pro/fp8"` (the three-segment variant form, which this route does
+  model catalog lists. It must be two non-empty segments: `"bfl"` alone,
+  `"bfl/flux-2-pro/fp8"` (the three-segment variant form, which this route does
   not take yet), and anything containing a `.` or `..` segment all raise
   `ValueError` locally, before any request. A non-string raises `TypeError`.
 - **The second argument is the model's own native input**, forwarded to the
@@ -432,7 +432,7 @@ The awaitable form is the **async client**, not a differently-named method:
 
 ```python
 async with AsyncComfy(api_key="comfyui-...") as client:
-    result = await client.models.run("fal-ai/flux-pro", {"prompt": "a cat"})
+    result = await client.models.run("bfl/flux-2-pro", {"prompt": "a cat"})
 ```
 
 There is no `run_async()`, and there will not be one — one operation, one name,
