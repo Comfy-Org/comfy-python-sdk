@@ -1,9 +1,12 @@
 """The bearer token must never leak to a host other than the configured
 ``base_url``.
 
-``job.urls.self`` / ``job.urls.events`` / ``job.urls.cancel`` are server-returned
-absolute URLs that ``Job.refresh()`` / ``events()`` / ``cancel()`` hand straight
-to the transport (see ``comfy_sdk/jobs.py``). Before this fix, ``_Prepared``
+``job.urls.self`` / ``job.urls.events`` / ``job.urls.cancel`` / ``job.urls.logs``
+are server-returned absolute URLs that ``Job.refresh()`` / ``events()`` /
+``cancel()`` / ``get_logs()`` hand straight to the transport (see
+``comfy_sdk/jobs.py``). The guard is generic — it keys on the resolved origin in
+``_Prepared.headers``, not on which link produced the URL — so a new follow-up
+link is covered the moment it is added. Before this fix, ``_Prepared``
 attached ``Authorization: Bearer <key>`` to *any* absolute URL with no origin
 check — a malicious or misconfigured server could point a job's follow-up link
 at an attacker-controlled host and have the client hand it the credential.

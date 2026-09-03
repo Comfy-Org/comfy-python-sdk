@@ -46,6 +46,7 @@ OPERATION_IDS: frozenset[str] = frozenset(
         "postJobs",
         "getJob",
         "getJobWorkflow",
+        "getJobLogs",
         "getJobEvents",
         "cancelJob",
     }
@@ -62,6 +63,7 @@ OPERATION_METHODS: dict[str, str] = {
     "postJobs": "post_jobs",
     "getJob": "get_job",
     "getJobWorkflow": "get_job_workflow",
+    "getJobLogs": "get_job_logs",
     "getJobEvents": "get_job_events",
     "cancelJob": "cancel_job",
 }

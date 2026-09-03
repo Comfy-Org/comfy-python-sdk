@@ -52,3 +52,15 @@ def test_auth_still_attaches_to_origin_resolved_links() -> None:
     p = _Prepared(PATH_MOUNTED_BASE, "comfyui-k")
     url = p.url("/deployment/dep_123/api/v2/jobs/j1")
     assert p.headers(url)["Authorization"] == "Bearer comfyui-k"
+
+
+def test_gateway_logs_link_resolves_against_origin() -> None:
+    # The reason get_logs() follows urls.logs instead of building
+    # /jobs/{id}/logs: on a path-mounted proxy the server's link already carries
+    # the mount prefix, and a synthesized path would resolve under base_url and
+    # double it. Pinned here because the stub server in the suite is mounted at
+    # the root, where the two forms coincide and a regression would be silent.
+    p = _Prepared(PATH_MOUNTED_BASE, "comfyui-k")
+    link = "/deployment/dep_123/api/v2/jobs/j1/logs"
+    assert p.url(link) == "https://proxy.example" + link
+    assert p.url("/jobs/j1/logs") == PATH_MOUNTED_BASE + "/api/v2/jobs/j1/logs"
