@@ -278,7 +278,7 @@ components:
       description: A canonical Comfy Router model ID, `{provider}/{model}` - exactly the value that addresses the model on `POST /v2/models/{provider}/{model}`, so a caller can interpolate it into that path without re-deriving it from anything. Its `pattern` is `RouterProviderSegment` and `RouterModelSegment` joined by a single `/`, and `maxLength` is their sum plus that separator.
       pattern: ^[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$
       maxLength: 193
-      example: bfl/flux-2-pro
+      example: fal-ai/flux-pro
     RouterModelInput:
       type: object
       description: 'A partner model''s native JSON input document, forwarded to the provider as-is. Its concrete shape is owned by the partner rather than by Comfy, so this is an open object: Router does not narrow, rename, or re-envelope the fields. It is a named component (never an inline anonymous object) because ComfyUI''s spec-driven codegen needs a class to generate.'
@@ -337,7 +337,7 @@ components:
       description: Lowercase `model` segment of the canonical `{provider}/{model}[/{variant}]` model ID - the model to run within that provider. Shared by the invocation route's `model` path parameter and a catalog entry's `model` field, for the same no-drift reason as `RouterProviderSegment`.
       pattern: ^[a-z0-9]+([._-][a-z0-9]+)*$
       maxLength: 128
-      example: flux-2-pro
+      example: flux-pro
     RouterPageCursor:
       type: string
       description: 'An OPAQUE cursor into a Router list. It is produced by the server and only ever round-tripped: it is not an offset, not a model ID, not ordered, and not stable across catalog rebuilds, so parsing one, incrementing one, or persisting one beyond the walk it came from are all outside the contract. Cursor rather than offset because the catalog is a moving list - an offset walk silently skips or repeats entries when entries are added or removed mid-walk, and a caller cannot tell that it happened.'
@@ -350,7 +350,7 @@ components:
       description: Lowercase `provider` segment of the canonical `{provider}/{model}[/{variant}]` model ID - the partner whose model is being addressed. The invocation route's `provider` path parameter and a catalog entry's `provider` field both reference this one schema, which is what keeps the listed IDs and the accepted IDs from drifting apart.
       pattern: ^[a-z0-9]+([._-][a-z0-9]+)*$
       maxLength: 64
-      example: bfl
+      example: fal-ai
     RouterValidationErrorContext:
       type: object
       description: 'The violated bound for one `RouterValidationErrorDetail`, carried from the provider verbatim - for example `{"limit_value": 8}` alongside `greater_than`, `{"min_width": 512}` alongside `image_too_small`, or `{"max_size_bytes": 10485760}` alongside `file_too_large`. The key set is specific to the provider and the error type, so this is deliberately an open object: narrowing it to a fixed field list, or folding it into the `msg` string, is precisely how a ported integration compiles and then silently loses the branch that read the bound. Absent when the error type carries no bound.'
