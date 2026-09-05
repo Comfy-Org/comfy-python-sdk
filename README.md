@@ -474,7 +474,7 @@ The default policy:
 | Retried, at the server's pace | a `429` carrying `Retry-After` (queue full, out of credits, a concurrency limit) — a reject that started no work, so the key is released. The delay is the one the server named, not a guess |
 | Retried, at the server's pace | the answers that pace a resend of the *same* key for work already running: a `deadline_exceeded` `504` carrying `Retry-After` (Comfy stopped holding the connection at its own bound; the contract says to retry with the same key, which collects that generation rather than dispatching another), and an in-flight-key `concurrency_limit_exceeded` `409` carrying `Retry-After` (another call is already running under the same key; the resend collects it — the same bucket on a `429` is plain throttling and takes the ordinary retry path). One `run()` rides that loop to the finished result |
 | Not retried | every other 4xx — `400`/`content_policy_violation`, `404`, any `409` that is not the paced in-flight `concurrency_limit_exceeded` one above (`hash_mismatch` carries a `Retry-After` and is still deterministic, and the router's `invalid_input` key cases are answered by a NEW key), `422`, `401`, `402` — because asking again cannot change a deterministic refusal. A `429` with no `Retry-After` is not asking to be asked again either |
-| Not retried by default | anything whose outcome is unknown: any **other 5xx response** — including the router's `service_unavailable` `503` (which asks a caller to retry with backoff but says nothing about the key), a `504` carrying no `Retry-After` (the router sends it only when it holds a generation to collect), and a `504` that is `provider_timeout` rather than `deadline_exceeded` — and a client-side timeout where the server may still be generating. The key stays claimed for these, so a same-key retry comes back `422 idempotency_key_reuse` and hides the real error — while a fresh-key retry is the second billed generation the one-key rule exists to prevent |
+| Not retried by default | anything whose outcome is unknown: any **other 5xx response** — including the router's `service_unavailable` `503` (which asks a caller to retry with backoff but says nothing about the key), a `504` carrying no `Retry-After` (the router sends it only when it holds a generation to collect), and a `504` that is `provider_timeout` rather than `deadline_exceeded` — and a client-side timeout where the server may still be generating. The key stays claimed for these, so a same-key retry only comes back `422 idempotency_key_reuse` (that refusal no longer hides the real error — see below — but it is still a wasted request) — while a fresh-key retry is the second billed generation the one-key rule exists to prevent |
 | Budget | 60 seconds of **total elapsed time** from the first attempt, not a number of attempts. The collect loop gets its own, longer budget: 1200 seconds, two server deadline windows, so it can outlast the deadline that started it |
 | Backoff | 0.5s doubling to a 15s ceiling, with full jitter (each wait is drawn from `[0, ceiling]`), clamped to whatever is left of the budget. A `Retry-After` the server named is used as given instead |
 
@@ -510,8 +510,10 @@ A note on what the default trades: the collect rule is
 `spec/router-openapi.yaml`'s, so it binds Comfy Router — but
 `COMFY_ROUTER_BASE_URL` can name a deployment that applies the v2 rule instead
 and keeps the key claimed across the `504`. There the collect resend comes back
-`422 idempotency_key_reuse` in place of the real `504`. Set
-`retry_collectable=False` on such a deployment.
+`422 idempotency_key_reuse` — one wasted request, but not a lost diagnosis:
+`run` raises the real `504` and chains the refusal onto it as `__cause__`, so
+`except IdempotencyKeyReuse` around `run` does *not* catch it. Set
+`retry_collectable=False` on such a deployment to skip the resend entirely.
 
 Other 5xx responses and client-side timeouts are the cases left out by default,
 and for the same reason. `run` holds the connection open while the server
@@ -631,7 +633,10 @@ asset, job, event, and output helpers translate protocol errors, so catches of
   no replay — so if you pass your own `idempotency_key=` and reuse it, the second
   call raises this. After an ambiguous failure (e.g. a timeout where you don't
   know if the job was created), poll or list your jobs rather than resubmitting
-  with the same key.
+  with the same key. One exception: when `models.run`'s *own* retry is refused
+  for key reuse, it raises the failure that caused the retry and chains this
+  exception onto it as `__cause__`, since the refusal says nothing about why the
+  call failed.
 - `InsufficientCredits` — the account can't afford the job.
 - `QueueFull` — backpressure; carries `.retry_after` seconds. `client.submit`
   retries 429 responses with `Retry-After` for a bounded budget (including
