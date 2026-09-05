@@ -181,6 +181,11 @@ class ServerState:
     # Idempotency-Key -> job id of the first (accepted) request, so a reuse of
     # the same key can be detected and rejected (single-use, no replay).
     idempotency: dict[str, str] = field(default_factory=dict)
+    # Every Idempotency-Key seen on POST /jobs, in arrival order (`None`
+    # records a submit that arrived without the header at all). Distinct from
+    # `idempotency`, which only records the keys an *accepted* request claimed
+    # — a test about a failed submit needs the key the server actually saw.
+    jobs_idempotency_keys: list[str | None] = field(default_factory=list)
     # Raw bytes of the last POST /assets multipart body (so tests can inspect
     # the parts actually sent — e.g. how many `tags` fields were included).
     last_upload_body: bytes = b""
@@ -660,6 +665,7 @@ def _make_handler(state: ServerState):
             state.last_workflow = body.get("workflow")
             state.last_jobs_body = body
             key = self.headers.get("Idempotency-Key")
+            state.jobs_idempotency_keys.append(key)
 
             if key and key in state.idempotency:
                 # Reject-on-duplicate (single-use keys, no replay): any reuse of

@@ -48,7 +48,7 @@ from comfy_low.transport import ROUTER_BASE_URL, AsyncComfyLow, ComfyLow, origin
 
 from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
-from .exceptions import MissingApiKey, WorkflowFormatUi, to_sdk_error
+from .exceptions import MissingApiKey, WorkflowFormatUi, to_sdk_error, translating
 from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory
 from .models import AsyncModels, Models
 from .retry import DEFAULT_RETRY, RetryPolicy
@@ -310,6 +310,14 @@ class Comfy:
         reused key is *rejected*, not replayed: on reuse, catch the error and
         poll/list for the job the first attempt already created.
 
+        Every exception a failed submit raises carries the key it was made
+        under on ``.idempotency_key`` — including a transport failure that
+        never reached a response (``httpx.ConnectError``, a read timeout),
+        which reads ``.request_id`` and ``.retry_after`` as ``None`` rather
+        than raising. Because a reused key is rejected rather than replayed,
+        that key is a record of what was sent, not a replay handle: use it to
+        go looking for the job, not to resubmit.
+
         ``api_key`` authenticates partner (API) nodes embedded in the workflow
         (e.g. Gemini) — unrelated to idempotency and unrelated to the bearer
         token this client was constructed with. It is never persisted or
@@ -321,17 +329,23 @@ class Comfy:
         key = idempotency_key or _core.new_idempotency_key()
         extra_data = _core.extra_data_for(api_key)
         deadline = _now() + _QUEUE_RETRY_BUDGET
-        while True:
-            try:
-                model = self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
-                return Job(self._low, model)
-            except ApiError as exc:
-                err = to_sdk_error(exc)
-                delay = _retry_delay(exc, deadline)
-                if delay is None:
-                    raise err from exc
-                time.sleep(delay)
-                continue
+        # The key is a local of this frame, so anything that propagates past
+        # here takes the caller's only record of what was sent with it. The
+        # inner handler still owns what is retried and what surfaces; this
+        # stamps the key onto whatever it lets out — including a transport
+        # failure that never reached a response to translate.
+        with translating(idempotency_key=key):
+            while True:
+                try:
+                    model = self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
+                    return Job(self._low, model)
+                except ApiError as exc:
+                    err = to_sdk_error(exc)
+                    delay = _retry_delay(exc, deadline)
+                    if delay is None:
+                        raise err from exc
+                    time.sleep(delay)
+                    continue
 
     def run(
         self,
@@ -426,17 +440,22 @@ class AsyncComfy:
         key = idempotency_key or _core.new_idempotency_key()
         extra_data = _core.extra_data_for(api_key)
         deadline = _now() + _QUEUE_RETRY_BUDGET
-        while True:
-            try:
-                model = await self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
-                return AsyncJob(self._low, model)
-            except ApiError as exc:
-                err = to_sdk_error(exc)
-                delay = _retry_delay(exc, deadline)
-                if delay is None:
-                    raise err from exc
-                await asyncio.sleep(delay)
-                continue
+        # See :meth:`Comfy.submit` — same stamp, and here it also rides out on
+        # the cancellation of an in-flight `post_jobs`.
+        with translating(idempotency_key=key):
+            while True:
+                try:
+                    model = await self._low.post_jobs(
+                        graph, idempotency_key=key, extra_data=extra_data
+                    )
+                    return AsyncJob(self._low, model)
+                except ApiError as exc:
+                    err = to_sdk_error(exc)
+                    delay = _retry_delay(exc, deadline)
+                    if delay is None:
+                        raise err from exc
+                    await asyncio.sleep(delay)
+                    continue
 
     async def run(
         self,

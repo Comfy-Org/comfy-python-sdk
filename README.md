@@ -584,12 +584,22 @@ Three attributes carry this:
 All three read as `None` rather than raising on any exception `models.run`
 raises, so a handler never has to guard the attribute access itself.
 
-`idempotency_key` is `None` on errors from *other* surfaces, though — it is
-`models.run` that records it, and `submit()` sends a key without stamping one.
-So `None` means "this SDK did not record a key for you", **not** "no key was
-sent, resend freely": check for it before replaying, as the snippet above does,
-rather than passing it straight back into `idempotency_key=` where `None` means
-"mint a fresh one" and starts a second billed generation.
+`submit()` — and so `run()`, which submits through it — stamps the key too, but
+what the key is *good for* differs, so read it with the surface in mind.
+`models.run` sends it to a surface that **replays** a claimed key, which is what
+makes it a handle on a generation you were already billed for. `POST /jobs`
+instead **rejects** a reused key with `422 idempotency_key_reuse` (see the
+[`IdempotencyKeyReuse`](#typed-errors) bullet below): keys there are single-use
+and there is no replay. So on a `submit()` failure `exc.idempotency_key` tells
+you a key *was* sent — do not resubmit blindly under it, poll or list for the
+job the first attempt may already have created.
+
+`idempotency_key` is still `None` on errors from every other surface — one that
+sends no key, and an asset upload, which mints a key per handle without
+recording it. So `None` means "this SDK did not record a key for you", **not**
+"no key was sent, resend freely": check for it before replaying, as the snippet above
+does, rather than passing it straight back into `idempotency_key=` where `None`
+means "mint a fresh one" and starts a second billed generation.
 
 ## Sync and async
 

@@ -23,12 +23,23 @@ class ComfyError(Exception):
     """Base for every SDK-level error."""
 
     #: The ``Idempotency-Key`` the failed call was made under. Populated by
-    #: :meth:`comfy_sdk.models.Models.run` and its async twin, which are the
-    #: operations that pass a key to :func:`translating`; ``None`` everywhere
-    #: else — including on operations that *do* send a key but do not stamp it
-    #: (``Comfy.submit()``), and on an exception constructed by hand. So
-    #: ``None`` means "this SDK did not record a key for you", never "no key
-    #: reached the server": do not infer from it that a resend is safe.
+    #: :meth:`comfy_sdk.models.Models.run` and its async twin, and by
+    #: :meth:`comfy_sdk.client.Comfy.submit` /
+    #: :meth:`comfy_sdk.client.AsyncComfy.submit` — and therefore by
+    #: ``Comfy.run`` / ``AsyncComfy.run``, which submit through them. It is
+    #: ``None`` everywhere else: on an operation that sends no key, on an
+    #: asset upload (which mints a key per handle and does not record it), and
+    #: on an exception constructed by hand. So ``None`` means "this SDK did not
+    #: record a key for you", never "no key reached the server": do not infer
+    #: from it that a resend is safe.
+    #:
+    #: What the key is *good for* differs by surface, so read it with the
+    #: operation in mind: ``models.run`` sends it to a surface that replays a
+    #: claimed key, so the key is a handle on the generation you were already
+    #: billed for. ``POST /jobs`` instead *rejects* a reused key with
+    #: ``422 idempotency_key_reuse``, so on a ``submit`` failure the key says a
+    #: key was sent — poll or list for the job the first attempt may have
+    #: created rather than resubmitting under it.
     #:
     #: Declared on the base rather than set per subclass so that a bucket this
     #: SDK version has never heard of — which arrives as a bare

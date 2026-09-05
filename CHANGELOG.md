@@ -14,6 +14,22 @@ notes for each version.
 
 ### Added
 
+- Every exception `client.submit()` — and so `client.run()`, which submits
+  through it — raises **for a failed call** now carries the `Idempotency-Key`
+  it was made under, on `.idempotency_key`, matching `client.models.run()`:
+  the mapped `ComfyError` subclasses, a `QueueFull` raised once the 429 retry
+  budget is exhausted (the same key on every retried attempt), and a transport
+  failure with no response at all (a dropped connection, a read timeout), which
+  previously escaped `submit()` untranslated and now reads `.request_id` and
+  `.retry_after` as `None` rather than raising `AttributeError`. Cancelling an
+  in-flight `AsyncComfy.submit()` yields the key too, and the cancellation
+  still propagates unchanged. The semantics differ from `models.run`'s and the
+  difference matters: `POST /jobs` **rejects** a reused key with
+  `422 idempotency_key_reuse` rather than replaying it, so the key on a
+  `submit()` error records what was sent — poll or list for the job the first
+  attempt may already have created — rather than being a replay handle to
+  resubmit under. Nothing about what is retried, what key is minted, or what
+  goes on the wire changed.
 - Every exception `client.models.run()` raises **for a failed call** now
   carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the
   typed `RouterError` buckets, a `RouterError` whose `error_type` this version
