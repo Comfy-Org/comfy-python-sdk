@@ -13,7 +13,11 @@ Three checks, one job:
    that matters there is a bucket the spec declares and the SDK has no class
    for, which would reach callers as an untyped ``RouterError``. This compares
    the spec's ``x-comfy-error-types`` list against ``ROUTER_ERROR_TYPES``,
-   which is what makes the next vendored Router sync a real diff review.
+   which is what makes the next vendored Router sync a real diff review. It
+   then compares each entry's ``meaning`` against the ``_spec_meaning_digest``
+   read marker on that bucket's class, because values and order say nothing
+   about the prose: a sync that rewrites a bucket's retry guidance and nothing
+   else would otherwise pass with the docstring left stale.
 3. **The bound model-run route vs ``spec/router-openapi.yaml``.** Same reason,
    different artifact: ``comfy_low.transport`` posts a model run to a
    hand-written path constant and a hand-written host constant. The spec
@@ -70,8 +74,13 @@ def _generate(out: Path) -> None:
     )
 
 
-def _declared_router_error_types() -> list[str]:
-    """The router spec's ``x-comfy-error-types`` values, in declaration order.
+def _declared_router_error_types() -> list[dict[str, str]]:
+    """The router spec's ``x-comfy-error-types`` entries, in declaration order.
+
+    Each entry is narrowed to the three fields both passes below read --
+    ``value``, ``tier`` and ``meaning`` -- rather than to the value alone: the
+    digest pass needs the prose, and validating it here keeps every "the sync
+    reshaped the extension" message in one place.
 
     Raises :class:`ValueError` rather than letting a ``KeyError``/``TypeError``
     escape: a sync that reshapes or drops the extension should fail this job
@@ -107,22 +116,42 @@ def _declared_router_error_types() -> list[str]:
         node = node[key]
     if not isinstance(node, list) or not node:
         raise ValueError(f"{ROUTER_SPEC.name}'s x-comfy-error-types is not a non-empty list")
-    values: list[str] = []
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
     for entry in node:
         if not isinstance(entry, dict) or not isinstance(entry.get("value"), str):
+            raise ValueError(f"{ROUTER_SPEC.name} has an x-comfy-error-types entry with no value")
+        value = entry["value"]
+        if not value:
             raise ValueError(f"{ROUTER_SPEC.name} has an x-comfy-error-types entry with no value")
         # Rejected here rather than downstream: `ROUTER_ERROR_TYPES` is built
         # from a dict and so is deduplicated, and a repeated value would make
         # the two lists differ only in length -- reported below as "same values,
         # different order", sending the operator hunting for an ordering diff
         # that does not exist.
-        if entry["value"] in values:
+        if value in seen:
             raise ValueError(
-                f"{ROUTER_SPEC.name} declares x-comfy-error-types value "
-                f"{entry['value']!r} more than once"
+                f"{ROUTER_SPEC.name} declares x-comfy-error-types value {value!r} more than once"
             )
-        values.append(entry["value"])
-    return values
+        seen.add(value)
+        tier = entry.get("tier")
+        if not isinstance(tier, str) or tier not in ("request", "transport"):
+            raise ValueError(
+                f"{ROUTER_SPEC.name}'s x-comfy-error-types entry {value!r} declares tier "
+                f"{tier!r}, which is neither 'request' nor 'transport'"
+            )
+        meaning = entry.get("meaning")
+        # `.strip()` and not just a type check: a bucket whose prose is blank
+        # would otherwise get a digest of the empty string -- a stable value
+        # that would sail past the digest pass forever, which is the one
+        # outcome a read marker must never have.
+        if not isinstance(meaning, str) or not meaning.strip():
+            raise ValueError(
+                f"{ROUTER_SPEC.name}'s x-comfy-error-types entry {value!r} has no "
+                "non-empty string meaning"
+            )
+        entries.append({"value": value, "tier": tier, "meaning": meaning})
+    return entries
 
 
 def _declared_run_route() -> tuple[str, str]:
@@ -244,7 +273,11 @@ def _check_router_error_types() -> int:
     # runs (and still reports) when the package itself will not import.
     sys.path.insert(0, str(ROOT / "src"))
     try:
-        from comfy_sdk.router_exceptions import ROUTER_ERROR_TYPES
+        from comfy_sdk.router_exceptions import (
+            ROUTER_ERROR_TYPES,
+            _meaning_digest,
+            exception_for,
+        )
     except Exception as exc:
         # This check supervises that very module, so a syntax or import error
         # in it is the failure to report, not a traceback to leak.
@@ -252,43 +285,94 @@ def _check_router_error_types() -> int:
         return 1
 
     try:
-        declared = _declared_router_error_types()
+        entries = _declared_router_error_types()
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    declared = [entry["value"] for entry in entries]
     known = list(ROUTER_ERROR_TYPES)
-    if declared == known:
+    if declared != known:
+        missing = [value for value in declared if value not in known]
+        extra = [value for value in known if value not in declared]
         print(
-            f"OK: comfy_sdk.router_exceptions covers all {len(declared)} error types "
-            "in spec/router-openapi.yaml"
+            "ERROR: the router exception table has drifted from spec/router-openapi.yaml.",
+            file=sys.stderr,
         )
-        return 0
+        if missing:
+            print(
+                f"  declared in the spec, no class in the SDK: {', '.join(missing)}\n"
+                "  Add one RouterError subclass per value to src/comfy_sdk/router_exceptions.py,\n"
+                "  named as the PascalCase of the wire value, with the spec's `meaning`\n"
+                "  as its docstring.",
+                file=sys.stderr,
+            )
+        if extra:
+            print(
+                f"  a class in the SDK, not declared in the spec: {', '.join(extra)}",
+                file=sys.stderr,
+            )
+        if not missing and not extra:
+            print(
+                f"  same values, different order.\n    spec: {declared}\n    sdk:  {known}",
+                file=sys.stderr,
+            )
+        return 1
 
-    missing = [value for value in declared if value not in known]
-    extra = [value for value in known if value not in declared]
+    # The values and the order match, so every bucket has a class and the
+    # lookup below always finds one. What is still unchecked at this point is
+    # the PROSE: `meaning` is where the difference between two buckets sharing
+    # a status is written down, and a sync that rewrites one leaves the class
+    # docstring stale with everything above green. So each class carries a
+    # `_spec_meaning_digest` read marker -- the digest of the `meaning` its
+    # docstring was written against. This never compares the digest to the
+    # docstring: the docstrings reword the prose into reST, so equality is
+    # impossible by design. It only asks whether the prose moved since someone
+    # last read it.
+    stale: list[tuple[str, str | None, str]] = []
+    for entry in entries:
+        cls = exception_for(entry["value"])
+        # `getattr(..., None)` rather than an attribute read, and the base
+        # class deliberately declares no default: a subclass that forgets the
+        # marker has to fail here rather than inherit a blessing for prose
+        # nobody read.
+        blessed = getattr(cls, "_spec_meaning_digest", None)
+        expected = _meaning_digest(entry["meaning"])
+        if blessed != expected:
+            stale.append((entry["value"], blessed, expected))
+    if stale:
+        print(
+            f"ERROR: spec/router-openapi.yaml's `meaning` for {len(stale)} error "
+            f"{'type' if len(stale) == 1 else 'types'} is not the prose the SDK docstring "
+            "was written against, so that docstring may now be wrong.",
+            file=sys.stderr,
+        )
+        for value, blessed, expected in stale:
+            name = exception_for(value).__name__
+            # `blessed is None` is the other half of this check: not a changed
+            # `meaning` but a class that never recorded one, which is what a
+            # freshly added bucket looks like. Same fix, different sentence --
+            # telling someone their prose "changed" when they simply have not
+            # blessed it yet sends them diffing a spec that did not move.
+            if blessed is None:
+                head = f"  {value}: {name} carries no _spec_meaning_digest"
+            else:
+                head = f"  {value}: {name} is blessed against {blessed!r}"
+            print(
+                f"{head}, and the spec's `meaning` hashes to {expected!r}.\n"
+                f"  Re-read {name}'s docstring in src/comfy_sdk/router_exceptions.py against "
+                "that entry's `meaning`\n"
+                "  and update the docstring if the semantics moved, then set\n"
+                f'      _spec_meaning_digest: str = "{expected}"\n'
+                "  on that class to record that this docstring was written against that prose.",
+                file=sys.stderr,
+            )
+        return 1
+
     print(
-        "ERROR: the router exception table has drifted from spec/router-openapi.yaml.",
-        file=sys.stderr,
+        f"OK: comfy_sdk.router_exceptions covers all {len(declared)} error types "
+        "in spec/router-openapi.yaml, each blessed against that entry's `meaning`"
     )
-    if missing:
-        print(
-            f"  declared in the spec, no class in the SDK: {', '.join(missing)}\n"
-            "  Add one RouterError subclass per value to src/comfy_sdk/router_exceptions.py,\n"
-            "  named as the PascalCase of the wire value, with the spec's `meaning`\n"
-            "  as its docstring.",
-            file=sys.stderr,
-        )
-    if extra:
-        print(
-            f"  a class in the SDK, not declared in the spec: {', '.join(extra)}",
-            file=sys.stderr,
-        )
-    if not missing and not extra:
-        print(
-            f"  same values, different order.\n    spec: {declared}\n    sdk:  {known}",
-            file=sys.stderr,
-        )
-    return 1
+    return 0
 
 
 def _run(name: str, check: Callable[[], int]) -> int:
