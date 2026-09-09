@@ -395,7 +395,9 @@ client's `COMFY_BASE_URL`. See
 two variables.
 
 `base_url` and `timeout` are a read-only view of that configuration; model
-operations are added to this namespace as they land.
+operations are added to this namespace as they land. There are two ways to run
+a model on it — `run`, which waits, and `submit`, which queues — and they send
+the same request.
 
 ### `models.run` — one call, one result
 
@@ -444,6 +446,103 @@ API calls). Pass `timeout=` seconds, an `httpx.Timeout`, or `None` to wait
 indefinitely. Each call also sends a fresh `Idempotency-Key`, so an accidental
 exact resend is rejected by the server instead of billing a second generation;
 pass `idempotency_key=` to choose the value yourself.
+
+### `models.submit` — queue it, collect it later
+
+`run` holds one connection open until the generation is finished. When the
+caller cannot wait that long — a web request that has to return now, a worker
+that submits in one process and collects in another, a batch that should be in
+flight all at once — submit it to the queue instead:
+
+```python
+handle = client.models.submit("fal-ai/flux-pro", {"prompt": "a cat"})
+
+handle.request_id          # 'req_...' — all another process needs
+handle.status().status     # 'IN_QUEUE' / 'IN_PROGRESS' / 'COMPLETED'
+result = handle.get()      # blocks until complete, returns the provider payload
+```
+
+`submit` sends the same request `run` does — the same model id, the same native
+body — and returns as soon as the server has **accepted** it. The queue is the
+server's: ordering, admission, retries, timeouts, billing and expiry are all
+decided there, and this SDK adds polling and ergonomics on top of it and
+nothing else.
+
+The handle carries four operations:
+
+| | |
+|---|---|
+| `handle.status()` | one authoritative poll, returned as a `QueueUpdate` (`status`, `queue_position`, `error_type`, `retry_after`, `raw`) |
+| `handle.get(timeout=None)` | poll to completion, then return the provider's own payload — the same value `run` would have returned |
+| `handle.cancel()` | ask the server to cancel. A request, not a guarantee: a request that already completed stays completed |
+| `handle.iter_events(timeout=None)` | the poll loop with its updates exposed — yields the first observation, every change of status or queue position, and the completion |
+
+Polling is **poll-authoritative**: there is no stream to reconcile against on
+this surface, and `iter_events` is the poll loop rather than SSE. It backs off
+adaptively, and a `Retry-After` the server names on a poll beats that schedule
+— the server knows its own pace.
+
+**A `200` is not the same thing as a success here.** The server reports a
+failed *and* a cancelled request as `COMPLETED` carrying an `error_type`, so
+`get()` raises the matching typed exception from
+[`comfy_sdk.router_exceptions`](#typed-errors) rather than handing the failure
+back as a result. `iter_events` deliberately does not raise — it is a view of
+the queue's progress, and `get()` is the one that collects.
+
+Rehydrate a handle in another process from the two ids that address the
+request, with no call made:
+
+```python
+handle = client.models.handle("fal-ai/flux-pro", request_id)
+result = handle.get()
+```
+
+Both ids are needed because both address the route
+(`/v2/models/{provider}/{model}/requests/{request_id}`), and both are validated
+locally before anything is sent.
+
+### `models.subscribe` — submit, follow, collect
+
+```python
+def on_update(update):
+    print(update.status, update.queue_position)
+
+result = client.models.subscribe(
+    "fal-ai/flux-pro", {"prompt": "a cat"}, on_queue_update=on_update, timeout=300
+)
+```
+
+`submit` + poll + `get`, in one call, for a caller who does want to wait but
+also wants to show progress. `timeout=` is a **client-side** bound with no
+server-side meaning; when it runs out, `subscribe` makes a best-effort
+`cancel()` — so a caller who has stopped waiting is not still paying for a
+generation nobody will collect — and then raises `TimeoutError`. Use `submit`
+when the request should outlive the caller's patience.
+
+Each `submit` **call** mints one fresh `Idempotency-Key`: two deliberate
+submits of the same input are two requests, while a transport-level retry
+inside one call keeps the one key and replays the original rather than queueing
+a second generation. Pass `idempotency_key=` to choose it yourself — the case
+that earns it is a lost response, where the request may have been accepted and
+its id lost with the reply; every exception carries the key on
+`.idempotency_key` for exactly that.
+
+The awaitable form is the async client, with the identical names, arguments and
+argument order — there is no `submit_async`, for the same reason there is no
+`run_async`:
+
+```python
+async with AsyncComfy(api_key="comfyui-...") as client:
+    handle = await client.models.submit("fal-ai/flux-pro", {"prompt": "a cat"})
+    async for update in handle.iter_events():
+        print(update.status)
+    result = await handle.get()
+```
+
+This surface is **gated server side**. A caller the queue is not switched on
+for is answered `403 not_enabled`, which arrives as
+`comfy_sdk.router_exceptions.NotEnabled` — nothing about the request is wrong,
+and it is terminal: do not retry it.
 
 ### Retrying a run without paying for it twice
 
@@ -585,7 +684,8 @@ All three read as `None` rather than raising on any exception `models.run`
 raises, so a handler never has to guard the attribute access itself.
 
 `idempotency_key` is `None` on errors from *other* surfaces, though — it is
-`models.run` that records it, and `submit()` sends a key without stamping one.
+`models.run` and `models.submit` that record it, and the workflow surface's
+`client.submit()` sends a key without stamping one.
 So `None` means "this SDK did not record a key for you", **not** "no key was
 sent, resend freely": check for it before replaying, as the snippet above does,
 rather than passing it straight back into `idempotency_key=` where `None` means
@@ -706,3 +806,13 @@ python scripts/check_drift.py    # same check CI runs; fails if committed models
 Releases are published to PyPI from a GitHub Release (tag `vX.Y.Z`) by
 [`.github/workflows/publish.yml`](.github/workflows/publish.yml), using
 PyPI's Trusted Publishing (OIDC) — no API token is stored in this repo.
+
+**Pre-releases** (a release candidate) go out the same way, with one thing to
+get right: the workflow validates the tag as **SemVer**, where a pre-release is
+a `-`-separated segment. So tag it `v0.2.0-rc1` (or `v0.2.0-rc.1`) — **not**
+`v0.2.0rc1`, which is PEP 440's own spelling and is rejected by that check. The
+build normalises the accepted form to the PEP 440 version anyway, so
+`v0.2.0-rc1` produces `comfy_sdk-0.2.0rc1-py3-none-any.whl`, which `pip install
+comfy-sdk` will not pick up without `--pre`. That last part is the point of
+shipping one: a pre-release reaches the people who ask for it and nobody
+else.
