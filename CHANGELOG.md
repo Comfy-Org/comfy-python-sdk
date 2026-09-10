@@ -147,6 +147,19 @@ notes for each version.
 
 ### Changed
 
+- **Behaviour change: when a `client.models.run()` retry is refused `422`
+  `idempotency_key_reuse`, the failure that *caused* the retry is what is
+  raised** — the `deadline_exceeded` `504` the default collect loop resent
+  under, or the `500` a `retry_possibly_in_flight=True` policy resent under —
+  with the key refusal chained onto it as `__cause__`. The refusal is an
+  artefact of the retry loop rather than an answer about the request, and it
+  used to be the only error the caller saw, so the real failure was lost. **An
+  `except IdempotencyKeyReuse` around `models.run` no longer catches this
+  case**: catch the failure you actually care about (or `ComfyError`) and
+  inspect `exc.__cause__` to tell a rejected resend apart from a first-attempt
+  refusal. Nothing about *which* failures are retried changed, and no other
+  terminal failure is substituted — a `500` followed by a `404` still raises
+  the `404`.
 - **Breaking (wire): `client.models.run` now posts to Comfy Router.** It sends
   `POST {COMFY_ROUTER_BASE_URL}/v1/models/{provider}/{model}` — the route
   `spec/router-openapi.yaml` declares as `runRouterModel` — with the partner

@@ -81,11 +81,13 @@ That, not a guess about the network, is what sorts the failures:
    on a run is the important member: the generation-sized client timeout expired
    with no answer, which is precisely when the server is most likely still
    generating). Nothing on the wire says the key survives this, so a same-key
-   retry may be a ``422`` that replaces the real error — and a *fresh*-key retry
+   retry may be refused ``422`` — and a *fresh*-key retry
    is the second billed generation this module exists to prevent. Not retried by
    default. :attr:`RetryPolicy.retry_possibly_in_flight` opts in, and it is
    correct exactly when a deployment replays a repeated key instead of rejecting
-   it.
+   it. That refusal no longer costs the caller the diagnosis: ``models.run``
+   raises the failure that caused the retry and chains the ``422`` onto it as
+   ``__cause__``, so the real error is what surfaces.
 5. **Everything else** — every other 4xx is the server's considered answer
    about *this* request, and asking again spends money to be refused again.
    Never retried.
@@ -273,8 +275,9 @@ def is_unknown_outcome_status(status: int) -> bool:
     ``invalid_input``. That is why
     this class sits behind :attr:`RetryPolicy.retry_possibly_in_flight` rather
     than being retried by default: unless the deployment replays a claimed key,
-    the same-key retry cannot succeed and *replaces* the genuine 5xx with a
-    confusing key-reuse error.
+    the same-key retry cannot succeed at all. What it costs is one wasted
+    request rather than the diagnosis — ``models.run`` raises the genuine 5xx
+    and chains the key-reuse refusal onto it as ``__cause__``.
 
     A ``502``/``504`` from an intermediary belongs here for the same reason:
     the proxy's response completed, which says nothing about whether the origin
@@ -421,7 +424,9 @@ class RetryPolicy:
     #: caution: a key whose recorded answer cannot be replayed is answered
     #: ``409`` ``invalid_input`` on the router surface (use a NEW key), and the
     #: v2 jobs contract makes ``Idempotency-Key`` single-use outright — so a
-    #: same-key retry here can surface a key refusal that hides the real error.
+    #: same-key retry here buys a key refusal rather than an answer. It no
+    #: longer hides the real error: ``models.run`` raises the failure that
+    #: caused the retry, with the refusal chained on as ``__cause__``.
     #: Turn it on for a deployment that replays a repeated
     #: key instead of rejecting it — and raise ``max_elapsed`` when you do, since
     #: one full-length client timeout on a run spends the whole default budget on

@@ -1132,8 +1132,10 @@ def test_the_default_collect_loop_against_a_non_collecting_deployment(server) ->
     # rule is `spec/router-openapi.yaml`'s, so it binds Comfy Router -- but
     # `COMFY_ROUTER_BASE_URL` can name a deployment that applies the v2 rule
     # instead: key stays claimed across an unknown-outcome 5xx, and the resend
-    # is rejected. The caller then sees `422
-    # idempotency_key_reuse` in place of the real 504. That is the trade the
+    # is rejected `422 idempotency_key_reuse`. What the caller sees is still the
+    # real 504: the refusal is an artefact of the collect loop, not an answer
+    # about the request, so it is chained onto the 504 as `__cause__` rather
+    # than raised in its place. The wasted second request is the trade the
     # default makes; `retry_collectable=False` is the way out of it, and this
     # pins both halves so neither can change silently.
     server.state.model_run_collects_after_deadline = False
@@ -1141,9 +1143,15 @@ def test_the_default_collect_loop_against_a_non_collecting_deployment(server) ->
     server.state.model_run_error = (504, "deadline_exceeded")
     server.state.model_run_retry_after = "0"
     with Comfy(retry=FAST) as client:
-        with pytest.raises(IdempotencyKeyReuse):
+        with pytest.raises(ComfyError) as excinfo:
             client.models.run(MODEL, ARGS)
     assert server.state.model_run_count == 2
+    assert excinfo.value.http_status == 504
+    assert isinstance(excinfo.value.__cause__, IdempotencyKeyReuse)
+    # The substitution does not cost the caller the key: both halves of the
+    # chain carry the one key the call was made under.
+    assert excinfo.value.idempotency_key is not None
+    assert excinfo.value.__cause__.idempotency_key == excinfo.value.idempotency_key
 
     server.state.model_run_count = 0
     server.state.model_run_idempotency.clear()
@@ -1155,6 +1163,97 @@ def test_the_default_collect_loop_against_a_non_collecting_deployment(server) ->
             client.models.run(MODEL, ARGS)
     assert server.state.model_run_count == 1
     assert excinfo.value.http_status == 504
+
+
+# --- a rejected resend must not replace the failure that caused the retry ---
+
+
+async def test_the_refused_collect_resend_is_chained_on_the_async_client(server) -> None:
+    # The async loop makes the same substitution as the sync one. The two loops
+    # are kept structurally identical, and only a test driven through
+    # `AsyncComfy` proves the second copy was edited too.
+    server.state.model_run_collects_after_deadline = False
+    server.state.model_run_v2_key_rule = True
+    server.state.model_run_error = (504, "deadline_exceeded")
+    server.state.model_run_retry_after = "0"
+    async with AsyncComfy(retry=FAST) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            await client.models.run(MODEL, ARGS)
+    assert server.state.model_run_count == 2
+    assert excinfo.value.http_status == 504
+    assert isinstance(excinfo.value.__cause__, IdempotencyKeyReuse)
+
+
+def test_the_opt_in_path_also_raises_the_5xx_that_caused_the_retry(server) -> None:
+    # The same substitution on the other route into it, which needs no collect
+    # rule at all: `retry_possibly_in_flight` resends a plain 500 under the one
+    # key, and a deployment applying the v2 rule refuses it 422. The 500 is the
+    # error the caller has to act on; the 422 only says the resend was pointless.
+    server.state.model_run_v2_key_rule = True
+    server.state.model_run_error = (500, "internal_error")
+    with Comfy(retry=FAST_OPTED_IN) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert server.state.model_run_count == 2
+    assert excinfo.value.http_status == 500
+    assert isinstance(excinfo.value.__cause__, IdempotencyKeyReuse)
+    # One key across both attempts, exactly as before: what changed is which
+    # exception is raised, never what goes on the wire.
+    assert len(set(server.state.model_run_idempotency_keys)) == 1
+
+
+def test_only_a_key_refusal_substitutes_and_every_other_last_failure_wins(server) -> None:
+    # The negative half. Last-wins is still the rule for everything but key
+    # reuse: a 5xx followed by a genuinely different terminal answer raises
+    # that answer, because a 404 *is* the server's verdict on this request.
+    # The deployment replays a repeated key, so the second attempt reaches the
+    # route rather than being refused for the key.
+    server.state.model_run_replays_idempotency_key = True
+    server.state.model_run_transient_error = (500, "internal_error")
+    server.state.model_run_fail_times = 1
+    server.state.model_run_error = (404, "model_not_found")
+    with Comfy(retry=FAST_OPTED_IN) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert server.state.model_run_count == 2
+    assert excinfo.value.http_status == 404
+    assert not isinstance(excinfo.value.__cause__, IdempotencyKeyReuse)
+
+
+def test_a_first_attempt_key_refusal_is_still_raised_as_itself(server) -> None:
+    # The substitution is conditional on there having *been* a retry. A caller
+    # presenting a key the server already consumed gets a straight answer about
+    # that key on the first attempt — there is no earlier failure to restore,
+    # and `except IdempotencyKeyReuse` still catches this one.
+    server.state.model_run_v2_key_rule = True
+    server.state.model_run_idempotency["already-consumed-key-1"] = "done"
+    with Comfy(retry=FAST) as client:
+        with pytest.raises(IdempotencyKeyReuse) as excinfo:
+            client.models.run(MODEL, ARGS, idempotency_key="already-consumed-key-1")
+    assert server.state.model_run_count == 1
+    assert excinfo.value.http_status == 422
+
+
+def test_the_first_retryable_failure_is_the_one_kept() -> None:
+    # Only the *first* is remembered. Two different 5xx answers before the key
+    # refusal, and what surfaces is the one that started the retrying -- the
+    # later ones are the same call failing again, not new information.
+
+    class _ThenRefusedLow(_FlakyLow):
+        def _attempt(self, arguments: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+            self.keys.append(key)
+            if len(self.keys) == 1:
+                raise ApiError("first", code="internal_error", http_status=500)
+            if len(self.keys) == 2:
+                raise ApiError("second", code="internal_error", http_status=503)
+            raise ApiError("no", code="idempotency_key_reuse", http_status=422)
+
+    low = _ThenRefusedLow()
+    with pytest.raises(ComfyError) as excinfo:
+        _models(low, FAST_OPTED_IN).run(MODEL, ARGS)
+    assert len(low.keys) == 3
+    assert excinfo.value.http_status == 500
+    assert isinstance(excinfo.value.__cause__, IdempotencyKeyReuse)
 
 
 # --- the body snapshot the same-key rule rests on ---

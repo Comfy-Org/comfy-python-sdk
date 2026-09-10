@@ -49,10 +49,11 @@ from typing import Any, cast
 import httpx
 
 from comfy_low.errors import ApiError
+from comfy_low.errors import IdempotencyKeyReuse as ProtocolIdempotencyKeyReuse
 from comfy_low.transport import MODEL_RUN_TIMEOUT, AsyncComfyLow, ComfyLow
 
 from ._core import new_idempotency_key, validate_idempotency_key
-from .exceptions import translating
+from .exceptions import IdempotencyKeyReuse, _stamp, to_sdk_error, translating
 from .retry import DEFAULT_RETRY, Retrier, RetryPolicy
 from .router_exceptions import RouterError
 
@@ -72,7 +73,53 @@ from .router_exceptions import RouterError
 #: raising them, with no test failing.
 _CANDIDATE_FAILURES = (ApiError, RouterError, httpx.TransportError)
 
+#: The answer that means the resend was never going to work: the server refused
+#: the *key*, not the request. ``422`` is the v2 jobs rule
+#: (single-use, reject-on-duplicate), which a deployment named by
+#: ``COMFY_ROUTER_BASE_URL`` may apply to this route even though the router
+#: contract does not.
+_KEY_REUSE_STATUS = 422
+_KEY_REUSE_CODE = "idempotency_key_reuse"
+
 _now = time.monotonic
+
+
+def _is_key_reuse(exc: BaseException) -> bool:
+    """Whether ``exc`` is the server refusing a repeated ``Idempotency-Key``.
+
+    Matched on the wire facts — ``422`` plus the ``idempotency_key_reuse``
+    code — rather than on a class alone, because the retry loop runs *inside*
+    ``translating()``: what it catches is the raw
+    :class:`comfy_low.errors.ApiError`, and only the copy that leaves the block
+    is the idiomatic :class:`~comfy_sdk.exceptions.IdempotencyKeyReuse`. Either
+    layer's typed class is accepted outright so the answer does not depend on
+    which one raised.
+    """
+    if isinstance(exc, (IdempotencyKeyReuse, ProtocolIdempotencyKeyReuse)):
+        return True
+    return (
+        getattr(exc, "http_status", None) == _KEY_REUSE_STATUS
+        and getattr(exc, "code", None) == _KEY_REUSE_CODE
+    )
+
+
+def _as_sdk_error(exc: BaseException, idempotency_key: str) -> BaseException:
+    """``exc`` on the surface a caller catches, carrying ``idempotency_key``.
+
+    ``translating()`` converts and stamps the exception it is *handed*, and
+    nothing else — so an ``ApiError`` chained onto that one as ``__cause__``
+    would reach the caller as a raw protocol type this SDK otherwise never
+    shows. Both halves of the substitution below therefore go through here
+    first. Anything already idiomatic (a ``RouterError``, an ``httpx`` failure
+    with no response to translate) is only stamped.
+
+    The translated copy inherits the original's traceback, so the chain still
+    points at the attempt that produced each half rather than at the one line
+    of this module that re-raised them.
+    """
+    if not isinstance(exc, ApiError):
+        return _stamp(exc, idempotency_key)
+    return _stamp(to_sdk_error(exc).with_traceback(exc.__traceback__), idempotency_key)
 
 
 class _ModelsBase:
@@ -193,6 +240,15 @@ class Models(_ModelsBase):
         ``RetryPolicy(retry_possibly_in_flight=True)``. See
         :mod:`comfy_sdk.retry`, and ``Comfy(retry=NO_RETRY)`` to switch it off.
 
+        **When a resend is refused because the key was already claimed
+        (``422`` ``idempotency_key_reuse``), what is raised is the failure that
+        caused the retry** — the ``504``, the ``500`` — with the key refusal
+        chained onto it as ``__cause__``. That refusal is an artefact of this
+        retry loop rather than an answer about the request, so surfacing it in
+        place of the real failure would hide the only error worth diagnosing.
+        Every other terminal failure is raised exactly as the server sent it,
+        first or last.
+
         **Every exception this raises carries the key it sent** on
         ``.idempotency_key`` (and the server's ``.request_id`` when the response
         named one), so a caller who lost the response — a ``deadline_exceeded``
@@ -244,6 +300,11 @@ class Models(_ModelsBase):
         # the wire, so everything legal in it is deep-copyable.
         payload = deepcopy(dict(arguments))
         retrier = Retrier(self._retry, now=_now)
+        # The first retryable failure, kept so a key refusal on a later attempt
+        # cannot bury it. Only the first: every later one is the same call
+        # failing again, and the one the caller has to diagnose is the one that
+        # started the retrying.
+        first: BaseException | None = None
         # The key is stamped onto whatever this raises: it is a local of this
         # frame, so an exception that propagates past it would otherwise take
         # the caller's only route back to an already-billed generation with it.
@@ -252,9 +313,18 @@ class Models(_ModelsBase):
                 try:
                     return low.post_model_run(model, payload, idempotency_key=key, timeout=timeout)
                 except _CANDIDATE_FAILURES as exc:
+                    if first is not None and _is_key_reuse(exc):
+                        # The resend could never have succeeded — the server
+                        # refused the key, not the request — so raising it
+                        # would replace the real failure with an artefact of
+                        # this loop. Chained, not discarded: the 422 stays
+                        # reachable on `__cause__` and in the traceback.
+                        raise _as_sdk_error(first, key) from _as_sdk_error(exc, key)
                     delay = retrier.delay_before_retry(exc)
                     if delay is None:
                         raise
+                    if first is None:
+                        first = exc
                     time.sleep(delay)
 
 
@@ -277,8 +347,9 @@ class AsyncModels(_ModelsBase):
 
         This *is* the async form of ``run``: awaiting it on ``AsyncComfy`` is
         the whole difference from the sync client — including the model-id
-        rule, the retry policy, the one-key-per-call rule, and the
-        ``.idempotency_key`` every exception it raises carries for the replay.
+        rule, the retry policy, the one-key-per-call rule, the failure raised
+        when a resend is refused for key reuse, and the ``.idempotency_key``
+        every exception it raises carries for the replay.
         See :meth:`Models.run`.
         """
         low = cast(AsyncComfyLow, self._low)
@@ -293,6 +364,8 @@ class AsyncModels(_ModelsBase):
         # nested values included.
         payload = deepcopy(dict(arguments))
         retrier = Retrier(self._retry, now=_now)
+        # The first retryable failure — see :meth:`Models.run`.
+        first: BaseException | None = None
         # The key is stamped onto whatever this raises: it is a local of this
         # frame, so an exception that propagates past it would otherwise take
         # the caller's only route back to an already-billed generation with it.
@@ -303,7 +376,13 @@ class AsyncModels(_ModelsBase):
                         model, payload, idempotency_key=key, timeout=timeout
                     )
                 except _CANDIDATE_FAILURES as exc:
+                    if first is not None and _is_key_reuse(exc):
+                        # The rejected resend replaces nothing — see
+                        # :meth:`Models.run`.
+                        raise _as_sdk_error(first, key) from _as_sdk_error(exc, key)
                     delay = retrier.delay_before_retry(exc)
                     if delay is None:
                         raise
+                    if first is None:
+                        first = exc
                     await asyncio.sleep(delay)
