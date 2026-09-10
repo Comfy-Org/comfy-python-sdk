@@ -191,9 +191,14 @@ def _router_only_class(code: str) -> type[Any] | None:
 
 def to_sdk_error(exc: ApiError) -> ComfyError:
     """Translate a protocol ``ApiError`` into the idiomatic SDK exception."""
+    # `str(exc)`, not `exc.message`: they differ only when the protocol error
+    # carries a body excerpt — a response that stated no message of its own —
+    # and then `str(exc)` is the one that names the cause (`HTTP 503: no healthy
+    # upstream`). Callers read the SDK exception, never the protocol one, so the
+    # cause has to cross this boundary or it reaches no log.
     if exc.code == "queue_full":
         return QueueFull(
-            exc.message,
+            str(exc),
             retry_after=exc.retry_after or 0,
             code=exc.code,
             http_status=exc.http_status,
@@ -203,7 +208,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
     router_cls = _router_only_class(exc.code)
     if router_cls is not None:
         return router_cls(
-            exc.message,
+            str(exc),
             error_type=exc.code,
             http_status=exc.http_status,
             request_id=exc.request_id,
@@ -211,7 +216,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
         )
     cls = _BY_CODE.get(exc.code, ComfyError)
     return cls(
-        exc.message,
+        str(exc),
         code=exc.code,
         http_status=exc.http_status,
         details=exc.details,

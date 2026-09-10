@@ -10,6 +10,7 @@ stable, typed error surface.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 #: The leading run of characters a request id may consist of, bounded in the
@@ -44,27 +45,49 @@ def clean_request_id(raw: Any) -> str | None:
 #: page cannot flood the log line that prints it.
 _BODY_EXCERPT_LIMIT = 256
 
-#: Control characters dropped from a body excerpt. The excerpt is
-#: server-controlled text headed for a traceback or a log line, so it is reduced
-#: to something safe to *display* for the same reason ``clean_request_id``
-#: bounds the id: an escape sequence in an error page must not repaint the
-#: terminal reading it. The C1 range goes too — it is what a stray byte of
-#: Latin-1-decoded binary lands in.
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+#: Unicode general categories replaced by a space in a body excerpt. The
+#: excerpt is server-controlled text headed for a traceback or a log line, so
+#: it is reduced to something safe to *display* for the same reason
+#: ``clean_request_id`` bounds the id: an escape sequence in an error page must
+#: not repaint the terminal reading it. ``Cc`` is the C0/C1 control range (the
+#: C1 half is where a stray byte of Latin-1-decoded binary lands); ``Cf`` is the
+#: format characters — bidi overrides that reverse how a log line reads,
+#: zero-width joiners and spaces that hide a break, the BOM; ``Co`` and ``Cs``
+#: are private-use and lone surrogates, which no error page has a reason to
+#: contain and no terminal has a glyph for.
+_UNPRINTABLE_CATEGORIES = frozenset({"Cc", "Cf", "Co", "Cs"})
+
+#: How much of a body is walked to produce an excerpt, as a multiple of the
+#: excerpt limit. Collapsing whitespace and mapping characters is linear in the
+#: input, and an error page can be megabytes; the reduction has to cost the
+#: same for a 2 KiB body and a 20 MiB one.
+_BODY_EXCERPT_WINDOW = 8
 
 
 def clean_body_excerpt(raw: Any, *, limit: int = _BODY_EXCERPT_LIMIT) -> str | None:
     """``raw`` reduced to a bounded single-line excerpt, or ``None``.
 
-    Whitespace of every kind collapses to single spaces before the bound is
-    applied, so an indented HTML error page spends its budget on words rather
-    than on the margin, and the result is one line wherever it is printed.
-    Truncation is deliberately silent — no ellipsis — so the value stays exactly
-    what the server said, up to ``limit`` characters of it.
+    Unprintable characters become spaces rather than vanishing, so ``no
+    healthy\\x00upstream`` reads ``no healthy upstream`` and not ``no
+    healthyupstream``. Whitespace of every kind then collapses to single spaces
+    before the bound is applied, so an indented HTML error page spends its
+    budget on words rather than on the margin, and the result is one line
+    wherever it is printed. Truncation is deliberately silent — no ellipsis — so
+    the value stays exactly what the server said, up to ``limit`` characters of
+    it.
+
+    Only a bounded head of ``raw`` is examined (leading whitespace aside, which
+    is stripped first so an indented page still yields its words): a few
+    kilobytes is enough to fill a 256-character excerpt of any real error page,
+    and it keeps the cost of describing a huge body independent of its size.
     """
     if not isinstance(raw, str):
         return None
-    collapsed = _CONTROL_RE.sub("", " ".join(raw.split()))
+    head = raw.lstrip()[: limit * _BODY_EXCERPT_WINDOW]
+    printable = "".join(
+        " " if unicodedata.category(ch) in _UNPRINTABLE_CATEGORIES else ch for ch in head
+    )
+    collapsed = " ".join(printable.split())
     return collapsed[:limit] or None
 
 
@@ -97,27 +120,31 @@ class ApiError(Exception):
         #: because it is the id a user quotes in a support request and it is
         #: unreachable once the response object is gone.
         self.request_id = request_id
-        #: A bounded, single-line excerpt of a response body that carried no
-        #: error envelope, or ``None``. It is the only place such a response
+        #: A bounded, single-line excerpt of a response body that stated no
+        #: message of its own, or ``None``. It is the only place such a response
         #: states its cause: something in front of the API — a load balancer, a
         #: proxy — answers with plain text (``no healthy upstream``, ``upstream
         #: connect error or disconnect/reset before headers``) and no JSON, and
         #: that text used to be discarded with the response, leaving the cause
-        #: unrecoverable from any log. ``None`` whenever the body *was* a
-        #: well-formed envelope, where ``message`` already carries the cause.
+        #: unrecoverable from any log. ``None`` whenever the response *did*
+        #: state a message — an envelope's ``error.message``, Router's
+        #: ``detail`` — because there ``message`` already carries the cause;
+        #: :func:`error_from_envelope` enforces that, so a set excerpt always
+        #: means ``message`` is one this SDK synthesised.
         self.body_excerpt = body_excerpt
 
     def __str__(self) -> str:
-        """``message``, plus the body excerpt when the message is a bare status.
+        """``message``, plus the body excerpt whenever there is one.
 
-        A response with no envelope has no message to carry, so ``message`` is
-        the synthetic ``HTTP <status>`` — which names no cause. Appending the
-        excerpt there is what puts the cause into the one string a caller prints
-        and a logger formats: ``HTTP 503: no healthy upstream``. When the
-        response *did* state a message, that message is the cause and the
-        excerpt is not spliced into it; it stays readable on ``.body_excerpt``.
+        An excerpt is only ever kept beside a message this SDK made up — the
+        ``HTTP <status>`` of a response with no envelope, the "could not decode"
+        of a success whose body was not JSON — and such a message names no
+        cause. Appending the excerpt is what puts the cause into the one string
+        a caller prints and a logger formats: ``HTTP 503: no healthy upstream``.
+        A message the server actually sent never has an excerpt beside it (see
+        :attr:`body_excerpt`), so it is returned unchanged.
         """
-        if self.body_excerpt and self.message == f"HTTP {self.http_status}":
+        if self.body_excerpt:
             return f"{self.message}: {self.body_excerpt}"
         return self.message
 
@@ -213,11 +240,17 @@ def error_from_envelope(
     well-formed envelope (so a bare ``401`` with no JSON still maps to
     ``Unauthorized``).
 
-    ``body_excerpt`` is the caller's already-reduced excerpt of a non-envelope
-    body (:func:`clean_body_excerpt`), kept on the exception because such a
-    response states its cause nowhere else. It is the caller's to pass rather
-    than this function's to read: only the caller holds the response, and only
-    it can tell an unread streaming body from an empty one.
+    ``body_excerpt`` is the caller's already-reduced excerpt of the body
+    (:func:`clean_body_excerpt`). It is kept on the exception only when no
+    message could be read from the body — a response with no envelope states
+    its cause nowhere else, while one that carried ``error.message`` or Router's
+    ``detail`` has already said everything it is going to say, and a second copy
+    of the same text helps nobody. The gate lives here rather than at the raise
+    site because this is the function that knows whether a message was found:
+    ``{"message": "no healthy upstream"}`` is a JSON object and still not an
+    envelope. The text itself is the caller's to pass rather than this
+    function's to read: only the caller holds the response, and only it can
+    tell an unread streaming body from an empty one.
 
     Not every route answers in the envelope shape. ``POST {router}/v2/models/{provider}/{model}``
     is fronted by Router, whose error body is ``{detail, error_type}`` and which
@@ -250,7 +283,11 @@ def error_from_envelope(
     """
     err = (body or {}).get("error") if isinstance(body, dict) else None
     code = (err or {}).get("code") if isinstance(err, dict) else None
-    message = (err or {}).get("message") if isinstance(err, dict) else None
+    # Through `_clean` like every other string read off the wire: `message` ends
+    # up as `str(exc)`, and a non-string here (a list, a number) would make that
+    # raise `TypeError: __str__ returned non-string` at the one moment — inside
+    # a logger or a traceback — where an exception must not fail.
+    message = _clean((err or {}).get("message") if isinstance(err, dict) else None)
     details = (err or {}).get("details") if isinstance(err, dict) else None
 
     if code is None:
@@ -275,7 +312,11 @@ def error_from_envelope(
     if not message:
         # Router names its human-readable string `detail`, not `error.message`.
         message = _clean((body or {}).get("detail") if isinstance(body, dict) else None)
-    if not message:
+    if message:
+        # The response stated its cause; the excerpt would be a second copy of
+        # it (or of the envelope around it). See the docstring.
+        body_excerpt = None
+    else:
         message = f"HTTP {http_status}"
 
     cls = _BY_CODE.get(code, ApiError)

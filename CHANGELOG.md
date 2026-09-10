@@ -15,20 +15,24 @@ notes for each version.
 ### Added
 
 - `ApiError.body_excerpt` — a bounded, single-line excerpt of a response body
-  that carried no error envelope, and `str(exc)` now shows it beside a bare
-  status: `HTTP 503: no healthy upstream`. A `503` answered by a load balancer
-  in front of the deployment arrives as plain text with no JSON and no
-  `X-Comfy-Request-Id`, and that text — `no healthy upstream`, `upstream connect
-  error or disconnect/reset before headers` — is the only thing that names the
-  cause. It used to be discarded with the response, so the cause was
-  unrecoverable from any log. The excerpt is whitespace-collapsed, stripped of
-  control characters and capped at 256 characters (an HTML error page is the
-  realistic case), and it is `None` whenever the body *was* a well-formed
-  envelope, where `message` already carries the cause. It is deliberately not
-  spliced into a message the server actually sent. The `invalid_response` error
-  — a success status whose body would not decode, i.e. a proxy interstitial
-  served as a `200` — carries it too, for the same reason: the message says the
-  body would not decode, and only the excerpt says what answered instead.
+  that stated no message of its own, and `str(exc)` now shows it beside the
+  bare status: `HTTP 503: no healthy upstream`. The `ComfyError` it is
+  translated to carries the same string as its message, so the cause reaches
+  the exception an integrator actually catches and logs. A `503` answered by a
+  load balancer in front of the deployment arrives as plain text with no JSON
+  and no `X-Comfy-Request-Id`, and that text — `no healthy upstream`, `upstream
+  connect error or disconnect/reset before headers` — is the only thing that
+  names the cause. It used to be discarded with the response, so the cause was
+  unrecoverable from any log. The excerpt is whitespace-collapsed, has control,
+  format (bidi override, zero-width), private-use and surrogate characters
+  replaced by spaces, and is capped at 256 characters (an HTML error page is
+  the realistic case). It is `None` whenever the response *did* state a message
+  — an envelope's `error.message`, Router's `detail` — where `message` already
+  carries the cause; a JSON object that is not an envelope (`{"message": "no
+  healthy upstream"}`) keeps its excerpt. The `invalid_response` error — a
+  success status whose body would not decode, i.e. a proxy interstitial served
+  as a `200` — carries and shows it too, for the same reason: the message says
+  the body would not decode, and only the excerpt says what answered instead.
 
 - Every exception `client.models.run()` raises **for a failed call** now
   carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the

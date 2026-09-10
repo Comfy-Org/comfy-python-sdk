@@ -375,24 +375,26 @@ class _Prepared:
             # Passing it here is what keeps the bucket alive across the layer
             # boundary; see `error_from_envelope`.
             error_type=resp.headers.get("X-Comfy-Error-Type"),
-            # Only for a body that is not an envelope: there the response has
-            # already said everything it is going to say in its `message`, and
-            # a second copy of the same text helps nobody. Everywhere else this
-            # is the only statement of the cause the response made.
-            body_excerpt=None if isinstance(body, dict) else _body_excerpt(resp),
+            # Passed for every error response; `error_from_envelope` keeps it
+            # only when it found no message in the body, because it is the one
+            # place that knows — `{"message": "no healthy upstream"}` is a JSON
+            # object and still not an envelope. For such a response the text is
+            # the only statement of the cause it made.
+            body_excerpt=_body_excerpt(resp),
         )
 
 
 def _body_excerpt(resp: httpx.Response) -> str | None:
     """A bounded, single-line excerpt of ``resp``'s body text, or ``None``.
 
-    Read off the two responses whose body was not the JSON this client expected,
-    where the text served instead is the sole statement of what answered: a load
-    balancer in front of the deployment answering a ``503`` with ``no healthy
-    upstream`` or ``upstream connect error or disconnect/reset before headers``,
-    as plain text with no JSON and no ``X-Comfy-Request-Id``; and a proxy
-    interstitial served with a success status. Both used to discard that text
-    with the response.
+    Read off every error response and off a success whose body would not
+    decode, and kept (by ``error_from_envelope``) only where the body stated no
+    message of its own — there the text served is the sole statement of what
+    answered: a load balancer in front of the deployment answering a ``503``
+    with ``no healthy upstream`` or ``upstream connect error or disconnect/reset
+    before headers``, as plain text with no JSON and no ``X-Comfy-Request-Id``;
+    a proxy interstitial served with a success status. Both used to discard
+    that text with the response.
 
     Never raises, for the same reason the ``resp.json()`` above is guarded:
     ``resp.text`` decodes the *buffered* body and raises ``ResponseNotRead`` on a

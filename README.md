@@ -645,8 +645,8 @@ asset, job, event, and output helpers translate protocol errors, so catches of
   your own policy; the SDK does not retry these for you. The one line naming
   the cause (`no healthy upstream`, `upstream connect error or disconnect/reset
   before headers`) is kept on the protocol-level exception as
-  `comfy_low.errors.ApiError.body_excerpt`, and appears in that exception's
-  `str()` — `HTTP 503: no healthy upstream`.
+  `comfy_low.errors.ApiError.body_excerpt`, and is what `str()` of the error
+  you catch reads — `HTTP 503: no healthy upstream` — at both layers.
 
 ```python
 from comfy_sdk import JobFailed, QueueFull, Unauthorized
