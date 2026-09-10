@@ -14,6 +14,18 @@ notes for each version.
 
 ### Added
 
+- `client.models.run()` (and `AsyncModels.run`) now accept three optional
+  keyword-only params matching Comfy Router's own query params on this route:
+  `model_provider` (run the model on a specific alternate provider instead of
+  its current default), `strict_mode` (only meaningful with `model_provider`;
+  `False`, the default, translates the request body to/from the alternate
+  provider's own schema, `True` sends it through unmodified), and
+  `fallback_provider` (Router's own retry against the model's other
+  registered provider on a failure attributable to Router or the provider
+  tried; defaults ON, pass `False` to opt out). All three default to `None`
+  and are omitted from the request entirely when unset, so an existing caller
+  sees no change. See the README's "`models.run`" section.
+
 - Every exception `client.models.run()` raises **for a failed call** now
   carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the
   typed `RouterError` buckets, a `RouterError` whose `error_type` this version

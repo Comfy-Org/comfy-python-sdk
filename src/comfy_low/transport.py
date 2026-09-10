@@ -39,7 +39,7 @@ from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any, BinaryIO
-from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -143,6 +143,10 @@ def model_run_request(
     model: str,
     arguments: Mapping[str, Any],
     idempotency_key: str | None,
+    *,
+    model_provider: str | None = None,
+    strict_mode: bool | None = None,
+    fallback_provider: bool | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, str]]:
     """Sans-IO ``(path, json_body, headers)`` for one model run.
 
@@ -160,11 +164,32 @@ def model_run_request(
 
     ``arguments`` is copied into a plain dict so any ``Mapping`` is accepted and
     the caller's object is never handed to the JSON encoder directly.
+
+    ``model_provider``, ``strict_mode`` and ``fallback_provider`` are Router's
+    three query params on this route (``spec/router-openapi.yaml``'s
+    ``ModelProvider``, ``StrictMode``, ``FallbackProvider`` parameters) —
+    ``None`` (the default for all three) omits the param entirely rather than
+    sending an empty or ``"None"`` value, which is what lets a caller who never
+    heard of them get byte-for-byte today's request. ``fallback_provider`` is
+    the one with an inverted sense on the wire: Router defaults it ON, so this
+    only ever sends the query param when the caller passes ``False`` — sending
+    ``fallback_provider=true`` explicitly would be a no-op byte string, never
+    a distinct request the stub or a real deployment could tell apart from
+    omitting it.
     """
     provider, name = parse_model_id(model)
     path = _MODEL_RUN_PATH_TEMPLATE.format(
         provider=quote(provider, safe=""), model=quote(name, safe="")
     )
+    query: dict[str, str] = {}
+    if model_provider is not None:
+        query["model_provider"] = model_provider
+    if strict_mode is not None:
+        query["strict_mode"] = "true" if strict_mode else "false"
+    if fallback_provider is False:
+        query["fallback_provider"] = "false"
+    if query:
+        path = f"{path}?{urlencode(query)}"
     body: dict[str, Any] = dict(arguments)
     headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
     return path, body, headers
@@ -765,6 +790,9 @@ class ComfyLow:
         *,
         idempotency_key: str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | None = None,
     ) -> dict[str, Any]:
         """POST ``{router_base_url}/v2/models/{provider}/{model}`` — awaited server-side.
 
@@ -786,10 +814,21 @@ class ComfyLow:
         ``spec/router-openapi.yaml``, hand-bound — see
         :data:`_MODEL_RUN_PATH_TEMPLATE`.
 
+        ``model_provider``, ``strict_mode`` and ``fallback_provider`` are
+        Router's three query params — see :func:`model_run_request`, which
+        builds them into the path; ``None`` (every default) omits all three.
+
         Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
         any request when ``model`` is not a ``{provider}/{model}`` id.
         """
-        path, body, headers = model_run_request(model, arguments, idempotency_key)
+        path, body, headers = model_run_request(
+            model,
+            arguments,
+            idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+        )
         url = self._p.router_base_url + path
         resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 201))
@@ -1102,9 +1141,19 @@ class AsyncComfyLow:
         *,
         idempotency_key: str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | None = None,
     ) -> dict[str, Any]:
         """Async :meth:`ComfyLow.post_model_run`."""
-        path, body, headers = model_run_request(model, arguments, idempotency_key)
+        path, body, headers = model_run_request(
+            model,
+            arguments,
+            idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+        )
         url = self._p.router_base_url + path
         resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 201))

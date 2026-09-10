@@ -422,6 +422,36 @@ Three things follow from that, and they are the whole contract of this method:
   partner's own API documents as the request body is what you pass here, so you
   can move between the partner's API and Router by changing the host.
 
+**`model_provider`, `strict_mode` and `fallback_provider`** are three optional
+keyword-only params, all `None` by default:
+
+```python
+result = client.models.run(
+    "openai/gpt-image-2",
+    {"prompt": "a red circle"},
+    model_provider="fal",       # run this model on fal instead of its default provider
+    strict_mode=False,          # (default) translate the body to/from fal's own schema
+    fallback_provider=True,     # (default) retry once on Router's or fal's own failure
+)
+```
+
+- **`model_provider`** picks a specific alternate provider for `model` instead
+  of its current default. Omitted (`None`, the default) is byte-for-byte
+  today's default-provider behavior.
+- **`strict_mode`** is only meaningful together with `model_provider`.
+  `False` (Router's own default) translates `arguments` from `model`'s native
+  contract into the alternate provider's real schema; `True` sends
+  `arguments` through unmodified, so it must already be that provider's own
+  native shape.
+- **`fallback_provider`** controls Router's own retry: on a failure
+  attributable to Router's own side or to the specific provider tried — never
+  to `arguments` or your account — Router retries once against the model's
+  other registered provider. This defaults ON (Router's own behavior when the
+  param is omitted); pass `False` to opt out.
+
+All three default to `None`, which omits the corresponding query param
+entirely — a caller who never passes them gets exactly today's request.
+
 `run` returns when the generation is **complete**. There is no submit step and
 nothing to poll: where the platform has to submit-and-poll an upstream
 provider, that happens server side inside this one call. The value you get back

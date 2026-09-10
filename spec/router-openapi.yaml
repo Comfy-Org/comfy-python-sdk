@@ -90,6 +90,9 @@ paths:
       - $ref: '#/components/parameters/RouterProvider'
       - $ref: '#/components/parameters/RouterModel'
       - $ref: '#/components/parameters/RouterIdempotencyKey'
+      - $ref: '#/components/parameters/ModelProvider'
+      - $ref: '#/components/parameters/StrictMode'
+      - $ref: '#/components/parameters/FallbackProvider'
       requestBody:
         required: true
         description: The partner model's native JSON input, forwarded to the provider unchanged.
@@ -488,6 +491,22 @@ components:
           schema:
             $ref: '#/components/schemas/RouterErrorResponse'
   parameters:
+    FallbackProvider:
+      name: fallback_provider
+      in: query
+      required: false
+      description: 'Controls whether Router retries this call against the model''s OTHER registered provider when the FIRST attempt fails for a reason attributable to Router''s own side or to the specific provider tried - never for a reason attributable to the request itself (an unretried failure is refused exactly as it always was). Omitted, or any value other than `false`: fallback is ON (the default) and Router uses the one alternate the model has today. `false`: fallback is OFF - a failure is refused, never retried. A response where a fallback actually ran carries the `X-Comfy-Router-Fallback-Provider` header, naming the provider that ultimately served it, and no case retries a generation that may already have been submitted to a provider.'
+      schema:
+        type: string
+        example: fal
+    ModelProvider:
+      name: model_provider
+      in: query
+      required: false
+      description: Selects an alternate provider for this model, instead of its current default. Omitted, or `default`, is byte-for-byte today's behavior. A value naming a real provider that does not serve this model is refused `404 provider_not_available`; an unrecognized value is refused `422 validation_error`.
+      schema:
+        type: string
+        example: fal
     RouterCatalogCursor:
       name: cursor
       in: query
@@ -528,6 +547,14 @@ components:
       description: Lowercase provider segment of the canonical `{provider}/{model}[/{variant}]` model ID - the partner whose model is being run.
       schema:
         $ref: '#/components/schemas/RouterProviderSegment'
+    StrictMode:
+      name: strict_mode
+      in: query
+      required: false
+      description: 'Only meaningful together with `model_provider`. `false` (the default): the request body must be this model''s own native contract, translated to the alternate provider''s real schema - any native field that cannot be expressed exactly is dropped and disclosed via the response''s `notes`, never silently. `true`: the body must already be the alternate provider''s own real schema, passed through unmodified in both directions - no translation, so no `notes`.'
+      schema:
+        type: boolean
+        default: false
   headers:
     CommittedSpendCurrentHeader:
       description: The USD cents the caller currently has committed to calls still in flight. On a `429` this EXCLUDES the refused call, whose commitment was rolled back before the refusal was sent; on an admitted response it INCLUDES the call being answered. Present alongside `X-Committed-Spend-Limit`.

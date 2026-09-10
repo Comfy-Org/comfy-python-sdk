@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 import pytest
 
@@ -197,9 +197,13 @@ class ServerState:
     # asserts the id the caller passed rather than a particular encoding of it.
     last_model_run_provider: str | None = None
     last_model_run_model: str | None = None
-    # ...and the raw, still-encoded request path, for the tests that are about
-    # the encoding itself.
+    # ...and the raw, still-encoded request path (query string stripped), for
+    # the tests that are about the encoding itself.
     last_model_run_path: str | None = None
+    # The last model run's query string, decoded to one value per key (see
+    # `_post_model_run`'s own note on why `parse_qs`'s list form is not kept).
+    # `None` before any run; `{}` after a run that carried none.
+    last_model_run_query: dict[str, str] | None = None
     # Every Idempotency-Key seen on a model run, in arrival order (`None`
     # records a run that arrived without the header at all).
     model_run_idempotency_keys: list[str | None] = field(default_factory=list)
@@ -498,10 +502,14 @@ def _make_handler(state: ServerState):
             # `/api/v2` paths above (a different host in production; the same
             # stub here, with `COMFY_ROUTER_BASE_URL` pointed at it). The two
             # segments are the model id, so they are matched rather than
-            # compared to a fixed string.
-            m = re.match(r"/v2/models/([^/]+)/([^/]+)$", self.path)
+            # compared to a fixed string. Split off the query string before
+            # matching: `model_provider`/`strict_mode`/`fallback_provider` ride
+            # in it, and `[^/]+` would otherwise swallow a `?...` suffix into
+            # the model segment rather than leaving it for `_post_model_run`.
+            path_only, _, query_string = self.path.partition("?")
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)$", path_only)
             if m:
-                self._post_model_run(m.group(1), m.group(2))
+                self._post_model_run(m.group(1), m.group(2), query_string)
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
@@ -527,7 +535,7 @@ def _make_handler(state: ServerState):
             else:
                 self._err(404, "blob_not_found", "no such blob")
 
-        def _post_model_run(self, provider: str, model: str) -> None:
+        def _post_model_run(self, provider: str, model: str, query_string: str) -> None:
             state.model_run_count += 1
             # Decoded, because the SDK percent-encodes each segment and a real
             # origin server decodes it before routing — asserting the encoded
@@ -536,7 +544,12 @@ def _make_handler(state: ServerState):
             # for the tests that are about the encoding.
             state.last_model_run_provider = unquote(provider)
             state.last_model_run_model = unquote(model)
-            state.last_model_run_path = self.path
+            state.last_model_run_path = self.path.partition("?")[0]
+            # `parse_qs` drops a key with no value at all, which never happens
+            # here — model_run_request only ever adds a key with a real value —
+            # so a plain single-valued dict is the faithful, easy-to-assert
+            # shape rather than parse_qs's list-per-key one.
+            state.last_model_run_query = {k: v[0] for k, v in parse_qs(query_string).items()}
             state.last_model_run_body = json.loads(self._read_body() or b"{}")
             key = self.headers.get("Idempotency-Key")
             state.model_run_idempotency_keys.append(key)
