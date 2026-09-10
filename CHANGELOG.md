@@ -14,6 +14,33 @@ notes for each version.
 
 ### Added
 
+- Every exception a failed `POST /jobs` attempt inside `client.submit()`
+  raises — and so the submit phase of `client.run()` — now carries the
+  `Idempotency-Key` it was made under, on `.idempotency_key`, matching
+  `client.models.run()`: the mapped `ComfyError` subclasses, a `QueueFull`
+  raised once the 429 retry budget is exhausted (the same key on every retried
+  attempt), and a transport failure with no response at all (a dropped
+  connection, a read timeout), which previously escaped `submit()` untranslated
+  and now reads `.request_id` and `.retry_after` as `None` rather than raising
+  `AttributeError`. A failure raised before the request exists (a UI-format
+  workflow, an asset that would not upload) or while `run()` polls the job
+  afterwards carries none. Cancelling an in-flight `AsyncComfy.submit()`
+  (`task.cancel()`) yields the key too, and the cancellation still propagates
+  unchanged; an `asyncio.wait_for` timeout raises its own `TimeoutError`, which
+  does not. The semantics differ from `models.run`'s and the difference
+  matters: `POST /jobs` **rejects** a reused key with
+  `422 idempotency_key_reuse` rather than replaying it, so the key on a
+  `submit()` error is the one this attempt was made under, not a replay handle:
+  after an ambiguous failure poll or list for the job the first attempt may
+  already have created; a failure the server never saw (a connect failure, an
+  exhausted `QueueFull`) leaves it unclaimed. Nothing about what is retried or
+  what goes on the wire changed.
+- `client.submit(idempotency_key=...)` now validates a caller-supplied key the
+  way `client.models.run()` does: an empty, over-long (> 255), or
+  non-printable-ASCII key raises `ValueError` locally, before any request.
+  Previously `""` fell into the mint-a-fresh-key branch — disabling the
+  caller's dedup and, with the stamp above, reporting a key the caller never
+  passed — and an invalid key failed at the transport after the round trip.
 - Every exception `client.models.run()` raises **for a failed call** now
   carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the
   typed `RouterError` buckets, a `RouterError` whose `error_type` this version
