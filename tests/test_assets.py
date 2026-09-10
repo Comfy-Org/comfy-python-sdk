@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from comfy_sdk import Comfy, HashMismatch, NotFound
+from comfy_sdk import AsyncComfy, Comfy, DownloadUrl, HashMismatch, NotFound
 
 
 def test_dedup_fast_path_skips_upload(server, tmp_path) -> None:
@@ -158,3 +158,52 @@ def test_delete_uncommitted_asset_raises(server) -> None:
             asset.delete()
 
     assert server.state.delete_count == 0
+
+
+# -- get_download_url: a fetchable URL for an *uploaded* asset ---------------
+
+_SIGNED_URL = (
+    "https://storage.googleapis.com/bucket/object"
+    "?X-Goog-Algorithm=GOOG4-RSA-SHA256"
+    "&X-Goog-Credential=example%2F20260710%2Fauto%2Fstorage%2Fgoog4_request"
+    "&X-Goog-Date=20260710T180000Z"
+    "&X-Goog-Expires=3600"
+    "&X-Goog-SignedHeaders=host"
+    "&X-Goog-Signature=deadbeef"
+)
+
+
+def test_get_download_url_commits_then_resolves_signed_url(server) -> None:
+    # Cloud path: the content endpoint redirects to a signed URL. Calling
+    # get_download_url on an uncommitted handle must upload first, then
+    # resolve — the flow that feeds an uploaded image to a URL-taking model.
+    server.state.redirect_content_to = _SIGNED_URL
+    with Comfy() as client:
+        asset = client.assets.from_bytes(b"router-input-bytes", filename="photo.png")
+        download = asset.get_download_url()
+
+    assert isinstance(download, DownloadUrl)
+    assert asset.id == "asset_uploaded_01"  # committed as a side effect
+    assert server.state.upload_count == 1
+    assert download.url == _SIGNED_URL
+    assert download.expires_at == datetime(2026, 7, 10, 19, 0, tzinfo=timezone.utc)
+
+
+def test_get_download_url_self_hosted_returns_content_endpoint(server) -> None:
+    with Comfy() as client:
+        asset = client.assets.from_bytes(b"router-input-bytes", filename="photo.png")
+        download = asset.get_download_url()
+
+    assert download.url == f"{server.base_url}/api/v2/assets/{asset.id}/content"
+    assert download.expires_at is None
+
+
+async def test_async_get_download_url_commits_then_resolves(server) -> None:
+    server.state.redirect_content_to = _SIGNED_URL
+    async with AsyncComfy() as client:
+        asset = client.assets.from_bytes(b"router-input-bytes", filename="photo.png")
+        download = await asset.get_download_url()
+
+    assert asset.id == "asset_uploaded_01"
+    assert download.url == _SIGNED_URL
+    assert download.expires_at == datetime(2026, 7, 10, 19, 0, tzinfo=timezone.utc)

@@ -14,6 +14,15 @@ notes for each version.
 
 ### Added
 
+- `Asset.get_download_url()` / `AsyncAsset.get_download_url()` — a
+  directly-fetchable URL for an *uploaded* asset's bytes, mirroring
+  `Output.get_download_url()` (same `DownloadUrl`, commits the asset first if
+  needed). On Comfy Cloud / serverless it is a short-lived signed URL any
+  fetcher can read until `expires_at`, which is what lets a local image be
+  passed to a URL-taking image-to-image model via `client.models.run()`:
+  upload the file as an asset, resolve its URL, put the URL in the model's
+  input. The README's "Image to image — upload an asset first" section walks
+  through the flow.
 - Every exception `client.models.run()` raises **for a failed call** now
   carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the
   typed `RouterError` buckets, a `RouterError` whose `error_type` this version

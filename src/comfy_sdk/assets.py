@@ -27,6 +27,7 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow
 
 from . import _core, _hashing
 from .exceptions import translating
+from .outputs import DownloadUrl
 
 Opener = Callable[[], "tuple[BinaryIO, int | None]"]
 Hasher = Callable[[], str]
@@ -159,6 +160,25 @@ class Asset(_AssetBase):
         assert self._id is not None
         return _core.asset_reference(self._id, hash=self._hash, file_path=self._file_path)
 
+    def get_download_url(self) -> DownloadUrl:
+        """A directly-fetchable URL for this asset's bytes (commits first if
+        needed).
+
+        The counterpart of ``Output.get_download_url`` for an *uploaded* asset:
+        hand the URL to anything that fetches by URL instead of streaming the
+        bytes through your process — e.g. a Comfy Router model whose input
+        takes an image URL. On a Cloud/serverless backend it is a short-lived,
+        self-authorizing signed URL readable until ``expires_at`` with no
+        further auth; on a self-hosted backend it is the content endpoint
+        itself (normal auth still applies, so an external service cannot fetch
+        it) and ``expires_at`` is ``None``.
+        """
+        self.commit()
+        assert self._id is not None
+        with translating():
+            url, expires_at = self._low.get_asset_content_url(self._id)
+        return DownloadUrl(url=url, expires_at=expires_at)
+
 
 class AsyncAsset(_AssetBase):
     """A lazy asset handle bound to the asynchronous client."""
@@ -203,6 +223,15 @@ class AsyncAsset(_AssetBase):
         await self.commit()
         assert self._id is not None
         return _core.asset_reference(self._id, hash=self._hash, file_path=self._file_path)
+
+    async def get_download_url(self) -> DownloadUrl:
+        """See the sync ``Asset.get_download_url`` for the redirect/inline
+        split."""
+        await self.commit()
+        assert self._id is not None
+        with translating():
+            url, expires_at = await self._low.get_asset_content_url(self._id)
+        return DownloadUrl(url=url, expires_at=expires_at)
 
 
 # ---- source builders (shared, sans-IO except explicit reads) ------------
