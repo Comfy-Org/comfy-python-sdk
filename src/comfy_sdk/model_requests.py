@@ -494,10 +494,13 @@ class RequestHandle(_RequestHandleBase):
 
         The result is the partner model's own output, decoded from JSON and
         handed back as-is — the same value ``models.run`` returns for the same
-        model and arguments. It is a JSON object for every model Router serves
-        today; a partner whose native output were an array or a bare value
-        would be handed back unchanged too, since the payload is the partner's
-        and not this SDK's to reshape.
+        model and arguments, under the same ``dict[str, Any]`` annotation. That
+        annotation is the contract: every model Router serves answers with a
+        JSON object. A partner whose native output were an array or a bare
+        value would still be handed back unchanged rather than rejected, since
+        the payload is the partner's and not this SDK's to reshape — but that
+        is robustness against an off-contract payload, not a second supported
+        return type.
 
         Raises the typed router exception
         (:mod:`comfy_sdk.router_exceptions`) when the completion carries an

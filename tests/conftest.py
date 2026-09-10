@@ -586,6 +586,10 @@ def _make_handler(state: ServerState):
 
         # -- POST --
         def do_PUT(self) -> None:
+            if not self._auth_ok():
+                self._read_body()
+                self._err(401, "unauthorized", "no key")
+                return
             # Comfy Router's queue cancel is a PUT (the contract's
             # `cancelRouterModelRequest`), so it is served here and nowhere
             # else: a POST to the same path is the wrong verb and gets a 404

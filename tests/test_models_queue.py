@@ -810,9 +810,13 @@ async def test_async_subscribe_cancellation_requests_a_remote_cancel(server, mon
     real_sleep = asyncio.sleep
     pausing = asyncio.Event()
 
-    async def _pause(_delay: float) -> None:
+    # `comfy_sdk.model_requests` imports the `asyncio` module itself, so this
+    # patch lands on the shared `asyncio.sleep` for the test's duration. It is
+    # a pass-through that only *reports* the pause: every caller still waits
+    # the delay it asked for, and the cancel below is what cuts the wait short.
+    async def _pause(delay: float) -> None:
         pausing.set()
-        await real_sleep(0.05)
+        await real_sleep(delay)
 
     monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _pause)
 
