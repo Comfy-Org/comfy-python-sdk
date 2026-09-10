@@ -168,10 +168,18 @@ class Asset(_AssetBase):
         hand the URL to anything that fetches by URL instead of streaming the
         bytes through your process — e.g. a Comfy Router model whose input
         takes an image URL. On a Cloud/serverless backend it is a short-lived,
-        self-authorizing signed URL readable until ``expires_at`` with no
-        further auth; on a self-hosted backend it is the content endpoint
-        itself (normal auth still applies, so an external service cannot fetch
-        it) and ``expires_at`` is ``None``.
+        self-authorizing signed URL readable with no further auth; on a
+        self-hosted backend it is the content endpoint itself, where normal
+        auth still applies, so an external service cannot fetch it.
+
+        The returned ``expires_at`` is the signed URL's own expiry, read from
+        the URL when the SDK recognizes the signature format (today: GCS-style
+        ``X-Goog-Date``/``X-Goog-Expires`` query parameters). It is ``None``
+        whenever there is no expiry to read — always on a self-hosted backend,
+        and also for a signed URL in a format this SDK does not parse — so
+        treat ``None`` as "unknown", not "never expires". It is unrelated to
+        this handle's ``expires_at`` property, which is the asset's *retention*
+        deadline.
         """
         self.commit()
         assert self._id is not None

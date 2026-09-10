@@ -474,21 +474,22 @@ print(result["output"]["results"][0]["url"])
 `Asset.get_download_url()` commits the asset if needed (hash → dedup probe →
 upload, exactly like submitting it in a workflow) and returns the same
 `DownloadUrl` as an output's `get_download_url()`: on Comfy Cloud / serverless
-a signed storage URL any fetcher can read until `expires_at` — which is what
-lets the provider behind Router pull your image without your API key. Mind the
-two caveats that follow from that: the URL is short-lived, so resolve it right
-before the run rather than storing it; and on a *self-hosted* backend the URL
-is the auth-guarded content endpoint, which an external provider cannot fetch
-— upload to Comfy Cloud (the default `COMFY_BASE_URL` surface) for Router
-inputs.
+a signed storage URL any fetcher can read until `expires_at` (`None` when the
+URL carries no expiry the SDK can read) — which is what lets the provider
+behind Router pull your image without your API key. Mind the two caveats that
+follow from that: the URL is short-lived, so resolve it right before the run
+rather than storing it; and on a *self-hosted* backend the URL is the
+auth-guarded content endpoint, which an external provider cannot fetch — upload
+to Comfy Cloud (the default `COMFY_BASE_URL` surface) for Router inputs.
 
 Some models take images inline instead of by URL — `bfl/flux-2-pro`'s
 `input_image` is base64, for example — and then there is nothing to upload:
 
 ```python
 import base64
+from pathlib import Path
 
-image_b64 = base64.b64encode(open("photo.png", "rb").read()).decode()
+image_b64 = base64.b64encode(Path("photo.png").read_bytes()).decode()
 result = client.models.run(
     "bfl/flux-2-pro",
     {"prompt": "make it watercolor", "input_image": image_b64},
