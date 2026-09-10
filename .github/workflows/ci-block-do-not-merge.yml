@@ -1,0 +1,37 @@
+name: CI - Block do-not-merge
+
+# Fails the PR check whenever a `do-not-merge` label is present: the PR is
+# waiting on something outside this repo (typically a Comfy Cloud deployment
+# of the routes it talks to) and would be broken if released now.
+#
+# Posts on every PR event that can change the outcome, so the check exists on
+# every PR and can be marked as a required status check in branch protection
+# to become a hard block. Until then it is a red flag a reviewer sees.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  block-do-not-merge:
+    name: Block do-not-merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Fail if do-not-merge label is present
+        env:
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          if echo "$PR_LABELS" | jq -e 'index("do-not-merge")' > /dev/null; then
+            echo "::error::PR has the \`do-not-merge\` label. Remove the label before merging."
+            {
+              echo "## ❌ Blocked by \`do-not-merge\` label"
+              echo
+              echo "Remove the \`do-not-merge\` label to unblock this check."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "No \`do-not-merge\` label — OK."
