@@ -227,8 +227,9 @@ class Comfy:
     ``retry`` is the policy ``client.models`` calls fail under —
     :data:`~comfy_sdk.retry.DEFAULT_RETRY` unless replaced, and
     :data:`~comfy_sdk.retry.NO_RETRY` to make every call exactly one attempt.
-    It does not govern ``submit``/``run``, whose 429 handling follows the
-    server's own ``Retry-After`` instead.
+    It does not govern this client's own ``submit``/``run`` (the workflow
+    surface), whose 429 handling follows the server's own ``Retry-After``
+    instead.
     """
 
     def __init__(

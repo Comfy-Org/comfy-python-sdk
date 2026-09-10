@@ -23,7 +23,8 @@ class ComfyError(Exception):
     """Base for every SDK-level error."""
 
     #: The ``Idempotency-Key`` the failed call was made under. Populated by
-    #: :meth:`comfy_sdk.models.Models.run` and its async twin, which are the
+    #: :meth:`comfy_sdk.models.Models.run` and :meth:`comfy_sdk.models.Models.submit`
+    #: (and their async twins), which are the
     #: operations that pass a key to :func:`translating`; ``None`` everywhere
     #: else — including on operations that *do* send a key but do not stamp it
     #: (``Comfy.submit()``), and on an exception constructed by hand. So

@@ -8,8 +8,10 @@ the SDK at the stub by setting ``COMFY_BASE_URL`` *and*
 
 Both, because the SDK speaks to two surfaces: the ``/api/v2`` deployment (jobs,
 assets) and Comfy Router (``/v2/models/{provider}/{model}``), which is a
-different host in production. This one stub answers both route families, so a
-test that exercises either gets a single server — while a test that is *about*
+different host in production. This one stub answers three route families — the
+``/api/v2`` paths, the awaited model run, and the queued model routes under
+``.../requests`` — so a test that exercises any of them gets a single server
+— while a test that is *about*
 the two being separate points ``COMFY_ROUTER_BASE_URL`` at ``second_server``.
 """
 
@@ -165,6 +167,78 @@ class ServerState:
     # in, and the bucket-keyed collect rule has to read it.
     model_run_router_error_shape: bool = False
 
+    # --- the queued model surface (submit / status / result / cancel) ---
+    # POST .../requests answers this status with a body naming a request id.
+    queue_submit_status: int = 200
+    # (status, code) answered instead of accepting the submit — permanent.
+    queue_submit_error: tuple[int, str] | None = None
+    # Submits that fail transiently before one is accepted, and the (status,
+    # code) each answers with. Checked *before* `queue_submit_error`, exactly as
+    # `model_run_fail_times` is checked before `model_run_error`.
+    queue_submit_fail_times: int = 0
+    queue_submit_transient_error: tuple[int, str] = (429, "rate_limited")
+    queue_submit_transient_retry_after: str | None = "1"
+    # Answer the submit with a body carrying no `request_id` at all — accepted
+    # work the caller has no way to reach.
+    queue_submit_omits_request_id: bool = False
+    # The id the queue hands back, and the one every later route answers for.
+    queue_request_id: str = "req_stub_01"
+    # Status polls that report a non-terminal state before the request reaches
+    # COMPLETED. 0 means the very first poll is already complete.
+    queue_polls_to_complete: int = 2
+    # Non-terminal status reported by those polls, and the queue position they
+    # report (decremented per poll, floored at 0).
+    queue_pending_status: str = "IN_QUEUE"
+    queue_start_position: int = 2
+    # Sent as Retry-After on every *successful* status poll — the server naming
+    # its own poll pace, which the SDK honours over its local backoff.
+    queue_status_retry_after: str | None = None
+    # (status, code) answered by every status poll instead of the queue state
+    # — the permanent-failure knob.
+    queue_status_error: tuple[int, str] | None = None
+    # Status polls that fail transiently before answering normally, and the
+    # (status, code) each of those answers with. Checked *before*
+    # `queue_status_error`, exactly as `model_run_fail_times` is.
+    queue_status_fail_times: int = 0
+    queue_status_transient_error: tuple[int, str] = (429, "rate_limited")
+    # Retry-After sent alongside a transient status failure.
+    queue_status_transient_retry_after: str | None = "1"
+    # `error_type` carried by the COMPLETED status — how the server reports a
+    # failed or cancelled request. `None` is the ordinary success path.
+    queue_error_type: str | None = None
+    queue_error_detail: str | None = "the model refused the request"
+    # `error_type` carried by the *result* body only, with the status reporting
+    # a clean completion — the other half of "a 200 is not a success".
+    queue_result_error_type: str | None = None
+    # Extra keys merged into the served result payload — for the case where the
+    # provider's OWN native output happens to carry a field the queue envelope
+    # also uses (`error_type`), with no queue envelope around it.
+    queue_result_extra: dict[str, Any] = field(default_factory=dict)
+    # The provider's native payload served by GET .../requests/{id}.
+    queue_result: dict[str, Any] = field(
+        default_factory=lambda: {
+            "images": [{"url": "http://example.invalid/queued.png"}],
+            "seed": 7,
+        }
+    )
+    # Status code for the cancel response; 204 exercises the empty-body path.
+    queue_cancel_status: int = 200
+    # Cancels that answer a transient failure (status, code) before one is
+    # accepted — for proving the cleanup cancel after a timeout does not ride
+    # the client's retry policy.
+    queue_cancel_fail_times: int = 0
+    queue_cancel_transient_error: tuple[int, str] = (429, "rate_limited")
+    queue_cancel_transient_retry_after: str | None = "1"
+    # When set, the result read answers this JSON document verbatim instead of
+    # `queue_result` — for a provider whose native output is not an object.
+    queue_result_raw: Any = None
+    # The status read answers a body naming no `status` at all.
+    queue_status_omits_status: bool = False
+    # The bucket a cancelled request's completion carries.
+    queue_cancel_error_type: str = "client_disconnected"
+    # Set by a cancel; makes every later status poll report the cancellation.
+    queue_canceled: bool = False
+
     # --- counters the tests assert on ---
     upload_count: int = 0
     from_hash_count: int = 0
@@ -216,6 +290,26 @@ class ServerState:
     # and does not increment this, which is what lets a test tell a real replay
     # apart from a second generation that merely returns an equal payload.
     model_run_generations: int = 0
+    queue_submit_count: int = 0
+    queue_status_count: int = 0
+    # Status polls that were actually *answered with a queue state*, as
+    # distinct from polls that arrived (`queue_status_count`). A poll answered
+    # with a transient failure must not advance the request towards completion,
+    # or a retry test would silently shorten the queue it is testing.
+    queue_status_served: int = 0
+    queue_result_count: int = 0
+    queue_cancel_count: int = 0
+    # The HTTP method each cancel arrived with.
+    queue_cancel_methods: list[str] = field(default_factory=list)
+    # Every Idempotency-Key seen on a queue submit, in arrival order.
+    queue_submit_idempotency_keys: list[str | None] = field(default_factory=list)
+    # The native body of the last queue submit, and the two decoded id segments.
+    last_queue_submit_body: dict[str, Any] | None = None
+    last_queue_provider: str | None = None
+    last_queue_model: str | None = None
+    # Every raw path the queue routes answered, in order — for the tests that
+    # are about the routes themselves rather than about what came back.
+    queue_paths: list[str] = field(default_factory=list)
 
 
 def _asset_json(asset_id: str, hash_: str, created_new: bool, size: int) -> dict:
@@ -375,6 +469,18 @@ def _make_handler(state: ServerState):
                     return
                 self._json(200, _asset_json(m.group(1), state.server_hash, False, 33))
                 return
+            # Comfy Router's queued model routes — the status poll and the
+            # result collection. Matched before the two-segment run route
+            # patterns for the same reason they are anchored: a request id is
+            # a path segment, not a model name.
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests/([^/]+)/status$", self.path)
+            if m:
+                self._serve_queue_status(m.group(3))
+                return
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests/([^/]+)$", self.path)
+            if m:
+                self._serve_queue_result(m.group(3))
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)/events$", self.path)
             if m:
                 self._serve_events(m.group(1))
@@ -479,6 +585,23 @@ def _make_handler(state: ServerState):
             frame("status", {"status": state.terminal_status})
 
         # -- POST --
+        def do_PUT(self) -> None:
+            if not self._auth_ok():
+                self._read_body()
+                self._err(401, "unauthorized", "no key")
+                return
+            # Comfy Router's queue cancel is a PUT (the contract's
+            # `cancelRouterModelRequest`), so it is served here and nowhere
+            # else: a POST to the same path is the wrong verb and gets a 404
+            # like any other unrouted request.
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests/([^/]+)/cancel$", self.path)
+            if m:
+                self._read_body()
+                self._put_queue_cancel(m.group(3))
+                return
+            self._read_body()
+            self._err(404, "not_found")
+
         def do_POST(self) -> None:
             if not self._auth_ok():
                 self._read_body()
@@ -503,6 +626,10 @@ def _make_handler(state: ServerState):
             if m:
                 self._post_model_run(m.group(1), m.group(2))
                 return
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests$", self.path)
+            if m:
+                self._post_queue_submit(m.group(1), m.group(2))
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
                 self._json(200, _job_json(m.group(1), "canceling"))
@@ -526,6 +653,121 @@ def _make_handler(state: ServerState):
                 self._json(201, _asset_json("asset_dedup_01", body["hash"], False, 33))
             else:
                 self._err(404, "blob_not_found", "no such blob")
+
+        # -- the queued model surface --
+        def _post_queue_submit(self, provider: str, model: str) -> None:
+            state.queue_submit_count += 1
+            state.queue_paths.append(self.path)
+            state.last_queue_provider = unquote(provider)
+            state.last_queue_model = unquote(model)
+            state.last_queue_submit_body = json.loads(self._read_body() or b"{}")
+            state.queue_submit_idempotency_keys.append(self.headers.get("Idempotency-Key"))
+            if state.queue_submit_fail_times > 0:
+                state.queue_submit_fail_times -= 1
+                status, code = state.queue_submit_transient_error
+                self._router_err(status, code, retry_after=state.queue_submit_transient_retry_after)
+                return
+            if state.queue_submit_error:
+                status, code = state.queue_submit_error
+                self._router_err(status, code)
+                return
+            body: dict[str, Any] = {"status": state.queue_pending_status}
+            if not state.queue_submit_omits_request_id:
+                body["request_id"] = state.queue_request_id
+            self._json(state.queue_submit_status, body)
+
+        def _serve_queue_status(self, request_id: str) -> None:
+            state.queue_status_count += 1
+            state.queue_paths.append(self.path)
+            if state.queue_status_fail_times > 0:
+                state.queue_status_fail_times -= 1
+                status, code = state.queue_status_transient_error
+                self._router_err(status, code, retry_after=state.queue_status_transient_retry_after)
+                return
+            if state.queue_status_error:
+                status, code = state.queue_status_error
+                self._router_err(status, code)
+                return
+            headers = (
+                {"Retry-After": state.queue_status_retry_after}
+                if state.queue_status_retry_after
+                else {}
+            )
+            body: dict[str, Any] = {"request_id": unquote(request_id)}
+            if state.queue_status_omits_status:
+                self._json(200, body, headers=headers)
+                return
+            if state.queue_canceled:
+                body["status"] = "COMPLETED"
+                body["error_type"] = state.queue_cancel_error_type
+                body["detail"] = "the request was cancelled"
+                self._json(200, body, headers=headers)
+                return
+            served = state.queue_status_served
+            state.queue_status_served += 1
+            if served < state.queue_polls_to_complete:
+                body["status"] = state.queue_pending_status
+                body["queue_position"] = max(state.queue_start_position - served, 0)
+                self._json(200, body, headers=headers)
+                return
+            body["status"] = "COMPLETED"
+            if state.queue_error_type:
+                body["error_type"] = state.queue_error_type
+                if state.queue_error_detail is not None:
+                    body["detail"] = state.queue_error_detail
+            self._json(200, body, headers=headers)
+
+        def _serve_queue_result(self, request_id: str) -> None:
+            state.queue_result_count += 1
+            state.queue_paths.append(self.path)
+            if state.queue_result_raw is not None:
+                self._json(200, state.queue_result_raw)
+                return
+            if state.queue_result_error_type:
+                self._json(
+                    200,
+                    {
+                        "request_id": unquote(request_id),
+                        "status": "COMPLETED",
+                        "error_type": state.queue_result_error_type,
+                        "detail": "the result body carried the failure",
+                    },
+                )
+                return
+            self._json(200, {**state.queue_result, **state.queue_result_extra})
+
+        def _put_queue_cancel(self, request_id: str) -> None:
+            state.queue_cancel_count += 1
+            state.queue_paths.append(self.path)
+            state.queue_cancel_methods.append(self.command)
+            if state.queue_cancel_fail_times > 0:
+                state.queue_cancel_fail_times -= 1
+                status, code = state.queue_cancel_transient_error
+                self._router_err(status, code, retry_after=state.queue_cancel_transient_retry_after)
+                return
+            state.queue_canceled = True
+            if state.queue_cancel_status == 204:
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._json(
+                state.queue_cancel_status,
+                {
+                    "request_id": unquote(request_id),
+                    "status": "COMPLETED",
+                    "error_type": state.queue_cancel_error_type,
+                },
+            )
+
+        def _router_err(
+            self, status: int, code: str, message: str = "err", retry_after: str | None = None
+        ) -> None:
+            """Router's own error shape: the bucket on the header and in the body."""
+            headers = {"X-Comfy-Error-Type": code}
+            if retry_after:
+                headers["Retry-After"] = retry_after
+            self._json(status, {"detail": message, "error_type": code}, headers=headers)
 
         def _post_model_run(self, provider: str, model: str) -> None:
             state.model_run_count += 1

@@ -14,6 +14,34 @@ notes for each version.
 
 ### Added
 
+- **The queued model surface** — `client.models.submit()`, `client.models.subscribe()`
+  and `client.models.handle()`, plus the `RequestHandle` they hand back
+  (`status()`, `get()`, `cancel()`, `iter_events()`). `models.run` holds one
+  connection open until the generation is finished; `submit` returns as soon as
+  the server accepts the request, and the generation is collected later —
+  including from another process, since `client.models.handle(model,
+  request_id)` rebuilds the handle from nothing but the two ids. `subscribe` is
+  submit plus polling plus collection in one call, with an `on_queue_update=`
+  callback for progress and a client-side `timeout=` that makes a best-effort
+  cancel before it raises. `AsyncComfy` awaits the same method names with the
+  same arguments in the same order — there is no `submit_async`, for the reason
+  there is no `run_async`. Three properties are contract rather than
+  implementation: polling is authoritative and paced by the server's own
+  `Retry-After` when it names one; a `COMPLETED` status carrying an
+  `error_type` — which is how the server reports a failed *or* a cancelled
+  request — raises the typed `RouterError` subclass rather than being returned
+  as a successful result; and each `submit` **call** mints one fresh
+  `Idempotency-Key`, so two deliberate submits are two requests while a
+  transport retry inside one call replays the original. The queue itself stays
+  entirely server-owned: ordering, admission, retries, timeouts, billing and
+  expiry are not reimplemented here. The surface is gated server side — a
+  caller it is not switched on for is answered `403 not_enabled`, which arrives
+  as `comfy_sdk.router_exceptions.NotEnabled`. `client.models.run` is unchanged
+  in behaviour and signature.
+- `comfy_sdk.router_exceptions.error_from_completion()` — the typed exception a
+  completed-but-failed queued request reports, or `None`. Public because the
+  rule it encodes ("a `200` is not the same thing as a success on this
+  surface") is one a caller reading a raw payload has to apply too.
 - Every exception `client.models.run()` raises **for a failed call** now
   carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the
   typed `RouterError` buckets, a `RouterError` whose `error_type` this version

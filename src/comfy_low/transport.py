@@ -10,9 +10,10 @@ escape hatches the hand-written ``comfy_sdk`` layer builds on:
 * **per-request timeout / abort** — every method takes ``timeout`` and the raw
   httpx cancellation applies.
 
-One binding is *not* backed by an ``operationId`` *in this module's sense*:
-``post_model_run``. It targets a different surface — Comfy Router, on its own
-host (:data:`ROUTER_BASE_URL`) — rather than the ``/api/v2`` deployment the rest
+One family of bindings is *not* backed by an ``operationId`` *in this module's
+sense*: the model bindings. ``post_model_run`` targets a different surface —
+Comfy Router, on its own host
+(:data:`ROUTER_BASE_URL`) — rather than the ``/api/v2`` deployment the rest
 of these methods speak to, and it is declared by a *second* vendored contract,
 ``spec/router-openapi.yaml`` (``operationId: runRouterModel``, path
 ``/v2/models/{provider}/{model}``). Nothing is generated from that second file
@@ -22,6 +23,15 @@ hand-*invented*. It stays out of ``comfy_low.OPERATION_IDS`` (which is the
 / :data:`_MODEL_RUN_PATH_TEMPLATE`, so a Router spec sync is a one-place change
 — and ``tests/test_router_spec_contract.py`` plus ``scripts/check_drift.py``
 fail if that constant and the vendored path disagree.
+
+The four ``post_model_submit`` / ``get_model_request_status`` /
+``get_model_request_result`` / ``put_model_request_cancel`` bindings are the
+same story one step earlier: they are the *queued* form of that one operation,
+and the contract declaring them is authored but held, so the vendored Router
+spec does not carry them yet and there is nothing for the contract test to pin
+them against. Their routes are confined to the ``_MODEL_REQUEST*`` constants
+for exactly the reason the run path was, and they are the one part of this
+change a spec sync is expected to correct.
 
 This layer contains no orchestration, retries, hashing, or reconnection — those
 live in ``comfy_sdk``.
@@ -88,6 +98,31 @@ ROUTER_BASE_URL = "https://api.comfy.org"
 #: ``scripts/check_drift.py`` fail when the vendored spec's path moves and this
 #: constant does not follow it.
 _MODEL_RUN_PATH_TEMPLATE = "/v2/models/{provider}/{model}"
+
+#: Routes for the *queued* form of a model request — submit, poll, collect,
+#: cancel. They extend :data:`_MODEL_RUN_PATH_TEMPLATE` with a ``requests``
+#: collection under the same model-ID-addressed prefix, because a queued
+#: request is the same operation on the same model, reached without holding the
+#: connection open for it.
+#:
+#: **These four are not in the vendored contract yet.** The queue operations
+#: are authored upstream but held, and the one-way sync into
+#: ``spec/router-openapi.yaml`` strips a held operation — so unlike
+#: :data:`_MODEL_RUN_PATH_TEMPLATE`, which
+#: ``tests/test_router_spec_contract.py`` pins against the vendored file, these
+#: are hand-bound with nothing to pin them to. They are gathered here, in one
+#: place and nowhere else, precisely so the sync that publishes them is a
+#: four-line diff plus the assertion that pins them — exactly as the run path
+#: was hand-bound before its own spec arrived.
+_MODEL_REQUESTS_PATH_TEMPLATE = _MODEL_RUN_PATH_TEMPLATE + "/requests"
+_MODEL_REQUEST_PATH_TEMPLATE = _MODEL_REQUESTS_PATH_TEMPLATE + "/{request_id}"
+_MODEL_REQUEST_STATUS_PATH_TEMPLATE = _MODEL_REQUEST_PATH_TEMPLATE + "/status"
+_MODEL_REQUEST_CANCEL_PATH_TEMPLATE = _MODEL_REQUEST_PATH_TEMPLATE + "/cancel"
+
+#: Longest request id accepted into a path. The contract mints UUIDs (36
+#: characters); the bound exists so a server-controlled value that is NOT one
+#: cannot reach the public handle, a log line or an exception message unbounded.
+_MAX_REQUEST_ID_LENGTH = 256
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -168,6 +203,83 @@ def model_run_request(
     body: dict[str, Any] = dict(arguments)
     headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
     return path, body, headers
+
+
+def parse_request_id(request_id: str) -> str:
+    """``request_id`` unchanged, or an error for one that cannot address a route.
+
+    A queued request's id is the last segment of
+    ``/v2/models/{provider}/{model}/requests/{request_id}``, so it is subject to
+    exactly the discipline :func:`parse_model_id` applies to the two segments
+    before it: a wrong *type* raises ``TypeError``, a wrong *value* raises
+    ``ValueError``, and both fail locally rather than being pasted into a URL
+    and answered by whatever route they land on. ``.``/``..`` are refused rather
+    than encoded for the same reason they are there — ``quote`` leaves ``.``
+    alone, so a dot segment would survive into the path and walk the route on
+    any intermediary that normalizes it.
+    """
+    if not isinstance(request_id, str):
+        raise TypeError(f"request id must be a str, got {type(request_id).__name__}")
+    if not request_id:
+        raise ValueError("request id must not be empty")
+    if "/" in request_id:
+        raise ValueError(
+            f"request id must be a single path segment — it addresses "
+            f"{_MODEL_REQUEST_PATH_TEMPLATE}; got {request_id!r}"
+        )
+    if request_id in (".", ".."):
+        raise ValueError(
+            f"request id must not be '.' or '..' — it would traverse the request path "
+            f"rather than name a request; got {request_id!r}"
+        )
+    if len(request_id) > _MAX_REQUEST_ID_LENGTH:
+        raise ValueError(
+            f"request id must be at most {_MAX_REQUEST_ID_LENGTH} characters; got {len(request_id)}"
+        )
+    if not request_id.isprintable():
+        # It is displayed and interpolated into exception messages as well as
+        # into the path, so a control character is refused rather than encoded.
+        raise ValueError(f"request id must not contain control characters; got {request_id!r}")
+    return request_id
+
+
+def model_submit_request(
+    model: str,
+    arguments: Mapping[str, Any],
+    idempotency_key: str | None,
+) -> tuple[str, dict[str, Any], dict[str, str]]:
+    """Sans-IO ``(path, json_body, headers)`` for one *queued* model request.
+
+    Identical in shape to :func:`model_run_request` — the model id addresses the
+    request and the body is the partner model's own native JSON input, verbatim
+    — differing only in the route it targets. That sameness is deliberate: a
+    caller moves between the awaited and the queued form by choosing a method,
+    not by rewriting the request.
+    """
+    provider, name = parse_model_id(model)
+    path = _MODEL_REQUESTS_PATH_TEMPLATE.format(
+        provider=quote(provider, safe=""), model=quote(name, safe="")
+    )
+    body: dict[str, Any] = dict(arguments)
+    headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
+    return path, body, headers
+
+
+def model_request_path(model: str, request_id: str, template: str) -> str:
+    """Sans-IO path for one queued request, from ``template``.
+
+    ``template`` is one of the ``_MODEL_REQUEST_*`` constants; passing it in
+    rather than branching on an operation name keeps every route this family
+    reaches spelled in exactly one place. Each of the three segments is
+    percent-encoded with ``safe=""`` so nothing in it can add a path segment, a
+    query or a fragment.
+    """
+    provider, name = parse_model_id(model)
+    return template.format(
+        provider=quote(provider, safe=""),
+        model=quote(name, safe=""),
+        request_id=quote(parse_request_id(request_id), safe=""),
+    )
 
 
 def _build_user_agent(client_info: str | None) -> str:
@@ -794,6 +906,89 @@ class ComfyLow:
         resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 201))
 
+    # -- models: the queued form ------------------------------------------
+    #
+    # These four return the response HEADERS alongside the decoded body, which
+    # nothing else in this transport does. The reason is specific to the queue
+    # rather than a change of house style: a poll's whole job is to say when to
+    # ask again, and the server says it on `Retry-After` — a header, on a
+    # SUCCESS response, which `parse_or_raise` has no way to hand back. Reading
+    # it is what makes the layer above pace itself against the server's own
+    # answer instead of only against a local backoff schedule. The same channel
+    # carries `X-Comfy-Request-Id`, which is what a failure reported inside a
+    # 200 body has to be attributable by.
+    def post_model_submit(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = _UNSET,
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """POST ``{router_base_url}/v2/models/{provider}/{model}/requests`` — queued.
+
+        The queued sibling of :meth:`post_model_run`: same host, same
+        model-ID-addressed prefix, same verbatim body, but the server answers as
+        soon as the request is *accepted* rather than holding the connection
+        until the generation is finished. The response names the request id
+        every later call in this family is addressed by.
+
+        The timeout is therefore the client's ordinary default rather than
+        :data:`MODEL_RUN_TIMEOUT` — nothing here waits on a generation.
+
+        Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
+        any request when ``model`` is not a ``{provider}/{model}`` id.
+        """
+        path, body, headers = model_submit_request(model, arguments, idempotency_key)
+        url = self._p.router_base_url + path
+        resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 201, 202)), resp.headers
+
+    def get_model_request_status(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """GET the queue status of one submitted request — the authoritative read.
+
+        This is the source of truth for how far a queued request has got, and
+        the only one: there is no stream to reconcile against on this surface.
+        """
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_STATUS_PATH_TEMPLATE
+        )
+        resp = self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    def get_model_request_result(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """GET the finished result of one submitted request.
+
+        The body is the provider's own payload, exactly as
+        :meth:`post_model_run` returns it — this route is where a queued
+        request's result is collected, not a differently-shaped one.
+        """
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_PATH_TEMPLATE
+        )
+        resp = self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    def put_model_request_cancel(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """PUT a cancellation for one submitted request.
+
+        A request, not a guarantee — a deployment that answers ``204`` gives an
+        empty body, which ``parse_or_raise`` returns as ``{}``. The
+        authoritative state is whatever :meth:`get_model_request_status` says
+        next, exactly as it is for a job.
+        """
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_CANCEL_PATH_TEMPLATE
+        )
+        resp = self.raw_request("PUT", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 202, 204)), resp.headers
+
 
 class AsyncComfyLow:
     """Asynchronous protocol bindings — mirrors :class:`ComfyLow`."""
@@ -1108,6 +1303,51 @@ class AsyncComfyLow:
         url = self._p.router_base_url + path
         resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 201))
+
+    # -- models: the queued form ------------------------------------------
+    async def post_model_submit(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = _UNSET,
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """Async :meth:`ComfyLow.post_model_submit`."""
+        path, body, headers = model_submit_request(model, arguments, idempotency_key)
+        url = self._p.router_base_url + path
+        resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 201, 202)), resp.headers
+
+    async def get_model_request_status(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """Async :meth:`ComfyLow.get_model_request_status`."""
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_STATUS_PATH_TEMPLATE
+        )
+        resp = await self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    async def get_model_request_result(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """Async :meth:`ComfyLow.get_model_request_result`."""
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_PATH_TEMPLATE
+        )
+        resp = await self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    async def put_model_request_cancel(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """Async :meth:`ComfyLow.put_model_request_cancel`."""
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_CANCEL_PATH_TEMPLATE
+        )
+        resp = await self.raw_request("PUT", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 202, 204)), resp.headers
 
 
 def _looks_like_path(s: str) -> bool:
