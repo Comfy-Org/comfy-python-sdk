@@ -25,7 +25,7 @@ hand-*invented*. It stays out of ``comfy_low.OPERATION_IDS`` (which is the
 fail if that constant and the vendored path disagree.
 
 The four ``post_model_submit`` / ``get_model_request_status`` /
-``get_model_request_result`` / ``post_model_request_cancel`` bindings are the
+``get_model_request_result`` / ``put_model_request_cancel`` bindings are the
 same story one step earlier: they are the *queued* form of that one operation,
 and the contract declaring them is authored but held, so the vendored Router
 spec does not carry them yet and there is nothing for the contract test to pin
@@ -118,6 +118,11 @@ _MODEL_REQUESTS_PATH_TEMPLATE = _MODEL_RUN_PATH_TEMPLATE + "/requests"
 _MODEL_REQUEST_PATH_TEMPLATE = _MODEL_REQUESTS_PATH_TEMPLATE + "/{request_id}"
 _MODEL_REQUEST_STATUS_PATH_TEMPLATE = _MODEL_REQUEST_PATH_TEMPLATE + "/status"
 _MODEL_REQUEST_CANCEL_PATH_TEMPLATE = _MODEL_REQUEST_PATH_TEMPLATE + "/cancel"
+
+#: Longest request id accepted into a path. The contract mints UUIDs (36
+#: characters); the bound exists so a server-controlled value that is NOT one
+#: cannot reach the public handle, a log line or an exception message unbounded.
+_MAX_REQUEST_ID_LENGTH = 256
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -227,6 +232,14 @@ def parse_request_id(request_id: str) -> str:
             f"request id must not be '.' or '..' — it would traverse the request path "
             f"rather than name a request; got {request_id!r}"
         )
+    if len(request_id) > _MAX_REQUEST_ID_LENGTH:
+        raise ValueError(
+            f"request id must be at most {_MAX_REQUEST_ID_LENGTH} characters; got {len(request_id)}"
+        )
+    if not request_id.isprintable():
+        # It is displayed and interpolated into exception messages as well as
+        # into the path, so a control character is refused rather than encoded.
+        raise ValueError(f"request id must not contain control characters; got {request_id!r}")
     return request_id
 
 
@@ -960,10 +973,10 @@ class ComfyLow:
         resp = self.raw_request("GET", url, timeout=timeout)
         return self._p.parse_or_raise(resp, (200,)), resp.headers
 
-    def post_model_request_cancel(
+    def put_model_request_cancel(
         self, model: str, request_id: str, *, timeout: Any = _UNSET
     ) -> tuple[dict[str, Any], httpx.Headers]:
-        """POST a cancellation for one submitted request.
+        """PUT a cancellation for one submitted request.
 
         A request, not a guarantee — a deployment that answers ``204`` gives an
         empty body, which ``parse_or_raise`` returns as ``{}``. The
@@ -973,7 +986,7 @@ class ComfyLow:
         url = self._p.router_base_url + model_request_path(
             model, request_id, _MODEL_REQUEST_CANCEL_PATH_TEMPLATE
         )
-        resp = self.raw_request("POST", url, timeout=timeout)
+        resp = self.raw_request("PUT", url, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 202, 204)), resp.headers
 
 
@@ -1326,14 +1339,14 @@ class AsyncComfyLow:
         resp = await self.raw_request("GET", url, timeout=timeout)
         return self._p.parse_or_raise(resp, (200,)), resp.headers
 
-    async def post_model_request_cancel(
+    async def put_model_request_cancel(
         self, model: str, request_id: str, *, timeout: Any = _UNSET
     ) -> tuple[dict[str, Any], httpx.Headers]:
-        """Async :meth:`ComfyLow.post_model_request_cancel`."""
+        """Async :meth:`ComfyLow.put_model_request_cancel`."""
         url = self._p.router_base_url + model_request_path(
             model, request_id, _MODEL_REQUEST_CANCEL_PATH_TEMPLATE
         )
-        resp = await self.raw_request("POST", url, timeout=timeout)
+        resp = await self.raw_request("PUT", url, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 202, 204)), resp.headers
 
 

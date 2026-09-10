@@ -512,7 +512,7 @@ def test_a_failing_cancel_does_not_mask_the_timeout(server, monkeypatch) -> None
     def _explode(self: Any) -> None:
         raise ComfyError("cancel is unreachable")
 
-    monkeypatch.setattr(RequestHandle, "cancel", _explode)
+    monkeypatch.setattr(RequestHandle, "_cancel_best_effort", _explode)
 
     with _client() as client:
         with pytest.raises(TimeoutError):
@@ -685,3 +685,142 @@ async def test_async_completion_error_raises_the_typed_exception(server, fast_po
         handle = await client.models.submit(MODEL, ARGS)
         with pytest.raises(ContentPolicyViolation):
             await handle.get()
+
+
+# --- review follow-ups: bounded waits, malformed bodies, the cleanup cancel ---
+
+
+def test_a_blank_error_type_reads_as_no_error_on_an_update() -> None:
+    """The update and the raising path read ``error_type`` the same way."""
+    import httpx
+
+    from comfy_sdk.model_requests import _update_from
+
+    body = {"status": COMPLETED, "error_type": "  "}
+    update = _update_from(body, httpx.Headers(), request_id="r")
+
+    assert update.error_type is None
+    assert error_from_completion(body) is None
+
+
+def test_an_update_carries_the_id_it_was_addressed_by() -> None:
+    import httpx
+
+    from comfy_sdk.model_requests import _update_from
+
+    body = {"request_id": "somebody-else\n", "status": "IN_QUEUE"}
+    update = _update_from(body, httpx.Headers(), request_id="mine")
+
+    assert update.request_id == "mine"
+    assert update.raw == body
+
+
+def test_a_result_that_is_not_a_json_object_is_returned_unchanged(server, fast_poll) -> None:
+    """The result is the partner's document, whatever shape the partner gave it."""
+    server.state.queue_polls_to_complete = 0
+    server.state.queue_result_raw = [{"url": "http://example.invalid/a.png"}]
+
+    with _client() as client:
+        assert client.models.submit(MODEL, ARGS).get() == server.state.queue_result_raw
+
+
+def test_a_status_read_naming_no_status_is_an_invalid_response(server, fast_poll) -> None:
+    """A ``200 {}`` from the authoritative read must not poll forever."""
+    server.state.queue_status_omits_status = True
+
+    with _client() as client:
+        handle = client.models.submit(MODEL, ARGS)
+        with pytest.raises(ComfyError) as excinfo:
+            handle.get()
+
+    assert excinfo.value.code == "invalid_response"
+
+
+def test_a_huge_retry_after_is_capped_before_it_is_slept(server, monkeypatch) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr("comfy_sdk.model_requests.time.sleep", slept.append)
+    server.state.queue_polls_to_complete = 1
+    # Parses as an int; `float()` of it would overflow.
+    server.state.queue_status_retry_after = "9" * 400
+
+    with _client() as client:
+        client.models.submit(MODEL, ARGS).get()
+
+    assert slept == [60.0]
+
+
+def test_a_timeout_bounds_the_poll_and_its_retries_not_only_the_sleep(server, monkeypatch) -> None:
+    """``get(timeout=...)`` on a server that keeps throttling returns within the
+    bound instead of riding the retry policy's whole minute."""
+    monkeypatch.setattr("comfy_sdk.model_requests.time.sleep", lambda _s: None)
+    server.state.queue_status_fail_times = 10_000
+
+    started = time.monotonic()
+    with _client() as client:
+        handle = client.models.submit(MODEL, ARGS)
+        with pytest.raises((RouterError, TimeoutError)):
+            handle.get(timeout=0.5)
+
+    assert time.monotonic() - started < 5
+
+
+def test_the_cleanup_cancel_after_a_timeout_does_not_ride_the_retry_policy(
+    server, monkeypatch
+) -> None:
+    monkeypatch.setattr("comfy_sdk.model_requests.time.sleep", lambda _s: None)
+    server.state.queue_polls_to_complete = 10_000
+    # Every cancel is answered with a paced 429, which the full policy would
+    # retry for the whole of its budget.
+    server.state.queue_cancel_fail_times = 10_000
+
+    started = time.monotonic()
+    with _client() as client:
+        with pytest.raises(TimeoutError):
+            client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert server.state.queue_cancel_count == 1
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.parametrize("request_id", ["abc\n", "with\x00nul", "x" * 257])
+def test_handle_refuses_an_unprintable_or_oversized_request_id(server, request_id) -> None:
+    with _client() as client:
+        with pytest.raises(ValueError):
+            client.models.handle(MODEL, request_id)
+
+
+def test_cancel_is_a_put(server, fast_poll) -> None:
+    """The contract's cancel is ``PUT``; a POST would be the wrong verb."""
+    with _client() as client:
+        client.models.submit(MODEL, ARGS).cancel()
+
+    assert server.state.queue_cancel_methods == ["PUT"]
+
+
+async def test_async_subscribe_cancellation_requests_a_remote_cancel(server, monkeypatch) -> None:
+    """A task cancelled from outside still asks the server to stop the run.
+
+    The cancel is delivered while the loop is in its own pause between polls,
+    so the test exercises this SDK's handling of the cancellation rather than
+    the HTTP stack's: a ``Task.cancel()`` that lands inside an in-flight
+    request is the transport's to surface, and when it surfaces late the loop
+    simply reaches this same pause on its next iteration.
+    """
+    server.state.queue_polls_to_complete = 10_000
+    real_sleep = asyncio.sleep
+    pausing = asyncio.Event()
+
+    async def _pause(_delay: float) -> None:
+        pausing.set()
+        await real_sleep(0.05)
+
+    monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _pause)
+
+    async with AsyncComfy(api_key="comfyui-test-key") as client:
+        task = asyncio.ensure_future(client.models.subscribe(MODEL, ARGS))
+        await pausing.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert server.state.queue_cancel_count == 1

@@ -41,7 +41,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import httpx
@@ -51,7 +51,7 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow, parse_request_id
 
 from . import _core
 from .exceptions import ComfyError, translating
-from .retry import DEFAULT_RETRY, Retrier, RetryPolicy
+from .retry import DEFAULT_RETRY, NO_RETRY, Retrier, RetryPolicy
 from .router_exceptions import RouterError, error_from_completion
 
 #: The one terminal queue status. Deliberately a single value rather than a
@@ -71,6 +71,24 @@ _CANDIDATE_FAILURES = (ApiError, RouterError, httpx.TransportError)
 #: prompted it, and swallowing a bare ``Exception`` there would hide a bug in
 #: this SDK just as readily as it hides an unreachable server.
 _CANCEL_FAILURES = (ComfyError, httpx.HTTPError)
+
+#: Ceiling, in seconds, on a server-named ``Retry-After`` between two polls.
+#: The header is honoured because the server knows its own pace, but it is a
+#: hint and not a bound, and taking it verbatim would let one ``Retry-After:
+#: 86400`` park a thread for a day -- or an absurd-but-parseable value overflow
+#: ``float()``. A minute is long enough that a request told to wait longer is
+#: still polled rarely, and short enough that nothing is parked.
+_MAX_PACE = 60
+
+#: Floor, in seconds, on the per-request HTTP timeout derived from a caller's
+#: remaining deadline. A sub-second bound cannot complete a TLS handshake, so
+#: without the floor the last poll before a deadline would be a certain
+#: transport failure rather than an answer.
+_MIN_HTTP_TIMEOUT = 1.0
+
+#: HTTP timeout, in seconds, for the best-effort cleanup cancel ``subscribe``
+#: issues after its own timeout -- see ``RequestHandle._cancel_best_effort``.
+_CANCEL_TIMEOUT = 10.0
 
 _now = time.monotonic
 
@@ -139,33 +157,64 @@ def _retry_after_seconds(headers: httpx.Headers) -> int | None:
     return seconds if seconds > 0 else None
 
 
+def _text(value: Any) -> str | None:
+    """A body field as a non-empty, stripped string, or ``None``.
+
+    The same reading :func:`~comfy_sdk.router_exceptions.error_from_completion`
+    gives ``error_type``, so an update and the raising path cannot disagree
+    about whether a blank bucket is a failure.
+    """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _update_from(
-    payload: Mapping[str, Any], headers: httpx.Headers, *, request_id: str
+    payload: Any, headers: httpx.Headers, *, request_id: str, require_status: bool = False
 ) -> QueueUpdate:
     """Build a :class:`QueueUpdate` from one response.
 
-    ``request_id`` is the id the call was addressed by, used when the body does
-    not repeat it — which is what keeps an update from a body-less ``204``
-    cancel still identifying the request it is about.
+    ``request_id`` is the id the call was addressed by, and it is the one the
+    update carries: the body's copy is server-controlled and unvalidated, and
+    an update that named a different request from the one it was asked about
+    would be wrong in exactly the place a caller pastes into a support ticket.
+    It is also what keeps an update from a body-less ``204`` cancel still
+    identifying the request it is about.
+
+    ``require_status`` is set by the authoritative status read, where a body
+    naming no status is not a state to poll again but a response this SDK
+    cannot act on -- treating it as "not yet terminal" would poll a ``200 {}``
+    forever. It stays off for the cancel, whose ``204`` legitimately names none.
     """
-    body_id = payload.get("request_id")
+    if not isinstance(payload, Mapping):
+        raise ComfyError(
+            "the queue answered with a body that is not a JSON object, so the request's "
+            "state cannot be read from it",
+            code="invalid_response",
+        )
     status = payload.get("status")
+    if not isinstance(status, str):
+        status = ""
+    if require_status and not status.strip():
+        raise ComfyError(
+            "the status read answered without naming a status, so the request's state is unknown",
+            code="invalid_response",
+        )
     position = payload.get("queue_position")
     return QueueUpdate(
-        request_id=body_id if isinstance(body_id, str) and body_id else request_id,
-        status=status if isinstance(status, str) else "",
+        request_id=request_id,
+        status=status,
         queue_position=position
         if isinstance(position, int) and not isinstance(position, bool)
         else None,
-        error_type=payload.get("error_type")
-        if isinstance(payload.get("error_type"), str)
-        else None,
+        error_type=_text(payload.get("error_type")),
         retry_after=_retry_after_seconds(headers),
         raw=dict(payload),
     )
 
 
-def _request_id_of(payload: Mapping[str, Any]) -> str:
+def _request_id_of(payload: Any) -> str:
     """The request id a submit response names, or a :class:`ComfyError`.
 
     A submit whose response carries no usable id is unusable in the specific
@@ -174,6 +223,12 @@ def _request_id_of(payload: Mapping[str, Any]) -> str:
     call, so it is raised rather than papered over with a placeholder id that
     would 404 on the first poll.
     """
+    if not isinstance(payload, Mapping):
+        raise ComfyError(
+            "the queue accepted the request but answered with a body that is not a JSON "
+            "object, so no request_id could be read from it",
+            code="invalid_response",
+        )
     request_id = payload.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         raise ComfyError(
@@ -194,9 +249,7 @@ def _request_id_of(payload: Mapping[str, Any]) -> str:
         ) from exc
 
 
-def _raise_for_completion(
-    payload: Mapping[str, Any], *, request_id: str, envelope_only: bool = False
-) -> None:
+def _raise_for_completion(payload: Any, *, request_id: str, envelope_only: bool = False) -> None:
     """Raise the typed router exception a completion reports, if it reports one.
 
     The gate behind "a ``200`` with an error payload is never returned as
@@ -215,6 +268,11 @@ def _raise_for_completion(
     the server reports where it is authoritative is never the one that gets
     missed.
     """
+    if not isinstance(payload, Mapping):
+        # A partner's native output is whatever JSON document the partner
+        # answers with -- an array or a bare value is a result, not an
+        # envelope, and there is nothing in it the queue could have reported.
+        return
     if envelope_only and payload.get("status") != COMPLETED:
         return
     error = error_from_completion(payload, request_id=request_id)
@@ -240,10 +298,14 @@ def _pace(update: QueueUpdate, backoff: Iterator[float]) -> float:
     A pace the server named beats the schedule guessed here — that is the whole
     point of ``Retry-After`` — and the adaptive backoff carries the interval
     when it named none. The backoff is advanced either way so the schedule does
-    not restart from its floor the moment the server stops naming a pace.
+    not restart from its floor the moment the server stops naming a pace. The
+    named pace is capped at :data:`_MAX_PACE`: a hint, honoured, but not a bound
+    a single header can park the caller behind.
     """
     scheduled = next(backoff)
-    return float(update.retry_after) if update.retry_after is not None else scheduled
+    if update.retry_after is None:
+        return scheduled
+    return float(min(update.retry_after, _MAX_PACE))
 
 
 def _remaining(deadline: float | None) -> float | None:
@@ -275,10 +337,39 @@ def _last(updates: Iterator[QueueUpdate]) -> QueueUpdate:
     return _completed(final)
 
 
-def _timed_out(request_id: str, timeout: float | None, update: QueueUpdate) -> TimeoutError:
+def _timed_out(request_id: str, timeout: float | None, update: QueueUpdate | None) -> TimeoutError:
+    status = "unknown" if update is None else update.status
     return TimeoutError(
-        f"model request {request_id} not complete after {timeout}s (status={update.status!r})"
+        f"model request {request_id} not complete after {timeout}s (status={status!r})"
     )
+
+
+def _bounded(policy: RetryPolicy, budget: float | None) -> RetryPolicy:
+    """``policy`` with both of its elapsed budgets capped at ``budget`` seconds.
+
+    How a caller's deadline reaches the retrier: a poll made with two seconds
+    left must not be allowed a minute of retries, and one made with nothing
+    left gets exactly one attempt (a zero ``max_elapsed`` is ``NO_RETRY``).
+    """
+    if budget is None:
+        return policy
+    left = max(budget, 0.0)
+    return replace(
+        policy,
+        max_elapsed=min(policy.max_elapsed, left),
+        collect_max_elapsed=min(policy.collect_max_elapsed, left),
+    )
+
+
+def _http_timeout(budget: float | None) -> dict[str, Any]:
+    """Keyword arguments bounding one low-level call's HTTP timeout by ``budget``.
+
+    Empty when there is no budget, so the client's own timeout applies. Floored
+    at :data:`_MIN_HTTP_TIMEOUT` for the reason given there.
+    """
+    if budget is None:
+        return {}
+    return {"timeout": max(budget, _MIN_HTTP_TIMEOUT)}
 
 
 class _RequestHandleBase:
@@ -337,11 +428,23 @@ class RequestHandle(_RequestHandleBase):
         raising: this is the read a caller uses to *look*, and the raising
         belongs to :meth:`get`, which is the one that hands back a result.
         """
+        return self._status(budget=None)
+
+    def _status(self, *, budget: float | None) -> QueueUpdate:
+        """One authoritative poll, bounded by ``budget`` seconds when one is given.
+
+        The bound covers the whole call — the HTTP request and any retry of it
+        — so a caller's ``timeout`` on :meth:`iter_events` is a bound on the
+        loop and not only on the pauses between its polls.
+        """
         with translating():
             payload, headers = self._call(
-                lambda: self._low.get_model_request_status(self._model, self._request_id)
+                lambda: self._low.get_model_request_status(
+                    self._model, self._request_id, **_http_timeout(budget)
+                ),
+                budget=budget,
             )
-        return _update_from(payload, headers, request_id=self._request_id)
+        return _update_from(payload, headers, request_id=self._request_id, require_status=True)
 
     def iter_events(self, timeout: float | None = None) -> Generator[QueueUpdate, None, None]:
         """Poll to completion, yielding an update whenever the queue moves.
@@ -353,19 +456,28 @@ class RequestHandle(_RequestHandleBase):
         progress and a caller who wants the result calls :meth:`get`, which
         does raise.
 
-        ``timeout`` is a client-side bound in seconds on the whole loop; ``None``
-        polls until the server says the request is done. Exceeding it raises
-        ``TimeoutError`` and leaves the request running — the queue is the
-        server's, so a local clock running out says nothing about it. Cancelling
-        on the way out is ``models.subscribe``'s behaviour, deliberately not
-        this one's: an iterator that cancelled the work it was iterating would
-        make a ``for`` loop with a ``break`` destructive.
+        ``timeout`` is a client-side bound in seconds on the whole loop — the
+        polls, their retries and the pauses between them, not the pauses alone
+        — and ``None`` polls until the server says the request is done. The
+        first poll is always made, so ``timeout=0`` reads "look once". Past the
+        bound no further poll is started, and the last one is held to what is
+        left of it (with a floor of :data:`_MIN_HTTP_TIMEOUT` so it can still
+        complete a handshake), so the loop overruns its bound by at most one
+        such request. Exceeding it raises ``TimeoutError`` and leaves the
+        request running — the queue is the server's, so a local clock running
+        out says nothing about it. Cancelling on the way out is
+        ``models.subscribe``'s behaviour, deliberately not this one's: an
+        iterator that cancelled the work it was iterating would make a ``for``
+        loop with a ``break`` destructive.
         """
         deadline = None if timeout is None else _now() + timeout
         backoff = _core.backoff_schedule()
         previous: QueueUpdate | None = None
         while True:
-            update = self.status()
+            remaining = _remaining(deadline)
+            if previous is not None and remaining is not None and remaining <= 0:
+                raise _timed_out(self._request_id, timeout, previous)
+            update = self._status(budget=remaining)
             if _changed(previous, update):
                 yield update
             previous = update
@@ -382,31 +494,42 @@ class RequestHandle(_RequestHandleBase):
 
         The result is the partner model's own output, decoded from JSON and
         handed back as-is — the same value ``models.run`` returns for the same
-        model and arguments.
+        model and arguments. It is a JSON object for every model Router serves
+        today; a partner whose native output were an array or a bare value
+        would be handed back unchanged too, since the payload is the partner's
+        and not this SDK's to reshape.
 
         Raises the typed router exception
         (:mod:`comfy_sdk.router_exceptions`) when the completion carries an
         ``error_type``, which is how the server reports a failed *or* cancelled
         request. ``timeout`` bounds the wait exactly as it does on
-        :meth:`iter_events`, and raises ``TimeoutError`` without cancelling.
+        :meth:`iter_events`, the result fetch included, and raises
+        ``TimeoutError`` without cancelling.
 
         Calling it on a request that has already completed is one status poll
         and one fetch, so collecting a result twice — or from a second process
         — costs no more than the first time.
         """
-        return self._collect(_last(self.iter_events(timeout=timeout)))
+        deadline = None if timeout is None else _now() + timeout
+        completion = _last(self.iter_events(timeout=timeout))
+        return self._collect(completion, budget=_remaining(deadline))
 
-    def _collect(self, completion: QueueUpdate) -> dict[str, Any]:
+    def _collect(self, completion: QueueUpdate, *, budget: float | None = None) -> dict[str, Any]:
         """Turn an observed completion into a result, or into the typed error.
 
         Split out of :meth:`get` so ``models.subscribe`` — which has already
         polled its way to the completion — can collect from the update it is
         holding instead of spending one more status request re-discovering it.
+        ``budget`` is what is left of the caller's deadline, and bounds the
+        fetch the way :meth:`_status` bounds a poll.
         """
         _raise_for_completion(completion.raw, request_id=self._request_id)
         with translating():
             payload, _headers = self._call(
-                lambda: self._low.get_model_request_result(self._model, self._request_id)
+                lambda: self._low.get_model_request_result(
+                    self._model, self._request_id, **_http_timeout(budget)
+                ),
+                budget=budget,
             )
         # Checked again on the result body: which of the two responses carries
         # the `error_type` is the server's choice, and reading only one of them
@@ -426,12 +549,34 @@ class RequestHandle(_RequestHandleBase):
         """
         with translating():
             payload, headers = self._call(
-                lambda: self._low.post_model_request_cancel(self._model, self._request_id)
+                lambda: self._low.put_model_request_cancel(self._model, self._request_id)
             )
         return _update_from(payload, headers, request_id=self._request_id)
 
+    def _cancel_best_effort(self) -> None:
+        """The cleanup cancel ``models.subscribe`` issues after its own timeout.
+
+        One attempt under :data:`~comfy_sdk.retry.NO_RETRY` and a short HTTP
+        bound, because it runs inside the handling of a ``TimeoutError`` the
+        caller is about to see: a cancel that rode the client's full retry
+        policy could hold that caller for the whole of ``max_elapsed`` — or
+        ``collect_max_elapsed``, if the cancel were answered with a paced
+        ``429`` — after they had already stopped waiting.
+        """
+        with translating():
+            self._call(
+                lambda: self._low.put_model_request_cancel(
+                    self._model, self._request_id, timeout=_CANCEL_TIMEOUT
+                ),
+                policy=NO_RETRY,
+            )
+
     def _call(
-        self, send: Callable[[], tuple[dict[str, Any], httpx.Headers]]
+        self,
+        send: Callable[[], tuple[dict[str, Any], httpx.Headers]],
+        *,
+        budget: float | None = None,
+        policy: RetryPolicy | None = None,
     ) -> tuple[dict[str, Any], httpx.Headers]:
         """Run one queue call under the client's retry policy.
 
@@ -440,8 +585,10 @@ class RequestHandle(_RequestHandleBase):
         would spend the whole budget on its first hour of polling and then
         surface the next blip as a hard failure. What it buys here is that a
         ``429`` naming a ``Retry-After`` paces the poll instead of ending it.
+        ``budget`` caps that policy's elapsed budgets at what is left of the
+        caller's deadline; ``policy`` substitutes another policy outright.
         """
-        retrier = Retrier(self._retry, now=_now)
+        retrier = Retrier(_bounded(policy or self._retry, budget), now=_now)
         while True:
             try:
                 return send()
@@ -470,11 +617,18 @@ class AsyncRequestHandle(_RequestHandleBase):
 
     async def status(self) -> QueueUpdate:
         """Awaitable :meth:`RequestHandle.status` — one authoritative poll."""
+        return await self._status(budget=None)
+
+    async def _status(self, *, budget: float | None) -> QueueUpdate:
+        """Async :meth:`RequestHandle._status` — one poll, bounded by ``budget``."""
         with translating():
             payload, headers = await self._call(
-                lambda: self._low.get_model_request_status(self._model, self._request_id)
+                lambda: self._low.get_model_request_status(
+                    self._model, self._request_id, **_http_timeout(budget)
+                ),
+                budget=budget,
             )
-        return _update_from(payload, headers, request_id=self._request_id)
+        return _update_from(payload, headers, request_id=self._request_id, require_status=True)
 
     async def iter_events(self, timeout: float | None = None) -> AsyncGenerator[QueueUpdate, None]:
         """Async :meth:`RequestHandle.iter_events` — ``async for`` over the updates."""
@@ -482,7 +636,10 @@ class AsyncRequestHandle(_RequestHandleBase):
         backoff = _core.backoff_schedule()
         previous: QueueUpdate | None = None
         while True:
-            update = await self.status()
+            remaining = _remaining(deadline)
+            if previous is not None and remaining is not None and remaining <= 0:
+                raise _timed_out(self._request_id, timeout, previous)
+            update = await self._status(budget=remaining)
             if _changed(previous, update):
                 yield update
             previous = update
@@ -496,17 +653,23 @@ class AsyncRequestHandle(_RequestHandleBase):
 
     async def get(self, timeout: float | None = None) -> dict[str, Any]:
         """Async :meth:`RequestHandle.get` — wait, then collect or raise."""
+        deadline = None if timeout is None else _now() + timeout
         completion: QueueUpdate | None = None
         async for update in self.iter_events(timeout=timeout):
             completion = update
-        return await self._collect(_completed(completion))
+        return await self._collect(_completed(completion), budget=_remaining(deadline))
 
-    async def _collect(self, completion: QueueUpdate) -> dict[str, Any]:
+    async def _collect(
+        self, completion: QueueUpdate, *, budget: float | None = None
+    ) -> dict[str, Any]:
         """Async :meth:`RequestHandle._collect`."""
         _raise_for_completion(completion.raw, request_id=self._request_id)
         with translating():
             payload, _headers = await self._call(
-                lambda: self._low.get_model_request_result(self._model, self._request_id)
+                lambda: self._low.get_model_request_result(
+                    self._model, self._request_id, **_http_timeout(budget)
+                ),
+                budget=budget,
             )
         _raise_for_completion(payload, request_id=self._request_id, envelope_only=True)
         return payload
@@ -515,15 +678,29 @@ class AsyncRequestHandle(_RequestHandleBase):
         """Async :meth:`RequestHandle.cancel` — a request, not a guarantee."""
         with translating():
             payload, headers = await self._call(
-                lambda: self._low.post_model_request_cancel(self._model, self._request_id)
+                lambda: self._low.put_model_request_cancel(self._model, self._request_id)
             )
         return _update_from(payload, headers, request_id=self._request_id)
 
+    async def _cancel_best_effort(self) -> None:
+        """Async :meth:`RequestHandle._cancel_best_effort` — one bounded attempt."""
+        with translating():
+            await self._call(
+                lambda: self._low.put_model_request_cancel(
+                    self._model, self._request_id, timeout=_CANCEL_TIMEOUT
+                ),
+                policy=NO_RETRY,
+            )
+
     async def _call(
-        self, send: Callable[[], Awaitable[tuple[dict[str, Any], httpx.Headers]]]
+        self,
+        send: Callable[[], Awaitable[tuple[dict[str, Any], httpx.Headers]]],
+        *,
+        budget: float | None = None,
+        policy: RetryPolicy | None = None,
     ) -> tuple[dict[str, Any], httpx.Headers]:
         """Async :meth:`RequestHandle._call` — one queue call under the retry policy."""
-        retrier = Retrier(self._retry, now=_now)
+        retrier = Retrier(_bounded(policy or self._retry, budget), now=_now)
         while True:
             try:
                 return await send()

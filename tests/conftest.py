@@ -223,6 +223,17 @@ class ServerState:
     )
     # Status code for the cancel response; 204 exercises the empty-body path.
     queue_cancel_status: int = 200
+    # Cancels that answer a transient failure (status, code) before one is
+    # accepted — for proving the cleanup cancel after a timeout does not ride
+    # the client's retry policy.
+    queue_cancel_fail_times: int = 0
+    queue_cancel_transient_error: tuple[int, str] = (429, "rate_limited")
+    queue_cancel_transient_retry_after: str | None = "1"
+    # When set, the result read answers this JSON document verbatim instead of
+    # `queue_result` — for a provider whose native output is not an object.
+    queue_result_raw: Any = None
+    # The status read answers a body naming no `status` at all.
+    queue_status_omits_status: bool = False
     # The bucket a cancelled request's completion carries.
     queue_cancel_error_type: str = "client_disconnected"
     # Set by a cancel; makes every later status poll report the cancellation.
@@ -288,6 +299,8 @@ class ServerState:
     queue_status_served: int = 0
     queue_result_count: int = 0
     queue_cancel_count: int = 0
+    # The HTTP method each cancel arrived with.
+    queue_cancel_methods: list[str] = field(default_factory=list)
     # Every Idempotency-Key seen on a queue submit, in arrival order.
     queue_submit_idempotency_keys: list[str | None] = field(default_factory=list)
     # The native body of the last queue submit, and the two decoded id segments.
@@ -572,6 +585,19 @@ def _make_handler(state: ServerState):
             frame("status", {"status": state.terminal_status})
 
         # -- POST --
+        def do_PUT(self) -> None:
+            # Comfy Router's queue cancel is a PUT (the contract's
+            # `cancelRouterModelRequest`), so it is served here and nowhere
+            # else: a POST to the same path is the wrong verb and gets a 404
+            # like any other unrouted request.
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests/([^/]+)/cancel$", self.path)
+            if m:
+                self._read_body()
+                self._put_queue_cancel(m.group(3))
+                return
+            self._read_body()
+            self._err(404, "not_found")
+
         def do_POST(self) -> None:
             if not self._auth_ok():
                 self._read_body()
@@ -599,11 +625,6 @@ def _make_handler(state: ServerState):
             m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests$", self.path)
             if m:
                 self._post_queue_submit(m.group(1), m.group(2))
-                return
-            m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests/([^/]+)/cancel$", self.path)
-            if m:
-                self._read_body()
-                self._post_queue_cancel(m.group(3))
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
@@ -669,6 +690,9 @@ def _make_handler(state: ServerState):
                 else {}
             )
             body: dict[str, Any] = {"request_id": unquote(request_id)}
+            if state.queue_status_omits_status:
+                self._json(200, body, headers=headers)
+                return
             if state.queue_canceled:
                 body["status"] = "COMPLETED"
                 body["error_type"] = state.queue_cancel_error_type
@@ -692,6 +716,9 @@ def _make_handler(state: ServerState):
         def _serve_queue_result(self, request_id: str) -> None:
             state.queue_result_count += 1
             state.queue_paths.append(self.path)
+            if state.queue_result_raw is not None:
+                self._json(200, state.queue_result_raw)
+                return
             if state.queue_result_error_type:
                 self._json(
                     200,
@@ -705,9 +732,15 @@ def _make_handler(state: ServerState):
                 return
             self._json(200, {**state.queue_result, **state.queue_result_extra})
 
-        def _post_queue_cancel(self, request_id: str) -> None:
+        def _put_queue_cancel(self, request_id: str) -> None:
             state.queue_cancel_count += 1
             state.queue_paths.append(self.path)
+            state.queue_cancel_methods.append(self.command)
+            if state.queue_cancel_fail_times > 0:
+                state.queue_cancel_fail_times -= 1
+                status, code = state.queue_cancel_transient_error
+                self._router_err(status, code, retry_after=state.queue_cancel_transient_retry_after)
+                return
             state.queue_canceled = True
             if state.queue_cancel_status == 204:
                 self.send_response(204)

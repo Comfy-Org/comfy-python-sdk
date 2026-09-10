@@ -457,7 +457,7 @@ flight all at once — submit it to the queue instead:
 ```python
 handle = client.models.submit("fal-ai/flux-pro", {"prompt": "a cat"})
 
-handle.request_id          # 'req_...' — all another process needs
+handle.request_id          # a UUID; with the model id, all another process needs
 handle.status().status     # 'IN_QUEUE' / 'IN_PROGRESS' / 'COMPLETED'
 result = handle.get()      # blocks until complete, returns the provider payload
 ```

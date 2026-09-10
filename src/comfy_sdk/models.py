@@ -62,10 +62,12 @@ from ._core import new_idempotency_key, validate_idempotency_key
 from .exceptions import translating
 from .model_requests import (
     _CANCEL_FAILURES,
+    _CANCEL_TIMEOUT,
     AsyncRequestHandle,
     QueueUpdate,
     RequestHandle,
     _completed,
+    _remaining,
     _request_id_of,
 )
 from .retry import DEFAULT_RETRY, Retrier, RetryPolicy
@@ -362,8 +364,10 @@ class Models(_ModelsBase):
         exception it raises propagates and abandons the wait (the request keeps
         running server side).
 
-        ``timeout`` is a **client-side** bound in seconds on the whole wait,
-        with no server-side meaning: the queue's own timeouts are the server's.
+        ``timeout`` is a **client-side** bound in seconds on the whole call —
+        the submit's wait excluded only where its own retry policy is already
+        running, then every poll, retry and pause, and the result fetch — with
+        no server-side meaning: the queue's own timeouts are the server's.
         When it runs out this makes a best-effort
         :meth:`~comfy_sdk.model_requests.RequestHandle.cancel` — so a caller
         that has stopped waiting is not also still paying for a generation
@@ -378,12 +382,15 @@ class Models(_ModelsBase):
         exception rather than returning, so a ``200`` never comes back as a
         successful result.
         """
+        # The clock starts here, before the submit, so ``timeout`` bounds the
+        # whole call as documented and not only the polling after it.
+        deadline = None if timeout is None else _now() + timeout
         handle = self.submit(model, arguments, idempotency_key=idempotency_key)
         # ``closing`` so the poll generator is finalised on every exit — the
         # completion, the timeout, and above all the one where the caller's
         # callback raises, which otherwise leaves it suspended until the
         # collector happens to reach it.
-        with contextlib.closing(handle.iter_events(timeout=timeout)) as updates:
+        with contextlib.closing(handle.iter_events(timeout=_remaining(deadline))) as updates:
             completion: QueueUpdate | None = None
             while True:
                 # Only the *iteration* is inside the ``except TimeoutError``. A
@@ -398,7 +405,7 @@ class Models(_ModelsBase):
                     break
                 except TimeoutError:
                     try:
-                        handle.cancel()
+                        handle._cancel_best_effort()
                     except _CANCEL_FAILURES:
                         # Best-effort is literal: the timeout is the failure
                         # worth reporting, and a masked one sends the caller
@@ -408,7 +415,7 @@ class Models(_ModelsBase):
                 completion = update
                 if on_queue_update is not None:
                     on_queue_update(update)
-        return handle._collect(_completed(completion))
+        return handle._collect(_completed(completion), budget=_remaining(deadline))
 
     def handle(self, model: str, request_id: str) -> RequestHandle:
         """Rebuild the handle for a request submitted anywhere.
@@ -533,33 +540,50 @@ class AsyncModels(_ModelsBase):
         an awaitable it returns is awaited before the next poll, so an async
         callback does not need wrapping. See :meth:`Models.subscribe`.
         """
+        deadline = None if timeout is None else _now() + timeout
         handle = await self.submit(model, arguments, idempotency_key=idempotency_key)
-        # ``aclosing`` for the reason ``Models.subscribe`` uses ``closing``, and
-        # a sharper one: an async generator left suspended is finalised by the
-        # event loop's own shutdown hook, well after this call returned.
-        async with contextlib.aclosing(handle.iter_events(timeout=timeout)) as updates:
-            completion: QueueUpdate | None = None
-            while True:
-                # Scoped to the iteration alone, for the reason
-                # `Models.subscribe` gives — and it bites harder here, where a
-                # callback that awaits anything under `asyncio.wait_for` raises
-                # `TimeoutError` natively.
-                try:
-                    update = await anext(updates)
-                except StopAsyncIteration:
-                    break
-                except TimeoutError:
+        completion: QueueUpdate | None = None
+        try:
+            # ``aclosing`` for the reason ``Models.subscribe`` uses ``closing``,
+            # and a sharper one: an async generator left suspended is finalised
+            # by the event loop's own shutdown hook, well after this call
+            # returned.
+            async with contextlib.aclosing(
+                handle.iter_events(timeout=_remaining(deadline))
+            ) as updates:
+                while True:
+                    # Scoped to the iteration alone, for the reason
+                    # `Models.subscribe` gives — and it bites harder here, where
+                    # a callback that awaits anything under `asyncio.wait_for`
+                    # raises `TimeoutError` natively.
                     try:
-                        await handle.cancel()
-                    except _CANCEL_FAILURES:
-                        pass
-                    raise
-                completion = update
-                if on_queue_update is not None:
-                    outcome = on_queue_update(update)
-                    if isinstance(outcome, Awaitable):
-                        await outcome
-        return await handle._collect(_completed(completion))
+                        update = await anext(updates)
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError:
+                        try:
+                            await handle._cancel_best_effort()
+                        except _CANCEL_FAILURES:
+                            pass
+                        raise
+                    completion = update
+                    if on_queue_update is not None:
+                        outcome = on_queue_update(update)
+                        if isinstance(outcome, Awaitable):
+                            await outcome
+        except asyncio.CancelledError:
+            # The task was cancelled from outside while the request is still
+            # queued or running. `subscribe` has exposed neither the handle nor
+            # its key, so the caller has no way back to a generation that would
+            # otherwise keep running — and keep billing — after they stopped
+            # waiting for it. One shielded, bounded best-effort cancel, exactly
+            # as on the timeout path, then the cancellation proceeds.
+            with contextlib.suppress(*_CANCEL_FAILURES, TimeoutError, asyncio.TimeoutError):
+                await asyncio.shield(
+                    asyncio.wait_for(handle._cancel_best_effort(), _CANCEL_TIMEOUT + 1.0)
+                )
+            raise
+        return await handle._collect(_completed(completion), budget=_remaining(deadline))
 
     async def handle(self, model: str, request_id: str) -> AsyncRequestHandle:
         """Awaitable :meth:`Models.handle` — rebuild a handle from the two ids.
