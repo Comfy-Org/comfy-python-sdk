@@ -720,6 +720,15 @@ asset, job, event, and output helpers translate protocol errors, so catches of
   deployment warm-up), then raises the translated error if backpressure remains.
 - `JobFailed` — a job reached a non-`succeeded` terminal state; `.error`
   carries node-level detail when the platform provided one.
+- A plain `ComfyError` whose `.code` reads `http_<status>` (`http_503`,
+  `http_500`) — the response was answered by something in front of Router
+  rather than by the service itself, so no service verdict was reached: no
+  error envelope, no error bucket, usually no `X-Comfy-Request-Id`. Retry per
+  your own policy; the SDK does not retry these for you. The one line naming
+  the cause (`no healthy upstream`, `upstream connect error or disconnect/reset
+  before headers`) is kept on the protocol-level exception as
+  `comfy_low.errors.ApiError.body_excerpt`, and is what `str()` of the error
+  you catch reads — `HTTP 503: no healthy upstream` — at both layers.
 
 ```python
 from comfy_sdk import JobFailed, QueueFull, Unauthorized
