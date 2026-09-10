@@ -24,6 +24,40 @@ notes for each version.
   input. The README's "Image to image — upload an asset first" section walks
   through the flow.
 
+- `ApiError.body_excerpt` — a bounded, single-line excerpt of a response body
+  that stated no message of its own, and `str(exc)` now shows it beside the
+  bare status: `HTTP 503: no healthy upstream`. The `ComfyError` it is
+  translated to carries the same string as its message, so the cause reaches
+  the exception an integrator actually catches and logs. A `503` answered by a
+  load balancer in front of the deployment arrives as plain text with no JSON
+  and no `X-Comfy-Request-Id`, and that text — `no healthy upstream`, `upstream
+  connect error or disconnect/reset before headers` — is the only thing that
+  names the cause. It used to be discarded with the response, so the cause was
+  unrecoverable from any log. The excerpt is whitespace-collapsed, has control,
+  format (bidi override, zero-width), private-use and surrogate characters
+  replaced by spaces, and is capped at 256 characters (an HTML error page is
+  the realistic case). It is `None` whenever the response *did* state a message
+  — an envelope's `error.message`, Router's `detail` — where `message` already
+  carries the cause; a JSON object that is not an envelope (`{"message": "no
+  healthy upstream"}`) keeps its excerpt. The `invalid_response` error — a
+  success status whose body would not decode, i.e. a proxy interstitial served
+  as a `200` — carries and shows it too, for the same reason: the message says
+  the body would not decode, and only the excerpt says what answered instead.
+
+### Changed
+
+- An error response nothing in the stack recognised now carries the code
+  `http_<status>` — `http_503`, `http_500` — instead of `"error"`. It is reached
+  only after the envelope's own `code`, Router's `X-Comfy-Error-Type` bucket and
+  the status table have all declined, so a bare `401` still maps to
+  `Unauthorized` and every documented code is untouched. `"error"` was the class
+  default an exception built by hand carries, so it was indistinguishable from
+  "nobody set a code" and told a caller nothing about a response that had
+  already lost its body. Read `http_<status>` as *answered by something in front
+  of Router rather than by the service itself, so no service verdict was
+  reached; retry per your own policy* — nothing about what the SDK retries
+  changed, and such a `5xx` is still not retried automatically.
+
 ## [0.1.9] - 2026-09-01
 
 ### Added
@@ -55,26 +89,6 @@ notes for each version.
   Previously `""` fell into the mint-a-fresh-key branch — disabling the
   caller's dedup and, with the stamp above, reporting a key the caller never
   passed — and an invalid key failed at the transport after the round trip.
-
-- `ApiError.body_excerpt` — a bounded, single-line excerpt of a response body
-  that stated no message of its own, and `str(exc)` now shows it beside the
-  bare status: `HTTP 503: no healthy upstream`. The `ComfyError` it is
-  translated to carries the same string as its message, so the cause reaches
-  the exception an integrator actually catches and logs. A `503` answered by a
-  load balancer in front of the deployment arrives as plain text with no JSON
-  and no `X-Comfy-Request-Id`, and that text — `no healthy upstream`, `upstream
-  connect error or disconnect/reset before headers` — is the only thing that
-  names the cause. It used to be discarded with the response, so the cause was
-  unrecoverable from any log. The excerpt is whitespace-collapsed, has control,
-  format (bidi override, zero-width), private-use and surrogate characters
-  replaced by spaces, and is capped at 256 characters (an HTML error page is
-  the realistic case). It is `None` whenever the response *did* state a message
-  — an envelope's `error.message`, Router's `detail` — where `message` already
-  carries the cause; a JSON object that is not an envelope (`{"message": "no
-  healthy upstream"}`) keeps its excerpt. The `invalid_response` error — a
-  success status whose body would not decode, i.e. a proxy interstitial served
-  as a `200` — carries and shows it too, for the same reason: the message says
-  the body would not decode, and only the excerpt says what answered instead.
 
 - Every exception `client.models.run()` raises **for a failed call** now
   carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the
@@ -200,18 +214,6 @@ notes for each version.
   against the URL exactly as given.
 
 ### Changed
-
-- An error response nothing in the stack recognised now carries the code
-  `http_<status>` — `http_503`, `http_500` — instead of `"error"`. It is reached
-  only after the envelope's own `code`, Router's `X-Comfy-Error-Type` bucket and
-  the status table have all declined, so a bare `401` still maps to
-  `Unauthorized` and every documented code is untouched. `"error"` was the class
-  default an exception built by hand carries, so it was indistinguishable from
-  "nobody set a code" and told a caller nothing about a response that had
-  already lost its body. Read `http_<status>` as *answered by something in front
-  of Router rather than by the service itself, so no service verdict was
-  reached; retry per your own policy* — nothing about what the SDK retries
-  changed, and such a `5xx` is still not retried automatically.
 
 - **`client.models.run` posts to Comfy Router.** It sends
   `POST {COMFY_ROUTER_BASE_URL}/v2/models/{provider}/{model}` — the route
