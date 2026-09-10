@@ -38,6 +38,36 @@ def clean_request_id(raw: Any) -> str | None:
     return match.group(0) if match else None
 
 
+#: Longest body excerpt kept on an exception. Long enough for the one-line
+#: reason an intermediary states (``no healthy upstream``, ``upstream connect
+#: error or disconnect/reset before headers``), short enough that an HTML error
+#: page cannot flood the log line that prints it.
+_BODY_EXCERPT_LIMIT = 256
+
+#: Control characters dropped from a body excerpt. The excerpt is
+#: server-controlled text headed for a traceback or a log line, so it is reduced
+#: to something safe to *display* for the same reason ``clean_request_id``
+#: bounds the id: an escape sequence in an error page must not repaint the
+#: terminal reading it. The C1 range goes too — it is what a stray byte of
+#: Latin-1-decoded binary lands in.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def clean_body_excerpt(raw: Any, *, limit: int = _BODY_EXCERPT_LIMIT) -> str | None:
+    """``raw`` reduced to a bounded single-line excerpt, or ``None``.
+
+    Whitespace of every kind collapses to single spaces before the bound is
+    applied, so an indented HTML error page spends its budget on words rather
+    than on the margin, and the result is one line wherever it is printed.
+    Truncation is deliberately silent — no ellipsis — so the value stays exactly
+    what the server said, up to ``limit`` characters of it.
+    """
+    if not isinstance(raw, str):
+        return None
+    collapsed = _CONTROL_RE.sub("", " ".join(raw.split()))
+    return collapsed[:limit] or None
+
+
 class ApiError(Exception):
     """Base for every error carried by the API's error envelope."""
 
@@ -52,6 +82,7 @@ class ApiError(Exception):
         details: dict[str, Any] | None = None,
         retry_after: int | None = None,
         request_id: str | None = None,
+        body_excerpt: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -66,6 +97,29 @@ class ApiError(Exception):
         #: because it is the id a user quotes in a support request and it is
         #: unreachable once the response object is gone.
         self.request_id = request_id
+        #: A bounded, single-line excerpt of a response body that carried no
+        #: error envelope, or ``None``. It is the only place such a response
+        #: states its cause: something in front of the API — a load balancer, a
+        #: proxy — answers with plain text (``no healthy upstream``, ``upstream
+        #: connect error or disconnect/reset before headers``) and no JSON, and
+        #: that text used to be discarded with the response, leaving the cause
+        #: unrecoverable from any log. ``None`` whenever the body *was* a
+        #: well-formed envelope, where ``message`` already carries the cause.
+        self.body_excerpt = body_excerpt
+
+    def __str__(self) -> str:
+        """``message``, plus the body excerpt when the message is a bare status.
+
+        A response with no envelope has no message to carry, so ``message`` is
+        the synthetic ``HTTP <status>`` — which names no cause. Appending the
+        excerpt there is what puts the cause into the one string a caller prints
+        and a logger formats: ``HTTP 503: no healthy upstream``. When the
+        response *did* state a message, that message is the cause and the
+        excerpt is not spliced into it; it stays readable on ``.body_excerpt``.
+        """
+        if self.body_excerpt and self.message == f"HTTP {self.http_status}":
+            return f"{self.message}: {self.body_excerpt}"
+        return self.message
 
 
 class InvalidWorkflow(ApiError):
@@ -151,6 +205,7 @@ def error_from_envelope(
     retry_after: int | None = None,
     request_id: str | None = None,
     error_type: str | None = None,
+    body_excerpt: str | None = None,
 ) -> ApiError:
     """Build the typed exception for an error response.
 
@@ -158,21 +213,28 @@ def error_from_envelope(
     well-formed envelope (so a bare ``401`` with no JSON still maps to
     ``Unauthorized``).
 
+    ``body_excerpt`` is the caller's already-reduced excerpt of a non-envelope
+    body (:func:`clean_body_excerpt`), kept on the exception because such a
+    response states its cause nowhere else. It is the caller's to pass rather
+    than this function's to read: only the caller holds the response, and only
+    it can tell an unread streaming body from an empty one.
+
     Not every route answers in the envelope shape. ``POST {router}/v2/models/{provider}/{model}``
     is fronted by Router, whose error body is ``{detail, error_type}`` and which
     repeats the same coarse bucket on the ``X-Comfy-Error-Type`` header
     (``spec/router-openapi.yaml``). Reading only ``error["code"]`` would collapse
     every one of those to the status-derived default — for a ``504`` that
-    default is the meaningless ``"error"``, and ``comfy_sdk.retry`` keys its
-    default-on collect rule on the bucket, so the rule would be a silent no-op
-    against every real Router ``504``. ``error_type`` (the header, passed by the
+    default names only the status (``"http_504"``), and ``comfy_sdk.retry`` keys
+    its default-on collect rule on the bucket, so the rule would be a silent
+    no-op against every real Router ``504``. ``error_type`` (the header, passed by the
     caller) and the body's own top-level ``error_type`` are read to prevent that.
 
     The precedence is: the envelope's ``code`` always wins; then, when the
     response identifies itself as Router's — the ``X-Comfy-Error-Type`` header
     or a top-level body ``error_type`` is present — that bucket wins for EVERY
     status; only then does :data:`_CODE_BY_STATUS` fill in, for the bare and
-    proxy-shaped responses it was built for.
+    proxy-shaped responses it was built for; and a status that table does not
+    name falls back to ``http_<status>`` (see below).
 
     The bucket outranking the status table is the load-bearing choice, learned
     three times on live traffic: the table turned Router's ``409`` errors into
@@ -198,7 +260,18 @@ def error_from_envelope(
     if code is None:
         code = _CODE_BY_STATUS.get(http_status)
     if code is None:
-        code = "error"
+        # Nothing identified this response: no envelope ``code``, no Router
+        # bucket, and a status :data:`_CODE_BY_STATUS` does not name. ``"error"``
+        # was the answer here, and it was indistinguishable from the class
+        # default an exception built by hand carries — so it told a caller
+        # nothing at all, on the one class of failure where the SDK has nothing
+        # else to say. The status is the single fact such a response does carry,
+        # so it becomes the code. The shape is deliberately prefixed rather than
+        # bare: ``http_503`` reads as "no service verdict was reached — something
+        # in front of the API answered", which is exactly what it means, and it
+        # cannot collide with a wire ``code`` or a Router bucket, none of which
+        # are spelled that way.
+        code = f"http_{http_status}"
     if not message:
         # Router names its human-readable string `detail`, not `error.message`.
         message = _clean((body or {}).get("detail") if isinstance(body, dict) else None)
@@ -213,6 +286,7 @@ def error_from_envelope(
         details=details if isinstance(details, dict) else None,
         retry_after=retry_after,
         request_id=request_id,
+        body_excerpt=body_excerpt,
     )
 
 
