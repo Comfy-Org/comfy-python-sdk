@@ -216,6 +216,99 @@ def test_run_accepts_any_mapping_and_does_not_alias_the_callers_object(server) -
     assert caller_args == {"prompt": "a dog"}
 
 
+# --- model_provider / strict_mode / fallback_provider --------------------
+#
+# Comfy Router's three query params on this route (`spec/router-openapi.yaml`'s
+# `ModelProvider`, `StrictMode`, `FallbackProvider` parameters). All default to
+# `None` on `run`, which must omit the corresponding query param entirely — a
+# caller who never heard of them gets byte-for-byte today's plain request,
+# which `test_run_addresses_the_model_by_path_and_sends_the_native_body` above
+# already pins for the fully-omitted case.
+
+
+def test_omitting_all_three_sends_no_query_string_at_all(server) -> None:
+    with Comfy() as client:
+        client.models.run(MODEL, ARGS)
+    assert server.state.last_model_run_query == {}
+
+
+def test_model_provider_is_sent_verbatim(server) -> None:
+    with Comfy() as client:
+        client.models.run(MODEL, ARGS, model_provider="fal")
+    assert server.state.last_model_run_query == {"model_provider": "fal"}
+
+
+def test_strict_mode_true_and_false_are_both_sent_explicitly(server) -> None:
+    with Comfy() as client:
+        client.models.run(MODEL, ARGS, model_provider="fal", strict_mode=True)
+    assert server.state.last_model_run_query == {"model_provider": "fal", "strict_mode": "true"}
+
+    with Comfy() as client:
+        client.models.run(MODEL, ARGS, model_provider="fal", strict_mode=False)
+    assert server.state.last_model_run_query == {"model_provider": "fal", "strict_mode": "false"}
+
+
+def test_fallback_provider_false_opts_out_explicitly(server) -> None:
+    # The one param with an inverted sense: Router defaults it ON, so `False`
+    # is the only value this SDK ever has a reason to put on the wire.
+    with Comfy() as client:
+        client.models.run(MODEL, ARGS, fallback_provider=False)
+    assert server.state.last_model_run_query == {"fallback_provider": "false"}
+
+
+def test_fallback_provider_true_is_the_same_as_omitting_it(server) -> None:
+    # `True` is Router's own default, so sending it explicitly would be a
+    # distinct wire value nothing downstream could tell apart from omitting it
+    # — asserted here so this stays a deliberate no-op rather than a forgotten
+    # branch.
+    with Comfy() as client:
+        client.models.run(MODEL, ARGS, fallback_provider=True)
+    assert server.state.last_model_run_query == {}
+
+
+async def test_the_async_client_sends_the_same_three_params(server) -> None:
+    async with AsyncComfy() as client:
+        await client.models.run(
+            MODEL, ARGS, model_provider="fal", strict_mode=True, fallback_provider=False
+        )
+    assert server.state.last_model_run_query == {
+        "model_provider": "fal",
+        "strict_mode": "true",
+        "fallback_provider": "false",
+    }
+
+
+def test_the_sans_io_builder_agrees_with_the_wire_for_all_three(server) -> None:
+    # The one place the query-string shape is decided, asserted directly
+    # against the same real HTTP round trip the tests above exercise —
+    # mirrors test_the_sans_io_request_builder_agrees_with_the_wire above.
+    path, _body, _headers = model_run_request(
+        MODEL, ARGS, None, model_provider="fal", strict_mode=True, fallback_provider=False
+    )
+    assert path == (
+        "/v2/models/acme/flux-dev?model_provider=fal&strict_mode=true&fallback_provider=false"
+    )
+
+    with Comfy() as client:
+        client.models.run(
+            MODEL, ARGS, model_provider="fal", strict_mode=True, fallback_provider=False
+        )
+    assert server.state.last_model_run_path == "/v2/models/acme/flux-dev"
+    assert server.state.last_model_run_query == {
+        "model_provider": "fal",
+        "strict_mode": "true",
+        "fallback_provider": "false",
+    }
+
+
+def test_a_run_with_these_params_still_returns_the_native_result(server) -> None:
+    # The three params change what Router does server side, never the shape of
+    # what `run` hands back — still the provider's own payload, unwrapped.
+    with Comfy() as client:
+        result = client.models.run(MODEL, ARGS, model_provider="fal")
+    assert result == server.state.model_run_result
+
+
 # --- which host the run is addressed to ---------------------------------
 
 
@@ -495,6 +588,9 @@ class _RaisingLow:
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | None = None,
     ) -> dict[str, Any]:
         self.keys.append(idempotency_key)
         raise self._exc
@@ -508,6 +604,9 @@ class _AsyncRaisingLow(_RaisingLow):
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | None = None,
     ) -> dict[str, Any]:
         self.keys.append(idempotency_key)
         raise self._exc

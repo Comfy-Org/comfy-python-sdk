@@ -131,6 +131,9 @@ class Models(_ModelsBase):
         *,
         idempotency_key: str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | None = None,
     ) -> dict[str, Any]:
         """Run ``model`` with ``arguments`` and return the completed result.
 
@@ -223,6 +226,22 @@ class Models(_ModelsBase):
         generation instead of collecting the first. Every exception *this*
         method raises carries a real key, but an ``except ComfyError`` that also
         catches errors from other surfaces can hand you one that does not.
+
+        ``model_provider`` requests a specific alternate provider for
+        ``model`` instead of its current default (``?model_provider=`` on the
+        wire); omitted, or ``None``, is byte-for-byte today's default-provider
+        behavior. ``strict_mode`` is only meaningful together with
+        ``model_provider``: ``False`` (Router's own default) translates
+        ``arguments`` from ``model``'s native contract to the alternate
+        provider's real schema; ``True`` sends ``arguments`` through
+        unmodified, so it must already be that provider's own native shape.
+        ``fallback_provider`` is Router's own retry: on a failure attributable
+        to Router's own side or to the specific provider tried — never to
+        ``arguments`` or your account — Router retries once against the
+        model's other registered provider, and this defaults ON (``None`` or
+        ``True``); pass ``False`` to opt out. All three default to ``None``,
+        which omits the corresponding query param entirely rather than
+        sending an explicit "off" value Router would have to special-case.
         """
         low = cast(ComfyLow, self._low)
         # Minted once, outside the loop: reusing this exact value on every
@@ -250,7 +269,15 @@ class Models(_ModelsBase):
         with translating(idempotency_key=key):
             while True:
                 try:
-                    return low.post_model_run(model, payload, idempotency_key=key, timeout=timeout)
+                    return low.post_model_run(
+                        model,
+                        payload,
+                        idempotency_key=key,
+                        timeout=timeout,
+                        model_provider=model_provider,
+                        strict_mode=strict_mode,
+                        fallback_provider=fallback_provider,
+                    )
                 except _CANDIDATE_FAILURES as exc:
                     delay = retrier.delay_before_retry(exc)
                     if delay is None:
@@ -272,14 +299,18 @@ class AsyncModels(_ModelsBase):
         *,
         idempotency_key: str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | None = None,
     ) -> dict[str, Any]:
         """Awaitable :meth:`Models.run` — same arguments, same result shape.
 
         This *is* the async form of ``run``: awaiting it on ``AsyncComfy`` is
         the whole difference from the sync client — including the model-id
-        rule, the retry policy, the one-key-per-call rule, and the
-        ``.idempotency_key`` every exception it raises carries for the replay.
-        See :meth:`Models.run`.
+        rule, the retry policy, the one-key-per-call rule, the
+        ``.idempotency_key`` every exception it raises carries for the replay,
+        and ``model_provider``/``strict_mode``/``fallback_provider``. See
+        :meth:`Models.run`.
         """
         low = cast(AsyncComfyLow, self._low)
         key = (
@@ -300,7 +331,13 @@ class AsyncModels(_ModelsBase):
             while True:
                 try:
                     return await low.post_model_run(
-                        model, payload, idempotency_key=key, timeout=timeout
+                        model,
+                        payload,
+                        idempotency_key=key,
+                        timeout=timeout,
+                        model_provider=model_provider,
+                        strict_mode=strict_mode,
+                        fallback_provider=fallback_provider,
                     )
                 except _CANDIDATE_FAILURES as exc:
                     delay = retrier.delay_before_retry(exc)
