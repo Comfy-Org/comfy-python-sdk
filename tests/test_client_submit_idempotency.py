@@ -38,7 +38,14 @@ def _wf(client: Comfy | AsyncComfy):
 
 
 def _closed_port() -> int:
-    """A port nothing is listening on — bound, read, then released."""
+    """A port nothing is listening on — bound, read, then released.
+
+    Released rather than held: holding the socket bound-but-not-listening
+    would close the tiny window in which something else could take the port,
+    but a SYN to such a port is *dropped* on macOS rather than refused, so the
+    connect runs to ``ConnectTimeout`` instead of the ``ConnectError`` these
+    tests are about. The window between release and connect is the price.
+    """
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
@@ -107,6 +114,25 @@ async def test_a_caller_supplied_key_round_trips_on_the_async_client(server) -> 
     assert server.state.jobs_idempotency_keys == ["abc-async"]
 
 
+def test_an_empty_caller_key_is_refused_before_any_request(server) -> None:
+    # `""` used to fall into the mint-a-fresh-key branch: the caller's dedup
+    # silently disabled, and the exception then reporting a key the caller
+    # never passed. Validated like `models.run`'s key, before any bytes move.
+    with Comfy() as client:
+        with pytest.raises(ValueError, match="must not be empty"):
+            client.submit(_wf(client), idempotency_key="")
+    assert server.state.jobs_idempotency_keys == []
+
+
+async def test_an_invalid_caller_key_is_refused_before_any_async_request(server) -> None:
+    async with AsyncComfy() as client:
+        with pytest.raises(ValueError, match="must not be empty"):
+            await client.submit(_wf(client), idempotency_key="")
+        with pytest.raises(ValueError, match="printable ASCII"):
+            await client.submit(_wf(client), idempotency_key="bad\r\nkey")
+    assert server.state.jobs_idempotency_keys == []
+
+
 # --- the retried paths: one key across every attempt ----------------------
 
 
@@ -139,6 +165,7 @@ async def test_an_exhausted_async_queue_full_budget_carries_the_retried_key(
     sent = server.state.jobs_idempotency_keys
     assert len(sent) > 1
     assert set(sent) == {excinfo.value.idempotency_key}
+    assert excinfo.value.idempotency_key is not None
 
 
 # --- reject-not-replay: the key that was refused --------------------------
@@ -230,10 +257,12 @@ async def test_async_run_surfaces_the_key_of_a_failed_submit_phase(server) -> No
 
 
 async def test_cancelling_an_in_flight_submit_still_yields_the_key(server) -> None:
-    # A submit cancelled mid-flight — what `asyncio.wait_for` around it does —
+    # A submit cancelled mid-flight — `task.cancel()` on the task awaiting it —
     # may already have reached the server and created a job, so the key is the
     # caller's only record of what to look for. The cancellation itself must
-    # still propagate: it is re-raised bare, never converted.
+    # still propagate: it is re-raised bare, never converted. (An
+    # `asyncio.wait_for` timeout is a different exit: it swallows the inner
+    # cancellation and raises its own `TimeoutError`, which carries no key.)
     seen: list[str | None] = []
 
     async def _cancelled_post_jobs(

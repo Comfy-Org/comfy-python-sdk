@@ -584,22 +584,32 @@ Three attributes carry this:
 All three read as `None` rather than raising on any exception `models.run`
 raises, so a handler never has to guard the attribute access itself.
 
-`submit()` — and so `run()`, which submits through it — stamps the key too, but
-what the key is *good for* differs, so read it with the surface in mind.
-`models.run` sends it to a surface that **replays** a claimed key, which is what
-makes it a handle on a generation you were already billed for. `POST /jobs`
-instead **rejects** a reused key with `422 idempotency_key_reuse` (see the
+`submit()` stamps the key too — on every failure of the `POST /jobs` attempt
+itself, and so on the submit phase of `run()`. A failure raised before the
+request exists (a UI-format workflow, an asset that would not upload) or while
+`run()` polls the job afterwards carries none. What the key is *good for*
+differs, so read it with the surface in mind. `models.run` sends it to a
+surface that **replays** a claimed key, which is what makes it a handle on a
+generation you were already billed for. `POST /jobs` instead **rejects** a
+reused key with `422 idempotency_key_reuse` (see the
 [`IdempotencyKeyReuse`](#typed-errors) bullet below): keys there are single-use
-and there is no replay. So on a `submit()` failure `exc.idempotency_key` tells
-you a key *was* sent — do not resubmit blindly under it, poll or list for the
-job the first attempt may already have created.
+and there is no replay. So on a `submit()` failure `exc.idempotency_key` is the
+key this attempt was made under, not a replay handle. Whether the server ever
+saw it depends on the failure: a connect failure never delivered it, and an
+exhausted `QueueFull` was refused on every attempt, so the key is unclaimed and
+resubmitting under it is fine. After an ambiguous failure — a read timeout, a
+connection dropped mid-request — poll or list for the job the first attempt may
+already have created rather than resubmitting under it.
 
-`idempotency_key` is still `None` on errors from every other surface — one that
-sends no key, and an asset upload, which mints a key per handle without
-recording it. So `None` means "this SDK did not record a key for you", **not**
-"no key was sent, resend freely": check for it before replaying, as the snippet above
-does, rather than passing it straight back into `idempotency_key=` where `None`
-means "mint a fresh one" and starts a second billed generation.
+`idempotency_key` reads as `None` on every `ComfyError` from other surfaces —
+one that sends no key, and an asset upload, which mints a key per handle without
+recording it. A raw `httpx` error from one of those key-free calls is re-raised
+untouched and does not carry the attribute at all, so a handler that spans
+surfaces reads it with `getattr(exc, "idempotency_key", None)`. Either way
+`None` means "this SDK did not record a key for you", **not** "no key was sent,
+resend freely": check for it before replaying, as the snippet above does, rather
+than passing it straight back into `idempotency_key=` where `None` means "mint a
+fresh one" and starts a second billed generation.
 
 ## Sync and async
 

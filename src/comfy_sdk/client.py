@@ -310,13 +310,25 @@ class Comfy:
         reused key is *rejected*, not replayed: on reuse, catch the error and
         poll/list for the job the first attempt already created.
 
-        Every exception a failed submit raises carries the key it was made
-        under on ``.idempotency_key`` — including a transport failure that
-        never reached a response (``httpx.ConnectError``, a read timeout),
-        which reads ``.request_id`` and ``.retry_after`` as ``None`` rather
-        than raising. Because a reused key is rejected rather than replayed,
-        that key is a record of what was sent, not a replay handle: use it to
-        go looking for the job, not to resubmit.
+        A caller-supplied ``idempotency_key`` is validated the way
+        ``models.run`` validates its own — an empty, over-long, or
+        non-printable-ASCII key raises ``ValueError`` here, before any request
+        — so an explicit ``""`` never silently mints a fresh key.
+
+        Every exception the ``POST /jobs`` attempt itself raises carries the
+        key it was made under on ``.idempotency_key``: the mapped
+        ``ComfyError``, a ``QueueFull`` once the retry budget is spent, and a
+        transport failure that never reached a response (``httpx.ConnectError``,
+        a read timeout), which reads ``.request_id`` and ``.retry_after`` as
+        ``None`` rather than raising. A failure raised before the request
+        exists — a UI-format workflow, an asset that would not upload — carries
+        none. Because a reused key is rejected rather than replayed, the key is
+        not a replay handle. Whether the server ever saw it depends on the
+        failure: a connect failure never delivered it and a ``QueueFull`` was
+        refused on every attempt, so the key is unclaimed and resubmitting
+        under it is fine; after an ambiguous failure (a read timeout, a
+        connection dropped mid-request) poll or list for the job the first
+        attempt may already have created rather than resubmitting under it.
 
         ``api_key`` authenticates partner (API) nodes embedded in the workflow
         (e.g. Gemini) — unrelated to idempotency and unrelated to the bearer
@@ -325,8 +337,14 @@ class Comfy:
         only when supplied; omitted from the request entirely otherwise.
         """
         _guard_ui_format(workflow)
+        # Validated before any bytes move, like `models.run`: `""` used to
+        # fall into the mint-a-fresh-key branch and disable the caller's dedup.
+        key = (
+            _core.validate_idempotency_key(idempotency_key)
+            if idempotency_key is not None
+            else _core.new_idempotency_key()
+        )
         graph = self._materialize(workflow)
-        key = idempotency_key or _core.new_idempotency_key()
         extra_data = _core.extra_data_for(api_key)
         deadline = _now() + _QUEUE_RETRY_BUDGET
         # The key is a local of this frame, so anything that propagates past
@@ -436,8 +454,12 @@ class AsyncComfy:
         import asyncio
 
         _guard_ui_format(workflow)
+        key = (
+            _core.validate_idempotency_key(idempotency_key)
+            if idempotency_key is not None
+            else _core.new_idempotency_key()
+        )
         graph = await self._materialize(workflow)
-        key = idempotency_key or _core.new_idempotency_key()
         extra_data = _core.extra_data_for(api_key)
         deadline = _now() + _QUEUE_RETRY_BUDGET
         # See :meth:`Comfy.submit` — same stamp, and here it also rides out on
