@@ -12,6 +12,8 @@ notes for each version.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-10
+
 ### Added
 
 - `Asset.get_download_url()` / `AsyncAsset.get_download_url()` — a
@@ -398,6 +400,7 @@ First public release of the Comfy API v2 Python SDK (`comfy-sdk`).
 - Sync and async clients. Python 3.10+.
 
 [unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.9...HEAD
+[0.2.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.5...v0.1.7
