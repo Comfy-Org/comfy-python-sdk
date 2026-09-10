@@ -180,11 +180,14 @@ def error_from_envelope(
     ``invalid_input`` into ``invalid_workflow`` (failing every reachability
     probe), and its ``403`` ``not_enabled`` into ``forbidden`` (so ``except
     NotEnabled`` — the one handler every pre-launch caller writes — never
-    fired). Retyping only happens on responses that carry a bucket, which only
-    Router sends, and there the bucket IS the truth; a v2 envelope carries
-    ``error.code`` and no top-level ``error_type``, and an intermediary's
-    reject carries neither, so both keep exactly the classes integrators
-    already catch.
+    fired). ``409`` has since been dropped from the table outright (see the
+    admission rule on :data:`_CODE_BY_STATUS`), so the first of those three no
+    longer needs this ordering as its second line of defence; the ordering
+    still decides the other two. Retyping only happens on responses that carry
+    a bucket, which only Router sends, and there the bucket IS the truth; a v2
+    envelope carries ``error.code`` and no top-level ``error_type``, and an
+    intermediary's reject carries neither, so both keep exactly the classes
+    integrators already catch.
     """
     err = (body or {}).get("error") if isinstance(body, dict) else None
     code = (err or {}).get("code") if isinstance(err, dict) else None
@@ -216,12 +219,37 @@ def error_from_envelope(
     )
 
 
+#: The last resort: a code guessed from the status, consulted only when the
+#: response named none of its own — no envelope ``error.code``, no Router
+#: bucket. That is exactly the population this table must be sized for, and it
+#: is not the compliant surface: the producers of a code-less body are Router
+#: (whose error body is ``{detail, error_type}``, with no ``error.code``) and
+#: the intermediaries between the caller and either surface, and neither is
+#: bound by what any route documents for the status.
+#:
+#: **Admission rule for a new status: only a status with ONE meaning across
+#: every documented surface gets a typed guess.** A status the contract itself
+#: spells two ways cannot be guessed, because the guess is not "unknown, but
+#: roughly this" — it is a class the caller catches and acts on.
+#:
+#: ``409`` is the worked example of exclusion, and it was removed from this
+#: table for that reason: the contract uses it for both ``hash_mismatch``
+#: (``POST /assets``) and ``asset_in_use`` (``DELETE /assets/{id}``), so even
+#: on the compliant surface the status alone does not say which. A code-less
+#: ``409`` therefore stays a bare ``ApiError`` carrying the real status, and
+#: surfaces to the caller as a plain ``ComfyError``. A real hash mismatch is
+#: unaffected: it always arrives enveloped, and ``error.code`` wins outright.
+#:
+#: ``422`` and ``429`` are kept deliberately, and the rule is what keeps them:
+#: their possible misreadings stay inside the right *action class*. A ``422``
+#: read as ``invalid_workflow`` is still a terminal refusal to fix the request;
+#: a ``429`` read as ``queue_full`` is still back-off-and-retry. ``HashMismatch``
+#: is the one that failed the rule — it tells the caller to re-upload bytes.
 _CODE_BY_STATUS: dict[int, str] = {
     401: "unauthorized",
     402: "insufficient_credits",
     403: "forbidden",
     404: "not_found",
-    409: "hash_mismatch",
     422: "invalid_workflow",
     429: "queue_full",
 }
