@@ -37,6 +37,15 @@ bucket the contract adds cannot land in the SDK as an untyped
 same comparison in CI, which is what makes the next vendored Router sync a real
 diff review rather than a silent widening.
 
+That gate reads values and order, which say nothing about the prose -- so a
+sync that rewrites a bucket's ``meaning`` (its retry guidance, say) would leave
+the docstring below silently stale with every check green. Each class therefore
+carries a ``_spec_meaning_digest``: :func:`_meaning_digest` of the ``meaning``
+its docstring was written against. It is a read marker, never a comparison
+against the docstring -- these docstrings deliberately reword the prose into
+reST, so equality is impossible by design -- and re-blessing one is a deliberate
+re-read, which is the whole point.
+
 **An unrecognised ``error_type`` raises the base class rather than failing.**
 The error set grows on the server's release cycle while an SDK is pinned by its
 users, so a bucket this version has never heard of must still arrive as a
@@ -71,6 +80,7 @@ summarises them for a human, but the branch a caller writes reads the entries.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -100,6 +110,27 @@ REQUEST_ID_HEADER = "X-Comfy-Request-Id"
 #: unreachable and turn the retry the default policy is built to make into a
 #: silent no-op.
 RETRY_AFTER_HEADER = "Retry-After"
+
+
+def _meaning_digest(meaning: str) -> str:
+    """First 12 hex of sha256 of the whitespace-normalized spec prose.
+
+    The single source of truth for the ``_spec_meaning_digest`` markers below,
+    for ``scripts/check_drift.py`` and for
+    ``tests/test_router_spec_contract.py`` -- three readers of one rule, so a
+    checker and a test can never disagree about what a bucket's digest is.
+
+    It hashes the **spec's** ``meaning``, never a docstring: a digest says "the
+    docstring was written against this version of the prose", which is a
+    question a checker can answer, where "does the docstring say the same
+    thing" is not.
+
+    ``" ".join(meaning.split())`` first, so a sync that only re-wraps a line or
+    re-indents a YAML block scalar does not demand a re-read that has nothing
+    to read. Truncated to 12 hex characters because this is a change detector
+    pasted into source by hand, not a security boundary.
+    """
+    return hashlib.sha256(" ".join(meaning.split()).encode("utf-8")).hexdigest()[:12]
 
 
 @dataclass(frozen=True)
@@ -185,7 +216,17 @@ class RouterError(ComfyError):
         self.errors: tuple[ValidationErrorDetail, ...] = tuple(errors)
 
 
-# -- the six request-level buckets -------------------------------------------
+# Each class below carries two lines of contract under its docstring:
+# `error_type`, the wire value it maps to, and `_spec_meaning_digest`, the
+# `_meaning_digest` of the spec `meaning` that docstring was written against.
+# The digest sits next to the docstring it blesses because re-blessing it is
+# the act of re-reading that docstring against the new prose. It is deliberately
+# absent from `RouterError` itself: a subclass that forgets it must fail the
+# check via `getattr(cls, "_spec_meaning_digest", None)` rather than inherit a
+# value that blesses prose nobody read.
+
+
+# -- request-level buckets ---------------------------------------------------
 
 
 class InvalidInput(RouterError):
@@ -200,6 +241,7 @@ class InvalidInput(RouterError):
     """
 
     error_type = "invalid_input"
+    _spec_meaning_digest: str = "de3933467ee7"
 
 
 class ContentPolicyViolation(RouterError):
@@ -211,12 +253,14 @@ class ContentPolicyViolation(RouterError):
     """
 
     error_type = "content_policy_violation"
+    _spec_meaning_digest: str = "bf2e91e6a6dd"
 
 
 class ProviderError(RouterError):
     """The upstream model provider returned an error."""
 
     error_type = "provider_error"
+    _spec_meaning_digest: str = "1a23c8c324dd"
 
 
 class ProviderTimeout(RouterError):
@@ -227,12 +271,14 @@ class ProviderTimeout(RouterError):
     """
 
     error_type = "provider_timeout"
+    _spec_meaning_digest: str = "eccffed3686f"
 
 
 class InsufficientCredits(RouterError):
     """The account does not have enough credits to run this model."""
 
     error_type = "insufficient_credits"
+    _spec_meaning_digest: str = "303c7b5e1b47"
 
 
 class ModelNotFound(RouterError):
@@ -240,21 +286,24 @@ class ModelNotFound(RouterError):
     names nothing"."""
 
     error_type = "model_not_found"
+    _spec_meaning_digest: str = "202e4b3e144d"
 
 
-# -- the nine transport-level buckets ----------------------------------------
+# -- transport-level buckets -------------------------------------------------
 
 
 class Unauthorized(RouterError):
     """Authentication is required, or the key presented was not accepted."""
 
     error_type = "unauthorized"
+    _spec_meaning_digest: str = "b6e0bf263c47"
 
 
 class Forbidden(RouterError):
     """The caller is authenticated but has no access to this model."""
 
     error_type = "forbidden"
+    _spec_meaning_digest: str = "e96ef9663ad4"
 
 
 class ConcurrencyLimitExceeded(RouterError):
@@ -268,12 +317,14 @@ class ConcurrencyLimitExceeded(RouterError):
     """
 
     error_type = "concurrency_limit_exceeded"
+    _spec_meaning_digest: str = "e5ae6e20a963"
 
 
 class ClientDisconnected(RouterError):
     """The client closed the connection before the request completed."""
 
     error_type = "client_disconnected"
+    _spec_meaning_digest: str = "51b8d3227903"
 
 
 class InternalError(RouterError):
@@ -284,6 +335,7 @@ class InternalError(RouterError):
     """
 
     error_type = "internal_error"
+    _spec_meaning_digest: str = "c9a8420f6251"
 
 
 class DeadlineExceeded(RouterError):
@@ -318,6 +370,7 @@ class DeadlineExceeded(RouterError):
     """
 
     error_type = "deadline_exceeded"
+    _spec_meaning_digest: str = "37858aa46b94"
 
 
 class NotEnabled(RouterError):
@@ -331,6 +384,7 @@ class NotEnabled(RouterError):
     """
 
     error_type = "not_enabled"
+    _spec_meaning_digest: str = "bc789c2d6efb"
 
 
 class ServiceUnavailable(RouterError):
@@ -365,6 +419,7 @@ class ServiceUnavailable(RouterError):
     """
 
     error_type = "service_unavailable"
+    _spec_meaning_digest: str = "28b40d6c0f89"
 
 
 class RateLimited(RouterError):
@@ -378,11 +433,12 @@ class RateLimited(RouterError):
     """
 
     error_type = "rate_limited"
+    _spec_meaning_digest: str = "a51a7fe6b18d"
 
 
 #: Every class in the closed set, in the order the error set declares it: the
-#: six request-level buckets, then the nine transport-level ones. The order is
-#: the vendored spec's ``x-comfy-error-types`` order, and
+#: request-level buckets, then the transport-level ones. The order is the
+#: vendored spec's ``x-comfy-error-types`` order, and
 #: ``tests/test_router_spec_contract.py`` asserts that -- so this tuple cannot
 #: drift from the contract two SDKs generate their surface from.
 ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (

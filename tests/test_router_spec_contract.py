@@ -5,7 +5,9 @@ restated here:
 
 * the closed error set it declares as ``x-comfy-error-types`` -- one entry per
   wire value, each with the ``meaning`` prose the exception docstrings
-  reproduce -- compared against :mod:`comfy_sdk.router_exceptions`;
+  reproduce -- compared against :mod:`comfy_sdk.router_exceptions`, both for
+  the values and their order and, per bucket, for whether that prose has moved
+  since its docstring was written;
 * the **route** ``post_model_run`` is bound to -- the path whose
   ``post.operationId`` is ``runRouterModel``, and the ``servers[0].url`` it is
   addressed against -- compared against
@@ -40,6 +42,7 @@ from comfy_sdk.router_exceptions import (
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
     RouterError,
+    _meaning_digest,
     exception_for,
 )
 
@@ -89,6 +92,19 @@ DECLARED_VALUES = [
     entry["value"]
     for entry in DECLARED
     if isinstance(entry, dict) and isinstance(entry.get("value"), str)
+]
+# The same filter, one field wider, for the tests that read `tier` and
+# `meaning`. Built at import for the same reason and with the same guard: an
+# entry missing either field would raise here rather than fail a test, and
+# `test_the_spec_states_a_meaning_and_a_tier_for_every_bucket` is what refuses
+# to let a filtered-out entry read as a pass.
+DECLARED_ENTRIES = [
+    entry
+    for entry in DECLARED
+    if isinstance(entry, dict)
+    and isinstance(entry.get("value"), str)
+    and isinstance(entry.get("tier"), str)
+    and isinstance(entry.get("meaning"), str)
 ]
 
 
@@ -155,6 +171,52 @@ def test_the_spec_states_a_meaning_and_a_tier_for_every_bucket() -> None:
         assert isinstance(entry, dict), f"x-comfy-error-types entry is not a mapping: {entry!r}"
         assert entry.get("tier") in {"request", "transport"}, entry
         assert isinstance(entry.get("meaning"), str) and entry["meaning"].strip(), entry
+
+
+def test_every_request_tier_bucket_precedes_every_transport_tier_one() -> None:
+    """The assumption that lets the order check above stand in for a tier check.
+
+    Nothing else in this file reads ``tier``: the class table is compared as a
+    flat ordered list, which only carries the request/transport split as long
+    as the spec keeps the two runs contiguous and request-first. A sync that
+    interleaved them would leave the section comments in
+    ``router_exceptions.py`` describing an order the spec no longer declares,
+    with every other assertion here green.
+    """
+    tiers = [entry["tier"] for entry in DECLARED_ENTRIES]
+    first_transport = tiers.index("transport") if "transport" in tiers else len(tiers)
+    assert "request" not in tiers[first_transport:], (
+        "the spec's x-comfy-error-types no longer declares every `request`-tier bucket "
+        f"before every `transport`-tier one: {tiers} -- the flat order comparison in this "
+        "file no longer implies the tier split the section comments in "
+        "src/comfy_sdk/router_exceptions.py describe"
+    )
+
+
+@pytest.mark.parametrize(
+    "entry", DECLARED_ENTRIES, ids=[entry["value"] for entry in DECLARED_ENTRIES]
+)
+def test_every_class_is_blessed_against_the_spec_s_current_meaning(
+    entry: dict[str, Any],
+) -> None:
+    """The read marker: this docstring was written against this ``meaning``.
+
+    Deliberately not a comparison against the docstring -- the docstrings
+    reword the spec's prose into reST, so equality is impossible by design.
+    The digest only answers whether the prose moved since someone last read it.
+    """
+    cls = exception_for(entry["value"])
+    expected = _meaning_digest(entry["meaning"])
+    # `getattr(..., None)` because `RouterError` deliberately declares no
+    # default: a subclass that forgets the marker has to fail here rather than
+    # inherit a blessing for prose nobody read.
+    assert getattr(cls, "_spec_meaning_digest", None) == expected, (
+        f"spec/router-openapi.yaml's `meaning` for {entry['value']!r} is not the prose "
+        f"{cls.__name__}'s docstring in src/comfy_sdk/router_exceptions.py was written "
+        "against -- it changed, or this class was never blessed. Re-read that docstring "
+        "against the entry's `meaning` and update it if the semantics moved, then set "
+        f'_spec_meaning_digest: str = "{expected}" on the class to record that.'
+    )
 
 
 # --- the route the SDK posts a model run to -----------------------------
