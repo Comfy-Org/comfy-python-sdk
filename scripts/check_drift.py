@@ -21,7 +21,11 @@ Three checks, one job:
    and ``servers[0].url``. A sync that *moves* the route (the ``/v1`` -> ``/v2``
    move already on the roadmap) while those constants stay put would leave the
    SDK posting to a route the contract no longer declares, with nothing else in
-   CI noticing.
+   CI noticing. The same check covers the **media types that route's 200 can
+   answer under**, because the SDK hand-branches on them too: an
+   ``application/json`` success decodes to a ``dict`` and any other one comes
+   back as a ``BinaryResult``, so a branch added or dropped upstream changes
+   what ``post_model_run`` returns.
 
 ``tests/test_router_spec_contract.py`` asserts the same things from the test
 suite. Both exist on purpose: the suite is where a contributor sees it, and
@@ -39,6 +43,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 COMMITTED = ROOT / "src" / "comfy_low" / "models" / "_generated.py"
 ROUTER_SPEC = ROOT / "spec" / "router-openapi.yaml"
+
+#: The media types ``runRouterModel``'s ``200`` is expected to declare, sorted.
+#: This is not a restatement of the spec for its own sake: it is the shape
+#: ``comfy_low.transport._Prepared.parse_run_result`` is written against -- one
+#: JSON branch that decodes to a ``dict``, one catch-all binary branch that
+#: comes back as a ``BinaryResult``. Unlike the path and host below, there is no
+#: constant in the SDK to compare against, because the branch is control flow
+#: rather than data; so the expectation lives here.
+_BOUND_RUN_MEDIA_TYPES = ["*/*", "application/json"]
 
 
 def _generate(out: Path) -> None:
@@ -125,8 +138,8 @@ def _declared_router_error_types() -> list[str]:
     return values
 
 
-def _declared_run_route() -> tuple[str, str]:
-    """The spec's ``(runRouterModel path, servers[0].url)``.
+def _declared_run_route() -> tuple[str, str, list[str]]:
+    """The spec's ``(runRouterModel path, servers[0].url, 200 media types)``.
 
     Same failure policy as :func:`_declared_router_error_types`: every way the
     file can be unusable becomes a ``ValueError`` with a sentence someone can
@@ -173,7 +186,17 @@ def _declared_run_route() -> tuple[str, str]:
     host = servers[0].get("url")
     if not isinstance(host, str) or not host:
         raise ValueError(f"{ROUTER_SPEC.name}'s servers[0].url is not a non-empty string")
-    return declared[0], host
+
+    # The media types that route's 200 can answer under. The SDK branches on
+    # exactly two -- JSON to a dict, anything else to a BinaryResult -- so a
+    # sync that drops or adds one changes what `post_model_run` must return.
+    responses = paths[declared[0]]["post"].get("responses")
+    if not isinstance(responses, dict) or not isinstance(responses.get("200"), dict):
+        raise ValueError(f"{ROUTER_SPEC.name}'s runRouterModel declares no 200 response")
+    content = responses["200"].get("content")
+    if not isinstance(content, dict) or not content:
+        raise ValueError(f"{ROUTER_SPEC.name}'s runRouterModel 200 declares no content")
+    return declared[0], host, sorted(content)
 
 
 def _check_router_run_route() -> int:
@@ -188,12 +211,24 @@ def _check_router_run_route() -> int:
         return 1
 
     try:
-        declared_path, declared_host = _declared_run_route()
+        declared_path, declared_host, declared_media = _declared_run_route()
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     failed = False
+    if declared_media != _BOUND_RUN_MEDIA_TYPES:
+        print(
+            f"ERROR: the model-run 200's media types have drifted from {ROUTER_SPEC.name}.\n"
+            f"  spec (runRouterModel 200 content): {declared_media}\n"
+            f"  sdk  (the branches parse_run_result takes): {_BOUND_RUN_MEDIA_TYPES}\n"
+            "  comfy_low.transport._Prepared.parse_run_result decodes an "
+            "'application/json' success to a dict and returns anything else as a "
+            "BinaryResult. A branch added or removed upstream changes what "
+            "post_model_run returns, so reconcile it rather than widening this list.",
+            file=sys.stderr,
+        )
+        failed = True
     if declared_path != _MODEL_RUN_PATH_TEMPLATE:
         print(
             f"ERROR: the bound model-run route has drifted from {ROUTER_SPEC.name}.\n"
@@ -214,7 +249,10 @@ def _check_router_run_route() -> int:
         failed = True
     if failed:
         return 1
-    print(f"OK: the SDK posts a model run to {declared_host}{declared_path}, as the spec declares")
+    print(
+        f"OK: the SDK posts a model run to {declared_host}{declared_path} and branches its "
+        f"200 on {declared_media}, as the spec declares"
+    )
     return 0
 
 

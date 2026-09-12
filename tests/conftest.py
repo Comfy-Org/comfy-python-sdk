@@ -120,6 +120,21 @@ class ServerState:
     # interstitial served under a 200, a response truncated mid-stream. The
     # generation ran and was billed; only the result is unreadable.
     model_run_undecodable_body: bool = False
+    # The Content-Type that undecodable body is served under. `application/json`
+    # by default, because that is the case that is still an ERROR: the response
+    # promised a JSON document and did not deliver one. Point it at `text/html`
+    # and the same body is instead a success carrying non-JSON bytes, which is
+    # what the run route's `*/*` branch says to do with it — the SDK cannot tell
+    # a proxy's interstitial from a partner's native text output, and on this
+    # route the contract says the body is the partner's.
+    model_run_undecodable_content_type: str = "application/json"
+    # Answer a successful run with these raw bytes under
+    # `model_run_binary_content_type` instead of `model_run_result` as JSON —
+    # the ElevenLabs-shaped direct-return binary 200. `None` serves JSON.
+    model_run_binary_body: bytes | None = None
+    # Content-Type for `model_run_binary_body`. `None` sends no Content-Type
+    # header at all, which is the header-stripping-intermediary case.
+    model_run_binary_content_type: str | None = "audio/mpeg"
     # Model the deployment `retry_possibly_in_flight` exists for: one that
     # *replays* a repeated Idempotency-Key rather than rejecting it, so a key
     # is released rather than claimed when a request fails 5xx. Default False
@@ -149,8 +164,10 @@ class ServerState:
     # 409). `None` sends no header at all, which is the same failure the policy
     # must *not* retry.
     model_run_retry_after: str | None = None
-    # Sent as X-Comfy-Request-Id alongside a failed run. `None` sends no header,
-    # which is the response an intermediary that never reached the router gives.
+    # Sent as X-Comfy-Request-Id on a model run's answer, success or failure —
+    # Router stamps it on both, and `BinaryResult.request_id` is read off a
+    # success. `None` sends no header, which is the response an intermediary
+    # that never reached the router gives.
     model_run_request_id: str | None = None
     # Answer a repeated model-run key with the v2 jobs rule (422
     # idempotency_key_reuse) instead of the router contract's replay-or-409.
@@ -305,12 +322,25 @@ def _make_handler(state: ServerState):
             self.end_headers()
             self.wfile.write(body)
 
-        def _raw(self, status: int, body: bytes, content_type: str) -> None:
+        def _raw(
+            self,
+            status: int,
+            body: bytes,
+            content_type: str | None,
+            headers: dict | None = None,
+        ) -> None:
             """A response whose body is *not* JSON — the case a client that
-            calls ``.json()`` unguarded on a success status falls over on."""
+            calls ``.json()`` unguarded on a success status falls over on.
+
+            ``content_type=None`` sends **no** ``Content-Type`` header at all,
+            which is a real shape (an intermediary that strips it) and the one a
+            client branching on the header has nothing to branch on."""
             self.send_response(status)
-            self.send_header("Content-Type", content_type)
+            if content_type is not None:
+                self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -551,7 +581,7 @@ def _make_handler(state: ServerState):
             # rather than rejecting the resend, and the model does not run
             # again — which is the whole point of asking under the same key.
             if key and key in state.model_run_replay_store:
-                self._json(
+                self._serve_run_result(
                     200,
                     state.model_run_replay_store[key],
                     headers={"Idempotent-Replayed": "true"},
@@ -654,10 +684,34 @@ def _make_handler(state: ServerState):
                 self._raw(
                     state.model_run_status,
                     b"<html><body>502 from an intermediary</body></html>",
-                    "text/html",
+                    state.model_run_undecodable_content_type,
                 )
                 return
-            self._json(state.model_run_status, state.model_run_result)
+            self._serve_run_result(state.model_run_status, state.model_run_result)
+
+        def _serve_run_result(
+            self, status: int, payload: dict, headers: dict | None = None
+        ) -> None:
+            """A successful run's body — the partner's JSON, or its own bytes.
+
+            Both shapes go through one helper so the *replay* of a claimed key
+            answers in whichever shape the run itself would have: the route's
+            ``Idempotent-Replayed`` 200 carries the recorded result, and a
+            recorded result that was audio is still audio.
+            """
+            if state.model_run_request_id is not None:
+                # Router stamps the id on every answer, not only on failures;
+                # `BinaryResult.request_id` is read off a *success*.
+                headers = {**(headers or {}), "X-Comfy-Request-Id": state.model_run_request_id}
+            if state.model_run_binary_body is not None:
+                self._raw(
+                    status,
+                    state.model_run_binary_body,
+                    state.model_run_binary_content_type,
+                    headers=headers,
+                )
+                return
+            self._json(status, payload, headers=headers)
 
         def _post_jobs(self) -> None:
             state.submit_count += 1
