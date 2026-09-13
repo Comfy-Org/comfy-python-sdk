@@ -49,6 +49,30 @@ class Asset(BaseModel):
     ] = None
 
 
+class JobLogs(BaseModel):
+    """
+    A job's captured execution log — the body of `GET /api/v2/jobs/{id}/logs`. Diagnostics, not a contract on content: this is whatever the workflow's own code and nodes wrote to standard output, in the order they wrote it, so nothing about its shape is stable between runs or between releases of a build. It is **untrusted text** — a workflow chooses what goes in it — and must be rendered as plain text rather than interpreted.
+    """
+
+    text: Annotated[str, Field(description='The captured output.')]
+    truncated: Annotated[
+        bool,
+        Field(
+            description='The BEGINNING of the captured output was discarded — `text` is the TAIL of a longer run. Implementations bound what they capture and store, so a workflow that prints megabytes keeps its last lines, where a failure normally is, instead of being dropped whole. True with an empty `text` means the log was captured and then shed entirely to fit. This describes the stored log, never the response: it does not mean a caller asked for part of one.'
+        ),
+    ]
+    captured_at: Annotated[
+        AwareDatetime,
+        Field(description="When the run's output was read back off the worker."),
+    ]
+    complete: Annotated[
+        bool,
+        Field(
+            description='No further output will be appended to this log. Always `true` today, because a log is read back off the worker once, when the run ends, so a log that exists is already whole. Sent so that a surface which later captures output while a run is still going can say so, and a client written now against `false` keeps working when it does. `false` does not promise that more output will arrive, only that this snapshot may not be the last one.'
+        ),
+    ]
+
+
 class Format(Enum):
     """
     Discriminates the `workflow` field's shape. `save`: the original authoring workflow JSON, at the version pinned to the job. `api`: the executed API-format prompt graph.
@@ -100,6 +124,12 @@ class JobUrls(BaseModel):
     self: str
     events: str
     cancel: str
+    logs: Annotated[
+        str | None,
+        Field(
+            description='Where to read what this run printed. Present on any surface that captures execution logs, which is why it is the one link here that is optional: absent means this surface captures none, for any job, so a client can stop looking without spending a request on an answer it already has.\nFollow this link rather than building the path from the job id. The two are not interchangeable: a surface may be mounted under a prefix this link already carries and a hand-built path would not, and a surface that does not implement the operation at all answers a routing `404` — indistinguishable, to the client, from the `404` that means the job itself is gone. Present does NOT mean this job has a log, and it is deliberately not a signal about one: a surface that captures logs offers the link on every job, including those it will answer `204` for and those whose log it withholds. Read the log, not the link.'
+        ),
+    ] = None
 
 
 class Progress(BaseModel):
@@ -251,7 +281,13 @@ class Output(BaseModel):
     A committed job output. Outputs are assets: `id` is the asset UUID, retrievable via GET /api/v2/assets/{id} for as long as the job is retained. `hash` is lazily computed and may be null on the retrieval hot path.
     """
 
-    node_id: Annotated[str, Field(examples=['9'])]
+    node_id: Annotated[
+        str,
+        Field(
+            description='The workflow node that reported this file; empty when the worker named none.',
+            examples=['9'],
+        ),
+    ]
     name: Annotated[str, Field(examples=['ComfyUI_00001_.png'])]
     type: OutputType
     content_type: Annotated[str, Field(examples=['image/png'])]
