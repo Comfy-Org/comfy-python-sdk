@@ -285,7 +285,12 @@ def error_from_envelope(
     integrators already catch.
     """
     err = (body or {}).get("error") if isinstance(body, dict) else None
-    code = (err or {}).get("code") if isinstance(err, dict) else None
+    # `_clean`ed like every other code source: an empty or whitespace
+    # `error.code` reads as absent rather than surviving as a code of its own.
+    # Without it `{"error": {"code": ""}}` is not None, so it short-circuits
+    # both the Router bucket and the status table below and a bare 401 yields
+    # `ApiError(code="")` instead of `Unauthorized`.
+    code = _clean((err or {}).get("code") if isinstance(err, dict) else None)
     # Through `_clean` like every other string read off the wire: `message` ends
     # up as `str(exc)`, and a non-string here (a list, a number) would make that
     # raise `TypeError: __str__ returned non-string` at the one moment — inside
@@ -342,10 +347,11 @@ def error_from_envelope(
 #: the intermediaries between the caller and either surface, and neither is
 #: bound by what any route documents for the status.
 #:
-#: **Admission rule for a new status: only a status with ONE meaning across
-#: every documented surface gets a typed guess.** A status the contract itself
-#: spells two ways cannot be guessed, because the guess is not "unknown, but
-#: roughly this" — it is a class the caller catches and acts on.
+#: **Admission rule for a new status: a status gets a typed guess only when
+#: every meaning the contract gives it asks the caller for the SAME action.**
+#: The guess is not "unknown, but roughly this" — it is a class the caller
+#: catches and acts on, so what has to be single-valued is the action, not the
+#: code. A status whose meanings span two action classes cannot be guessed.
 #:
 #: ``409`` is the worked example of exclusion, and it was removed from this
 #: table for that reason: the contract uses it for both ``hash_mismatch``
@@ -353,13 +359,26 @@ def error_from_envelope(
 #: on the compliant surface the status alone does not say which. A code-less
 #: ``409`` therefore stays a bare ``ApiError`` carrying the real status, and
 #: surfaces to the caller as a plain ``ComfyError``. A real hash mismatch is
-#: unaffected: it always arrives enveloped, and ``error.code`` wins outright.
+#: unaffected *whenever its body decodes*: ``error.code`` is then present and
+#: wins outright. The one path it does not cover is a body that fails to parse
+#: at all — the transport sets ``body=None`` for an HTML proxy page or a
+#: truncated response, so a genuine ``POST /assets`` mismatch behind a broken
+#: intermediary now raises ``ComfyError`` rather than ``HashMismatch``. That is
+#: the trade this table exists to make: on an unparseable body there is nothing
+#: that distinguishes the two documented ``409``s, and inventing the re-upload
+#: one is the guess being removed.
 #:
-#: ``422`` and ``429`` are kept deliberately, and the rule is what keeps them:
-#: their possible misreadings stay inside the right *action class*. A ``422``
-#: read as ``invalid_workflow`` is still a terminal refusal to fix the request;
-#: a ``429`` read as ``queue_full`` is still back-off-and-retry. ``HashMismatch``
-#: is the one that failed the rule — it tells the caller to re-upload bytes.
+#: ``422`` and ``429`` are kept deliberately: their misreadings stay inside one
+#: action class. A ``429`` read as ``queue_full`` is still back-off-and-retry.
+#: A ``422`` read as ``invalid_workflow`` is still a terminal refusal — with
+#: one known exception, ``idempotency_key_reuse``, whose real answer is "your
+#: first request was already accepted, do NOT resubmit". It is retained because
+#: every ``422`` the contract documents arrives enveloped and is therefore
+#: decided by ``error.code`` before this table is reached (``IdempotencyKeyReuse``
+#: is in :data:`_BY_CODE`); only a code-less ``422`` — which no documented
+#: surface emits — could reach the guess. ``HashMismatch`` failed the rule on
+#: a stronger footing: it tells the caller to re-upload bytes, and ``409``
+#: *is* emitted code-less by Router and intermediaries.
 _CODE_BY_STATUS: dict[int, str] = {
     401: "unauthorized",
     402: "insufficient_credits",
