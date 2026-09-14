@@ -137,7 +137,7 @@ def test_the_sans_io_request_builder_agrees_with_the_wire() -> None:
         # `RouterModelSegment` pattern, and none of them is percent-encoded:
         # they are unreserved (or sub-delims) in a path segment, so the URL the
         # caller reads in a log is the id they passed.
-        ("fal-ai/flux-pro", "/v2/models/fal-ai/flux-pro"),
+        ("bfl/flux-2-pro", "/v2/models/bfl/flux-2-pro"),
         ("acme/sd_xl.turbo", "/v2/models/acme/sd_xl.turbo"),
         ("acme_labs/v1.5", "/v2/models/acme_labs/v1.5"),
         # ...while anything that would change the *structure* of the path is
