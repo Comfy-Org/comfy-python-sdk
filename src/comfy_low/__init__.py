@@ -17,6 +17,7 @@ from __future__ import annotations
 from . import models
 from .errors import (
     ApiError,
+    AssetInUse,
     BlobNotFound,
     Forbidden,
     HashMismatch,
@@ -77,6 +78,7 @@ __all__ = [
     "WorkflowFormatUi",
     "MissingAsset",
     "HashMismatch",
+    "AssetInUse",
     "BlobNotFound",
     "IdempotencyKeyReuse",
     "QueueFull",

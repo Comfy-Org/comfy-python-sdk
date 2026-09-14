@@ -281,6 +281,13 @@ older [comfy-api-proxy](https://github.com/Comfy-Org/comfy-api-proxy)
 returns `405` instead. (`AsyncAsset.delete()` / `AsyncAssetFactory.delete()`
 mirror both with `await`.)
 
+A delete the platform still depends on raises
+[`AssetInUse`](#typed-errors) — a job's outputs reference the record, a
+moderation workflow requires it preserved. Which hold applies is deliberately
+not stated, and an immediate retry does not clear it; on an `Asset` handle the
+id survives the refusal, so you can retry once the hold clears without
+re-uploading.
+
 ## Live progress
 
 ```python
@@ -806,6 +813,9 @@ asset, job, event, and output helpers translate protocol errors, so catches of
   catches this locally before it ever reaches the server.
 - `MissingAsset` — a `core/ASSET` reference could not be resolved.
 - `HashMismatch`, `BlobNotFound` — asset upload/dedup failures.
+- `AssetInUse` — a delete was refused because the platform still depends on the
+  asset — see [Assets and `core/ASSET`](#assets-and-coreasset). An immediate
+  retry does not clear the hold; the asset stays deletable once it does.
 - `IdempotencyKeyReuse` — the `Idempotency-Key` was reused. `submit()` (and
   `run()`) attach a fresh key to every call, so an accidental exact resend never
   runs the workflow twice. Keys are single-use — reject-on-duplicate, there is
