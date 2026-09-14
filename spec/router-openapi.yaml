@@ -346,7 +346,7 @@ components:
       additionalProperties: true
     RouterModelSegment:
       type: string
-      description: Lowercase `model` segment of the canonical `{provider}/{model}[/{variant}]` model ID - the model to run within that provider. Shared by the invocation route's `model` path parameter and a catalog entry's `model` field, for the same no-drift reason as `RouterProviderSegment`.
+      description: Lowercase `model` segment of the canonical `{provider}/{model}` model ID - the model to run within that provider. Shared by the invocation route's `model` path parameter and a catalog entry's `model` field, for the same no-drift reason as `RouterProviderSegment`.
       pattern: ^[a-z0-9]+([._-][a-z0-9]+)*$
       maxLength: 128
       example: flux-2-pro
@@ -359,7 +359,7 @@ components:
       example: q7Fm2xTn9pLd4RsV
     RouterProviderSegment:
       type: string
-      description: Lowercase `provider` segment of the canonical `{provider}/{model}[/{variant}]` model ID - the partner whose model is being addressed. The invocation route's `provider` path parameter and a catalog entry's `provider` field both reference this one schema, which is what keeps the listed IDs and the accepted IDs from drifting apart.
+      description: Lowercase `provider` segment of the canonical `{provider}/{model}` model ID - the partner whose model is being addressed. The invocation route's `provider` path parameter and a catalog entry's `provider` field both reference this one schema, which is what keeps the listed IDs and the accepted IDs from drifting apart.
       pattern: ^[a-z0-9]+([._-][a-z0-9]+)*$
       maxLength: 64
       example: bfl
@@ -518,14 +518,14 @@ components:
       name: model
       in: path
       required: true
-      description: Lowercase model segment of the canonical `{provider}/{model}[/{variant}]` model ID - the model to run within that provider.
+      description: Lowercase model segment of the canonical `{provider}/{model}` model ID - the model to run within that provider.
       schema:
         $ref: '#/components/schemas/RouterModelSegment'
     RouterProvider:
       name: provider
       in: path
       required: true
-      description: Lowercase provider segment of the canonical `{provider}/{model}[/{variant}]` model ID - the partner whose model is being run.
+      description: Lowercase provider segment of the canonical `{provider}/{model}` model ID - the partner whose model is being run.
       schema:
         $ref: '#/components/schemas/RouterProviderSegment'
   headers:
