@@ -521,6 +521,63 @@ def error_from_response(
     )
 
 
+def error_from_completion(
+    payload: Any,
+    *,
+    request_id: str | None = None,
+    retry_after: int | None = None,
+) -> RouterError | None:
+    """The typed exception a *completed* queued request reports, or ``None``.
+
+    The queue expresses a failure and a cancellation the same way it expresses
+    a success: the request reaches ``COMPLETED``, and the failure rides in the
+    body as an ``error_type``. There is no error *status* to read — the poll
+    that discovered it was a ``200`` — so a client that only mapped HTTP status
+    codes would hand a caller a failed generation as a successful result.
+
+    Returns ``None`` when the payload names no ``error_type``, which is the
+    ordinary success path; every caller has to treat that as "no error found"
+    rather than as "no error possible".
+
+    ``http_status`` is left unset on what this builds, deliberately: there was
+    no failing status. That also keeps :mod:`comfy_sdk.retry` out of it — a
+    completion carrying an ``error_type`` is the server's final answer about a
+    request that already ran, not a transport condition another attempt could
+    survive.
+
+    Like :func:`error_from_response`, this never raises: a malformed body
+    degrades to the least specific exception the payload still supports.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    error_type = _clean(payload.get("error_type"))
+    if error_type is None:
+        return None
+
+    errors: tuple[ValidationErrorDetail, ...] = ()
+    detail: str | None = None
+    raw_detail = payload.get("detail")
+    if isinstance(raw_detail, str):
+        detail = raw_detail or None
+    elif isinstance(raw_detail, Sequence) and not isinstance(raw_detail, (str, bytes)):
+        errors = tuple(_detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping))
+
+    if detail is None:
+        detail = _summarise(errors) or f"the request completed with error_type {error_type!r}"
+
+    return exception_for(error_type)(
+        detail,
+        error_type=error_type,
+        # Filtered, not merely stripped, and by the same function
+        # `error_from_response` uses: a completion's id is just as
+        # server-controlled as a header's, and it lands in the same displayed,
+        # pasted-into-a-support-ticket place.
+        request_id=clean_request_id(request_id),
+        retry_after=retry_after,
+        errors=errors,
+    )
+
+
 def _lowercase_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
     """Header names are case-insensitive on the wire; normalise so a plain dict
     works as well as an ``httpx.Headers``."""
@@ -617,6 +674,7 @@ __all__ = [
     "ServiceUnavailable",
     "Unauthorized",
     "ValidationErrorDetail",
+    "error_from_completion",
     "error_from_response",
     "exception_for",
 ]

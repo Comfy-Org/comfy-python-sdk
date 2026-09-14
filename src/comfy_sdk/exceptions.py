@@ -23,7 +23,8 @@ class ComfyError(Exception):
     """Base for every SDK-level error."""
 
     #: The ``Idempotency-Key`` the failed call was made under. Populated by
-    #: :meth:`comfy_sdk.models.Models.run` and its async twin, and by
+    #: :meth:`comfy_sdk.models.Models.run` and
+    #: :meth:`comfy_sdk.models.Models.submit` and their async twins, and by
     #: :meth:`comfy_sdk.client.Comfy.submit` /
     #: :meth:`comfy_sdk.client.AsyncComfy.submit` on every failure of the
     #: ``POST /jobs`` attempt itself — and so by the submit phase of
@@ -37,15 +38,15 @@ class ComfyError(Exception):
     #: a resend is safe.
     #:
     #: What the key is *good for* differs by surface, so read it with the
-    #: operation in mind: ``models.run`` sends it to a surface that replays a
-    #: claimed key, so the key is a handle on the generation you were already
-    #: billed for. ``POST /jobs`` instead *rejects* a reused key with
-    #: ``422 idempotency_key_reuse``, so on a ``submit`` failure the key is the
-    #: one this attempt was made under, not a replay handle: after an
-    #: ambiguous failure poll or list for the job the first attempt may have
-    #: created rather than resubmitting under it, while a failure the server
-    #: never saw (a connect failure, an exhausted ``QueueFull``) leaves the key
-    #: unclaimed.
+    #: operation in mind: ``models.run`` and ``models.submit`` send it to a
+    #: surface that replays a claimed key, so the key is a handle on the
+    #: generation you were already billed for. ``POST /jobs`` instead
+    #: *rejects* a reused key with ``422 idempotency_key_reuse``, so on a
+    #: ``Comfy.submit`` failure the key is the one this attempt was made
+    #: under, not a replay handle: after an ambiguous failure poll or list for
+    #: the job the first attempt may have created rather than resubmitting
+    #: under it, while a failure the server never saw (a connect failure, an
+    #: exhausted ``QueueFull``) leaves the key unclaimed.
     #:
     #: Declared on the base rather than set per subclass so that a bucket this
     #: SDK version has never heard of — which arrives as a bare
