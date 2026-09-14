@@ -100,12 +100,40 @@ for `py310`. Anything newer than 3.10 syntax breaks a quarter of the matrix.
 
 ### `public-repo-hygiene`
 
-This repo is public. [`scripts/check_public_repo_hygiene.py`](scripts/check_public_repo_hygiene.py)
-scans every git-tracked file (except its own source and
-`src/comfy_low/models/`) and fails on three categories:
+This repo is public. [`.github/workflows/public-repo-hygiene.yml`](.github/workflows/public-repo-hygiene.yml)
+is a thin caller into the shared reusable workflow in `Comfy-Org/github-workflows`,
+which owns both the checker and its known-public allowlist — this repo used to
+carry its own copy of the checker (`scripts/check_public_repo_hygiene.py`), but
+that let a PR widen the allowlist or disable the scan and still go green. The
+reusable loads the checker from a pinned `workflows_ref` commit instead, so a
+PR here cannot reach it through this workflow's inputs.
+
+**What the pin does and does not buy.** `workflows_ref` binds the checker to the
+commit the caller's own `uses:` line selected — the reusable asserts the two
+match, and that is all it asserts. A `pull_request` run executes the workflow
+file from the PR head, so a PR that rewrites *both* the `uses:` SHA and
+`workflows_ref` (or replaces the caller job outright) still satisfies that
+equality check while running a checker of its own choosing. That is true of
+every reusable workflow on GitHub, not a quirk of this one.
+
+The control for it is out of band, and it is a branch-protection setting rather
+than a file in this repo: `main` requires an approving **code-owner** review and
+dismisses stale approvals on every new push, so a change under
+`.github/workflows/` cannot land on its author's say-so.
+[`.github/CODEOWNERS`](.github/CODEOWNERS) owns `*`, which is what puts the
+workflow directory under that requirement — but CODEOWNERS *alone* enforces
+nothing, it only names reviewers. The rule is not absolute either: it is not
+enforced for administrators. Relax the branch-protection setting and the pin's
+guarantee relaxes with it, silently.
+
+The job runs from its own workflow file, not `ci.yml`, so the status-check
+context it reports is `hygiene / public-repo-hygiene`.
+
+The checker scans every git-tracked file (except `src/comfy_low/models/`) and
+fails on three categories:
 
 1. **Ticket-shaped identifiers** — anything matching `[A-Z]{2,6}-\d{2,6}`.
-   Common tech acronyms are handled by an explicit allowlist in the script.
+   Common tech acronyms are handled by an explicit allowlist.
 2. **Internal collaboration-tool links/markers** — Notion, Slack archive and
    client links, Google Docs/Drive, Datadog, PostHog project links, Linear, and
    `incident-<n>` strings.
@@ -116,14 +144,8 @@ scans every git-tracked file (except its own source and
 Practical consequence: **do not paste internal context into code comments,
 docstrings, commit-adjacent docs, or test fixtures.** Describe *why* in plain
 prose instead of linking to where the discussion happened. If a flag is a
-genuine false positive, extend the allowlist in the script with a comment
-explaining why — do not loosen the regex.
-
-Run it locally with plain Python; it needs no dependencies:
-
-```bash
-python3 scripts/check_public_repo_hygiene.py
-```
+genuine false positive, the allowlist lives in `Comfy-Org/github-workflows`,
+not this repo — file the fix there.
 
 ### `build-check`
 
