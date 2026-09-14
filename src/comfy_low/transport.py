@@ -23,6 +23,11 @@ hand-*invented*. It stays out of ``comfy_low.OPERATION_IDS`` (which is the
 — and ``tests/test_router_spec_contract.py`` plus ``scripts/check_drift.py``
 fail if that constant and the vendored path disagree.
 
+It is also the one binding whose success may not be JSON: that route's ``200``
+declares a ``*/*`` ``format: binary`` branch beside its ``application/json``
+one, so it returns ``dict | BinaryResult`` and parses through
+:meth:`_Prepared.parse_run_result` rather than :meth:`_Prepared.parse_or_raise`.
+
 This layer contains no orchestration, retries, hashing, or reconnection — those
 live in ``comfy_sdk``.
 """
@@ -35,10 +40,11 @@ import secrets
 import sys
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, NoReturn, cast
 from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
 import httpx
@@ -90,6 +96,79 @@ ROUTER_BASE_URL = "https://api.comfy.org"
 _MODEL_RUN_PATH_TEMPLATE = "/v2/models/{provider}/{model}"
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+@dataclass(frozen=True)
+class BinaryResult:
+    """A completed model run whose native output is bytes rather than JSON.
+
+    What ``post_model_run`` — and so ``comfy_sdk.models.run`` — returns instead
+    of a ``dict`` when Comfy Router answers a run under a media type that is not
+    JSON. Router forwards the partner model's output *unchanged*, and for a
+    model whose partner answers a generation directly as bytes (the ElevenLabs
+    audio models are the first in the catalog) that output is raw audio under
+    the partner's own ``Content-Type``. The run route's ``200`` declares both
+    branches — ``application/json`` and a ``*/*`` ``format: binary`` one — and
+    the spec tells clients to branch on the response ``Content-Type``.
+
+    The bytes are handed over exactly as they arrived: not base64-encoded, not
+    wrapped in a dict, not decoded or transcoded. The point of the surface is
+    that the partner's native output comes back unchanged, so writing
+    ``result.content`` to a file gives you the file the partner produced.
+
+    Frozen because it is a value, not a handle: two runs that produced the same
+    bytes under the same media type are the same result.
+    """
+
+    #: The response body verbatim — the partner's own file bytes.
+    content: bytes
+    #: The response's ``Content-Type`` **verbatim**, parameters included
+    #: (``audio/mpeg``, ``audio/L16; rate=16000``, ...), because for some
+    #: partner media types the parameters are part of what the bytes are.
+    #: Empty string when the response carried no ``Content-Type`` at all.
+    content_type: str
+    #: The server-minted ``X-Comfy-Request-Id`` for the call, or ``None`` when
+    #: the response named none. The id to quote in a support request — the same
+    #: one a failure of this call would have carried on ``exc.request_id``.
+    request_id: str | None
+
+    def __repr__(self) -> str:
+        # Written out rather than inherited: the dataclass default would render
+        # the whole body, and this object lands in tracebacks, REPL echoes and
+        # CI logs holding a multi-megabyte audio file. The length is the part
+        # anyone reading a repr actually wants.
+        return (
+            f"{type(self).__name__}(content=<{len(self.content)} bytes>, "
+            f"content_type={self.content_type!r}, request_id={self.request_id!r})"
+        )
+
+
+def media_type(content_type: str | None) -> str:
+    """The bare, lowercased media type of a ``Content-Type`` header value.
+
+    ``"application/json; charset=utf-8"`` -> ``"application/json"``. Returns
+    ``""`` for ``None`` or for a header that names no type at all, which is the
+    "the response said nothing" case callers branch on separately from "the
+    response said something that is not JSON".
+    """
+    if not content_type:
+        return ""
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def is_json_media_type(media: str) -> bool:
+    """Whether ``media`` (a bare media type) denotes a JSON document.
+
+    ``application/json`` and the ``+json`` structured suffix (RFC 6839), which
+    is what the run route's ``application/json`` branch covers and what a
+    partner returning a JSON-shaped result arrives under. Everything else is
+    the ``*/*`` binary branch as far as this SDK is concerned — deliberately
+    including ``text/plain`` and ``text/html``: the SDK cannot tell a partner's
+    native text output from a proxy interstitial, and on this route the
+    contract says the body is the partner's, so it hands the bytes back rather
+    than throwing away a generation the caller was billed for.
+    """
+    return media == "application/json" or media.endswith("+json")
 
 
 def parse_model_id(model: str) -> tuple[str, str]:
@@ -338,28 +417,87 @@ class _Prepared:
 
     def parse_or_raise(self, resp: httpx.Response, ok: tuple[int, ...]) -> dict[str, Any]:
         if resp.status_code in ok:
+            return self._decode_json(resp)
+        self._raise_for_response(resp)
+
+    def parse_run_result(
+        self, resp: httpx.Response, ok: tuple[int, ...]
+    ) -> dict[str, Any] | BinaryResult:
+        """:meth:`parse_or_raise` for an operation whose success may not be JSON.
+
+        Used by ``post_model_run`` and nothing else. Comfy Router forwards the
+        partner model's native output **under the partner's own media type**:
+        the run route's ``200`` declares an ``application/json`` branch *and* a
+        ``*/*`` ``format: binary`` branch, and the spec says in as many words
+        that a client MUST branch on the response ``Content-Type`` rather than
+        assume a JSON document. So this is the one place that does, and every
+        other operation keeps :meth:`parse_or_raise` — including its reading of
+        an undecodable success as an interstitial, which stays correct for a
+        route whose only declared success media type is JSON.
+
+        The branch is on the declared type, not on whether the bytes happen to
+        parse: an ``audio/mpeg`` body that coincidentally started with ``{``
+        would still be audio, and JSON that arrived under ``application/json``
+        but will not parse is still the truncated/interstitial failure the
+        caller needs raised rather than handed back as opaque bytes.
+
+        A success carrying no ``Content-Type`` at all is the one case with
+        nothing to branch on. An empty body stays ``{}`` (what every other
+        operation does with one) and a body that parses as JSON stays a dict;
+        only a non-empty body that does not parse becomes a
+        :class:`BinaryResult`, with ``content_type=""`` to say the response
+        never named one.
+        """
+        if resp.status_code in ok:
+            media = media_type(resp.headers.get("Content-Type"))
+            if media:
+                if is_json_media_type(media):
+                    return self._decode_json(resp)
+                return self._binary_result(resp)
             if not resp.content:
                 return {}
             try:
-                return resp.json()
-            except ValueError as exc:
-                # A success status whose body will not decode — a proxy
-                # interstitial served as 200, a response truncated mid-stream.
-                # Raised as an ApiError rather than escaping as the raw
-                # `json.JSONDecodeError` so it lands on the surface the SDK
-                # translates and stamps: on `models.run` this is a generation
-                # that ran and was billed with the result lost, which is
-                # exactly the failure the Idempotency-Key has to ride out on.
-                raise ApiError(
-                    f"Could not decode the {resp.status_code} response body as JSON",
-                    code="invalid_response",
-                    http_status=resp.status_code,
-                    request_id=_request_id(resp),
-                    # Whatever was served instead is the only description of
-                    # what answered — the interstitial's own text names the
-                    # proxy, and it is discarded with the response otherwise.
-                    body_excerpt=_body_excerpt(resp),
-                ) from exc
+                return cast("dict[str, Any]", resp.json())
+            except ValueError:
+                return self._binary_result(resp)
+        self._raise_for_response(resp)
+
+    def _binary_result(self, resp: httpx.Response) -> BinaryResult:
+        # The header verbatim rather than the bare media type: the partner's
+        # parameters are part of what the bytes are (`audio/L16; rate=16000`
+        # says nothing without its `rate`), and the whole point of the surface
+        # is that the native output comes back unchanged.
+        return BinaryResult(
+            content=resp.content,
+            content_type=resp.headers.get("Content-Type", ""),
+            request_id=_request_id(resp),
+        )
+
+    def _decode_json(self, resp: httpx.Response) -> dict[str, Any]:
+        if not resp.content:
+            return {}
+        try:
+            return cast("dict[str, Any]", resp.json())
+        except ValueError as exc:
+            # A success status whose body will not decode — a proxy
+            # interstitial served as 200, a response truncated mid-stream.
+            # Raised as an ApiError rather than escaping as the raw
+            # `json.JSONDecodeError` so it lands on the surface the SDK
+            # translates and stamps: on `models.run` this is a generation
+            # that ran and was billed with the result lost, which is
+            # exactly the failure the Idempotency-Key has to ride out on.
+            raise ApiError(
+                f"Could not decode the {resp.status_code} response body as JSON",
+                code="invalid_response",
+                http_status=resp.status_code,
+                request_id=_request_id(resp),
+                # Whatever was served instead is the only description of
+                # what answered — the interstitial's own text names the
+                # proxy, and it is discarded with the response otherwise.
+                body_excerpt=_body_excerpt(resp),
+            ) from exc
+
+    def _raise_for_response(self, resp: httpx.Response) -> NoReturn:
         body: dict[str, Any] | None
         try:
             body = resp.json()
@@ -798,7 +936,7 @@ class ComfyLow:
         *,
         idempotency_key: str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | BinaryResult:
         """POST ``{router_base_url}/v2/models/{provider}/{model}`` — awaited server-side.
 
         Addressed to Comfy Router, not to the ``/api/v2`` deployment
@@ -819,13 +957,24 @@ class ComfyLow:
         ``spec/router-openapi.yaml``, hand-bound — see
         :data:`_MODEL_RUN_PATH_TEMPLATE`.
 
+        **"Verbatim" includes not being JSON.** Router forwards the partner's
+        output under the partner's own media type, so the return type is
+        ``dict`` *or* :class:`BinaryResult`, decided by the response's
+        ``Content-Type``: ``application/json`` (or a ``+json`` suffix type)
+        decodes to a dict as before, anything else comes back as a
+        ``BinaryResult`` holding the bytes unchanged. That is the route's
+        published ``200``, which declares an ``application/json`` branch and a
+        ``*/*`` ``format: binary`` one; the models whose partner answers a
+        generation directly as bytes are the ElevenLabs audio models. See
+        :meth:`_Prepared.parse_run_result` for the no-``Content-Type`` case.
+
         Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
         any request when ``model`` is not a ``{provider}/{model}`` id.
         """
         path, body, headers = model_run_request(model, arguments, idempotency_key)
         url = self._p.router_base_url + path
         resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200, 201))
+        return self._p.parse_run_result(resp, (200, 201))
 
 
 class AsyncComfyLow:
@@ -1135,16 +1284,16 @@ class AsyncComfyLow:
         *,
         idempotency_key: str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
-        """Async :meth:`ComfyLow.post_model_run`."""
+    ) -> dict[str, Any] | BinaryResult:
+        """Async :meth:`ComfyLow.post_model_run` — same ``dict | BinaryResult`` result."""
         path, body, headers = model_run_request(model, arguments, idempotency_key)
         url = self._p.router_base_url + path
         resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200, 201))
+        return self._p.parse_run_result(resp, (200, 201))
 
 
 def _looks_like_path(s: str) -> bool:
     return s.startswith("http") or s.startswith("/")
 
 
-__all__ = ["ComfyLow", "AsyncComfyLow", "ApiError"]
+__all__ = ["ComfyLow", "AsyncComfyLow", "ApiError", "BinaryResult"]

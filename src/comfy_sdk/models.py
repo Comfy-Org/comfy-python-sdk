@@ -35,7 +35,10 @@ one operation is a published signature that cannot be withdrawn once released.
 to convention.
 
 Callers do not import anything for this: ``from comfy_sdk import Comfy`` stays
-the only entry point, and ``client.models`` is the whole surface.
+the only entry point, and ``client.models`` is the whole surface. The one name
+worth importing is :class:`~comfy_low.transport.BinaryResult`, re-exported here
+and from ``comfy_sdk``, for an ``isinstance`` check on a run whose model answers
+in bytes rather than JSON.
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ from typing import Any, cast
 import httpx
 
 from comfy_low.errors import ApiError
-from comfy_low.transport import MODEL_RUN_TIMEOUT, AsyncComfyLow, ComfyLow
+from comfy_low.transport import MODEL_RUN_TIMEOUT, AsyncComfyLow, BinaryResult, ComfyLow
 
 from ._core import new_idempotency_key, validate_idempotency_key
 from .exceptions import translating
@@ -131,7 +134,7 @@ class Models(_ModelsBase):
         *,
         idempotency_key: str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | BinaryResult:
         """Run ``model`` with ``arguments`` and return the completed result.
 
         ``model`` is the canonical ``{provider}/{model}`` id — exactly the two
@@ -155,9 +158,28 @@ class Models(_ModelsBase):
         awaitable form of this method is :meth:`AsyncModels.run` on
         ``AsyncComfy``.
 
-        The return value is the provider's own payload, decoded from JSON and
-        handed back as-is — no wrapper class stands between the caller and the
-        fields the provider documented.
+        The return value is the provider's own payload, handed back as-is — no
+        wrapper class stands between the caller and what the provider produced.
+        It comes in **two shapes**, decided by the response's ``Content-Type``,
+        because Router forwards the partner's output under the partner's own
+        media type:
+
+        * a ``dict`` — the provider's JSON document, decoded, with its own field
+          names untouched. This is what all but a couple of models in the
+          catalog return, and it is unchanged from previous releases.
+        * a :class:`~comfy_low.transport.BinaryResult` — for a model whose
+          partner answers a generation directly as bytes (the ElevenLabs audio
+          models are the first of these). ``result.content`` is the file bytes
+          exactly as they arrived, ``result.content_type`` the media type the
+          response named, ``result.request_id`` its ``X-Comfy-Request-Id``. The
+          bytes are not base64-encoded and not wrapped in a dict: write them to
+          a file and you have the file the partner produced.
+
+        Branch with ``isinstance(result, BinaryResult)`` when you call a model
+        that might do either; a model's own contract (``GET
+        /v2/models/{provider}/{model}/openapi.json``) says which it is, and a
+        ``200`` whose ``Content-Type`` claims JSON but whose body will not parse
+        is still an error rather than bytes.
 
         Because the server may legitimately hold the connection for minutes,
         ``timeout`` defaults to :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT`
@@ -272,7 +294,7 @@ class AsyncModels(_ModelsBase):
         *,
         idempotency_key: str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | BinaryResult:
         """Awaitable :meth:`Models.run` — same arguments, same result shape.
 
         This *is* the async form of ``run``: awaiting it on ``AsyncComfy`` is
@@ -307,3 +329,6 @@ class AsyncModels(_ModelsBase):
                     if delay is None:
                         raise
                     await asyncio.sleep(delay)
+
+
+__all__ = ["Models", "AsyncModels", "BinaryResult"]
