@@ -50,6 +50,7 @@ from .events import (
     StatusChange,
 )
 from .exceptions import (
+    AssetInUse,
     BlobNotFound,
     ComfyError,
     Forbidden,
@@ -119,6 +120,7 @@ __all__ = [
     "QueueFull",
     "MissingAsset",
     "HashMismatch",
+    "AssetInUse",
     "InvalidWorkflow",
     "WorkflowFormatUi",
     "BlobNotFound",

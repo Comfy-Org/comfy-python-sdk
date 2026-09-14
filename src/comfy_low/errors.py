@@ -165,6 +165,19 @@ class HashMismatch(ApiError):
     code = "hash_mismatch"
 
 
+class AssetInUse(ApiError):
+    """A delete was refused because the platform still depends on the record.
+
+    The ``409`` on ``DELETE /v2/assets/{id}``. Deliberately opaque about *which*
+    hold applies — the spec says the body never names it — so the class is a
+    signal to stop retrying the delete, not to inspect ``details``. Distinct
+    from :class:`HashMismatch`, the other documented ``409``, which is an upload
+    rejecting bytes that did not match ``expected_hash``.
+    """
+
+    code = "asset_in_use"
+
+
 class BlobNotFound(ApiError):
     code = "blob_not_found"
 
@@ -201,6 +214,7 @@ _BY_CODE: dict[str, type[ApiError]] = {
         WorkflowFormatUi,
         MissingAsset,
         HashMismatch,
+        AssetInUse,
         BlobNotFound,
         IdempotencyKeyReuse,
         QueueFull,
