@@ -12,6 +12,62 @@ notes for each version.
 
 ## [Unreleased]
 
+### Changed
+
+- **Behaviour change: when a `client.models.run()` retry is refused `422`
+  `idempotency_key_reuse`, the failure that *claimed the key* is what is
+  raised** — the `deadline_exceeded` `504` the default collect loop resent
+  under, or the `500` a `retry_possibly_in_flight=True` policy resent under —
+  with the key refusal chained onto it as `__cause__` and `.resend_refused` set
+  to `True`. The refusal is an artefact of the retry loop rather than an answer
+  about the request, and it used to be the only error the caller saw, so the
+  real failure was lost. **An `except IdempotencyKeyReuse` around `models.run`
+  no longer catches this case**: catch the failure you actually care about (or
+  `ComfyError`) and inspect `exc.__cause__` to tell a rejected resend apart from
+  a first-attempt refusal. Nothing about *which* failures are retried changed,
+  and no other terminal failure is substituted — a `500` followed by a `404`
+  still raises the `404`.
+
+  The substitution is deliberately narrow, so it never buries a *genuine* key
+  refusal. Only a failure that could have claimed the key is eligible: a
+  never-delivered transport failure (`ConnectError`, `ConnectTimeout`,
+  `PoolTimeout`, `ProxyError`) never reached a server, and a `429` is rejected
+  without starting work and releases the key — a `422` after either of those is
+  the server refusing a key spent somewhere else, and it is raised as itself.
+  Among eligible failures the **most recent** is kept rather than the first, so
+  a `429` → `504` → `422` run raises the `504` (a generation is held) instead of
+  the `429` (which would imply nothing started, and invite a fresh-key retry —
+  the second billed generation).
+
+- **New: `ComfyError.resend_refused`** — `True` only on the failure `models.run`
+  re-raises after a refused same-key resend, `False` everywhere else (and
+  defaulted onto the no-response failures, so it is always readable). Outer
+  retry wrappers typically key on `http_status` and never look at `__cause__`;
+  re-entering `run()` mints a *fresh* key, so retrying a refused resend bills a
+  second generation. Guard with
+  `if getattr(exc, "resend_refused", False): raise`.
+
+- **New: `comfy_sdk.retry.may_have_claimed_key(exc)`** — the predicate behind
+  that narrowing, exported for callers writing their own loops: whether a
+  failure could have left the `Idempotency-Key` claimed server-side.
+
+### Fixed
+
+- A `409` whose body names no error code at all now raises a plain
+  `ComfyError` carrying `http_status == 409`, instead of `HashMismatch`. The
+  status table that decoded it is consulted only when the response named no
+  code of its own, so it never sees the compliant envelope surface — it sees
+  Router-shaped `{detail, error_type}` bodies and intermediaries, which can
+  answer a `409` for anything, and the contract itself already spells `409`
+  two ways (`hash_mismatch` on `POST /assets`, `asset_in_use` on
+  `DELETE /assets/{id}`). Guessing `HashMismatch` told those callers to
+  re-upload bytes over a conflict that was never about bytes. Enveloped
+  responses are unaffected: an `error.code` of `hash_mismatch` still raises
+  `HashMismatch`, as does the `409` `POST /assets` documents, and a `409`
+  carrying a Router bucket still keeps that bucket. Any `Retry-After` on the
+  response still reaches the caller on `.retry_after`. `422` and `429` keep
+  their status-derived codes.
+
 ### Added
 
 - **The queued model surface** — `client.models.submit()`, `client.models.subscribe()`

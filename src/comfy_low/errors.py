@@ -275,14 +275,22 @@ def error_from_envelope(
     ``invalid_input`` into ``invalid_workflow`` (failing every reachability
     probe), and its ``403`` ``not_enabled`` into ``forbidden`` (so ``except
     NotEnabled`` — the one handler every pre-launch caller writes — never
-    fired). Retyping only happens on responses that carry a bucket, which only
-    Router sends, and there the bucket IS the truth; a v2 envelope carries
-    ``error.code`` and no top-level ``error_type``, and an intermediary's
-    reject carries neither, so both keep exactly the classes integrators
-    already catch.
+    fired). ``409`` has since been dropped from the table outright (see the
+    admission rule on :data:`_CODE_BY_STATUS`), so the first of those three no
+    longer needs this ordering as its second line of defence; the ordering
+    still decides the other two. Retyping only happens on responses that carry
+    a bucket, which only Router sends, and there the bucket IS the truth; a v2
+    envelope carries ``error.code`` and no top-level ``error_type``, and an
+    intermediary's reject carries neither, so both keep exactly the classes
+    integrators already catch.
     """
     err = (body or {}).get("error") if isinstance(body, dict) else None
-    code = (err or {}).get("code") if isinstance(err, dict) else None
+    # `_clean`ed like every other code source: an empty or whitespace
+    # `error.code` reads as absent rather than surviving as a code of its own.
+    # Without it `{"error": {"code": ""}}` is not None, so it short-circuits
+    # both the Router bucket and the status table below and a bare 401 yields
+    # `ApiError(code="")` instead of `Unauthorized`.
+    code = _clean((err or {}).get("code") if isinstance(err, dict) else None)
     # Through `_clean` like every other string read off the wire: `message` ends
     # up as `str(exc)`, and a non-string here (a list, a number) would make that
     # raise `TypeError: __str__ returned non-string` at the one moment — inside
@@ -331,12 +339,51 @@ def error_from_envelope(
     )
 
 
+#: The last resort: a code guessed from the status, consulted only when the
+#: response named none of its own — no envelope ``error.code``, no Router
+#: bucket. That is exactly the population this table must be sized for, and it
+#: is not the compliant surface: the producers of a code-less body are Router
+#: (whose error body is ``{detail, error_type}``, with no ``error.code``) and
+#: the intermediaries between the caller and either surface, and neither is
+#: bound by what any route documents for the status.
+#:
+#: **Admission rule for a new status: a status gets a typed guess only when
+#: every meaning the contract gives it asks the caller for the SAME action.**
+#: The guess is not "unknown, but roughly this" — it is a class the caller
+#: catches and acts on, so what has to be single-valued is the action, not the
+#: code. A status whose meanings span two action classes cannot be guessed.
+#:
+#: ``409`` is the worked example of exclusion, and it was removed from this
+#: table for that reason: the contract uses it for both ``hash_mismatch``
+#: (``POST /assets``) and ``asset_in_use`` (``DELETE /assets/{id}``), so even
+#: on the compliant surface the status alone does not say which. A code-less
+#: ``409`` therefore stays a bare ``ApiError`` carrying the real status, and
+#: surfaces to the caller as a plain ``ComfyError``. A real hash mismatch is
+#: unaffected *whenever its body decodes*: ``error.code`` is then present and
+#: wins outright. The one path it does not cover is a body that fails to parse
+#: at all — the transport sets ``body=None`` for an HTML proxy page or a
+#: truncated response, so a genuine ``POST /assets`` mismatch behind a broken
+#: intermediary now raises ``ComfyError`` rather than ``HashMismatch``. That is
+#: the trade this table exists to make: on an unparseable body there is nothing
+#: that distinguishes the two documented ``409``s, and inventing the re-upload
+#: one is the guess being removed.
+#:
+#: ``422`` and ``429`` are kept deliberately: their misreadings stay inside one
+#: action class. A ``429`` read as ``queue_full`` is still back-off-and-retry.
+#: A ``422`` read as ``invalid_workflow`` is still a terminal refusal — with
+#: one known exception, ``idempotency_key_reuse``, whose real answer is "your
+#: first request was already accepted, do NOT resubmit". It is retained because
+#: every ``422`` the contract documents arrives enveloped and is therefore
+#: decided by ``error.code`` before this table is reached (``IdempotencyKeyReuse``
+#: is in :data:`_BY_CODE`); only a code-less ``422`` — which no documented
+#: surface emits — could reach the guess. ``HashMismatch`` failed the rule on
+#: a stronger footing: it tells the caller to re-upload bytes, and ``409``
+#: *is* emitted code-less by Router and intermediaries.
 _CODE_BY_STATUS: dict[int, str] = {
     401: "unauthorized",
     402: "insufficient_credits",
     403: "forbidden",
     404: "not_found",
-    409: "hash_mismatch",
     422: "invalid_workflow",
     429: "queue_full",
 }
