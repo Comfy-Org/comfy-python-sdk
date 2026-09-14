@@ -261,6 +261,12 @@ produced it, or `None` for an asset with no producing job (e.g. a plain
 upload) — and `expires_at`, its retention deadline, or `None` if it doesn't
 expire.
 
+An uploaded asset can also hand out a directly-fetchable URL for its bytes —
+`asset.get_download_url()`, the same `DownloadUrl` an output returns (it
+commits first if needed). That is how a local image reaches a service that
+fetches by URL, e.g. an image-to-image model behind Comfy Router — see
+[Image to image — upload an asset first](#image-to-image--upload-an-asset-first).
+
 Delete an asset with `asset.delete()`, or by id alone with
 `client.assets.delete(asset_id)`:
 
@@ -395,16 +401,18 @@ client's `COMFY_BASE_URL`. See
 two variables.
 
 `base_url` and `timeout` are a read-only view of that configuration; model
-operations are added to this namespace as they land.
+operations are added to this namespace as they land. There are two ways to run
+a model on it — `run`, which waits, and `submit`, which queues — and they send
+the same request.
 
 ### `models.run` — one call, one result
 
 ```python
-result = client.models.run("fal-ai/flux-pro", {"prompt": "a cat", "steps": 4})
+result = client.models.run("bfl/flux-2-pro", {"prompt": "a cat", "steps": 4})
 result["images"][0]["url"]
 ```
 
-That call is `POST https://api.comfy.org/v2/models/fal-ai/flux-pro` with
+That call is `POST https://api.comfy.org/v2/models/bfl/flux-2-pro` with
 `{"prompt": "a cat", "steps": 4}` as the body.
 
 Three things follow from that, and they are the whole contract of this method:
@@ -413,8 +421,8 @@ Three things follow from that, and they are the whole contract of this method:
   `COMFY_ROUTER_BASE_URL`, not by `COMFY_BASE_URL`. Your API key goes with it.
 - **The first argument is the model's canonical id**, `{provider}/{model}` —
   exactly the two segments that address the route, and exactly what Router's
-  model catalog lists. It must be two non-empty segments: `"fal-ai"` alone,
-  `"fal-ai/flux-pro/fp8"` (the three-segment variant form, which this route does
+  model catalog lists. It must be two non-empty segments: `"bfl"` alone,
+  `"bfl/flux-2-pro/fp8"` (the three-segment variant form, which this route does
   not take yet), and anything containing a `.` or `..` segment all raise
   `ValueError` locally, before any request. A non-string raises `TypeError`.
 - **The second argument is the model's own native input**, forwarded to the
@@ -432,11 +440,67 @@ The awaitable form is the **async client**, not a differently-named method:
 
 ```python
 async with AsyncComfy(api_key="comfyui-...") as client:
-    result = await client.models.run("fal-ai/flux-pro", {"prompt": "a cat"})
+    result = await client.models.run("bfl/flux-2-pro", {"prompt": "a cat"})
 ```
 
 There is no `run_async()`, and there will not be one — one operation, one name,
 and `await` is what makes it asynchronous.
+
+### Image to image — upload an asset first
+
+An image-to-image model takes an image *as input*, and Router forwards the
+model's native body unchanged — so the image goes in whatever form the
+provider documents. Most URL-taking models want a URL the provider can fetch,
+and your local file doesn't have one yet. Give it one by uploading it as an
+asset and handing the model the asset's download URL:
+
+```python
+client = Comfy(api_key="comfyui-...")
+
+# 1. Upload the local image (dedup-aware; a re-run re-uploads nothing) and
+#    resolve a short-lived, self-authorizing signed URL for it.
+asset = client.assets.from_file("photo.png")
+url = asset.get_download_url().url
+
+# 2. Pass that URL wherever the model's own input schema takes an image.
+result = client.models.run(
+    "wan/wan2.5-i2i-preview",
+    {
+        "input": {"images": [url], "prompt": "Make it golden."},
+        "parameters": {"size": "768*768"},
+    },
+)
+print(result["output"]["results"][0]["url"])
+```
+
+`Asset.get_download_url()` commits the asset if needed (hash → dedup probe →
+upload, exactly like submitting it in a workflow) and returns the same
+`DownloadUrl` as an output's `get_download_url()`: on Comfy Cloud / serverless
+a signed storage URL any fetcher can read until `expires_at` (`None` when the
+URL carries no expiry the SDK can read) — which is what lets the provider
+behind Router pull your image without your API key. Mind the two caveats that
+follow from that: the URL is short-lived, so resolve it right before the run
+rather than storing it; and on a *self-hosted* backend the URL is the
+auth-guarded content endpoint, which an external provider cannot fetch — upload
+to Comfy Cloud (the default `COMFY_BASE_URL` surface) for Router inputs.
+
+Some models take images inline instead of by URL — `bfl/flux-2-pro`'s
+`input_image` is base64, for example — and then there is nothing to upload:
+
+```python
+import base64
+from pathlib import Path
+
+image_b64 = base64.b64encode(Path("photo.png").read_bytes()).decode()
+result = client.models.run(
+    "bfl/flux-2-pro",
+    {"prompt": "make it watercolor", "input_image": image_b64},
+)
+```
+
+Which form a model takes is in its input schema — `GET
+/v2/models/{provider}/{model}/openapi.json`, or the model's page in the
+[Router model catalog](https://docs.comfy.org/development/comfy-router/models).
 
 Because the server may legitimately hold the connection for minutes, `run` uses
 its own 10-minute timeout rather than the client's (which is sized for ordinary
@@ -444,6 +508,103 @@ API calls). Pass `timeout=` seconds, an `httpx.Timeout`, or `None` to wait
 indefinitely. Each call also sends a fresh `Idempotency-Key`, so an accidental
 exact resend is rejected by the server instead of billing a second generation;
 pass `idempotency_key=` to choose the value yourself.
+
+### `models.submit` — queue it, collect it later
+
+`run` holds one connection open until the generation is finished. When the
+caller cannot wait that long — a web request that has to return now, a worker
+that submits in one process and collects in another, a batch that should be in
+flight all at once — submit it to the queue instead:
+
+```python
+handle = client.models.submit("fal-ai/flux-pro", {"prompt": "a cat"})
+
+handle.request_id          # a UUID; with the model id, all another process needs
+handle.status().status     # 'IN_QUEUE' / 'IN_PROGRESS' / 'COMPLETED'
+result = handle.get()      # blocks until complete, returns the provider payload
+```
+
+`submit` sends the same request `run` does — the same model id, the same native
+body — and returns as soon as the server has **accepted** it. The queue is the
+server's: ordering, admission, retries, timeouts, billing and expiry are all
+decided there, and this SDK adds polling and ergonomics on top of it and
+nothing else.
+
+The handle carries four operations:
+
+| | |
+|---|---|
+| `handle.status()` | one authoritative poll, returned as a `QueueUpdate` (`status`, `queue_position`, `error_type`, `retry_after`, `raw`) |
+| `handle.get(timeout=None)` | poll to completion, then return the provider's own payload — the same value `run` would have returned |
+| `handle.cancel()` | ask the server to cancel. A request, not a guarantee: a request that already completed stays completed |
+| `handle.iter_events(timeout=None)` | the poll loop with its updates exposed — yields the first observation, every change of status or queue position, and the completion |
+
+Polling is **poll-authoritative**: there is no stream to reconcile against on
+this surface, and `iter_events` is the poll loop rather than SSE. It backs off
+adaptively, and a `Retry-After` the server names on a poll beats that schedule
+— the server knows its own pace.
+
+**A `200` is not the same thing as a success here.** The server reports a
+failed *and* a cancelled request as `COMPLETED` carrying an `error_type`, so
+`get()` raises the matching typed exception from
+[`comfy_sdk.router_exceptions`](#typed-errors) rather than handing the failure
+back as a result. `iter_events` deliberately does not raise — it is a view of
+the queue's progress, and `get()` is the one that collects.
+
+Rehydrate a handle in another process from the two ids that address the
+request, with no call made:
+
+```python
+handle = client.models.handle("fal-ai/flux-pro", request_id)
+result = handle.get()
+```
+
+Both ids are needed because both address the route
+(`/v2/models/{provider}/{model}/requests/{request_id}`), and both are validated
+locally before anything is sent.
+
+### `models.subscribe` — submit, follow, collect
+
+```python
+def on_update(update):
+    print(update.status, update.queue_position)
+
+result = client.models.subscribe(
+    "fal-ai/flux-pro", {"prompt": "a cat"}, on_queue_update=on_update, timeout=300
+)
+```
+
+`submit` + poll + `get`, in one call, for a caller who does want to wait but
+also wants to show progress. `timeout=` is a **client-side** bound with no
+server-side meaning; when it runs out, `subscribe` makes a best-effort
+`cancel()` — so a caller who has stopped waiting is not still paying for a
+generation nobody will collect — and then raises `TimeoutError`. Use `submit`
+when the request should outlive the caller's patience.
+
+Each `submit` **call** mints one fresh `Idempotency-Key`: two deliberate
+submits of the same input are two requests, while a transport-level retry
+inside one call keeps the one key and replays the original rather than queueing
+a second generation. Pass `idempotency_key=` to choose it yourself — the case
+that earns it is a lost response, where the request may have been accepted and
+its id lost with the reply; every exception carries the key on
+`.idempotency_key` for exactly that.
+
+The awaitable form is the async client, with the identical names, arguments and
+argument order — there is no `submit_async`, for the same reason there is no
+`run_async`:
+
+```python
+async with AsyncComfy(api_key="comfyui-...") as client:
+    handle = await client.models.submit("fal-ai/flux-pro", {"prompt": "a cat"})
+    async for update in handle.iter_events():
+        print(update.status)
+    result = await handle.get()
+```
+
+This surface is **gated server side**. A caller the queue is not switched on
+for is answered `403 not_enabled`, which arrives as
+`comfy_sdk.router_exceptions.NotEnabled` — nothing about the request is wrong,
+and it is terminal: do not retry it.
 
 ### Retrying a run without paying for it twice
 
@@ -588,12 +749,32 @@ Three attributes carry this:
 All three read as `None` rather than raising on any exception `models.run`
 raises, so a handler never has to guard the attribute access itself.
 
-`idempotency_key` is `None` on errors from *other* surfaces, though — it is
-`models.run` that records it, and `submit()` sends a key without stamping one.
-So `None` means "this SDK did not record a key for you", **not** "no key was
-sent, resend freely": check for it before replaying, as the snippet above does,
-rather than passing it straight back into `idempotency_key=` where `None` means
-"mint a fresh one" and starts a second billed generation.
+`submit()` stamps the key too — on every failure of the `POST /jobs` attempt
+itself, and so on the submit phase of `run()`. A failure raised before the
+request exists (a UI-format workflow, an asset that would not upload) or while
+`run()` polls the job afterwards carries none. What the key is *good for*
+differs, so read it with the surface in mind. `models.run` and `models.submit`
+send it to a surface that **replays** a claimed key, which is what makes it a
+handle on a generation you were already billed for. `POST /jobs` instead
+**rejects** a reused key with `422 idempotency_key_reuse` (see the
+[`IdempotencyKeyReuse`](#typed-errors) bullet below): keys there are single-use
+and there is no replay. So on a `submit()` failure `exc.idempotency_key` is the
+key this attempt was made under, not a replay handle. Whether the server ever
+saw it depends on the failure: a connect failure never delivered it, and an
+exhausted `QueueFull` was refused on every attempt, so the key is unclaimed and
+resubmitting under it is fine. After an ambiguous failure — a read timeout, a
+connection dropped mid-request — poll or list for the job the first attempt may
+already have created rather than resubmitting under it.
+
+`idempotency_key` reads as `None` on every `ComfyError` from other surfaces —
+one that sends no key, and an asset upload, which mints a key per handle without
+recording it. A raw `httpx` error from one of those key-free calls is re-raised
+untouched and does not carry the attribute at all, so a handler that spans
+surfaces reads it with `getattr(exc, "idempotency_key", None)`. Either way
+`None` means "this SDK did not record a key for you", **not** "no key was sent,
+resend freely": check for it before replaying, as the snippet above does, rather
+than passing it straight back into `idempotency_key=` where `None` means "mint a
+fresh one" and starts a second billed generation.
 
 ## Sync and async
 
@@ -648,6 +829,15 @@ asset, job, event, and output helpers translate protocol errors, so catches of
   deployment warm-up), then raises the translated error if backpressure remains.
 - `JobFailed` — a job reached a non-`succeeded` terminal state; `.error`
   carries node-level detail when the platform provided one.
+- A plain `ComfyError` whose `.code` reads `http_<status>` (`http_503`,
+  `http_500`) — the response was answered by something in front of Router
+  rather than by the service itself, so no service verdict was reached: no
+  error envelope, no error bucket, usually no `X-Comfy-Request-Id`. Retry per
+  your own policy; the SDK does not retry these for you. The one line naming
+  the cause (`no healthy upstream`, `upstream connect error or disconnect/reset
+  before headers`) is kept on the protocol-level exception as
+  `comfy_low.errors.ApiError.body_excerpt`, and is what `str()` of the error
+  you catch reads — `HTTP 503: no healthy upstream` — at both layers.
 
 ```python
 from comfy_sdk import JobFailed, QueueFull, Unauthorized
@@ -716,3 +906,13 @@ python scripts/check_drift.py    # same check CI runs; fails if committed models
 Releases are published to PyPI from a GitHub Release (tag `vX.Y.Z`) by
 [`.github/workflows/publish.yml`](.github/workflows/publish.yml), using
 PyPI's Trusted Publishing (OIDC) — no API token is stored in this repo.
+
+**Pre-releases** (a release candidate) go out the same way, with one thing to
+get right: the workflow validates the tag as **SemVer**, where a pre-release is
+a `-`-separated segment. So tag it `v0.2.0-rc1` (or `v0.2.0-rc.1`) — **not**
+`v0.2.0rc1`, which is PEP 440's own spelling and is rejected by that check. The
+build normalises the accepted form to the PEP 440 version anyway, so
+`v0.2.0-rc1` produces `comfy_sdk-0.2.0rc1-py3-none-any.whl`, which `pip install
+comfy-sdk` will not pick up without `--pre`. That last part is the point of
+shipping one: a pre-release reaches the people who ask for it and nobody
+else.

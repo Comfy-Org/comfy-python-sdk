@@ -148,9 +148,14 @@ to ship means adding it there, or it silently will not be packaged.
   the tuple reordered if the spec reordered, and a removal treated as the
   breaking change it is rather than a mechanical delete. Without it a new bucket
   reaches callers as an untyped `RouterError` — the drift this gate exists to
-  catch. The one thing it does **not** catch is a changed `meaning`: the gate
-  compares values and order, not prose, because the docstrings reword the spec
-  rather than quoting it. `spec/README.md` has the full reconcile procedure.
+  catch. A changed `meaning` is caught too, by a **read marker** rather than by
+  comparing prose: each class carries a `_spec_meaning_digest` of the `meaning`
+  its docstring was written against, so the check fails naming the bucket and
+  the sync becomes a three-step change — re-read that class's docstring, update
+  it if the semantics moved, then paste the new digest the check prints into
+  `_spec_meaning_digest`. It never compares the digest to the docstring: the
+  docstrings reword the spec rather than quoting it, so equality is impossible
+  by design. `spec/README.md` has the full reconcile procedure.
 - **Adding an operation to the contract is a four-file change.**
   `tests/test_spec_coverage.py` asserts that every non-internal `operationId`
   in `spec/openapi.yaml` appears in `comfy_low.OPERATION_IDS`, that

@@ -586,8 +586,15 @@ def test_the_models_namespace_is_covered() -> None:
     models_pairs = [pair for pair in _PAIRS if pair[1] is _SYNC_NAMESPACES["models"]]
     assert models_pairs, "the models namespace produced no pair to compare"
     _label, sync_models, async_models = models_pairs[0]
-    assert "run" in _methods(sync_models), f"{sync_models.__name__}.run is not being compared"
-    assert "run" in _methods(async_models), f"{async_models.__name__}.run is not being compared"
+    # Every operation the namespace publishes, named outright. `run` is the one
+    # this test was written for; the queued trio joined it, and a namespace
+    # method that silently dropped out of the walk would otherwise leave the
+    # generic comparisons above passing on a smaller surface than they claim.
+    for name in ("run", "submit", "subscribe", "handle"):
+        assert name in _methods(sync_models), f"{sync_models.__name__}.{name} is not being compared"
+        assert name in _methods(async_models), (
+            f"{async_models.__name__}.{name} is not being compared"
+        )
 
 
 def test_introspection_is_not_vacuous() -> None:
