@@ -137,6 +137,8 @@ paths:
           $ref: '#/components/responses/RouterModelValidationError'
         '429':
           $ref: '#/components/responses/RouterConcurrencyLimited'
+        '502':
+          $ref: '#/components/responses/RouterProviderError'
         '503':
           $ref: '#/components/responses/RouterRequestError'
         '504':
@@ -346,7 +348,7 @@ components:
       additionalProperties: true
     RouterModelSegment:
       type: string
-      description: Lowercase `model` segment of the canonical `{provider}/{model}[/{variant}]` model ID - the model to run within that provider. Shared by the invocation route's `model` path parameter and a catalog entry's `model` field, for the same no-drift reason as `RouterProviderSegment`.
+      description: Lowercase `model` segment of the canonical `{provider}/{model}` model ID - the model to run within that provider. Shared by the invocation route's `model` path parameter and a catalog entry's `model` field, for the same no-drift reason as `RouterProviderSegment`.
       pattern: ^[a-z0-9]+([._-][a-z0-9]+)*$
       maxLength: 128
       example: flux-2-pro
@@ -359,7 +361,7 @@ components:
       example: q7Fm2xTn9pLd4RsV
     RouterProviderSegment:
       type: string
-      description: Lowercase `provider` segment of the canonical `{provider}/{model}[/{variant}]` model ID - the partner whose model is being addressed. The invocation route's `provider` path parameter and a catalog entry's `provider` field both reference this one schema, which is what keeps the listed IDs and the accepted IDs from drifting apart.
+      description: Lowercase `provider` segment of the canonical `{provider}/{model}` model ID - the partner whose model is being addressed. The invocation route's `provider` path parameter and a catalog entry's `provider` field both reference this one schema, which is what keeps the listed IDs and the accepted IDs from drifting apart.
       pattern: ^[a-z0-9]+([._-][a-z0-9]+)*$
       maxLength: 64
       example: bfl
@@ -425,12 +427,14 @@ components:
           schema:
             $ref: '#/components/schemas/RouterErrorResponse'
     RouterDeadlineExceeded:
-      description: Comfy stopped holding the connection at its own configured bound (`deadline_exceeded`). The body and the two headers are exactly `RouterRequestError`'s; what this adds is the optional `Retry-After`, present when a retry with the same `Idempotency-Key` will collect the generation that is still running rather than dispatch a new one. See the `504` on `POST /v2/models/{provider}/{model}`.
+      description: 'Comfy stopped holding the connection at its own configured bound (`deadline_exceeded`). The body and the two headers are exactly `RouterRequestError`''s; what this adds is the optional `Retry-After`, present when a retry with the same `Idempotency-Key` will collect the generation that is still running rather than dispatch a new one. See the `504` on `POST /v2/models/{provider}/{model}`. The status is SHARED with `provider_timeout` - the partner not answering in time, rather than Comfy''s own bound expiring - which is why `X-Comfy-Upstream-Status` is declared here too: present, it carries the partner''s own status and the bound that expired was theirs; absent, the bound was Comfy''s.'
       headers:
         X-Comfy-Error-Type:
           $ref: '#/components/headers/RouterErrorTypeHeader'
         X-Comfy-Request-Id:
           $ref: '#/components/headers/RouterRequestIdHeader'
+        X-Comfy-Upstream-Status:
+          $ref: '#/components/headers/RouterUpstreamStatusHeader'
         Retry-After:
           $ref: '#/components/headers/RouterRetryAfterHeader'
       content:
@@ -463,6 +467,19 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/RouterValidationErrorResponse'
+    RouterProviderError:
+      description: The provider's own response could not be turned into a result (`provider_error`). The body is `RouterErrorResponse` and the bucket is repeated on `X-Comfy-Error-Type`. `X-Comfy-Upstream-Status` carries the provider's own status when Router's typed failure carrier held one; absent, either the failure came with no such status (a poll-transport failure, for example) or this 502 did not come from the provider at all.
+      headers:
+        X-Comfy-Error-Type:
+          $ref: '#/components/headers/RouterErrorTypeHeader'
+        X-Comfy-Request-Id:
+          $ref: '#/components/headers/RouterRequestIdHeader'
+        X-Comfy-Upstream-Status:
+          $ref: '#/components/headers/RouterUpstreamStatusHeader'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RouterErrorResponse'
     RouterRequestError:
       description: A Router request-level failure - the request never reached the model, or failed for a reason the model itself did not report. The body is `RouterErrorResponse` and the bucket is repeated on `X-Comfy-Error-Type`.
       headers:
@@ -481,6 +498,8 @@ components:
           $ref: '#/components/headers/RouterErrorTypeHeader'
         X-Comfy-Request-Id:
           $ref: '#/components/headers/RouterRequestIdHeader'
+        X-Comfy-Upstream-Status:
+          $ref: '#/components/headers/RouterUpstreamStatusHeader'
         Idempotent-Replayed:
           $ref: '#/components/headers/RouterIdempotentReplayedHeader'
       content:
@@ -518,14 +537,14 @@ components:
       name: model
       in: path
       required: true
-      description: Lowercase model segment of the canonical `{provider}/{model}[/{variant}]` model ID - the model to run within that provider.
+      description: Lowercase model segment of the canonical `{provider}/{model}` model ID - the model to run within that provider.
       schema:
         $ref: '#/components/schemas/RouterModelSegment'
     RouterProvider:
       name: provider
       in: path
       required: true
-      description: Lowercase provider segment of the canonical `{provider}/{model}[/{variant}]` model ID - the partner whose model is being run.
+      description: Lowercase provider segment of the canonical `{provider}/{model}` model ID - the partner whose model is being run.
       schema:
         $ref: '#/components/schemas/RouterProviderSegment'
   headers:
@@ -598,6 +617,14 @@ components:
       schema:
         type: string
         example: '"6b8c1f2e0a9d4c3b5e7f8a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f"'
+    RouterUpstreamStatusHeader:
+      description: 'The model provider''s OWN HTTP status for this call. Present only when the failure came FROM the provider, and ABSENT whenever Comfy Router refused the call itself - so branch on its presence: present means the request left Comfy, reached the provider, and the provider''s answer is what produced this response''s `error_type`.'
+      required: false
+      schema:
+        type: integer
+        minimum: 100
+        maximum: 599
+        example: 400
   securitySchemes:
     ApiKeyAuth:
       type: apiKey
