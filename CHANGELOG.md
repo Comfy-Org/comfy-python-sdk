@@ -51,6 +51,23 @@ notes for each version.
   that narrowing, exported for callers writing their own loops: whether a
   failure could have left the `Idempotency-Key` claimed server-side.
 
+### Fixed
+
+- A `409` whose body names no error code at all now raises a plain
+  `ComfyError` carrying `http_status == 409`, instead of `HashMismatch`. The
+  status table that decoded it is consulted only when the response named no
+  code of its own, so it never sees the compliant envelope surface — it sees
+  Router-shaped `{detail, error_type}` bodies and intermediaries, which can
+  answer a `409` for anything, and the contract itself already spells `409`
+  two ways (`hash_mismatch` on `POST /assets`, `asset_in_use` on
+  `DELETE /assets/{id}`). Guessing `HashMismatch` told those callers to
+  re-upload bytes over a conflict that was never about bytes. Enveloped
+  responses are unaffected: an `error.code` of `hash_mismatch` still raises
+  `HashMismatch`, as does the `409` `POST /assets` documents, and a `409`
+  carrying a Router bucket still keeps that bucket. Any `Retry-After` on the
+  response still reaches the caller on `.retry_after`. `422` and `429` keep
+  their status-derived codes.
+
 ## [0.2.0] - 2026-09-10
 
 ### Added

@@ -1,7 +1,8 @@
 """How an error response on the wire becomes a typed exception.
 
-`to_sdk_error` mapping the server's 404 codes to the typed `NotFound`, and
-`error_from_envelope` reading the two body shapes this API answers in.
+`to_sdk_error` mapping the server's 404 codes to the typed `NotFound`,
+`error_from_envelope` reading the two body shapes this API answers in, and
+which statuses may be decoded to a typed code when the response named none.
 """
 
 from __future__ import annotations
@@ -12,12 +13,14 @@ import pytest
 import comfy_low.transport as low_transport
 from comfy_low.errors import (
     ApiError,
+    HashMismatch,
     QueueFull,
     Unauthorized,
     clean_body_excerpt,
     error_from_envelope,
 )
 from comfy_sdk.exceptions import ComfyError, NotFound, to_sdk_error
+from comfy_sdk.exceptions import HashMismatch as SdkHashMismatch
 from comfy_sdk.exceptions import Unauthorized as SdkUnauthorized
 from comfy_sdk.retry import RetryPolicy, error_bucket_of, is_collectable
 
@@ -104,6 +107,80 @@ def test_a_bucketless_429_still_means_queue_full() -> None:
     assert err.code == "queue_full"
     assert isinstance(err, QueueFull)
     assert err.retry_after == 3
+
+
+# --- which statuses the status table may decode, and which it may not ---
+#
+# The table is consulted only for a response that named no code of its own, so
+# it never sees the compliant envelope surface -- it sees Router-shaped bodies
+# and intermediaries, which can answer a status for anything. A typed guess is
+# therefore admissible only when every meaning the contract gives a status asks
+# the caller for the SAME action. 409 fails that: the contract spells it both
+# `hash_mismatch` (POST /assets) -- re-upload the bytes -- and `asset_in_use`
+# (DELETE /assets/{id}), which is not a bytes problem at all.
+
+
+def test_a_bucketless_409_is_not_guessed_to_be_a_hash_mismatch() -> None:
+    err = error_from_envelope(409, None)
+    assert type(err) is ApiError
+    assert not isinstance(err, HashMismatch)
+    # `http_409` is #141's name for "no verdict was reached", not a code the
+    # contract defines -- the point is that it is not `hash_mismatch`.
+    assert err.code == "http_409"
+    assert err.http_status == 409
+    # `HashMismatch` tells the caller to re-upload bytes, which is why this
+    # status cannot be guessed: it is a distinct action, not a vaguer wording
+    # of the same one.
+    sdk_err = to_sdk_error(err)
+    assert type(sdk_err) is ComfyError
+    assert not isinstance(sdk_err, SdkHashMismatch)
+    assert sdk_err.http_status == 409
+
+
+def test_a_bucketless_409_keeps_the_message_the_server_sent() -> None:
+    # Dropping the guessed code must not drop what the server actually said:
+    # the reason for the conflict is the only thing left that explains it, so
+    # it has to survive to the surface the caller reads.
+    err = error_from_envelope(409, {"error": {"message": "asset is still referenced"}})
+    assert err.code == "http_409"
+    assert err.http_status == 409
+    assert err.message == "asset is still referenced"
+    assert to_sdk_error(err).message == "asset is still referenced"
+
+
+def test_an_empty_envelope_code_reads_as_absent_not_as_a_code() -> None:
+    # `""` is not None, so without `_clean` it would short-circuit both the
+    # Router bucket and the status table and survive as the code itself --
+    # turning a bare 401 into `ApiError(code="")` instead of `Unauthorized`.
+    for blank in ("", "   "):
+        err = error_from_envelope(401, {"error": {"code": blank}})
+        assert err.code == "unauthorized", blank
+        assert isinstance(err, Unauthorized), blank
+        assert type(to_sdk_error(err)) is SdkUnauthorized, blank
+
+
+def test_a_bucketless_409_still_carries_the_pace_the_server_named() -> None:
+    # Dropping the code must not drop the header: a conflict that named a
+    # `Retry-After` is still telling the caller when to ask again.
+    err = error_from_envelope(409, None, retry_after=7)
+    assert err.retry_after == 7
+    assert to_sdk_error(err).retry_after == 7
+
+
+def test_an_enveloped_409_is_still_a_hash_mismatch() -> None:
+    # The assets path is unaffected whenever the body decodes: a real hash
+    # mismatch names itself, and `error.code` wins outright.
+    err = error_from_envelope(409, {"error": {"code": "hash_mismatch", "message": "m"}})
+    assert type(err) is HashMismatch
+    assert err.code == "hash_mismatch"
+    assert type(to_sdk_error(err)) is SdkHashMismatch
+
+
+def test_a_bodyless_401_still_maps_to_unauthorized() -> None:
+    # Only 409 was dropped -- the rest of the table decodes exactly as before.
+    err = error_from_envelope(401, None)
+    assert err.code == "unauthorized"
+    assert isinstance(err, Unauthorized)
 
 
 def test_a_router_validation_body_degrades_rather_than_coercing_its_detail() -> None:
