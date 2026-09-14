@@ -511,8 +511,10 @@ A note on what the default trades: the collect rule is
 `COMFY_ROUTER_BASE_URL` can name a deployment that applies the v2 rule instead
 and keeps the key claimed across the `504`. There the collect resend comes back
 `422 idempotency_key_reuse` — one wasted request, but not a lost diagnosis:
-`run` raises the real `504` and chains the refusal onto it as `__cause__`, so
-`except IdempotencyKeyReuse` around `run` does *not* catch it. Set
+`run` raises the real `504`, chains the refusal onto it as `__cause__` and sets
+`.resend_refused` on it, so `except IdempotencyKeyReuse` around `run` does *not*
+catch it. Check `.resend_refused` before letting an outer retry wrapper re-enter
+`run()`: a fresh key would start a second billed generation. Set
 `retry_collectable=False` on such a deployment to skip the resend entirely.
 
 Other 5xx responses and client-side timeouts are the cases left out by default,
@@ -634,9 +636,12 @@ asset, job, event, and output helpers translate protocol errors, so catches of
   call raises this. After an ambiguous failure (e.g. a timeout where you don't
   know if the job was created), poll or list your jobs rather than resubmitting
   with the same key. One exception: when `models.run`'s *own* retry is refused
-  for key reuse, it raises the failure that caused the retry and chains this
-  exception onto it as `__cause__`, since the refusal says nothing about why the
-  call failed.
+  for key reuse, it raises the failure that *claimed the key* and chains this
+  exception onto it as `__cause__` (with `.resend_refused` set on it), since the
+  refusal says nothing about why the call failed. That substitution only happens
+  when a failure that could actually have claimed the key preceded the refusal —
+  after a never-delivered `ConnectError` or a released `429`, a `422` is a
+  genuine refusal of a key spent elsewhere and is raised as itself.
 - `InsufficientCredits` — the account can't afford the job.
 - `QueueFull` — backpressure; carries `.retry_after` seconds. `client.submit`
   retries 429 responses with `Retry-After` for a bounded budget (including

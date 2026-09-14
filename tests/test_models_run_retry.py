@@ -1234,10 +1234,11 @@ def test_a_first_attempt_key_refusal_is_still_raised_as_itself(server) -> None:
     assert excinfo.value.http_status == 422
 
 
-def test_the_first_retryable_failure_is_the_one_kept() -> None:
-    # Only the *first* is remembered. Two different 5xx answers before the key
-    # refusal, and what surfaces is the one that started the retrying -- the
-    # later ones are the same call failing again, not new information.
+def test_the_most_recent_claim_capable_failure_is_the_one_kept() -> None:
+    # The LAST failure that could have claimed the key is remembered, not the
+    # first. Two different 5xx answers before the key refusal, and what surfaces
+    # is the 503: it describes the server state the refusal implies, where the
+    # 500 is a claim the later attempt superseded.
 
     class _ThenRefusedLow(_FlakyLow):
         def _attempt(self, arguments: Mapping[str, Any], key: str | None) -> dict[str, Any]:
@@ -1252,7 +1253,145 @@ def test_the_first_retryable_failure_is_the_one_kept() -> None:
     with pytest.raises(ComfyError) as excinfo:
         _models(low, FAST_OPTED_IN).run(MODEL, ARGS)
     assert len(low.keys) == 3
+    assert excinfo.value.http_status == 503
+    assert isinstance(excinfo.value.__cause__, IdempotencyKeyReuse)
+    assert excinfo.value.resend_refused is True
+
+
+def test_a_claim_capable_transport_failure_surfaces_as_httpx_not_a_comfy_error() -> None:
+    # The retained failure is not always an `ApiError`. A `ReadTimeout` is
+    # possibly-in-flight, so under the opt-in it CAN be the one kept -- and
+    # `_as_sdk_error` only stamps a non-`ApiError`, it does not translate one.
+    # What the caller catches is therefore the raw `httpx` failure with the key
+    # on it, NOT an `IdempotencyKeyReuse`: an `except ComfyError` handler does
+    # not fire for this case, which is why the docstring tells callers to catch
+    # both. The 422 still rides along on `__cause__`.
+
+    class _TimeoutThenRefusedLow(_FlakyLow):
+        def _attempt(self, arguments: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+            self.keys.append(key)
+            if len(self.keys) == 1:
+                raise httpx.ReadTimeout("timed out")
+            raise ApiError("no", code="idempotency_key_reuse", http_status=422)
+
+    low = _TimeoutThenRefusedLow()
+    with pytest.raises(httpx.ReadTimeout) as excinfo:
+        _models(low, FAST_OPTED_IN).run(MODEL, ARGS)
+    assert len(low.keys) == 2
+    assert len(set(low.keys)) == 1
+    assert excinfo.value.idempotency_key == low.keys[0]  # type: ignore[attr-defined]
+    assert excinfo.value.resend_refused is True  # type: ignore[attr-defined]
+    assert isinstance(excinfo.value.__cause__, IdempotencyKeyReuse)
+    assert excinfo.value.__cause__.idempotency_key == low.keys[0]
+
+
+def test_a_never_delivered_failure_does_not_suppress_a_genuine_key_refusal() -> None:
+    # A `ConnectError` never reached a server, so it cannot be why the key is
+    # claimed. A 422 after one is the server refusing a key spent somewhere else
+    # -- a caller-supplied key already used -- and it must surface as ITSELF.
+    # Demoting it to `__cause__` under the transport blip is how an outer
+    # wrapper that retries transport errors loops forever on a dead key.
+
+    class _ConnectThenRefusedLow(_FlakyLow):
+        def _attempt(self, arguments: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+            self.keys.append(key)
+            if len(self.keys) == 1:
+                raise httpx.ConnectError("connection refused")
+            raise ApiError("no", code="idempotency_key_reuse", http_status=422)
+
+    low = _ConnectThenRefusedLow()
+    with pytest.raises(IdempotencyKeyReuse) as excinfo:
+        _models(low, FAST).run(MODEL, ARGS, idempotency_key="spent-elsewhere-1")
+    assert len(low.keys) == 2
+    assert excinfo.value.http_status == 422
+    assert excinfo.value.resend_refused is False
+    assert not isinstance(excinfo.value.__cause__, IdempotencyKeyReuse)
+
+
+def test_a_released_429_does_not_suppress_a_genuine_key_refusal() -> None:
+    # A paced 429 is "rejected without starting work": the contract releases the
+    # key, so it cannot explain a later refusal either.
+
+    class _ThrottledThenRefusedLow(_FlakyLow):
+        def _attempt(self, arguments: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+            self.keys.append(key)
+            if len(self.keys) == 1:
+                raise ApiError("slow down", code="rate_limited", http_status=429, retry_after=0)
+            raise ApiError("no", code="idempotency_key_reuse", http_status=422)
+
+    low = _ThrottledThenRefusedLow()
+    with pytest.raises(IdempotencyKeyReuse) as excinfo:
+        _models(low, FAST).run(MODEL, ARGS, idempotency_key="spent-elsewhere-2")
+    assert excinfo.value.http_status == 422
+    assert excinfo.value.resend_refused is False
+
+
+def test_a_released_429_is_skipped_in_favour_of_the_claim_that_followed_it() -> None:
+    # The mixed sequence: 429 (nothing started, key released) -> a deadline 504
+    # (a generation IS now held under the key) -> 422. The 504 is what describes
+    # the server state the refusal implies. Raising the 429 would say nothing
+    # was started and invite a fresh-key retry -- the second billed generation.
+
+    class _ThrottledThenDeadlineThenRefusedLow(_FlakyLow):
+        def _attempt(self, arguments: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+            self.keys.append(key)
+            if len(self.keys) == 1:
+                raise ApiError("slow down", code="rate_limited", http_status=429, retry_after=0)
+            if len(self.keys) == 2:
+                raise DeadlineExceeded("still generating", http_status=504, retry_after=0)
+            raise ApiError("no", code="idempotency_key_reuse", http_status=422)
+
+    low = _ThrottledThenDeadlineThenRefusedLow()
+    with pytest.raises(ComfyError) as excinfo:
+        _models(low, FAST).run(MODEL, ARGS)
+    assert len(low.keys) == 3
+    assert excinfo.value.http_status == 504
+    assert isinstance(excinfo.value, DeadlineExceeded)
+    assert excinfo.value.resend_refused is True
+    assert isinstance(excinfo.value.__cause__, IdempotencyKeyReuse)
+
+
+def test_resend_refused_is_false_on_an_ordinary_failure(server) -> None:
+    # The flag marks exactly one thing: a failure whose same-key resend the
+    # server refused. Everything else reads False, so a wrapper can test it
+    # without guarding for the attribute being absent.
+    server.state.model_run_error = (500, "internal_error")
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert excinfo.value.resend_refused is False
+
+
+@pytest.mark.asyncio
+async def test_the_async_loop_applies_the_same_claim_rules() -> None:
+    # The async twin of the three rules above, asserted together: a
+    # never-delivered failure does not suppress the refusal, a claim-capable one
+    # does, and the substituted error is marked.
+
+    class _AsyncConnectThenRefusedLow(_AsyncFlakyLow):
+        def _attempt(self, arguments: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+            self.keys.append(key)
+            if len(self.keys) == 1:
+                raise httpx.ConnectError("connection refused")
+            raise ApiError("no", code="idempotency_key_reuse", http_status=422)
+
+    low = _AsyncConnectThenRefusedLow()
+    with pytest.raises(IdempotencyKeyReuse) as refusal:
+        await _async_models(low, FAST).run(MODEL, ARGS, idempotency_key="spent-elsewhere-3")
+    assert refusal.value.resend_refused is False
+
+    class _AsyncServerErrorThenRefusedLow(_AsyncFlakyLow):
+        def _attempt(self, arguments: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+            self.keys.append(key)
+            if len(self.keys) == 1:
+                raise ApiError("boom", code="internal_error", http_status=500)
+            raise ApiError("no", code="idempotency_key_reuse", http_status=422)
+
+    low2 = _AsyncServerErrorThenRefusedLow()
+    with pytest.raises(ComfyError) as excinfo:
+        await _async_models(low2, FAST_OPTED_IN).run(MODEL, ARGS)
     assert excinfo.value.http_status == 500
+    assert excinfo.value.resend_refused is True
     assert isinstance(excinfo.value.__cause__, IdempotencyKeyReuse)
 
 

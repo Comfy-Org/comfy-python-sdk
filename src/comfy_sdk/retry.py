@@ -293,6 +293,40 @@ def is_unknown_outcome_status(status: int) -> bool:
     return 500 <= status <= 599
 
 
+def may_have_claimed_key(exc: BaseException) -> bool:
+    """Whether ``exc`` could have left the ``Idempotency-Key`` claimed server-side.
+
+    The question :meth:`RetryPolicy.should_retry` does not ask: *that* one is
+    "could another attempt survive this", and several failures answer yes to it
+    precisely because the key is provably still spendable. This one separates
+    those two groups, because only a failure that could have claimed the key can
+    explain a later ``idempotency_key_reuse`` refusal as an artefact of the
+    retry loop rather than as a genuine answer about the caller's key.
+
+    False for the never-delivered transport failures (:data:`_NEVER_DELIVERED` —
+    the request never reached a server that could claim anything) and for a
+    ``429``, which the contract rejects *without starting work* and whose key is
+    explicitly released. True for a collectable answer (the server says it is
+    holding a generation under this very key) and for every other 5xx, whose
+    outcome the server could not characterise and whose key it therefore keeps.
+
+    When this is false and the resend still comes back refused, the refusal is
+    real: the key was consumed by something other than this loop — a
+    caller-supplied key already spent elsewhere — and it is the error worth
+    raising, not the transport blip that preceded it.
+    """
+    status = getattr(exc, "http_status", None)
+    if isinstance(status, int):
+        if status == _TOO_MANY_REQUESTS:
+            return False
+        if is_collectable(exc):
+            return True
+        return is_unknown_outcome_status(status)
+    if isinstance(exc, _NEVER_DELIVERED):
+        return False
+    return isinstance(exc, _POSSIBLY_IN_FLIGHT)
+
+
 def retry_after_of(exc: BaseException) -> float | None:
     """The pace the server named, in seconds, or ``None`` if it named none.
 
@@ -670,5 +704,6 @@ __all__ = [
     "error_bucket_of",
     "is_collectable",
     "is_unknown_outcome_status",
+    "may_have_claimed_key",
     "retry_after_of",
 ]
