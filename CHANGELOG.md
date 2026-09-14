@@ -12,8 +12,6 @@ notes for each version.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-09-10
-
 ### Added
 
 - **The queued model surface** — `client.models.submit()`, `client.models.subscribe()`
@@ -44,6 +42,11 @@ notes for each version.
   completed-but-failed queued request reports, or `None`. Public because the
   rule it encodes ("a `200` is not the same thing as a success on this
   surface") is one a caller reading a raw payload has to apply too.
+
+## [0.2.0] - 2026-09-10
+
+### Added
+
 - `Asset.get_download_url()` / `AsyncAsset.get_download_url()` — a
   directly-fetchable URL for an *uploaded* asset's bytes, mirroring
   `Output.get_download_url()` (same `DownloadUrl`, commits the asset first if
