@@ -67,6 +67,22 @@ class ComfyError(Exception):
     #: required ``int``.
     retry_after: int | None = None
 
+    #: ``True`` only on the failure :meth:`comfy_sdk.models.Models.run` re-raises
+    #: after a same-key resend was refused — the original failure, with the key
+    #: refusal on ``__cause__``. It exists for outer retry wrappers: a wrapper
+    #: keyed on ``http_status >= 500`` alone would retry this error, and every
+    #: re-entry into ``run()`` mints a *fresh* key, which is the second billed
+    #: generation the one-key rule exists to prevent. Read it before retrying
+    #: anything out of ``run()``::
+    #:
+    #:     if getattr(exc, "resend_refused", False):
+    #:         raise  # the key is spent; a retry can only bill again
+    #:
+    #: ``False`` everywhere else, including on a first-attempt failure that was
+    #: never resent. Declared on the base, and defaulted onto the no-response
+    #: failures by :func:`_stamp`, so the attribute is always readable.
+    resend_refused: bool = False
+
     def __init__(
         self,
         message: str,
@@ -273,6 +289,11 @@ _STAMPABLE: tuple[type[BaseException], ...] = (
 #: ``tests/test_error_contract.py`` pins the pairing.
 _STAMPED_ATTRIBUTES = ("request_id", "retry_after")
 
+#: Stamped like :data:`_STAMPED_ATTRIBUTES`, but defaulted to ``False``
+#: rather than ``None``: these are booleans a caller tests directly, and a
+#: ``None`` default would read as falsey by luck rather than by contract.
+_STAMPED_FLAGS = ("resend_refused",)
+
 _E = TypeVar("_E", bound=BaseException)
 
 
@@ -299,6 +320,9 @@ def _stamp(exc: _E, idempotency_key: str | None) -> _E:
     for name in _STAMPED_ATTRIBUTES:
         if not hasattr(exc, name):
             setattr(exc, name, None)
+    for name in _STAMPED_FLAGS:
+        if not hasattr(exc, name):
+            setattr(exc, name, False)
     return exc
 
 

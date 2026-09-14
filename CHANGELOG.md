@@ -12,6 +12,45 @@ notes for each version.
 
 ## [Unreleased]
 
+### Changed
+
+- **Behaviour change: when a `client.models.run()` retry is refused `422`
+  `idempotency_key_reuse`, the failure that *claimed the key* is what is
+  raised** — the `deadline_exceeded` `504` the default collect loop resent
+  under, or the `500` a `retry_possibly_in_flight=True` policy resent under —
+  with the key refusal chained onto it as `__cause__` and `.resend_refused` set
+  to `True`. The refusal is an artefact of the retry loop rather than an answer
+  about the request, and it used to be the only error the caller saw, so the
+  real failure was lost. **An `except IdempotencyKeyReuse` around `models.run`
+  no longer catches this case**: catch the failure you actually care about (or
+  `ComfyError`) and inspect `exc.__cause__` to tell a rejected resend apart from
+  a first-attempt refusal. Nothing about *which* failures are retried changed,
+  and no other terminal failure is substituted — a `500` followed by a `404`
+  still raises the `404`.
+
+  The substitution is deliberately narrow, so it never buries a *genuine* key
+  refusal. Only a failure that could have claimed the key is eligible: a
+  never-delivered transport failure (`ConnectError`, `ConnectTimeout`,
+  `PoolTimeout`, `ProxyError`) never reached a server, and a `429` is rejected
+  without starting work and releases the key — a `422` after either of those is
+  the server refusing a key spent somewhere else, and it is raised as itself.
+  Among eligible failures the **most recent** is kept rather than the first, so
+  a `429` → `504` → `422` run raises the `504` (a generation is held) instead of
+  the `429` (which would imply nothing started, and invite a fresh-key retry —
+  the second billed generation).
+
+- **New: `ComfyError.resend_refused`** — `True` only on the failure `models.run`
+  re-raises after a refused same-key resend, `False` everywhere else (and
+  defaulted onto the no-response failures, so it is always readable). Outer
+  retry wrappers typically key on `http_status` and never look at `__cause__`;
+  re-entering `run()` mints a *fresh* key, so retrying a refused resend bills a
+  second generation. Guard with
+  `if getattr(exc, "resend_refused", False): raise`.
+
+- **New: `comfy_sdk.retry.may_have_claimed_key(exc)`** — the predicate behind
+  that narrowing, exported for callers writing their own loops: whether a
+  failure could have left the `Idempotency-Key` claimed server-side.
+
 ## [0.2.0] - 2026-09-10
 
 ### Added
