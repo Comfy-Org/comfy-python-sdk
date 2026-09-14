@@ -77,10 +77,16 @@ def _generate(out: Path) -> None:
 def _declared_router_error_types() -> list[dict[str, str]]:
     """The router spec's ``x-comfy-error-types`` entries, in declaration order.
 
-    Each entry is narrowed to the three fields both passes below read --
-    ``value``, ``tier`` and ``meaning`` -- rather than to the value alone: the
-    digest pass needs the prose, and validating it here keeps every "the sync
-    reshaped the extension" message in one place.
+    Each entry is narrowed to three fields -- ``value``, ``tier`` and
+    ``meaning`` -- rather than to the value alone: the digest pass needs the
+    prose, and validating them here keeps every "the sync reshaped the
+    extension" message in one place.
+
+    Only ``value`` and ``meaning`` are READ by the two passes below. ``tier``
+    is validated and carried but never consulted, deliberately: a vendored
+    sync that introduces a third tier is a spec change this job should stop
+    on, not absorb silently, and the closed-set check is the only thing that
+    would notice. See ``spec/README.md`` for what to do when it fires.
 
     Raises :class:`ValueError` rather than letting a ``KeyError``/``TypeError``
     escape: a sync that reshapes or drops the extension should fail this job
@@ -122,8 +128,17 @@ def _declared_router_error_types() -> list[dict[str, str]]:
         if not isinstance(entry, dict) or not isinstance(entry.get("value"), str):
             raise ValueError(f"{ROUTER_SPEC.name} has an x-comfy-error-types entry with no value")
         value = entry["value"]
-        if not value:
-            raise ValueError(f"{ROUTER_SPEC.name} has an x-comfy-error-types entry with no value")
+        # `.strip()`, matching `meaning` below: a whitespace-only value would
+        # otherwise pass here and through the dedup set, then be reported as
+        # "declared in the spec, no class in the SDK: " with a blank-looking
+        # name. The message differs from the missing/non-string one above on
+        # purpose -- two distinct malformations that print identically are two
+        # CI failures an operator cannot tell apart.
+        if not value.strip():
+            raise ValueError(
+                f"{ROUTER_SPEC.name} has an x-comfy-error-types entry whose value is empty "
+                "or whitespace"
+            )
         # Rejected here rather than downstream: `ROUTER_ERROR_TYPES` is built
         # from a dict and so is deduplicated, and a repeated value would make
         # the two lists differ only in length -- reported below as "same values,
@@ -303,7 +318,9 @@ def _check_router_error_types() -> int:
                 f"  declared in the spec, no class in the SDK: {', '.join(missing)}\n"
                 "  Add one RouterError subclass per value to src/comfy_sdk/router_exceptions.py,\n"
                 "  named as the PascalCase of the wire value, with the spec's `meaning`\n"
-                "  as its docstring.",
+                "  as its docstring, then set `_spec_meaning_digest` on it -- the digest\n"
+                "  pass below runs once these lists match and will fail on the next run\n"
+                "  without it.",
                 file=sys.stderr,
             )
         if extra:
@@ -331,11 +348,13 @@ def _check_router_error_types() -> int:
     stale: list[tuple[str, str | None, str]] = []
     for entry in entries:
         cls = exception_for(entry["value"])
-        # `getattr(..., None)` rather than an attribute read, and the base
-        # class deliberately declares no default: a subclass that forgets the
-        # marker has to fail here rather than inherit a blessing for prose
-        # nobody read.
-        blessed = getattr(cls, "_spec_meaning_digest", None)
+        # `cls.__dict__.get(...)` rather than `getattr`: the invariant is that
+        # a class carries its OWN marker, and `getattr` walks the MRO. That is
+        # harmless only while every bucket derives directly from `RouterError`,
+        # which declares no default -- a future bucket derived from another
+        # bucket would silently inherit that class's blessing for prose nobody
+        # read. Reading the class dict enforces the rule as written.
+        blessed = cls.__dict__.get("_spec_meaning_digest")
         expected = _meaning_digest(entry["meaning"])
         if blessed != expected:
             stale.append((entry["value"], blessed, expected))

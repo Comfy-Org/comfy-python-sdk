@@ -206,11 +206,26 @@ def test_every_class_is_blessed_against_the_spec_s_current_meaning(
     The digest only answers whether the prose moved since someone last read it.
     """
     cls = exception_for(entry["value"])
+    # A bucket the SDK has no class for resolves to the `RouterError` BASE, and
+    # the failure below would then tell the developer to set
+    # `_spec_meaning_digest` on it -- blessing the base, which every subclass
+    # would inherit, and which this module exists to prevent. `check_drift.py`
+    # cannot reach that state because its digest pass runs only once the value
+    # lists match; these parametrized cases have no such ordering, so the guard
+    # is explicit here. Reporting the missing class is
+    # `test_every_declared_bucket_has_a_class`'s job, not this one's.
+    assert cls is not RouterError, (
+        f"{entry['value']!r} is declared in spec/router-openapi.yaml but has no RouterError "
+        "subclass in src/comfy_sdk/router_exceptions.py -- add it (see "
+        "test_every_declared_bucket_has_a_class). Do NOT set _spec_meaning_digest on "
+        "RouterError itself: every bucket would inherit the blessing."
+    )
     expected = _meaning_digest(entry["meaning"])
-    # `getattr(..., None)` because `RouterError` deliberately declares no
-    # default: a subclass that forgets the marker has to fail here rather than
-    # inherit a blessing for prose nobody read.
-    assert getattr(cls, "_spec_meaning_digest", None) == expected, (
+    # `cls.__dict__.get(...)` rather than `getattr`: the invariant is that a
+    # class carries its OWN marker, and `getattr` walks the MRO, so a future
+    # bucket derived from another bucket would inherit that class's blessing
+    # for prose nobody read.
+    assert cls.__dict__.get("_spec_meaning_digest") == expected, (
         f"spec/router-openapi.yaml's `meaning` for {entry['value']!r} is not the prose "
         f"{cls.__name__}'s docstring in src/comfy_sdk/router_exceptions.py was written "
         "against -- it changed, or this class was never blessed. Re-read that docstring "
