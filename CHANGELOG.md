@@ -12,6 +12,39 @@ notes for each version.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-14
+
+### Added
+
+- **The queued model surface** — `client.models.submit()`, `client.models.subscribe()`
+  and `client.models.handle()`, plus the `RequestHandle` they hand back
+  (`status()`, `get()`, `cancel()`, `iter_events()`). `models.run` holds one
+  connection open until the generation is finished; `submit` returns as soon as
+  the server accepts the request, and the generation is collected later —
+  including from another process, since `client.models.handle(model,
+  request_id)` rebuilds the handle from nothing but the two ids. `subscribe` is
+  submit plus polling plus collection in one call, with an `on_queue_update=`
+  callback for progress and a client-side `timeout=` that makes a best-effort
+  cancel before it raises. `AsyncComfy` awaits the same method names with the
+  same arguments in the same order — there is no `submit_async`, for the reason
+  there is no `run_async`. Three properties are contract rather than
+  implementation: polling is authoritative and paced by the server's own
+  `Retry-After` when it names one; a `COMPLETED` status carrying an
+  `error_type` — which is how the server reports a failed *or* a cancelled
+  request — raises the typed `RouterError` subclass rather than being returned
+  as a successful result; and each `submit` **call** mints one fresh
+  `Idempotency-Key`, so two deliberate submits are two requests while a
+  transport retry inside one call replays the original. The queue itself stays
+  entirely server-owned: ordering, admission, retries, timeouts, billing and
+  expiry are not reimplemented here. The surface is gated server side — a
+  caller it is not switched on for is answered `403 not_enabled`, which arrives
+  as `comfy_sdk.router_exceptions.NotEnabled`. `client.models.run` is unchanged
+  in behaviour and signature.
+- `comfy_sdk.router_exceptions.error_from_completion()` — the typed exception a
+  completed-but-failed queued request reports, or `None`. Public because the
+  rule it encodes ("a `200` is not the same thing as a success on this
+  surface") is one a caller reading a raw payload has to apply too.
+
 ### Changed
 
 - **Behaviour change: when a `client.models.run()` retry is refused `422`
@@ -67,37 +100,6 @@ notes for each version.
   carrying a Router bucket still keeps that bucket. Any `Retry-After` on the
   response still reaches the caller on `.retry_after`. `422` and `429` keep
   their status-derived codes.
-
-### Added
-
-- **The queued model surface** — `client.models.submit()`, `client.models.subscribe()`
-  and `client.models.handle()`, plus the `RequestHandle` they hand back
-  (`status()`, `get()`, `cancel()`, `iter_events()`). `models.run` holds one
-  connection open until the generation is finished; `submit` returns as soon as
-  the server accepts the request, and the generation is collected later —
-  including from another process, since `client.models.handle(model,
-  request_id)` rebuilds the handle from nothing but the two ids. `subscribe` is
-  submit plus polling plus collection in one call, with an `on_queue_update=`
-  callback for progress and a client-side `timeout=` that makes a best-effort
-  cancel before it raises. `AsyncComfy` awaits the same method names with the
-  same arguments in the same order — there is no `submit_async`, for the reason
-  there is no `run_async`. Three properties are contract rather than
-  implementation: polling is authoritative and paced by the server's own
-  `Retry-After` when it names one; a `COMPLETED` status carrying an
-  `error_type` — which is how the server reports a failed *or* a cancelled
-  request — raises the typed `RouterError` subclass rather than being returned
-  as a successful result; and each `submit` **call** mints one fresh
-  `Idempotency-Key`, so two deliberate submits are two requests while a
-  transport retry inside one call replays the original. The queue itself stays
-  entirely server-owned: ordering, admission, retries, timeouts, billing and
-  expiry are not reimplemented here. The surface is gated server side — a
-  caller it is not switched on for is answered `403 not_enabled`, which arrives
-  as `comfy_sdk.router_exceptions.NotEnabled`. `client.models.run` is unchanged
-  in behaviour and signature.
-- `comfy_sdk.router_exceptions.error_from_completion()` — the typed exception a
-  completed-but-failed queued request reports, or `None`. Public because the
-  rule it encodes ("a `200` is not the same thing as a success on this
-  surface") is one a caller reading a raw payload has to apply too.
 
 ## [0.2.0] - 2026-09-10
 
@@ -486,7 +488,8 @@ First public release of the Comfy API v2 Python SDK (`comfy-sdk`).
   and download outputs.
 - Sync and async clients. Python 3.10+.
 
-[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.9...HEAD
+[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.7...v0.1.8
