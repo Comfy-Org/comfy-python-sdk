@@ -41,18 +41,35 @@ the only entry point, and ``client.models`` is the whole surface.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from typing import Any, cast
 
 import httpx
 
 from comfy_low.errors import ApiError
-from comfy_low.transport import MODEL_RUN_TIMEOUT, AsyncComfyLow, ComfyLow
+from comfy_low.transport import (
+    MODEL_RUN_TIMEOUT,
+    AsyncComfyLow,
+    ComfyLow,
+    parse_model_id,
+    parse_request_id,
+)
 
 from ._core import new_idempotency_key, validate_idempotency_key
 from .exceptions import translating
+from .model_requests import (
+    _CANCEL_FAILURES,
+    _CANCEL_TIMEOUT,
+    AsyncRequestHandle,
+    QueueUpdate,
+    RequestHandle,
+    _completed,
+    _remaining,
+    _request_id_of,
+)
 from .retry import DEFAULT_RETRY, Retrier, RetryPolicy
 from .router_exceptions import RouterError
 
@@ -257,6 +274,170 @@ class Models(_ModelsBase):
                         raise
                     time.sleep(delay)
 
+    # -- the queued form: submit, hold a handle, collect ------------------
+    def submit(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> RequestHandle:
+        """Queue ``model`` with ``arguments`` and return a handle to the request.
+
+        The queued counterpart of :meth:`run`, and the same request either way:
+        ``model`` is the canonical ``{provider}/{model}`` id and ``arguments``
+        is the partner model's own native JSON input, forwarded unchanged. The
+        difference is when the server answers — here, as soon as the request is
+        *accepted*, with the generation collected later through the returned
+        :class:`~comfy_sdk.model_requests.RequestHandle`.
+
+        Reach for it over :meth:`run` when the caller cannot hold a connection
+        for the length of a generation: a web request that has to return now, a
+        worker that submits in one process and collects in another, or a batch
+        where the submits should all be in flight at once.
+
+        **A fresh** ``Idempotency-Key`` **is minted per call**, which is what
+        makes two deliberate submits of the same input two requests rather than
+        one deduplicated request, while a transport-level retry *inside* this
+        one call keeps the one key and so replays the original rather than
+        queueing a second generation. Pass ``idempotency_key`` to choose the
+        key yourself — the case that earns it is a lost response: the request
+        may have been accepted and its id lost with the response, and resending
+        under the same key is the only way back to it. The uniqueness rules are
+        :meth:`run`'s, unchanged: the keyspace is the whole workspace's, so
+        mint keys with real entropy and never from a guessable label.
+
+        Every exception this raises carries that key on ``.idempotency_key``,
+        for exactly that recovery.
+
+        The surface is gated server side: a caller the queue is not switched on
+        for is answered ``403`` ``not_enabled``, which arrives here as
+        :class:`~comfy_sdk.router_exceptions.NotEnabled`. Nothing about the
+        request is wrong in that case, and it is terminal — do not retry it.
+        """
+        low = cast(ComfyLow, self._low)
+        key = (
+            validate_idempotency_key(idempotency_key)
+            if idempotency_key is not None
+            else new_idempotency_key()
+        )
+        # Snapshotted deeply before the first attempt, for the reason `run`
+        # gives: a mutation between attempts would send a different body under
+        # the one key, which is the same-key-different-body case the contract
+        # refuses outright.
+        payload = deepcopy(dict(arguments))
+        retrier = Retrier(self._retry, now=_now)
+        with translating(idempotency_key=key):
+            while True:
+                try:
+                    body, _headers = low.post_model_submit(model, payload, idempotency_key=key)
+                    break
+                except _CANDIDATE_FAILURES as exc:
+                    delay = retrier.delay_before_retry(exc)
+                    if delay is None:
+                        raise
+                    time.sleep(delay)
+            request_id = _request_id_of(body)
+        return RequestHandle(low, model, request_id, self._retry)
+
+    def subscribe(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        on_queue_update: Callable[[QueueUpdate], Any] | None = None,
+        timeout: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Queue a request, follow it to completion, and return its result.
+
+        :meth:`submit` plus polling plus
+        :meth:`~comfy_sdk.model_requests.RequestHandle.get`, in one call — the
+        ergonomic form for a caller who does want to wait but also wants to
+        show progress while waiting. The return value is the provider's own
+        payload, identical to what :meth:`run` would have returned.
+
+        ``on_queue_update`` is called with a
+        :class:`~comfy_sdk.model_requests.QueueUpdate` each time the queue
+        moves — first observation, every change of status or position, and the
+        completion. It is called from this thread, so keep it quick; an
+        exception it raises propagates and abandons the wait (the request keeps
+        running server side).
+
+        ``timeout`` is a **client-side** bound in seconds on the whole call —
+        the submit's wait excluded only where its own retry policy is already
+        running, then every poll, retry and pause, and the result fetch — with
+        no server-side meaning: the queue's own timeouts are the server's.
+        When it runs out this makes a best-effort
+        :meth:`~comfy_sdk.model_requests.RequestHandle.cancel` — so a caller
+        that has stopped waiting is not also still paying for a generation
+        nobody will collect — and then raises ``TimeoutError``. Best-effort is
+        literal: a cancel that itself fails is swallowed, because the timeout
+        is the failure worth reporting and a masked one would send the caller
+        looking in the wrong place. Use :meth:`submit` instead when the request
+        should outlive the caller's patience.
+
+        A completion carrying an ``error_type`` — which is how the server
+        reports a failure *and* a cancellation — raises the typed router
+        exception rather than returning, so a ``200`` never comes back as a
+        successful result.
+        """
+        # The clock starts here, before the submit, so ``timeout`` bounds the
+        # whole call as documented and not only the polling after it.
+        deadline = None if timeout is None else _now() + timeout
+        handle = self.submit(model, arguments, idempotency_key=idempotency_key)
+        # ``closing`` so the poll generator is finalised on every exit — the
+        # completion, the timeout, and above all the one where the caller's
+        # callback raises, which otherwise leaves it suspended until the
+        # collector happens to reach it.
+        with contextlib.closing(handle.iter_events(timeout=_remaining(deadline))) as updates:
+            completion: QueueUpdate | None = None
+            while True:
+                # Only the *iteration* is inside the ``except TimeoutError``. A
+                # callback is the caller's own code and may raise a
+                # ``TimeoutError`` of its own — from an HTTP call it makes to
+                # render progress, say — and catching that here would cancel a
+                # perfectly healthy request on the strength of a failure that
+                # had nothing to do with the wait.
+                try:
+                    update = next(updates)
+                except StopIteration:
+                    break
+                except TimeoutError:
+                    try:
+                        handle._cancel_best_effort()
+                    except _CANCEL_FAILURES:
+                        # Best-effort is literal: the timeout is the failure
+                        # worth reporting, and a masked one sends the caller
+                        # looking in the wrong place.
+                        pass
+                    raise
+                completion = update
+                if on_queue_update is not None:
+                    on_queue_update(update)
+        return handle._collect(_completed(completion), budget=_remaining(deadline))
+
+    def handle(self, model: str, request_id: str) -> RequestHandle:
+        """Rebuild the handle for a request submitted anywhere.
+
+        Takes no state beyond the two ids that address the request, so a
+        process that never made the submit — a worker draining a queue of ids,
+        a retry after a restart — reaches the same
+        :class:`~comfy_sdk.model_requests.RequestHandle` the submitting process
+        held. Makes no request of its own: an id that names nothing surfaces on
+        the first :meth:`~comfy_sdk.model_requests.RequestHandle.status` or
+        :meth:`~comfy_sdk.model_requests.RequestHandle.get`, as the server's
+        own answer rather than as a guess made here.
+
+        Both ids are validated locally — a malformed ``{provider}/{model}`` id
+        or a ``request_id`` that is not a single path segment raises
+        ``ValueError`` (a non-string raises ``TypeError``) rather than being
+        pasted into a URL.
+        """
+        parse_model_id(model)
+        parse_request_id(request_id)
+        return RequestHandle(cast(ComfyLow, self._low), model, request_id, self._retry)
+
 
 class AsyncModels(_ModelsBase):
     """``client.models`` on :class:`~comfy_sdk.client.AsyncComfy` — mirrors :class:`Models`."""
@@ -307,3 +488,110 @@ class AsyncModels(_ModelsBase):
                     if delay is None:
                         raise
                     await asyncio.sleep(delay)
+
+    # -- the queued form: submit, hold a handle, collect ------------------
+    async def submit(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> AsyncRequestHandle:
+        """Awaitable :meth:`Models.submit` — same arguments, an async handle.
+
+        Including the fresh-key-per-call rule and the ``.idempotency_key`` every
+        exception carries for a lost-response recovery. See :meth:`Models.submit`.
+        """
+        low = cast(AsyncComfyLow, self._low)
+        key = (
+            validate_idempotency_key(idempotency_key)
+            if idempotency_key is not None
+            else new_idempotency_key()
+        )
+        payload = deepcopy(dict(arguments))
+        retrier = Retrier(self._retry, now=_now)
+        with translating(idempotency_key=key):
+            while True:
+                try:
+                    body, _headers = await low.post_model_submit(
+                        model, payload, idempotency_key=key
+                    )
+                    break
+                except _CANDIDATE_FAILURES as exc:
+                    delay = retrier.delay_before_retry(exc)
+                    if delay is None:
+                        raise
+                    await asyncio.sleep(delay)
+            request_id = _request_id_of(body)
+        return AsyncRequestHandle(low, model, request_id, self._retry)
+
+    async def subscribe(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        on_queue_update: Callable[[QueueUpdate], Any] | None = None,
+        timeout: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Awaitable :meth:`Models.subscribe` — same arguments, same result.
+
+        ``on_queue_update`` may be a plain callable or a coroutine function;
+        an awaitable it returns is awaited before the next poll, so an async
+        callback does not need wrapping. See :meth:`Models.subscribe`.
+        """
+        deadline = None if timeout is None else _now() + timeout
+        handle = await self.submit(model, arguments, idempotency_key=idempotency_key)
+        completion: QueueUpdate | None = None
+        try:
+            # ``aclosing`` for the reason ``Models.subscribe`` uses ``closing``,
+            # and a sharper one: an async generator left suspended is finalised
+            # by the event loop's own shutdown hook, well after this call
+            # returned.
+            async with contextlib.aclosing(
+                handle.iter_events(timeout=_remaining(deadline))
+            ) as updates:
+                while True:
+                    # Scoped to the iteration alone, for the reason
+                    # `Models.subscribe` gives — and it bites harder here, where
+                    # a callback that awaits anything under `asyncio.wait_for`
+                    # raises `TimeoutError` natively.
+                    try:
+                        update = await anext(updates)
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError:
+                        try:
+                            await handle._cancel_best_effort()
+                        except _CANCEL_FAILURES:
+                            pass
+                        raise
+                    completion = update
+                    if on_queue_update is not None:
+                        outcome = on_queue_update(update)
+                        if isinstance(outcome, Awaitable):
+                            await outcome
+        except asyncio.CancelledError:
+            # The task was cancelled from outside while the request is still
+            # queued or running. `subscribe` has exposed neither the handle nor
+            # its key, so the caller has no way back to a generation that would
+            # otherwise keep running — and keep billing — after they stopped
+            # waiting for it. One shielded, bounded best-effort cancel, exactly
+            # as on the timeout path, then the cancellation proceeds.
+            with contextlib.suppress(*_CANCEL_FAILURES, TimeoutError, asyncio.TimeoutError):
+                await asyncio.shield(
+                    asyncio.wait_for(handle._cancel_best_effort(), _CANCEL_TIMEOUT + 1.0)
+                )
+            raise
+        return await handle._collect(_completed(completion), budget=_remaining(deadline))
+
+    async def handle(self, model: str, request_id: str) -> AsyncRequestHandle:
+        """Awaitable :meth:`Models.handle` — rebuild a handle from the two ids.
+
+        Awaited for symmetry with the rest of the async client rather than
+        because it does any I/O; it makes no request, exactly as the sync form
+        makes none. See :meth:`Models.handle`.
+        """
+        parse_model_id(model)
+        parse_request_id(request_id)
+        return AsyncRequestHandle(cast(AsyncComfyLow, self._low), model, request_id, self._retry)

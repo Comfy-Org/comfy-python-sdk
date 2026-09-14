@@ -23,12 +23,30 @@ class ComfyError(Exception):
     """Base for every SDK-level error."""
 
     #: The ``Idempotency-Key`` the failed call was made under. Populated by
-    #: :meth:`comfy_sdk.models.Models.run` and its async twin, which are the
-    #: operations that pass a key to :func:`translating`; ``None`` everywhere
-    #: else — including on operations that *do* send a key but do not stamp it
-    #: (``Comfy.submit()``), and on an exception constructed by hand. So
-    #: ``None`` means "this SDK did not record a key for you", never "no key
-    #: reached the server": do not infer from it that a resend is safe.
+    #: :meth:`comfy_sdk.models.Models.run` and
+    #: :meth:`comfy_sdk.models.Models.submit` and their async twins, and by
+    #: :meth:`comfy_sdk.client.Comfy.submit` /
+    #: :meth:`comfy_sdk.client.AsyncComfy.submit` on every failure of the
+    #: ``POST /jobs`` attempt itself — and so by the submit phase of
+    #: ``Comfy.run`` / ``AsyncComfy.run``. A failure while ``run`` polls the
+    #: job afterwards (a ``JobFailed``, a wait timeout) carries none: by then
+    #: the job exists and its id is the handle. It is ``None`` everywhere
+    #: else: on an operation that sends no key, on an asset upload (which
+    #: mints a key per handle and does not record it), and on an exception
+    #: constructed by hand. So ``None`` means "this SDK did not record a key
+    #: for you", never "no key reached the server": do not infer from it that
+    #: a resend is safe.
+    #:
+    #: What the key is *good for* differs by surface, so read it with the
+    #: operation in mind: ``models.run`` and ``models.submit`` send it to a
+    #: surface that replays a claimed key, so the key is a handle on the
+    #: generation you were already billed for. ``POST /jobs`` instead
+    #: *rejects* a reused key with ``422 idempotency_key_reuse``, so on a
+    #: ``Comfy.submit`` failure the key is the one this attempt was made
+    #: under, not a replay handle: after an ambiguous failure poll or list for
+    #: the job the first attempt may have created rather than resubmitting
+    #: under it, while a failure the server never saw (a connect failure, an
+    #: exhausted ``QueueFull``) leaves the key unclaimed.
     #:
     #: Declared on the base rather than set per subclass so that a bucket this
     #: SDK version has never heard of — which arrives as a bare
@@ -191,9 +209,14 @@ def _router_only_class(code: str) -> type[Any] | None:
 
 def to_sdk_error(exc: ApiError) -> ComfyError:
     """Translate a protocol ``ApiError`` into the idiomatic SDK exception."""
+    # `str(exc)`, not `exc.message`: they differ only when the protocol error
+    # carries a body excerpt — a response that stated no message of its own —
+    # and then `str(exc)` is the one that names the cause (`HTTP 503: no healthy
+    # upstream`). Callers read the SDK exception, never the protocol one, so the
+    # cause has to cross this boundary or it reaches no log.
     if exc.code == "queue_full":
         return QueueFull(
-            exc.message,
+            str(exc),
             retry_after=exc.retry_after or 0,
             code=exc.code,
             http_status=exc.http_status,
@@ -203,7 +226,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
     router_cls = _router_only_class(exc.code)
     if router_cls is not None:
         return router_cls(
-            exc.message,
+            str(exc),
             error_type=exc.code,
             http_status=exc.http_status,
             request_id=exc.request_id,
@@ -211,7 +234,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
         )
     cls = _BY_CODE.get(exc.code, ComfyError)
     return cls(
-        exc.message,
+        str(exc),
         code=exc.code,
         http_status=exc.http_status,
         details=exc.details,
