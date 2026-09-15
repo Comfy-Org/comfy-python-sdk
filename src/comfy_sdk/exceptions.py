@@ -241,14 +241,30 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
         )
     router_cls = _router_only_class(exc.code)
     if router_cls is not None:
+        # Imported here for the same reason `_router_only_class` imports
+        # `_BY_ERROR_TYPE` lazily: `router_exceptions` subclasses `ComfyError`
+        # from this module. This is the conversion the layering rule forces —
+        # `comfy_low` carries a Router validation body's `detail[]` entries up
+        # raw because it may not import `comfy_sdk`, and this is the boundary
+        # that can type them. Without it `.errors` was empty on the whole
+        # `models.run` path while the documented contract says it is populated
+        # whenever the response carried the array.
+        from comfy_sdk.router_exceptions import _detail_from
+
         return router_cls(
             str(exc),
             error_type=exc.code,
             http_status=exc.http_status,
             request_id=exc.request_id,
             retry_after=exc.retry_after,
+            errors=tuple(_detail_from(entry) for entry in exc.validation_errors),
         )
     cls = _BY_CODE.get(exc.code, ComfyError)
+    # No `errors=` here, deliberately: `.errors` is a `RouterError` attribute
+    # and none of these classes takes the argument. A validation body that
+    # reaches this branch — a `detail[]` under a v2 `error.code`, or under the
+    # status-derived guess when no bucket was sent at all — still gets the
+    # entries' messages, since those became `exc.message` one layer down.
     return cls(
         str(exc),
         code=exc.code,
