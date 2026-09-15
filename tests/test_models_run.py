@@ -24,6 +24,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from comfy_low.errors import ApiError as LowApiError
 from comfy_low.transport import (
     MODEL_RUN_TIMEOUT,
     ROUTER_BASE_URL,
@@ -45,7 +46,9 @@ from comfy_sdk.models import AsyncModels, Models
 from comfy_sdk.router_exceptions import (
     ERROR_TYPE_HEADER,
     DeadlineExceeded,
+    InvalidInput,
     RouterError,
+    error_from_completion,
     error_from_response,
 )
 
@@ -463,6 +466,116 @@ def test_an_unmapped_failure_still_lands_as_a_comfy_error(server) -> None:
             client.models.run(MODEL, ARGS)
     assert excinfo.value.code == "model_unavailable"
     assert excinfo.value.http_status == 503
+
+
+# --- a per-field validation failure, end to end --------------------------
+#
+# Router answers a model whose schema rejected the input with a `422` whose
+# body is a `detail` ARRAY, one entry per failing field, and the coarse bucket
+# on `X-Comfy-Error-Type` -- that body carries no `error_type` of its own. The
+# entries are the only place the provider-level reason survives, and
+# `RouterError.errors` is documented as populated whenever the response carried
+# them. Getting there means crossing the layer boundary: `comfy_low` decodes
+# the response but may not import `comfy_sdk`, so it carries the entries raw
+# and `to_sdk_error` types them.
+
+#: Two failing fields, the shape `spec/router-openapi.yaml` documents.
+VALIDATION_DETAIL: list[Any] = [
+    {
+        "loc": ["body", "steps"],
+        "msg": "ensure this value is less than or equal to 8",
+        "type": "less_than_equal",
+        "ctx": {"limit_value": 8},
+        "input": 50,
+    },
+    {
+        "loc": ["body", "model"],
+        "msg": "unknown model variant",
+        "type": "value_error",
+    },
+]
+
+
+def _assert_validation_surface(exc: InvalidInput) -> None:
+    """The whole contract of a per-field failure, asserted identically on both
+    clients so the sync and async paths cannot diverge on it."""
+    assert len(exc.errors) == 2
+    assert exc.errors[1].loc == ("body", "model")
+    assert exc.errors[1].msg == "unknown model variant"
+    assert exc.errors[1].type == "value_error"
+    # The bound the first entry carries, which the coarse bucket cannot express
+    # and which a caller reads to say what the limit actually was.
+    assert exc.errors[0].ctx == {"limit_value": 8}
+    assert exc.errors[0].input == 50
+    # The human-readable line is the entries' own messages, joined -- not the
+    # `HTTP 422` a caller used to get, and not a Python repr of the array.
+    assert exc.detail == "ensure this value is less than or equal to 8; unknown model variant"
+    assert str(exc) == exc.detail
+    assert "[" not in exc.detail
+    assert exc.error_type == "invalid_input"
+    assert exc.http_status == 422
+    # The raw entries on the protocol error underneath: the carrier the
+    # layering rule forces, readable through `__cause__` for anyone debugging
+    # the boundary itself.
+    cause = exc.__cause__
+    assert isinstance(cause, LowApiError)
+    assert cause.validation_errors == tuple(VALIDATION_DETAIL)
+
+
+def test_a_per_field_validation_failure_populates_errors(server) -> None:
+    server.state.model_run_validation_detail = VALIDATION_DETAIL
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            client.models.run(MODEL, ARGS)
+    _assert_validation_surface(excinfo.value)
+
+
+async def test_an_async_per_field_validation_failure_populates_errors_too(server) -> None:
+    server.state.model_run_validation_detail = VALIDATION_DETAIL
+    async with AsyncComfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            await client.models.run(MODEL, ARGS)
+    _assert_validation_surface(excinfo.value)
+
+
+def test_a_validation_body_of_non_mappings_degrades_and_never_raises(server) -> None:
+    # A `detail` array whose members are not objects at all. Nothing can be
+    # typed out of them, so `.errors` is empty and the message falls back to
+    # the status -- decoding an error response must never replace a diagnosable
+    # failure with an undiagnosable one.
+    server.state.model_run_validation_detail = [1, "x"]
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert excinfo.value.errors == ()
+    assert excinfo.value.http_status == 422
+    # `HTTP 422` plus the body excerpt, which is exactly the pre-existing rule
+    # for a body that stated no message -- the excerpt is dropped only where a
+    # message WAS found, and none was here. Nothing about this case changed,
+    # and it is the response for which the raw text is the only description of
+    # what the server objected to.
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, LowApiError)
+    assert cause.message == "HTTP 422"
+    assert cause.validation_errors == ()
+    assert excinfo.value.detail == 'HTTP 422: {"detail": [1, "x"]}'
+
+
+def test_the_run_and_queued_paths_agree_on_one_validation_body(server) -> None:
+    # The queued surface builds its exception from the completion payload
+    # (`error_from_completion`) and the awaited one from the HTTP response, so
+    # the two reach `.errors` by different code entirely. One wire body has to
+    # produce one set of entries, or a caller's branch works on `submit()` and
+    # silently does not on `run()`.
+    server.state.model_run_validation_detail = VALIDATION_DETAIL
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            client.models.run(MODEL, ARGS)
+    queued = error_from_completion(
+        {"error_type": "invalid_input", "detail": VALIDATION_DETAIL},
+    )
+    assert queued is not None
+    assert excinfo.value.errors == queued.errors
 
 
 # --- the key survives the failure ----------------------------------------
