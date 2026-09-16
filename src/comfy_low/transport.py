@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any, BinaryIO
-from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -174,10 +174,38 @@ def parse_model_id(model: str) -> tuple[str, str]:
     return provider, name
 
 
+def _router_run_query(
+    model_provider: str | None,
+    strict_mode: bool | None,
+    fallback_provider: str | None,
+) -> str:
+    """The Comfy Router alt-provider query string for a model run, or ``""``.
+
+    Each field is sent only when the caller set it (``None`` means "send
+    nothing"), so a call that names none is byte-for-byte the request this route
+    has always made -- the server applies its own defaults rather than being
+    handed ``model_provider=default`` / ``strict_mode=false`` spelled out on the
+    wire. ``strict_mode`` is rendered ``true``/``false`` (the spec's query
+    form); the two provider fields pass through as given.
+    """
+    params: list[tuple[str, str]] = []
+    if model_provider is not None:
+        params.append(("model_provider", model_provider))
+    if strict_mode is not None:
+        params.append(("strict_mode", "true" if strict_mode else "false"))
+    if fallback_provider is not None:
+        params.append(("fallback_provider", fallback_provider))
+    return urlencode(params)
+
+
 def model_run_request(
     model: str,
     arguments: Mapping[str, Any],
     idempotency_key: str | None,
+    *,
+    model_provider: str | None = None,
+    strict_mode: bool | None = None,
+    fallback_provider: str | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, str]]:
     """Sans-IO ``(path, json_body, headers)`` for one model run.
 
@@ -200,6 +228,9 @@ def model_run_request(
     path = _MODEL_RUN_PATH_TEMPLATE.format(
         provider=quote(provider, safe=""), model=quote(name, safe="")
     )
+    query = _router_run_query(model_provider, strict_mode, fallback_provider)
+    if query:
+        path = f"{path}?{query}"
     body: dict[str, Any] = dict(arguments)
     headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
     return path, body, headers
@@ -909,6 +940,9 @@ class ComfyLow:
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any]:
         """POST ``{router_base_url}/v2/models/{provider}/{model}`` — awaited server-side.
@@ -934,7 +968,14 @@ class ComfyLow:
         Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
         any request when ``model`` is not a ``{provider}/{model}`` id.
         """
-        path, body, headers = model_run_request(model, arguments, idempotency_key)
+        path, body, headers = model_run_request(
+            model,
+            arguments,
+            idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+        )
         url = self._p.router_base_url + path
         resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 201))
@@ -1329,10 +1370,20 @@ class AsyncComfyLow:
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any]:
         """Async :meth:`ComfyLow.post_model_run`."""
-        path, body, headers = model_run_request(model, arguments, idempotency_key)
+        path, body, headers = model_run_request(
+            model,
+            arguments,
+            idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+        )
         url = self._p.router_base_url + path
         resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 201))

@@ -108,6 +108,7 @@ class _FlakyLow:
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
+        **_: Any,
     ) -> dict[str, Any]:
         return self._attempt(arguments, idempotency_key)
 
@@ -120,6 +121,7 @@ class _AsyncFlakyLow(_FlakyLow):
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
+        **_: Any,
     ) -> dict[str, Any]:
         return self._attempt(arguments, idempotency_key)
 

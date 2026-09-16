@@ -215,6 +215,9 @@ class Models(_ModelsBase):
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any]:
         """Run ``model`` with ``arguments`` and return the completed result.
@@ -232,6 +235,17 @@ class Models(_ModelsBase):
         forwarded to the provider unchanged — there is no Comfy-shaped envelope
         around it, so whatever the partner documents as its request body is
         what goes here.
+
+        ``model_provider`` selects an alternate serving provider for this model
+        (Comfy Router's ``model_provider`` query param); omitted, the model runs
+        on its default provider and the request is byte-for-byte what it always
+        was. Under the default ``strict_mode`` (``False``) the ``arguments`` you
+        pass stay this model's own native input, and Router translates them to
+        the alternate provider's schema on the way in and the response back to
+        native on the way out; ``strict_mode=True`` sends and returns that
+        provider's own raw shape unchanged, so no translation happens either
+        way. ``fallback_provider`` controls the retry-against-another-provider
+        behavior — pass ``"false"`` to opt out. Each is sent only when set.
 
         One call, one result. It blocks until the generation is finished —
         including for a provider the platform has to submit-and-poll, where the
@@ -379,7 +393,15 @@ class Models(_ModelsBase):
         with translating(idempotency_key=key):
             while True:
                 try:
-                    return low.post_model_run(model, payload, idempotency_key=key, timeout=timeout)
+                    return low.post_model_run(
+                        model,
+                        payload,
+                        idempotency_key=key,
+                        model_provider=model_provider,
+                        strict_mode=strict_mode,
+                        fallback_provider=fallback_provider,
+                        timeout=timeout,
+                    )
                 except _CANDIDATE_FAILURES as exc:
                     if claimed is not None and _is_key_reuse(exc):
                         # The resend could never have succeeded — the server
@@ -575,6 +597,9 @@ class AsyncModels(_ModelsBase):
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any]:
         """Awaitable :meth:`Models.run` — same arguments, same result shape.
@@ -608,7 +633,13 @@ class AsyncModels(_ModelsBase):
             while True:
                 try:
                     return await low.post_model_run(
-                        model, payload, idempotency_key=key, timeout=timeout
+                        model,
+                        payload,
+                        idempotency_key=key,
+                        model_provider=model_provider,
+                        strict_mode=strict_mode,
+                        fallback_provider=fallback_provider,
+                        timeout=timeout,
                     )
                 except _CANDIDATE_FAILURES as exc:
                     if claimed is not None and _is_key_reuse(exc):

@@ -130,6 +130,45 @@ def test_the_sans_io_request_builder_agrees_with_the_wire() -> None:
     assert headers == {"Idempotency-Key": "k-1"}
 
 
+def test_the_alt_provider_controls_are_query_params_sent_only_when_set() -> None:
+    # Omitted -> no query at all, so a call that names none of the controls is
+    # byte-for-byte the request this route has always made.
+    assert model_run_request(MODEL, ARGS, None)[0] == "/v2/models/acme/flux-dev"
+    # Each control is a query param on the run path; `strict_mode` renders as the
+    # spec's `true`/`false` rather than Python's `True`/`False`.
+    assert (
+        model_run_request(MODEL, ARGS, None, model_provider="fal")[0]
+        == "/v2/models/acme/flux-dev?model_provider=fal"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, strict_mode=True)[0]
+        == "/v2/models/acme/flux-dev?strict_mode=true"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, strict_mode=False)[0]
+        == "/v2/models/acme/flux-dev?strict_mode=false"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider="false")[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=false"
+    )
+    # All three together, in the order the builder emits them; the body and the
+    # Idempotency-Key are untouched by the query.
+    path, body, headers = model_run_request(
+        MODEL,
+        ARGS,
+        "k-1",
+        model_provider="fal",
+        strict_mode=False,
+        fallback_provider="false",
+    )
+    assert path == (
+        "/v2/models/acme/flux-dev?model_provider=fal&strict_mode=false&fallback_provider=false"
+    )
+    assert body == ARGS
+    assert headers == {"Idempotency-Key": "k-1"}
+
+
 @pytest.mark.parametrize(
     "model, path",
     [
@@ -495,6 +534,7 @@ class _RaisingLow:
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
+        **_: Any,
     ) -> dict[str, Any]:
         self.keys.append(idempotency_key)
         raise self._exc
@@ -508,6 +548,7 @@ class _AsyncRaisingLow(_RaisingLow):
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
+        **_: Any,
     ) -> dict[str, Any]:
         self.keys.append(idempotency_key)
         raise self._exc
