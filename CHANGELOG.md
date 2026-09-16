@@ -10,6 +10,32 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`except RouterError` now catches every Comfy Router refusal.** `insufficient_credits`,
+  `unauthorized` and `forbidden` raised a class that was *not* a `RouterError`, so the obvious
+  catch-all around a `client.models.*` call caught nothing for them. Those three buckets are now
+  one class each, exported from both `comfy_sdk.exceptions` and `comfy_sdk.router_exceptions` —
+  `comfy_sdk.exceptions.InsufficientCredits is comfy_sdk.router_exceptions.InsufficientCredits`,
+  so either import catches what the other does. A Router bucket this version does not know now
+  raises `RouterError` rather than a bare `ComfyError`.
+- A cancel the server refuses raises a named exception instead of an untyped `409`:
+  `AlreadyCompleted` (the `{"status": "ALREADY_COMPLETED"}` answer to cancelling finished work),
+  under the `CancelRefused` base. Nothing has to match on the response body text any more.
+
+### Changed
+
+- **Because those three buckets are now one class each, they descend from `RouterError` on the
+  workflow surface too**: a `POST /jobs` call that fails `401`/`403`/`402` raises a `RouterError`
+  subclass. `except Unauthorized` / `except Forbidden` / `except InsufficientCredits` (from either
+  module) and `except ComfyError` are unchanged; only `except RouterError` sees more than its name
+  suggests.
+- `RouterError` is exported from the package root, alongside `CancelRefused` and
+  `AlreadyCompleted`. The fifteen per-bucket classes still live in `comfy_sdk.router_exceptions`.
+- `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
+  body's `error_type`), or `None` when it named none — which is also how the SDK tells which
+  surface answered.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added

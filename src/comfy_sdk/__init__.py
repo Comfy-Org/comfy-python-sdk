@@ -50,7 +50,9 @@ from .events import (
     StatusChange,
 )
 from .exceptions import (
+    AlreadyCompleted,
     BlobNotFound,
+    CancelRefused,
     ComfyError,
     Forbidden,
     HashMismatch,
@@ -62,6 +64,7 @@ from .exceptions import (
     MissingAsset,
     NotFound,
     QueueFull,
+    RouterError,
     Unauthorized,
     WorkflowFormatUi,
 )
@@ -128,6 +131,15 @@ __all__ = [
     "MissingApiKey",
     "Unauthorized",
     "Forbidden",
+    # Comfy Router failures. `RouterError` is the base of every one of them and
+    # is lifted here because it is the broad catch a caller writes first; the
+    # per-bucket classes stay in `comfy_sdk.router_exceptions`, which is one
+    # import path for the whole closed set rather than half of it here and half
+    # of it there. `AlreadyCompleted` / `CancelRefused` are the cancel route's
+    # refusals, which that closed set does not name.
+    "RouterError",
+    "CancelRefused",
+    "AlreadyCompleted",
     # retry policy
     "RetryPolicy",
     "DEFAULT_RETRY",
