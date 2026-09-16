@@ -10,6 +10,28 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Added
+
+- `DetachedRequest` / `AsyncDetachedRequest` — what `models.subscribe` now returns when its
+  `timeout` expires on a run the queue has already dispatched. Carries the `request_id`, the model
+  id and a live handle, so the generation stays collectable.
+- `SubscribeTimeout` — a `TimeoutError` subclass raised by the `models.subscribe` timeouts that
+  still raise, carrying `.request_id`, `.model`, `.cancelled` and `.cancel_error`.
+
+### Changed
+
+- **`models.subscribe(timeout=N)` now returns a `DetachedRequest` instead of raising** when the
+  queue refuses the cleanup cancel because the request is already in flight. Such a run is served
+  and **billed** whatever the caller does, so the timeout is a detach rather than a cancellation
+  and the request stays collectable by `request_id`. Its return type is now
+  `dict[str, Any] | DetachedRequest` — check the type before using the result.
+- A `subscribe` timeout that *did* cancel the request raises `SubscribeTimeout` rather than a bare
+  `TimeoutError`. It subclasses `TimeoutError`, so `except TimeoutError` is unaffected.
+- **A cleanup cancel that fails for any other reason is no longer swallowed.** A transport
+  failure, a `401` or a `500` on the cancel now reaches the caller on
+  `SubscribeTimeout.cancel_error` and `__cause__`, with `.cancelled` `False`, instead of looking
+  exactly like a successful cancellation.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added

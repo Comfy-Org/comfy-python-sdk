@@ -238,6 +238,14 @@ class ServerState:
     queue_cancel_error_type: str = "client_disconnected"
     # Set by a cancel; makes every later status poll report the cancellation.
     queue_canceled: bool = False
+    # When set, the cancel route REFUSES: `(status, detail)`, answered with no
+    # error bucket at all and leaving the request running. That code-less shape
+    # is the one the queue's state refusals have today — the documented
+    # cancel-after-completion answers `409` with `{"status": "ALREADY_COMPLETED"}`
+    # and names no bucket — so it is what the SDK has to cope with. Also the way
+    # to drive a cancel that fails for a reason that is NOT benign: set it to a
+    # `401` or a `500` and the refusal must surface rather than read as a detach.
+    queue_cancel_refusal: tuple[int, str] | None = None
 
     # --- counters the tests assert on ---
     upload_count: int = 0
@@ -749,6 +757,12 @@ def _make_handler(state: ServerState):
                 state.queue_cancel_fail_times -= 1
                 status, code = state.queue_cancel_transient_error
                 self._router_err(status, code, retry_after=state.queue_cancel_transient_retry_after)
+                return
+            if state.queue_cancel_refusal is not None:
+                status, detail = state.queue_cancel_refusal
+                # No `error_type`, on the header or in the body: the refusal
+                # the SDK sees carries only a status and prose.
+                self._json(status, {"detail": detail})
                 return
             state.queue_canceled = True
             if state.queue_cancel_status == 204:

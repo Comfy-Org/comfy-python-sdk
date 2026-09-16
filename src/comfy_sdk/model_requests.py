@@ -90,6 +90,24 @@ _MIN_HTTP_TIMEOUT = 1.0
 #: issues after its own timeout -- see ``RequestHandle._cancel_best_effort``.
 _CANCEL_TIMEOUT = 10.0
 
+#: The status a cancel is refused with when the REQUEST'S OWN STATE is what
+#: refuses it, rather than the caller, the credential or the server. The queue
+#: honours a cancel only while the request is still waiting to be dispatched: a
+#: run already in flight is served and billed, and one that has already finished
+#: cannot be un-finished. Both refusals are the plain HTTP reading of ``409``
+#: -- the target's current state conflicts with the operation -- and that
+#: reading is what this keys on, deliberately rather than on the refusal's
+#: prose, which no contract pins and which differs between the two.
+#:
+#: It is a STATUS and not an ``error_type`` because the queue names no bucket on
+#: these today: a cancel-after-completion answers ``409`` carrying
+#: ``{"status": "ALREADY_COMPLETED"}`` and no bucket at all, which reaches this
+#: SDK as a bare :class:`~comfy_sdk.exceptions.ComfyError`. When the contract
+#: does name a bucket for the in-flight refusal, this is the one predicate to
+#: widen -- branching on the typed class is strictly better than branching on
+#: the status, and the status branch can then narrow to the legacy shape.
+_CANCEL_REFUSED_STATUS = 409
+
 _now = time.monotonic
 
 
@@ -344,6 +362,89 @@ def _timed_out(request_id: str, timeout: float | None, update: QueueUpdate | Non
     )
 
 
+class SubscribeTimeout(TimeoutError):
+    """``models.subscribe``'s own timeout, saying what became of the request.
+
+    A ``TimeoutError`` subclass rather than a new hierarchy, so every
+    ``except TimeoutError`` already written around ``subscribe`` keeps catching
+    it and keeps reading the same message. What it adds is the state a caller
+    otherwise had to guess at: whether the cleanup cancel actually stopped the
+    run, and the two ids that reach it again if it did not.
+
+    It is raised for the two timeout outcomes that leave nothing to collect.
+    The third -- the queue refused the cancel because the run was already in
+    flight -- is not an error at all and is *returned* as a
+    :class:`DetachedRequest`; see :meth:`comfy_sdk.models.Models.subscribe`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str,
+        model: str,
+        cancelled: bool,
+        cancel_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        #: The request the timed-out call was following. Pass it and
+        #: :attr:`model` to ``client.models.handle`` to reach it again.
+        self.request_id = request_id
+        #: The canonical ``{provider}/{model}`` id the request was submitted to.
+        self.model = model
+        #: ``True`` only when the queue ACCEPTED the cleanup cancel, which it
+        #: does only while the request is still waiting to be dispatched. The
+        #: run is then gone and there is nothing left to collect or be billed
+        #: for. ``False`` means the cancel failed and the run's fate is
+        #: unknown -- read :attr:`cancel_error`, and treat the request as
+        #: possibly still running.
+        self.cancelled = cancelled
+        #: The failure the cleanup cancel raised, when it raised one. Also on
+        #: ``__cause__``. ``None`` when the cancel was accepted. It is surfaced
+        #: rather than swallowed because a cancel that failed on a transport
+        #: error or a rejected credential says the run may well still be
+        #: running -- and billing -- which is the opposite of what a bare
+        #: timeout has always implied here.
+        self.cancel_error = cancel_error
+
+
+def _refused_on_state(exc: BaseException) -> bool:
+    """Whether a failed cancel was the queue refusing on the REQUEST's state.
+
+    True for the refusals described on :data:`_CANCEL_REFUSED_STATUS` -- an
+    in-flight run the queue will not recall, or one that has already completed
+    -- and false for everything else, which is what keeps a transport failure,
+    a rejected credential and a ``500`` raising instead of being read as a
+    benign detach. ``getattr`` because the transport-level failures in
+    :data:`_CANCEL_FAILURES` are httpx's own classes and carry no
+    ``http_status`` at all; those are exactly the ones that must not be
+    swallowed, so their absence reading as "not a refusal" is the right answer.
+    """
+    return getattr(exc, "http_status", None) == _CANCEL_REFUSED_STATUS
+
+
+def _subscribe_timed_out(
+    handle: _RequestHandleBase,
+    timed_out: BaseException,
+    *,
+    cancelled: bool,
+    cancel_error: BaseException | None = None,
+) -> SubscribeTimeout:
+    """``timed_out`` re-expressed with the outcome of the cleanup cancel."""
+    note = (
+        "the request was cancelled"
+        if cancelled
+        else f"the cleanup cancel failed ({cancel_error}), so the request may still be running"
+    )
+    return SubscribeTimeout(
+        f"{timed_out}; {note}",
+        request_id=handle.request_id,
+        model=handle.model,
+        cancelled=cancelled,
+        cancel_error=cancel_error,
+    )
+
+
 def _bounded(policy: RetryPolicy, budget: float | None) -> RetryPolicy:
     """``policy`` with both of its elapsed budgets capped at ``budget`` seconds.
 
@@ -430,12 +531,16 @@ class RequestHandle(_RequestHandleBase):
         """
         return self._status(budget=None)
 
-    def _status(self, *, budget: float | None) -> QueueUpdate:
+    def _status(self, *, budget: float | None, policy: RetryPolicy | None = None) -> QueueUpdate:
         """One authoritative poll, bounded by ``budget`` seconds when one is given.
 
         The bound covers the whole call — the HTTP request and any retry of it
         — so a caller's ``timeout`` on :meth:`iter_events` is a bound on the
-        loop and not only on the pauses between its polls.
+        loop and not only on the pauses between its polls. ``policy``
+        substitutes another retry policy outright, the way it does on
+        :meth:`_call`; the poll loop never passes one, and the confirming poll
+        in :meth:`_after_subscribe_timeout` passes ``NO_RETRY`` because it runs
+        after the caller's deadline has already run out.
         """
         with translating():
             payload, headers = self._call(
@@ -443,6 +548,7 @@ class RequestHandle(_RequestHandleBase):
                     self._model, self._request_id, **_http_timeout(budget)
                 ),
                 budget=budget,
+                policy=policy,
             )
         return _update_from(payload, headers, request_id=self._request_id, require_status=True)
 
@@ -549,6 +655,13 @@ class RequestHandle(_RequestHandleBase):
         than assuming the work stopped. A deployment that answers with no body
         gives an update whose ``status`` is ``""``; the authoritative state is
         the next :meth:`status`.
+
+        The queue honours a cancel only while the request is still waiting to
+        be dispatched. A run it has already started is served to the end and
+        **billed**, and asking to cancel it is *refused* rather than ignored —
+        which reaches you as an exception, not as an update. ``models.subscribe``
+        reads that refusal as a detach; here it is the caller's to handle, since
+        an explicit ``cancel()`` is not a timeout cleaning up after itself.
         """
         with translating():
             payload, headers = self._call(
@@ -573,6 +686,69 @@ class RequestHandle(_RequestHandleBase):
                 ),
                 policy=NO_RETRY,
             )
+
+    def _after_subscribe_timeout(self) -> DetachedRequest | QueueUpdate | None:
+        """``models.subscribe``'s timeout teardown: cancel, then say what happened.
+
+        Three answers, because the cancel has three meaningfully different
+        outcomes and a caller who has just lost their wait needs to tell them
+        apart:
+
+        * ``None`` — the queue ACCEPTED the cancel, which it does only for a
+          request it has not dispatched yet. The run is gone, nothing will be
+          billed for it and there is nothing to collect, so ``subscribe``
+          raises, exactly as it always has.
+        * a :class:`DetachedRequest` — the queue REFUSED the cancel on the
+          request's own state (:data:`_CANCEL_REFUSED_STATUS`) and a confirming
+          poll found the request still going. It was already in flight, so it
+          is served and billed whatever the caller does; the honest report is
+          that the caller detached from a run that is still theirs to collect.
+        * a :class:`QueueUpdate` — the same refusal, but the confirming poll
+          found the request ``COMPLETED``. It finished while the teardown was
+          running, so there IS a result, and ``subscribe`` collects it rather
+          than throwing away a generation the caller has been billed for.
+
+        Any other cancel failure propagates. That is the narrowing this method
+        exists for: the timeout path used to swallow every cancel failure
+        alike, so a rejected credential or an unreachable server read exactly
+        like a successful cancel and left the caller believing a still-running
+        generation had been stopped.
+        """
+        try:
+            self._cancel_best_effort()
+            return None
+        except _CANCEL_FAILURES as exc:
+            if not _refused_on_state(exc):
+                raise
+        return self._detach_report()
+
+    def _detach_report(self) -> DetachedRequest | QueueUpdate:
+        """What the refused cancel left behind, confirmed against the server.
+
+        One unretried, short-bounded poll: the caller's deadline has already
+        run out, so this is not the place to spend a retry budget. The poll is
+        what separates "still running" from "finished while we were tearing
+        down", which the refusal itself does not say — the queue names no
+        bucket on it, and the authoritative state of a request is always the
+        next status read, never what a cancel answered.
+
+        A poll that fails does not undo what the refusal established: the
+        request was NOT cancelled. So it still reports a detach, with
+        :attr:`DetachedRequest.status` left empty to say the state was not
+        confirmed, rather than raising and stranding the caller without the
+        handle to the run they are now paying for.
+        """
+        try:
+            update = self._status(budget=_CANCEL_TIMEOUT, policy=NO_RETRY)
+        except _CANCEL_FAILURES:
+            return DetachedRequest(
+                request_id=self._request_id, model=self._model, status="", handle=self
+            )
+        if update.is_completed:
+            return update
+        return DetachedRequest(
+            request_id=self._request_id, model=self._model, status=update.status, handle=self
+        )
 
     def _call(
         self,
@@ -622,7 +798,9 @@ class AsyncRequestHandle(_RequestHandleBase):
         """Awaitable :meth:`RequestHandle.status` — one authoritative poll."""
         return await self._status(budget=None)
 
-    async def _status(self, *, budget: float | None) -> QueueUpdate:
+    async def _status(
+        self, *, budget: float | None, policy: RetryPolicy | None = None
+    ) -> QueueUpdate:
         """Async :meth:`RequestHandle._status` — one poll, bounded by ``budget``."""
         with translating():
             payload, headers = await self._call(
@@ -630,6 +808,7 @@ class AsyncRequestHandle(_RequestHandleBase):
                     self._model, self._request_id, **_http_timeout(budget)
                 ),
                 budget=budget,
+                policy=policy,
             )
         return _update_from(payload, headers, request_id=self._request_id, require_status=True)
 
@@ -695,6 +874,30 @@ class AsyncRequestHandle(_RequestHandleBase):
                 policy=NO_RETRY,
             )
 
+    async def _after_subscribe_timeout(self) -> AsyncDetachedRequest | QueueUpdate | None:
+        """Async :meth:`RequestHandle._after_subscribe_timeout` — same three answers."""
+        try:
+            await self._cancel_best_effort()
+            return None
+        except _CANCEL_FAILURES as exc:
+            if not _refused_on_state(exc):
+                raise
+        return await self._detach_report()
+
+    async def _detach_report(self) -> AsyncDetachedRequest | QueueUpdate:
+        """Async :meth:`RequestHandle._detach_report`."""
+        try:
+            update = await self._status(budget=_CANCEL_TIMEOUT, policy=NO_RETRY)
+        except _CANCEL_FAILURES:
+            return AsyncDetachedRequest(
+                request_id=self._request_id, model=self._model, status="", handle=self
+            )
+        if update.is_completed:
+            return update
+        return AsyncDetachedRequest(
+            request_id=self._request_id, model=self._model, status=update.status, handle=self
+        )
+
     async def _call(
         self,
         send: Callable[[], Awaitable[tuple[dict[str, Any], httpx.Headers]]],
@@ -714,4 +917,72 @@ class AsyncRequestHandle(_RequestHandleBase):
                 await asyncio.sleep(delay)
 
 
-__all__ = ["COMPLETED", "AsyncRequestHandle", "QueueUpdate", "RequestHandle"]
+@dataclass(frozen=True)
+class _DetachedBase:
+    """The shared body of the two detach reports."""
+
+    #: The request that is STILL RUNNING — the same id
+    #: ``client.models.handle`` rehydrates from, and the one to quote in a
+    #: support request about the charge.
+    request_id: str
+    #: The canonical ``{provider}/{model}`` id it was submitted to. Needed
+    #: alongside :attr:`request_id` because every route in this family is
+    #: addressed by both.
+    model: str
+    #: The status the confirming poll reported for the request, verbatim —
+    #: ``"IN_PROGRESS"`` on the ordinary detach. ``""`` when that poll itself
+    #: failed, which says the state was not confirmed, never that the request
+    #: stopped: the refused cancel had already established that it did not.
+    status: str
+
+
+@dataclass(frozen=True)
+class DetachedRequest(_DetachedBase):
+    """What ``models.subscribe`` RETURNS when its timeout could not cancel the run.
+
+    The queue honours a cancel only before it dispatches a request. Past that
+    point the run is served and **billed** whatever the caller does, so a
+    ``subscribe`` timeout is a *detach* and not a cancellation: the caller has
+    stopped waiting, and the generation carries on without them.
+
+    It is returned rather than raised because nothing has gone wrong — the run
+    is healthy, it is the caller's patience that ran out — and because the
+    generation is still theirs to collect::
+
+        outcome = client.models.subscribe(model, arguments, timeout=30)
+        if isinstance(outcome, DetachedRequest):
+            print("still running, and still billed:", outcome.request_id)
+            result = outcome.handle.get()      # ...or collect it later, elsewhere
+        else:
+            result = outcome
+
+    Branch on the class, never on a message: that is the whole point of the
+    type. The three ways a ``subscribe`` timeout can end are this, a
+    :class:`SubscribeTimeout` with ``cancelled=True`` (the request was still
+    queued and really is gone), and an ordinary result (it completed while the
+    timeout was being torn down).
+    """
+
+    #: The live request, ready to poll or collect. The same object
+    #: ``client.models.handle(model, request_id)`` rebuilds in any other
+    #: process, so nothing here is required to stay in this one.
+    handle: RequestHandle
+
+
+@dataclass(frozen=True)
+class AsyncDetachedRequest(_DetachedBase):
+    """Awaitable-surface :class:`DetachedRequest` — what ``AsyncModels.subscribe`` returns."""
+
+    #: The live request as an :class:`AsyncRequestHandle`.
+    handle: AsyncRequestHandle
+
+
+__all__ = [
+    "COMPLETED",
+    "AsyncDetachedRequest",
+    "AsyncRequestHandle",
+    "DetachedRequest",
+    "QueueUpdate",
+    "RequestHandle",
+    "SubscribeTimeout",
+]

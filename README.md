@@ -536,7 +536,7 @@ The handle carries four operations:
 |---|---|
 | `handle.status()` | one authoritative poll, returned as a `QueueUpdate` (`status`, `queue_position`, `error_type`, `retry_after`, `raw`) |
 | `handle.get(timeout=None)` | poll to completion, then return the provider's own payload — the same value `run` would have returned |
-| `handle.cancel()` | ask the server to cancel. A request, not a guarantee: a request that already completed stays completed |
+| `handle.cancel()` | ask the server to cancel. A request, not a guarantee: the queue honours one only while the request is still waiting to be dispatched, and a run it has already started is served, billed, and its cancel *refused* — which reaches you as an exception rather than as an update |
 | `handle.iter_events(timeout=None)` | the poll loop with its updates exposed — yields the first observation, every change of status or queue position, and the completion |
 
 Polling is **poll-authoritative**: there is no stream to reconcile against on
@@ -575,11 +575,60 @@ result = client.models.subscribe(
 ```
 
 `submit` + poll + `get`, in one call, for a caller who does want to wait but
-also wants to show progress. `timeout=` is a **client-side** bound with no
-server-side meaning; when it runs out, `subscribe` makes a best-effort
-`cancel()` — so a caller who has stopped waiting is not still paying for a
-generation nobody will collect — and then raises `TimeoutError`. Use `submit`
-when the request should outlive the caller's patience.
+also wants to show progress. Use `submit` when the request is *meant* to
+outlive the caller's patience.
+
+#### A `timeout` detaches; it does not reliably cancel
+
+`timeout=` is a **client-side** bound with no server-side meaning. When it runs
+out, `subscribe` makes a best-effort `cancel()` — and **the queue honours a
+cancel only while the request is still waiting to be dispatched.** A run it has
+already started is served to the end and **billed in full**, whatever the
+caller does. So a timeout on an in-flight run is a *detach*, not a
+cancellation: you stop waiting, the generation carries on, it completes, and
+**you pay for it**.
+
+That is not a failure, so it is not raised. `subscribe` **returns** a
+`DetachedRequest` (`AsyncDetachedRequest` on the async client) carrying the
+`request_id`, the model id and a live handle — everything needed to collect the
+generation you are being billed for, here or in another process:
+
+```python
+from comfy_sdk import DetachedRequest, SubscribeTimeout
+
+try:
+    outcome = client.models.subscribe("fal-ai/flux-pro", {"prompt": "a cat"}, timeout=300)
+except SubscribeTimeout as exc:
+    # The request was still queued, the cancel was accepted, nothing ran and
+    # nothing is billed. `exc.cancelled` is False if the cancel itself failed,
+    # in which case the run may still be going — `exc.request_id` reaches it.
+    raise
+
+if isinstance(outcome, DetachedRequest):
+    print("still running, and still billed:", outcome.request_id)
+    result = outcome.handle.get()                     # ...now
+    # ...or later, anywhere: client.models.handle(model, request_id).get()
+else:
+    result = outcome
+```
+
+The three ways the timeout can end, told apart by type and never by a message:
+
+| | |
+|---|---|
+| **cancelled** | the request was still queued and the cancel was accepted. Nothing ran, nothing is billed. Raises `SubscribeTimeout` (a `TimeoutError`) with `.cancelled` `True` |
+| **detached** | the run was already in flight and the cancel was refused. It continues, completes and **is billed**. Returns a `DetachedRequest` |
+| **completed during teardown** | the run finished while the timeout was being torn down. The result exists and is paid for, so it is collected and returned like any other result |
+
+A cancel that fails for some *other* reason — a transport failure, a rejected
+credential, a `500` — is **not** treated as a detach and is not swallowed:
+`SubscribeTimeout` is raised with `.cancelled` `False` and the cancel's own
+failure on `.cancel_error` (and on `__cause__`). Such a cancel never landed, so
+the run may well still be going; `.request_id` and `.model` reach it.
+
+`SubscribeTimeout` subclasses `TimeoutError`, so an existing
+`except TimeoutError` around `subscribe` keeps catching the cases that still
+raise.
 
 Each `submit` **call** mints one fresh `Idempotency-Key`: two deliberate
 submits of the same input are two requests, while a transport-level retry

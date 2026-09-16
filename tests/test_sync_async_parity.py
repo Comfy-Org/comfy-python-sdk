@@ -108,6 +108,19 @@ _SYNC_ON_BOTH: dict[tuple[str, str], str] = {
     ),
 }
 
+#: ``pair key -> why the pair legitimately has no public methods at all.``
+#: The vacuity guard below reads "zero public methods" as "the walk broke",
+#: which is right for every pair that models an *operation*. A pair that models
+#: a *value* has none to find and never will, and excluding it from discovery
+#: instead would drop the one thing still worth checking about it — that the
+#: sync and async halves keep the same shape as each other.
+_DATA_ONLY: dict[str, str] = {
+    "comfy_sdk.model_requests.DetachedRequest": (
+        "a frozen dataclass reporting a detached request; its whole surface is fields, and "
+        "the two halves differ only in whether the handle they carry is the awaitable one"
+    ),
+}
+
 #: A name that encodes sync-vs-async instead of letting the client encode it.
 #: ``run_async`` is the specific decision this guards — there is one ``run``,
 #: and its awaitable form is ``AsyncComfy().models.run`` — and the pattern
@@ -609,7 +622,11 @@ def test_introspection_is_not_vacuous() -> None:
     assert not [label for label, s, a in _PAIRS if s is a], (
         "a pair was discovered comparing a class against itself, which cannot fail"
     )
-    empty = [label for label, sync_cls, _ in _PAIRS if not _methods(sync_cls)]
+    empty = [
+        label
+        for label, sync_cls, _ in _PAIRS
+        if not _methods(sync_cls) and _pair_key(sync_cls) not in _DATA_ONLY
+    ]
     assert not empty, f"pairs discovered with zero public methods (introspection broke?): {empty}"
     compared = sum(len(set(_methods(s)) & set(_methods(a, rename=True))) for _, s, a in _PAIRS)
     assert compared > 0, "no paired public methods were compared at all"
@@ -618,13 +635,17 @@ def test_introspection_is_not_vacuous() -> None:
 def test_the_asymmetry_tables_stay_current() -> None:
     """An allowance for something that no longer exists is a stale exemption.
 
-    Both tables are escape hatches keyed on ``module.Class``; an entry that
+    All three tables are escape hatches keyed on ``module.Class``; an entry that
     matches nothing is worse than no entry, because it reads like a live
     exception to a rule it has stopped touching — and it would silently
     re-arm as an exemption if that name ever came back for another reason.
     """
     pairs = {_pair_key(sync_cls): (sync_cls, async_cls) for _, sync_cls, async_cls in _PAIRS}
-    stale = []
+    stale = [f"{key} (no such pair is discovered)" for key in _DATA_ONLY if key not in pairs] + [
+        f"{key} (the pair has public methods now, so the exemption hides them)"
+        for key in _DATA_ONLY
+        if key in pairs and _methods(pairs[key][0])
+    ]
     for table, must_be_shared in ((_ALLOWED_ASYMMETRY, False), (_SYNC_ON_BOTH, True)):
         for key, name in table:
             if key not in pairs:
