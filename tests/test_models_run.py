@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import re
 from collections.abc import Mapping
 from typing import Any, cast
@@ -879,3 +880,77 @@ def test_an_undecodable_success_body_is_a_stamped_sdk_error(server) -> None:
     assert excinfo.value.idempotency_key is not None
     assert excinfo.value.http_status == 200
     assert excinfo.value.code == "invalid_response"
+
+
+# --- run_detailed: what Router disclosed about HOW the run ran ---------------
+
+
+class _HeaderLow:
+    """A stub whose ``post_model_run`` answers one canned (body, headers) pair."""
+
+    def __init__(self, headers: dict[str, str]) -> None:
+        self._headers = headers
+        self.result: dict[str, Any] = {"images": [{"url": "http://example.invalid/x.png"}]}
+
+    def post_model_run(
+        self, model: str, arguments: Mapping[str, Any], **_: Any
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
+        return self.result, self._headers
+
+
+def _detailed(headers: dict[str, str]) -> Any:
+    low = _HeaderLow(headers)
+    return Models(cast(Any, low)).run_detailed(MODEL, ARGS)
+
+
+def test_run_detailed_surfaces_the_provider_that_actually_served_the_call() -> None:
+    """The body cannot answer this, which is the whole reason the header exists.
+
+    An alt-provider response is translated back to the model's own native
+    contract, so a fal-served run and a natively-served one produce the SAME
+    document. ``X-Comfy-Router-Fallback-Provider`` is the only disclosure that
+    they differed, so dropping it -- as returning the bare body did -- left a
+    caller no way to tell which leg ran.
+    """
+    assert _detailed({"X-Comfy-Router-Fallback-Provider": "fal"}).serving_provider == "fal"
+    # Absent means "the provider asked for served it", the common case — NOT
+    # "unknown", so it must not be reported as a missing value.
+    assert _detailed({}).serving_provider is None
+
+
+def test_run_detailed_parses_dropped_params_as_json_not_as_a_comma_split() -> None:
+    """The spec's own example entry contains a comma, so a comma split is wrong.
+
+    The header is described in prose as "a JSON array of strings" while its
+    declared schema (``type: array``) means OpenAPI's simple comma-delimited
+    form. The example settles it: one entry reading ``moderation (fal applies
+    its own, non-configurable safety filtering)`` has a comma INSIDE it, and a
+    comma split would tear that single entry into two meaningless fragments.
+    """
+    entry = "moderation (fal applies its own, non-configurable safety filtering)"
+    got = _detailed({"X-Comfy-Router-Dropped-Params": json.dumps([entry])})
+    assert got.dropped_params == (entry,)
+    assert _detailed({}).dropped_params is None
+    # A value that is not JSON at all is kept whole rather than guessed at: one
+    # intact entry a human can read beats two confident fragments.
+    assert _detailed({"X-Comfy-Router-Dropped-Params": "not json"}).dropped_params == ("not json",)
+
+
+def test_run_detailed_reports_a_replay_from_the_headers_presence() -> None:
+    # The header is absent on a fresh run rather than sent as `false`, so this
+    # branches on presence — reading it as a boolean would make "absent" and
+    # "false" indistinguishable from a bug that stopped sending it.
+    assert _detailed({"X-Comfy-Idempotent-Replayed": "true"}).replayed is True
+    assert _detailed({}).replayed is False
+
+
+def test_run_returns_the_bare_body_so_the_default_surface_is_unchanged() -> None:
+    low = _HeaderLow({"X-Comfy-Router-Fallback-Provider": "fal"})
+    assert Models(cast(Any, low)).run(MODEL, ARGS) == low.result
+
+
+@pytest.mark.parametrize("cls", [Models, AsyncModels])
+def test_both_clients_expose_run_detailed(cls: type) -> None:
+    # The suffix rule is about sync-vs-async naming, not about a second
+    # operation — but both namespaces must still spell the same operations.
+    assert hasattr(cls, "run_detailed")

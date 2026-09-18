@@ -961,7 +961,7 @@ class ComfyLow:
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
         """POST ``{router_base_url}/v2/models/{provider}/{model}`` — awaited server-side.
 
         Addressed to Comfy Router, not to the ``/api/v2`` deployment
@@ -982,6 +982,15 @@ class ComfyLow:
         ``spec/router-openapi.yaml``, hand-bound — see
         :data:`_MODEL_RUN_PATH_TEMPLATE`.
 
+        Returns ``(body, headers)`` rather than the bare body, matching the four
+        ``*_model_request*`` queue methods beside it. The response headers are
+        not incidental on this route: ``X-Comfy-Router-Fallback-Provider`` is the
+        ONLY disclosure that a fallback retry served the call rather than the
+        provider asked for, and ``X-Comfy-Router-Dropped-Params`` the only
+        disclosure that translating a native body onto an alternate provider's
+        schema could not carry every field. Returning the body alone discarded
+        both, so a caller could not tell an alt-provider run from a native one.
+
         Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
         any request when ``model`` is not a ``{provider}/{model}`` id.
         """
@@ -995,7 +1004,7 @@ class ComfyLow:
         )
         url = self._p.router_base_url + path
         resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200, 201))
+        return self._p.parse_or_raise(resp, (200, 201)), resp.headers
 
     # -- models: the queued form ------------------------------------------
     #
@@ -1026,6 +1035,15 @@ class ComfyLow:
 
         The timeout is therefore the client's ordinary default rather than
         :data:`MODEL_RUN_TIMEOUT` — nothing here waits on a generation.
+
+        Returns ``(body, headers)`` rather than the bare body, matching the four
+        ``*_model_request*`` queue methods beside it. The response headers are
+        not incidental on this route: ``X-Comfy-Router-Fallback-Provider`` is the
+        ONLY disclosure that a fallback retry served the call rather than the
+        provider asked for, and ``X-Comfy-Router-Dropped-Params`` the only
+        disclosure that translating a native body onto an alternate provider's
+        schema could not carry every field. Returning the body alone discarded
+        both, so a caller could not tell an alt-provider run from a native one.
 
         Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
         any request when ``model`` is not a ``{provider}/{model}`` id.
@@ -1391,7 +1409,7 @@ class AsyncComfyLow:
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
         """Async :meth:`ComfyLow.post_model_run`."""
         path, body, headers = model_run_request(
             model,
@@ -1403,7 +1421,7 @@ class AsyncComfyLow:
         )
         url = self._p.router_base_url + path
         resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200, 201))
+        return self._p.parse_or_raise(resp, (200, 201)), resp.headers
 
     # -- models: the queued form ------------------------------------------
     async def post_model_submit(

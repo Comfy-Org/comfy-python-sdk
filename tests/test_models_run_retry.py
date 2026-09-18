@@ -91,15 +91,25 @@ class _FlakyLow:
         self.fail_times = fail_times
         self.keys: list[str | None] = []
         self.payloads: list[dict[str, Any]] = []
+        #: The alt-provider controls each attempt was called with. Recorded
+        #: rather than swallowed by `**_`, so a stub cannot quietly absorb a
+        #: kwarg `Models.run` failed to forward and still pass.
+        self.alt_provider_kwargs: list[dict[str, Any]] = []
         self.result: dict[str, Any] = {"images": [{"url": "http://example.invalid/x.png"}]}
 
-    def _attempt(self, arguments: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+    def _attempt(
+        self, arguments: Mapping[str, Any], key: str | None
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
         self.keys.append(key)
         self.payloads.append(dict(arguments))
         if self.fail_times > 0:
             self.fail_times -= 1
             raise httpx.ConnectError("connection refused")
-        return self.result
+        # `post_model_run` answers (body, headers) — see its docstring for why
+        # the headers are part of the contract on this route rather than
+        # incidental. The stub carries none; the tests here are about the retry
+        # loop, and the header plumbing is pinned in test_models_run.py.
+        return self.result, {}
 
     def post_model_run(
         self,
@@ -108,8 +118,11 @@ class _FlakyLow:
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
-        **_: Any,
-    ) -> dict[str, Any]:
+        **kw: Any,
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
+        self.alt_provider_kwargs.append(
+            {k: kw.get(k) for k in ("model_provider", "strict_mode", "fallback_provider")}
+        )
         return self._attempt(arguments, idempotency_key)
 
 
@@ -121,8 +134,11 @@ class _AsyncFlakyLow(_FlakyLow):
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
-        **_: Any,
-    ) -> dict[str, Any]:
+        **kw: Any,
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
+        self.alt_provider_kwargs.append(
+            {k: kw.get(k) for k in ("model_provider", "strict_mode", "fallback_provider")}
+        )
         return self._attempt(arguments, idempotency_key)
 
 
@@ -207,7 +223,9 @@ def test_the_body_is_frozen_before_the_first_attempt() -> None:
     arguments: dict[str, Any] = {"prompt": "a cat"}
 
     class _MutatingLow(_FlakyLow):
-        def _attempt(self, args: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+        def _attempt(
+            self, args: Mapping[str, Any], key: str | None
+        ) -> tuple[dict[str, Any], Mapping[str, str]]:
             result = super()._attempt(args, key)
             arguments["prompt"] = "something else entirely"
             return result
@@ -675,12 +693,14 @@ def test_service_unavailable_is_retried_under_the_replay_opt_in_on_one_key() -> 
     # subject to the rule the whole module exists for: the second attempt
     # carries the SAME key, so a retry cannot be billed as a second generation.
     class _UnavailableThenFine(_FlakyLow):
-        def _attempt(self, args: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+        def _attempt(
+            self, args: Mapping[str, Any], key: str | None
+        ) -> tuple[dict[str, Any], Mapping[str, str]]:
             self.keys.append(key)
             if self.fail_times > 0:
                 self.fail_times -= 1
                 raise ServiceUnavailable("try again shortly", http_status=503)
-            return self.result
+            return self.result, {}
 
     low = _UnavailableThenFine(fail_times=1)
     assert _models(low, FAST_OPTED_IN).run(MODEL, ARGS) == low.result
@@ -699,12 +719,14 @@ def test_a_router_error_reaches_the_retry_loop_at_all() -> None:
     # above unreachable and retry a silent no-op the day this route raises
     # them.
     class _RouterFailingLow(_FlakyLow):
-        def _attempt(self, args: Mapping[str, Any], key: str | None) -> dict[str, Any]:
+        def _attempt(
+            self, args: Mapping[str, Any], key: str | None
+        ) -> tuple[dict[str, Any], Mapping[str, str]]:
             self.keys.append(key)
             if self.fail_times > 0:
                 self.fail_times -= 1
                 raise InternalError("upstream blew up", http_status=500)
-            return self.result
+            return self.result, {}
 
     low = _RouterFailingLow(fail_times=1)
     policy = RetryPolicy(
