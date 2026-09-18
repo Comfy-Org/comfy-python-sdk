@@ -183,17 +183,62 @@ def test_a_bodyless_401_still_maps_to_unauthorized() -> None:
     assert isinstance(err, Unauthorized)
 
 
-def test_a_router_validation_body_degrades_rather_than_coercing_its_detail() -> None:
+def test_a_router_validation_body_is_read_rather_than_coerced_into_the_message() -> None:
     # Router's per-field validation body is the FastAPI `detail[]` shape. A
-    # list is not a message: stringifying it would put a Python repr in front of
-    # a caller, so the status-derived message answers instead.
+    # list is still not a message -- stringifying it would put a Python repr in
+    # front of a caller -- so the entries are read instead: they ride up raw for
+    # the translation boundary to type, and their own `msg` values become the
+    # message.
     err = error_from_envelope(
         500,
         {"detail": [{"loc": ["body", "steps"], "msg": "too large", "type": "value_error"}]},
         error_type="internal_error",
     )
     assert err.code == "internal_error"
-    assert err.message == "HTTP 500"
+    assert err.message == "too large"
+    # The intent the old status-derived message protected, unchanged: whatever
+    # reaches `str(exc)` is prose, never a repr of the array.
+    assert "[" not in err.message
+    assert err.validation_errors == (
+        {"loc": ["body", "steps"], "msg": "too large", "type": "value_error"},
+    )
+
+
+def test_a_validation_body_whose_entries_state_no_message_still_degrades() -> None:
+    # The entries decoded, so they are carried; none of them named a reason, so
+    # there is nothing to say but the status. Both halves matter: a caller that
+    # branches on `.errors` still gets them, and the message never becomes an
+    # empty string.
+    err = error_from_envelope(
+        422,
+        {"detail": [{"loc": ["body", "steps"]}, {"msg": "   "}]},
+        error_type="invalid_input",
+    )
+    assert err.message == "HTTP 422"
+    assert err.validation_errors == ({"loc": ["body", "steps"]}, {"msg": "   "})
+
+
+def test_a_string_detail_still_wins_over_the_array_reading() -> None:
+    # The request-level shape is untouched: `detail` as a string is the message
+    # and carries no entries.
+    err = error_from_envelope(403, {"detail": "not enabled"}, error_type="not_enabled")
+    assert err.message == "not enabled"
+    assert err.validation_errors == ()
+
+
+def test_an_envelope_message_outranks_the_validation_entries() -> None:
+    # Precedence is unchanged by the new reading: `error.message` is the
+    # envelope's own statement of the cause and still wins. The entries are
+    # carried regardless -- they are data, not a fallback for the message.
+    err = error_from_envelope(
+        422,
+        {
+            "error": {"code": "invalid_workflow", "message": "the graph is invalid"},
+            "detail": [{"loc": ["body", "steps"], "msg": "too large"}],
+        },
+    )
+    assert err.message == "the graph is invalid"
+    assert err.validation_errors == ({"loc": ["body", "steps"], "msg": "too large"},)
 
 
 @pytest.mark.parametrize("body", [None, {}, {"error": None}, {"error_type": "   "}, {"detail": 7}])
@@ -296,6 +341,21 @@ def test_a_message_the_server_actually_sent_is_not_joined_to_the_excerpt() -> No
         503, {"detail": "router is draining"}, body_excerpt='{"detail": "router is draining"}'
     )
     assert str(err) == "router is draining"
+    assert err.body_excerpt is None
+
+
+def test_a_validation_array_that_states_a_message_drops_the_excerpt_too() -> None:
+    # The same rule reached through the array: the entries stated the cause, so
+    # the raw JSON stops being glued onto `str(exc)`. That gluing was the whole
+    # of what a caller used to see for a per-field failure.
+    raw = '{"detail": [{"loc": ["body", "steps"], "msg": "too large"}]}'
+    err = error_from_envelope(
+        422,
+        {"detail": [{"loc": ["body", "steps"], "msg": "too large"}]},
+        error_type="invalid_input",
+        body_excerpt=raw,
+    )
+    assert str(err) == "too large"
     assert err.body_excerpt is None
 
 

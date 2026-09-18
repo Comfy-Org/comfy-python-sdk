@@ -10,6 +10,12 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- `models.run` now populates `RouterError.errors` from a Router 422's per-field `detail[]` and
+  uses the entries' messages as `detail`, instead of `HTTP 422`; `comfy_low.ApiError.validation_errors`
+  carries the raw entries.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added
