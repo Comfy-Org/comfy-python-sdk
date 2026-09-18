@@ -166,6 +166,16 @@ class ServerState:
     # fronted by Router, so this is the shape a real deployment's 504 arrives
     # in, and the bucket-keyed collect rule has to read it.
     model_run_router_error_shape: bool = False
+    # Answer the model run with Router's *per-field* validation failure: a
+    # `422` whose body is `{"detail": [...]}` -- this list, verbatim -- with the
+    # coarse bucket on `X-Comfy-Error-Type` and no `error_type` in the body,
+    # which is the one error shape Router sends that carries no bucket of its
+    # own. Set to a list to enable; `None` leaves the run alone. Checked before
+    # the other failure knobs, since it describes the whole response rather
+    # than a (status, code) pair the shared `fail()` helper can render.
+    model_run_validation_detail: list[Any] | None = None
+    # The bucket sent on `X-Comfy-Error-Type` alongside it.
+    model_run_validation_error_type: str = "invalid_input"
 
     # --- the queued model surface (submit / status / result / cancel) ---
     # POST .../requests answers this status with a body naming a request id.
@@ -891,6 +901,17 @@ def _make_handler(state: ServerState):
                     headers=headers or None,
                 )
 
+            if state.model_run_validation_detail is not None:
+                # Router's per-field validation body. Deliberately built here
+                # rather than through `fail()`: that helper always emits an
+                # `{error: {code, message}}` envelope or a `{detail, error_type}`
+                # string body, and the shape under test is neither.
+                self._json(
+                    422,
+                    {"detail": state.model_run_validation_detail},
+                    headers={"X-Comfy-Error-Type": state.model_run_validation_error_type},
+                )
+                return
             if state.model_run_fail_times > 0:
                 state.model_run_fail_times -= 1
                 status, code = state.model_run_transient_error

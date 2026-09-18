@@ -25,6 +25,9 @@ the fuller account of each version, including verification notes.
   Only the refusal shapes this version recognises are typed, and `ALREADY_COMPLETED` is the whole
   of that list today: a refusal that names no bucket and no code stays an untyped `ComfyError`,
   because nothing in such a response identifies it as a refusal at all.
+- `models.run` now populates `RouterError.errors` from a Router 422's per-field `detail[]` and
+  uses the entries' messages as `detail`, instead of `HTTP 422`; `comfy_low.ApiError.validation_errors`
+  carries the raw entries.
 
 ### Changed
 

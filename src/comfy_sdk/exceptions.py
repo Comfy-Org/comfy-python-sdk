@@ -46,6 +46,7 @@ from .router_exceptions import (
     InsufficientCredits,
     RouterError,
     Unauthorized,
+    _detail_from,
 )
 
 
@@ -199,6 +200,15 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
         # human-readable string. `details` — the per-field dict the v2 envelope
         # carries — is forwarded too: nothing about a shared bucket says the
         # response cannot have sent one.
+        #
+        # `errors=` is the conversion the layering rule forces: `comfy_low`
+        # carries a Router validation body's `detail[]` entries up raw because
+        # it may not import `comfy_sdk`, and this is the boundary that can type
+        # them. Without it `.errors` was empty on the whole `models.run` path
+        # while the documented contract says it is populated whenever the
+        # response carried the array. `_detail_from` is a plain module-level
+        # import now that `ComfyError` lives in `comfy_sdk._errors` — the cycle
+        # that forced the lazy one is what this change removed.
         return cls(
             str(exc),
             error_type=exc.code,
@@ -206,7 +216,13 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
             details=exc.details,
             request_id=exc.request_id,
             retry_after=exc.retry_after,
+            errors=tuple(_detail_from(entry) for entry in exc.validation_errors),
         )
+    # No `errors=` below, deliberately: `.errors` is a `RouterError` attribute
+    # and none of the remaining classes takes the argument. A validation body
+    # that reaches this branch — a `detail[]` under a v2 `error.code`, or under
+    # the status-derived guess when no bucket was sent at all — still gets the
+    # entries' messages, since those became `exc.message` one layer down.
     return cls(
         str(exc),
         code=exc.code,
