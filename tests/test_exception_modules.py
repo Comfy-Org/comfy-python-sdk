@@ -259,7 +259,10 @@ def test_a_409_that_states_no_status_is_not_typed_as_a_cancel_refusal(server) ->
         handle = client.models.submit(MODEL, ARGS)
         with pytest.raises(ComfyError) as caught:
             handle.cancel()
-    assert not isinstance(caught.value, CancelRefused)
+    # Exactly `ComfyError`, not merely "not a `CancelRefused`": a `409` that
+    # named no bucket is not a Router verdict either, so `RouterError` would
+    # pass the weaker assertion while being the wrong answer.
+    assert type(caught.value) is ComfyError
 
 
 def test_an_unrelated_409_body_status_on_another_route_is_left_alone(server) -> None:

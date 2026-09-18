@@ -80,7 +80,11 @@ that does not exist would leave a caller guessing which half of one hierarchy
 lives where. One import path for the whole set is the property worth keeping,
 and ``from comfy_sdk.router_exceptions import NotEnabled`` is it.
 :class:`RouterError` itself *is* lifted to the root, because it is the one name
-a caller writing a broad handler reaches for first.
+a caller writing a broad handler reaches for first -- and so are
+:class:`CancelRefused` and :class:`AlreadyCompleted`, which a caller handles at
+the ``cancel()`` call site rather than through this module. Those three are the
+whole of the package root's share; everything else is ``from
+comfy_sdk.router_exceptions import ...``.
 
 The coarse bucket is not the whole story. A per-field model-validation failure
 carries a ``detail`` *array* whose entries keep the specific, provider-level

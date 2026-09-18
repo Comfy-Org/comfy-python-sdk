@@ -867,8 +867,16 @@ try:
 except NotEnabled:
     print("Router is not switched on for this key yet")  # terminal — do not retry
 except RouterError as exc:
-    print(exc.error_type, exc.request_id)                # every other refusal
+    print(exc.error_type, exc.request_id)                # every other bucket
 ```
+
+`RouterError` covers every refusal Router itself answered with, including a
+bucket newer than your installed version — Router names the bucket on every
+error it sends, and that is what types the exception. A response that never
+reached Router carries no bucket to read (an intermediary's HTML `404`, a bare
+`503 no healthy upstream`), so it arrives as a plain `ComfyError` with the
+status on `.http_status`; keep an `except ComfyError` outside the clause above
+if you need to handle those in the same place.
 
 `RouterError` is exported from the package root because it is the handler most
 callers write first. The fifteen per-bucket classes stay in
@@ -889,10 +897,19 @@ descend from `RouterError` on one surface and not on the other, a *workflow*
 call that fails `401`/`403`/`402` raises a `RouterError` subclass too, so
 `except RouterError` is slightly wider than its name for exactly those three.
 
-A `cancel()` the server declines raises `CancelRefused`, or the more specific
-`AlreadyCompleted` when the request had already finished — there was nothing
-left to stop, and the result is still collectable with `handle.get()`. Both are
-`RouterError`s, and both are on the package root.
+A `cancel()` the server declines raises `AlreadyCompleted` when the request had
+already finished — there was nothing left to stop, and the result is still
+collectable with `handle.get()`. It descends from `CancelRefused`, the base to
+catch when all you want to know is "the cancel did not take"; both are
+`RouterError`s and both are on the package root.
+
+`AlreadyCompleted` is the only refusal shape this version recognises, so
+`except CancelRefused` fires for exactly it today. A refusal this SDK has not
+been taught is a `409` that names no bucket and no code at all — nothing
+identifies it as a refusal — so it stays an untyped `ComfyError` rather than
+being guessed at. Catch `ComfyError` if you need the residue too, and treat the
+next `handle.status()` as authoritative either way: cancelling is a request,
+not a guarantee.
 
 ## Architecture — two layers
 

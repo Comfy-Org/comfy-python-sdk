@@ -22,6 +22,9 @@ the fuller account of each version, including verification notes.
 - A cancel the server refuses raises a named exception instead of an untyped `409`:
   `AlreadyCompleted` (the `{"status": "ALREADY_COMPLETED"}` answer to cancelling finished work),
   under the `CancelRefused` base. Nothing has to match on the response body text any more.
+  Only the refusal shapes this version recognises are typed, and `ALREADY_COMPLETED` is the whole
+  of that list today: a refusal that names no bucket and no code stays an untyped `ComfyError`,
+  because nothing in such a response identifies it as a refusal at all.
 
 ### Changed
 
@@ -30,6 +33,14 @@ the fuller account of each version, including verification notes.
   subclass. `except Unauthorized` / `except Forbidden` / `except InsufficientCredits` (from either
   module) and `except ComfyError` are unchanged; only `except RouterError` sees more than its name
   suggests.
+- **Breaking, for code that *constructs* those three classes.** `Unauthorized`, `Forbidden` and
+  `InsufficientCredits` are now `RouterError` subclasses, so they take `RouterError`'s
+  constructor: the human-readable string is the positional `detail`, and the bucket is
+  `error_type=`. There is no `message=` or `code=` keyword any more, so a hand-built
+  `Unauthorized(message="...", code="unauthorized")` — in a test double, a re-raise, or a
+  subclass — now raises `TypeError` and becomes `Unauthorized("...")`. Only construction is
+  affected: `raise`, `except` and every attribute a caller reads inside the handler (`.message`,
+  `.code`, `.http_status`, `.details`, `.request_id`, `.retry_after`) are unchanged.
 - `RouterError` is exported from the package root, alongside `CancelRefused` and
   `AlreadyCompleted`. The fifteen per-bucket classes still live in `comfy_sdk.router_exceptions`.
 - `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
