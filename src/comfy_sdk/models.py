@@ -240,7 +240,7 @@ class RouterRunResult:
     """
 
     replayed: bool
-    """``X-Comfy-Idempotent-Replayed``: served from the key's record, not run again.
+    """``Idempotent-Replayed``: served from the key's record, not run again.
 
     A replay is not billed a second time. The header is absent on a fresh run
     rather than sent as ``false``, so this is derived from its presence.
@@ -284,7 +284,7 @@ def _run_result(body: dict[str, Any], headers: Mapping[str, str]) -> RouterRunRe
         output=body,
         serving_provider=headers.get("X-Comfy-Router-Fallback-Provider"),
         dropped_params=_dropped_params(headers.get("X-Comfy-Router-Dropped-Params")),
-        replayed=headers.get("X-Comfy-Idempotent-Replayed") is not None,
+        replayed=headers.get("Idempotent-Replayed") is not None,
         request_id=headers.get("X-Comfy-Request-Id"),
     )
 
