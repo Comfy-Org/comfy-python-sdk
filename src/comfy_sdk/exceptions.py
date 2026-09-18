@@ -33,7 +33,7 @@ from typing import Any, TypeVar
 
 import httpx
 
-from comfy_low.errors import ApiError
+from comfy_low.errors import _CANCEL_REFUSAL_STATUS, ApiError
 from comfy_low.models import JobError
 
 from ._errors import ComfyError
@@ -159,7 +159,12 @@ def _class_for(exc: ApiError) -> type[ComfyError]:
        a pre-launch caller catches.
     3. :data:`~comfy_sdk.router_exceptions._BY_CANCEL_REFUSAL` -- the cancel
        route's refusals, which the contract's bucket list does not name because
-       they are not run-route buckets.
+       they are not run-route buckets. Consulted only for a ``409``: the lookup
+       is on ``code``, and ``code`` is also whatever a v2 envelope's
+       ``error.code`` said, on any route at any status, so without the status
+       gate an unrelated failure that happened to spell ``already_completed``
+       inherited :class:`~comfy_sdk.router_exceptions.AlreadyCompleted` and the
+       benign "still collectable" reading that class documents.
 
     The fallback is where the *surface* matters.
     :attr:`comfy_low.errors.ApiError.error_type` is set only when the response
@@ -171,7 +176,18 @@ def _class_for(exc: ApiError) -> type[ComfyError]:
     hole on exactly the refusals nobody could have enumerated in advance.
     Anything else stays a bare ``ComfyError`` carrying the original code.
     """
-    cls = _BY_CODE.get(exc.code) or _BY_ERROR_TYPE.get(exc.code) or _BY_CANCEL_REFUSAL.get(exc.code)
+    cls = _BY_CODE.get(exc.code) or _BY_ERROR_TYPE.get(exc.code)
+    if cls is None and exc.http_status == _CANCEL_REFUSAL_STATUS:
+        # Gated on the STATUS as well as the code, which the low layer already
+        # does for the body-shape half (`_cancel_refusal_code` returns None off
+        # `409`). `_BY_CANCEL_REFUSAL` names refusals the CANCEL route answers
+        # `409` with and nothing else, but the lookup is on `exc.code`, and
+        # `code` is also whatever an envelope's `error.code` said — on any route
+        # and any status. Without this gate a `200`-adjacent `4xx` from a job or
+        # asset route whose envelope happened to say `already_completed` became
+        # `AlreadyCompleted`, which this SDK documents as benign and "the result
+        # is still collectable". That is a promise those routes never made.
+        cls = _BY_CANCEL_REFUSAL.get(exc.code)
     if cls is not None:
         return cls
     return RouterError if exc.error_type is not None else ComfyError

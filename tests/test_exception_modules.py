@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import pytest
 
+from comfy_low.errors import ApiError
 from comfy_sdk import AsyncComfy, Comfy
 from comfy_sdk import exceptions as sdk_exceptions
 from comfy_sdk import router_exceptions as router
@@ -275,3 +276,34 @@ def test_an_unrelated_409_body_status_on_another_route_is_left_alone(server) -> 
     with Comfy(retry=NO_RETRY) as client:
         with pytest.raises(router.ConcurrencyLimitExceeded):
             client.models.submit(MODEL, ARGS)
+
+
+@pytest.mark.parametrize("http_status", [400, 404, 410, 500])
+def test_an_already_completed_envelope_code_off_409_is_not_a_cancel_refusal(
+    http_status: int,
+) -> None:
+    """`already_completed` as an envelope ``code`` is not the cancel refusal.
+
+    `_BY_CANCEL_REFUSAL` is keyed on the code, but `code` is also whatever a v2
+    envelope's `error.code` said -- on any route, at any status. The cancel
+    refusal is specifically the CANCEL route answering `409`, and
+    `AlreadyCompleted` is documented as benign ("the result is still
+    collectable"). Typing some other route's failure that way would make that
+    promise on a response that never offered it, so the lookup is gated on the
+    status the refusal actually arrives with.
+    """
+    exc = ApiError(
+        "already completed",
+        code="already_completed",
+        http_status=http_status,
+    )
+    assert sdk_exceptions._class_for(exc) is not AlreadyCompleted
+    assert not issubclass(sdk_exceptions._class_for(exc), CancelRefused)
+
+
+def test_an_already_completed_envelope_code_on_409_still_maps() -> None:
+    # The gate narrows the lookup; it does not remove it. The status the
+    # refusal really arrives with still reaches `AlreadyCompleted`, so this
+    # pins the boundary from the other side.
+    exc = ApiError("already completed", code="already_completed", http_status=409)
+    assert sdk_exceptions._class_for(exc) is AlreadyCompleted
