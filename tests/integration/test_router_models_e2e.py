@@ -40,9 +40,20 @@ VIDEO_MODEL = os.environ.get(
 RUN_TIMEOUT_S = 300  # a direct image generation, held server-side
 VIDEO_TIMEOUT_S = 600  # submit-poll video, polled server-side inside the call
 
+#: These calls BILL, so the opt-in is a DEDICATED variable rather than the SDK's
+#: own documented credentials. `COMFY_ROUTER_BASE_URL` + `COMFY_API_KEY` are
+#: exactly what a developer pointed at staging has exported already, so gating
+#: on those alone means a plain `pytest` run silently spends money on an image
+#: AND a video generation. `COMFY_ROUTER_E2E=1` is the same opt-in the cloud
+#: repo's Router e2e suite uses, so the two agree on what "yes, bill me" means.
+E2E_OPT_IN = os.environ.get("COMFY_ROUTER_E2E") == "1"
+
 pytestmark = pytest.mark.skipif(
-    not (ROUTER_BASE_URL and API_KEY),
-    reason="set COMFY_ROUTER_BASE_URL and COMFY_API_KEY to run Router model e2e tests",
+    not (E2E_OPT_IN and ROUTER_BASE_URL and API_KEY),
+    reason=(
+        "set COMFY_ROUTER_E2E=1 (these calls bill) plus COMFY_ROUTER_BASE_URL "
+        "and COMFY_API_KEY to run Router model e2e tests"
+    ),
 )
 
 
