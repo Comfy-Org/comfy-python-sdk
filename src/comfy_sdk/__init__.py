@@ -79,6 +79,8 @@ try:
 except PackageNotFoundError:  # running from a source tree, not installed
     __version__ = "0+unknown"
 
+from .models import RouterRunResult
+
 __all__ = [
     # clients
     "Comfy",
@@ -88,6 +90,8 @@ __all__ = [
     "ROUTER_BASE_URL_ENV_VAR",
     "API_KEY_ENV_VAR",
     "AsyncComfy",
+    # model runs
+    "RouterRunResult",
     # assets / workflows / jobs / outputs
     "Asset",
     "AsyncAsset",

@@ -241,7 +241,7 @@ class InvalidInput(RouterError):
     """
 
     error_type = "invalid_input"
-    _spec_meaning_digest: str = "de3933467ee7"
+    _spec_meaning_digest: str = "fd6c671bd2b3"
 
 
 class ContentPolicyViolation(RouterError):
@@ -271,7 +271,7 @@ class ProviderTimeout(RouterError):
     """
 
     error_type = "provider_timeout"
-    _spec_meaning_digest: str = "eccffed3686f"
+    _spec_meaning_digest: str = "1e54e0cf49b1"
 
 
 class InsufficientCredits(RouterError):
@@ -283,10 +283,15 @@ class InsufficientCredits(RouterError):
 
 class ModelNotFound(RouterError):
     """No such model. An unknown provider lands here too: both are "that id
-    names nothing"."""
+    names nothing".
+
+    ``detail`` carries up to three suggestions drawn from the models the caller
+    is entitled to see. A catalogued id the provider does not currently serve
+    for Comfy also lands here, and the response then carries no suggestions.
+    """
 
     error_type = "model_not_found"
-    _spec_meaning_digest: str = "202e4b3e144d"
+    _spec_meaning_digest: str = "33ffb0dd68a1"
 
 
 # -- transport-level buckets -------------------------------------------------
@@ -317,7 +322,7 @@ class ConcurrencyLimitExceeded(RouterError):
     """
 
     error_type = "concurrency_limit_exceeded"
-    _spec_meaning_digest: str = "e5ae6e20a963"
+    _spec_meaning_digest: str = "72809ca14576"
 
 
 class ClientDisconnected(RouterError):
@@ -335,7 +340,7 @@ class InternalError(RouterError):
     """
 
     error_type = "internal_error"
-    _spec_meaning_digest: str = "c9a8420f6251"
+    _spec_meaning_digest: str = "81abec502482"
 
 
 class DeadlineExceeded(RouterError):
@@ -370,7 +375,7 @@ class DeadlineExceeded(RouterError):
     """
 
     error_type = "deadline_exceeded"
-    _spec_meaning_digest: str = "37858aa46b94"
+    _spec_meaning_digest: str = "837b53325ddd"
 
 
 class NotEnabled(RouterError):
@@ -384,7 +389,7 @@ class NotEnabled(RouterError):
     """
 
     error_type = "not_enabled"
-    _spec_meaning_digest: str = "bc789c2d6efb"
+    _spec_meaning_digest: str = "c4a48688282c"
 
 
 class ServiceUnavailable(RouterError):
@@ -433,7 +438,67 @@ class RateLimited(RouterError):
     """
 
     error_type = "rate_limited"
-    _spec_meaning_digest: str = "a51a7fe6b18d"
+    _spec_meaning_digest: str = "b4ae727df04d"
+
+
+# -- queue buckets -----------------------------------------------------------
+
+
+class Cancelled(RouterError):
+    """A queued request was withdrawn before it produced a result.
+
+    Reached through the cancel route or by an operator, and **terminal**. It is
+    not by itself a statement about the charge: a request cancelled while still
+    ``IN_QUEUE`` was never dispatched and cannot be charged, while one cancelled
+    after it was admitted may still be -- a partner generation that completes is
+    charged whether or not anyone collected it, which is why the cancel route
+    calls the ask a request, not a guarantee. It is not
+    :class:`ClientDisconnected`: that says nobody is listening any more while a
+    generation may still be running and billable, this says the request itself
+    was withdrawn. The status read answers ``200`` with this in the body (the
+    request ended, so the read succeeded); collecting the result answers ``409``
+    -- the read worked and found a request whose terminal state, the caller's
+    own decision, leaves nothing to return. Deliberately not ``410`` (which on
+    that route means the result aged out of retention) and not a ``5xx`` (which
+    would report the caller's own cancellation as a Router fault worth retrying).
+    """
+
+    error_type = "cancelled"
+    _spec_meaning_digest: str = "bfe02dc8551c"
+
+
+class QueueTimeout(RouterError):
+    """A queued request waited past its queue timeout without being admitted.
+
+    **Terminal, unbilled, and it never took a concurrency slot** -- the job
+    never reached a provider. Deliberately not :class:`DeadlineExceeded`, which
+    is the synchronous route's connection bound and may leave a generation
+    running and billable; this one provably never started. It is returned under
+    ``504``, shared with :class:`ProviderTimeout` and :class:`DeadlineExceeded`
+    because a status can only say a clock ran out -- which clock (the partner's,
+    Comfy's connection bound, or the queue's admission bound) is what
+    ``error_type`` carries. The request is terminal: submit a new one rather
+    than re-reading this one.
+    """
+
+    error_type = "queue_timeout"
+    _spec_meaning_digest: str = "82e468ef3539"
+
+
+class RequestNotFound(RouterError):
+    """The ``request_id`` names no request of the caller's under this model.
+
+    The second of the two conditions the queued reads' ``404`` covers; the
+    first is the ``{provider}/{model}`` id resolving to no partner model, which
+    is :class:`ModelNotFound` and carries fuzzy suggestions. It also covers the
+    right-id / wrong-model URL the path shape refuses, and it is deliberately
+    indistinguishable from a request in another workspace, so a probe with a
+    guessed id learns nothing. A request that merely aged out of its retention
+    window is ``410``, not this.
+    """
+
+    error_type = "request_not_found"
+    _spec_meaning_digest: str = "385112b3cdcf"
 
 
 #: Every class in the closed set, in the order the error set declares it: the
@@ -457,6 +522,9 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     NotEnabled,
     ServiceUnavailable,
     RateLimited,
+    Cancelled,
+    QueueTimeout,
+    RequestNotFound,
 )
 
 _BY_ERROR_TYPE: dict[str, type[RouterError]] = {cls.error_type: cls for cls in ROUTER_EXCEPTIONS}
@@ -713,6 +781,7 @@ __all__ = [
     "RETRY_AFTER_HEADER",
     "ROUTER_ERROR_TYPES",
     "ROUTER_EXCEPTIONS",
+    "Cancelled",
     "ClientDisconnected",
     "ConcurrencyLimitExceeded",
     "ContentPolicyViolation",
@@ -725,7 +794,9 @@ __all__ = [
     "NotEnabled",
     "ProviderError",
     "ProviderTimeout",
+    "QueueTimeout",
     "RateLimited",
+    "RequestNotFound",
     "RouterError",
     "ServiceUnavailable",
     "Unauthorized",

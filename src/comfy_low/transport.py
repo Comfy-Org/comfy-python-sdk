@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any, BinaryIO
-from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -174,10 +174,55 @@ def parse_model_id(model: str) -> tuple[str, str]:
     return provider, name
 
 
+def _router_run_query(
+    model_provider: str | None,
+    strict_mode: bool | None,
+    fallback_provider: bool | str | None,
+) -> str:
+    """The Comfy Router alt-provider query string for a model run, or ``""``.
+
+    Each field is sent only when the caller set it (``None`` means "send
+    nothing"), so a call that names none is byte-for-byte the request this route
+    has always made -- the server applies its own defaults rather than being
+    handed ``model_provider=default`` / ``strict_mode=false`` spelled out on the
+    wire.
+
+    ``strict_mode`` and ``fallback_provider`` are both rendered ``true``/
+    ``false`` from a ``bool``, and that is a correctness requirement rather than
+    a convenience on ``fallback_provider``. The spec reads it as "omitted, or
+    ANY value other than ``false``, turns fallback on", so Python's ``str(False)``
+    -- ``"False"``, capitalised -- is not the off switch a caller writing
+    ``fallback_provider=False`` is plainly asking for: it is a value other than
+    ``false``, so it would leave fallback ON, the exact opposite, and silently.
+    Normalising here is what makes the boolean spelling mean what it reads as.
+    A ``str`` still passes through as given, so ``"false"`` keeps working and a
+    future non-boolean vocabulary on this parameter needs no change here.
+    """
+    params: list[tuple[str, str]] = []
+    if model_provider is not None:
+        params.append(("model_provider", model_provider))
+    if strict_mode is not None:
+        params.append(("strict_mode", "true" if strict_mode else "false"))
+    if fallback_provider is not None:
+        params.append(
+            (
+                "fallback_provider",
+                ("true" if fallback_provider else "false")
+                if isinstance(fallback_provider, bool)
+                else fallback_provider,
+            )
+        )
+    return urlencode(params)
+
+
 def model_run_request(
     model: str,
     arguments: Mapping[str, Any],
     idempotency_key: str | None,
+    *,
+    model_provider: str | None = None,
+    strict_mode: bool | None = None,
+    fallback_provider: bool | str | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, str]]:
     """Sans-IO ``(path, json_body, headers)`` for one model run.
 
@@ -200,6 +245,9 @@ def model_run_request(
     path = _MODEL_RUN_PATH_TEMPLATE.format(
         provider=quote(provider, safe=""), model=quote(name, safe="")
     )
+    query = _router_run_query(model_provider, strict_mode, fallback_provider)
+    if query:
+        path = f"{path}?{query}"
     body: dict[str, Any] = dict(arguments)
     headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
     return path, body, headers
@@ -909,8 +957,11 @@ class ComfyLow:
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
         """POST ``{router_base_url}/v2/models/{provider}/{model}`` — awaited server-side.
 
         Addressed to Comfy Router, not to the ``/api/v2`` deployment
@@ -931,13 +982,29 @@ class ComfyLow:
         ``spec/router-openapi.yaml``, hand-bound — see
         :data:`_MODEL_RUN_PATH_TEMPLATE`.
 
+        Returns ``(body, headers)`` rather than the bare body, matching the four
+        ``*_model_request*`` queue methods beside it. The response headers are
+        not incidental on this route: ``X-Comfy-Router-Fallback-Provider`` is the
+        ONLY disclosure that a fallback retry served the call rather than the
+        provider asked for, and ``X-Comfy-Router-Dropped-Params`` the only
+        disclosure that translating a native body onto an alternate provider's
+        schema could not carry every field. Returning the body alone discarded
+        both, so a caller could not tell an alt-provider run from a native one.
+
         Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
         any request when ``model`` is not a ``{provider}/{model}`` id.
         """
-        path, body, headers = model_run_request(model, arguments, idempotency_key)
+        path, body, headers = model_run_request(
+            model,
+            arguments,
+            idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+        )
         url = self._p.router_base_url + path
         resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200, 201))
+        return self._p.parse_or_raise(resp, (200, 201)), resp.headers
 
     # -- models: the queued form ------------------------------------------
     #
@@ -968,6 +1035,15 @@ class ComfyLow:
 
         The timeout is therefore the client's ordinary default rather than
         :data:`MODEL_RUN_TIMEOUT` — nothing here waits on a generation.
+
+        Returns ``(body, headers)`` rather than the bare body, matching the four
+        ``*_model_request*`` queue methods beside it. The response headers are
+        not incidental on this route: ``X-Comfy-Router-Fallback-Provider`` is the
+        ONLY disclosure that a fallback retry served the call rather than the
+        provider asked for, and ``X-Comfy-Router-Dropped-Params`` the only
+        disclosure that translating a native body onto an alternate provider's
+        schema could not carry every field. Returning the body alone discarded
+        both, so a caller could not tell an alt-provider run from a native one.
 
         Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
         any request when ``model`` is not a ``{provider}/{model}`` id.
@@ -1329,13 +1405,23 @@ class AsyncComfyLow:
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
         """Async :meth:`ComfyLow.post_model_run`."""
-        path, body, headers = model_run_request(model, arguments, idempotency_key)
+        path, body, headers = model_run_request(
+            model,
+            arguments,
+            idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+        )
         url = self._p.router_base_url + path
         resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200, 201))
+        return self._p.parse_or_raise(resp, (200, 201)), resp.headers
 
     # -- models: the queued form ------------------------------------------
     async def post_model_submit(
