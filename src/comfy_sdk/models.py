@@ -439,6 +439,23 @@ class Models(_ModelsBase):
         ``Retry-After``. Without that attribute an auto-minted key died with the
         call and the paid-for generation was uncollectable.
 
+        **Resend the alt-provider controls with it.** A key's identity covers the
+        query as well as the method and body, and ``model_provider`` /
+        ``strict_mode`` / ``fallback_provider`` are query parameters — so a
+        recovery call that drops them presents the same key under a DIFFERENT
+        query and is refused, leaving the very generation it was meant to collect
+        uncollectable. This bites at the server default too: ``strict_mode=False``
+        is sent as ``strict_mode=false``, which is a different query from omitting
+        it. Pass the call back exactly as it was made::
+
+            client.models.run(
+                model, arguments,
+                idempotency_key=exc.idempotency_key,
+                model_provider=model_provider,
+                strict_mode=strict_mode,
+                fallback_provider=fallback_provider,
+            )
+
         Note that a dropped connection surfaces as an ``httpx`` error rather
         than a :class:`~comfy_sdk.ComfyError` — it never reached a response to
         translate — so a handler written for the replay has to catch both; see
