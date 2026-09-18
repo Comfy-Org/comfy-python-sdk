@@ -217,7 +217,7 @@ class Models(_ModelsBase):
         idempotency_key: str | None = None,
         model_provider: str | None = None,
         strict_mode: bool | None = None,
-        fallback_provider: str | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any]:
         """Run ``model`` with ``arguments`` and return the completed result.
@@ -245,7 +245,12 @@ class Models(_ModelsBase):
         native on the way out; ``strict_mode=True`` sends and returns that
         provider's own raw shape unchanged, so no translation happens either
         way. ``fallback_provider`` controls the retry-against-another-provider
-        behavior — pass ``"false"`` to opt out. Each is sent only when set.
+        behavior — pass ``False`` (or ``"false"``) to opt out. Each is sent only
+        when set. Note that the off switch is the only value that means
+        anything: Router reads *any* other value, and omission, as fallback ON,
+        which is why a ``bool`` here is normalised to ``"true"``/``"false"``
+        rather than str()-ed into the capitalised ``"False"`` that would read as
+        "on".
 
         One call, one result. It blocks until the generation is finished —
         including for a provider the platform has to submit-and-poll, where the
@@ -599,7 +604,7 @@ class AsyncModels(_ModelsBase):
         idempotency_key: str | None = None,
         model_provider: str | None = None,
         strict_mode: bool | None = None,
-        fallback_provider: str | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any]:
         """Awaitable :meth:`Models.run` — same arguments, same result shape.

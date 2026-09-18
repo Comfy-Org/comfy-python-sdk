@@ -177,7 +177,7 @@ def parse_model_id(model: str) -> tuple[str, str]:
 def _router_run_query(
     model_provider: str | None,
     strict_mode: bool | None,
-    fallback_provider: str | None,
+    fallback_provider: bool | str | None,
 ) -> str:
     """The Comfy Router alt-provider query string for a model run, or ``""``.
 
@@ -185,8 +185,18 @@ def _router_run_query(
     nothing"), so a call that names none is byte-for-byte the request this route
     has always made -- the server applies its own defaults rather than being
     handed ``model_provider=default`` / ``strict_mode=false`` spelled out on the
-    wire. ``strict_mode`` is rendered ``true``/``false`` (the spec's query
-    form); the two provider fields pass through as given.
+    wire.
+
+    ``strict_mode`` and ``fallback_provider`` are both rendered ``true``/
+    ``false`` from a ``bool``, and that is a correctness requirement rather than
+    a convenience on ``fallback_provider``. The spec reads it as "omitted, or
+    ANY value other than ``false``, turns fallback on", so Python's ``str(False)``
+    -- ``"False"``, capitalised -- is not the off switch a caller writing
+    ``fallback_provider=False`` is plainly asking for: it is a value other than
+    ``false``, so it would leave fallback ON, the exact opposite, and silently.
+    Normalising here is what makes the boolean spelling mean what it reads as.
+    A ``str`` still passes through as given, so ``"false"`` keeps working and a
+    future non-boolean vocabulary on this parameter needs no change here.
     """
     params: list[tuple[str, str]] = []
     if model_provider is not None:
@@ -194,7 +204,14 @@ def _router_run_query(
     if strict_mode is not None:
         params.append(("strict_mode", "true" if strict_mode else "false"))
     if fallback_provider is not None:
-        params.append(("fallback_provider", fallback_provider))
+        params.append(
+            (
+                "fallback_provider",
+                ("true" if fallback_provider else "false")
+                if isinstance(fallback_provider, bool)
+                else fallback_provider,
+            )
+        )
     return urlencode(params)
 
 
@@ -205,7 +222,7 @@ def model_run_request(
     *,
     model_provider: str | None = None,
     strict_mode: bool | None = None,
-    fallback_provider: str | None = None,
+    fallback_provider: bool | str | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, str]]:
     """Sans-IO ``(path, json_body, headers)`` for one model run.
 
@@ -942,7 +959,7 @@ class ComfyLow:
         idempotency_key: str | None = None,
         model_provider: str | None = None,
         strict_mode: bool | None = None,
-        fallback_provider: str | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any]:
         """POST ``{router_base_url}/v2/models/{provider}/{model}`` — awaited server-side.
@@ -1372,7 +1389,7 @@ class AsyncComfyLow:
         idempotency_key: str | None = None,
         model_provider: str | None = None,
         strict_mode: bool | None = None,
-        fallback_provider: str | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any]:
         """Async :meth:`ComfyLow.post_model_run`."""

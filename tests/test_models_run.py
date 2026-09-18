@@ -169,6 +169,40 @@ def test_the_alt_provider_controls_are_query_params_sent_only_when_set() -> None
     assert headers == {"Idempotency-Key": "k-1"}
 
 
+def test_a_bool_fallback_provider_renders_the_spec_spelling_not_pythons() -> None:
+    """``fallback_provider=False`` must turn fallback OFF, not silently leave it on.
+
+    The spec reads this parameter as "omitted, or any value other than
+    ``false``, turns fallback on". Python's ``str(False)`` is the capitalised
+    ``"False"``, which is *a value other than* ``false`` -- so passing the
+    boolean through unnormalised would put fallback ON for the one caller who
+    explicitly asked for it OFF, and do it silently, with a 200 that looks
+    exactly like the intended one. That is the whole reason this normalisation
+    exists, so it is pinned here rather than left to the type hint.
+    """
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider=False)[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=false"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider=True)[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=true"
+    )
+    # A str still passes through as given: "false" keeps working, and a future
+    # non-boolean vocabulary on this parameter needs no change to the builder.
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider="false")[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=false"
+    )
+    # The capitalised spelling is what a caller gets ONLY by asking for it as a
+    # string, and it is left alone -- normalising a str would be this function
+    # second-guessing a value the spec says to forward verbatim.
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider="False")[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=False"
+    )
+
+
 @pytest.mark.parametrize(
     "model, path",
     [
