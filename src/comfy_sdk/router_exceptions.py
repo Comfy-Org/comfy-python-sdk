@@ -85,7 +85,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from comfy_low.errors import clean_request_id
+from comfy_low.errors import clean_request_id, summarise_detail
 
 from .exceptions import ComfyError
 
@@ -626,6 +626,9 @@ def error_from_response(
             errors = tuple(
                 _detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping)
             )
+            # The same summariser the awaited `models.run` path uses, so one wire
+            # body produces one `.detail` whichever surface built the exception.
+            detail = summarise_detail(raw_detail)
         if error_type is None:
             error_type = _clean(body.get("error_type"))
 
@@ -633,7 +636,7 @@ def error_from_response(
         error_type = _ERROR_TYPE_BY_STATUS.get(http_status)
 
     if detail is None:
-        detail = _summarise(errors) or f"HTTP {http_status}"
+        detail = f"HTTP {http_status}"
 
     return exception_for(error_type)(
         detail,
@@ -685,9 +688,12 @@ def error_from_completion(
         detail = raw_detail or None
     elif isinstance(raw_detail, Sequence) and not isinstance(raw_detail, (str, bytes)):
         errors = tuple(_detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping))
+        # One summariser across both surfaces (see `error_from_response`), so the
+        # queued path's `.detail` matches the awaited one for the same body.
+        detail = summarise_detail(raw_detail)
 
     if detail is None:
-        detail = _summarise(errors) or f"the request completed with error_type {error_type!r}"
+        detail = f"the request completed with error_type {error_type!r}"
 
     return exception_for(error_type)(
         detail,
@@ -757,22 +763,6 @@ def _detail_from(entry: Mapping[str, Any]) -> ValidationErrorDetail:
         ctx=ctx if isinstance(ctx, Mapping) else None,
         input=entry.get("input"),
     )
-
-
-def _summarise(errors: Sequence[ValidationErrorDetail]) -> str:
-    """A one-line message for a per-field failure.
-
-    This is *in addition to* ``.errors``, never instead of it -- the entries stay
-    readable as data, and a caller branching on a field reads them rather than
-    parsing this back apart.
-    """
-    parts: list[str] = []
-    for entry in errors:
-        if entry.location and entry.msg:
-            parts.append(f"{entry.location}: {entry.msg}")
-        elif entry.location or entry.msg:
-            parts.append(entry.location or entry.msg)
-    return "; ".join(parts)
 
 
 __all__ = [

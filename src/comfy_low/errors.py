@@ -236,17 +236,80 @@ def _clean(value: Any) -> str | None:
     reads as absent rather than being coerced, so a malformed body degrades to
     the status-derived default instead of producing a nonsense code.
 
-    The list form is still dropped here, and that is still right for the CODE
-    fields: a list is not a code and stringifying one would put a Python repr
-    where a caller expects a wire value. It is no longer how the list ``detail``
-    is *read*, though — :func:`error_from_envelope` handles that shape itself,
-    before it reaches this function, because the entries carry both the
-    per-field data and the messages that summarise it.
+    The list form is dropped here, and that is right for the CODE fields: a list
+    is not a code and stringifying one would put a Python repr where a caller
+    expects a wire value. It is load-bearing for ``detail`` too: a Router
+    validation array that produced no summary — every member a non-mapping, or
+    every ``msg`` missing or blank — still reaches this function through the
+    ``message = _clean(raw_detail)`` fallback in :func:`error_from_envelope`, so
+    the ``isinstance(value, str)`` guard below is what keeps a Python list repr
+    out of the caller's message on that path. It is *not* how a populated array
+    is read: :func:`error_from_envelope` runs it through :func:`summarise_detail`
+    before that fallback, because the entries carry both the per-field data and
+    the messages that summarise it.
     """
     if not isinstance(value, str):
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _location(raw_loc: Any) -> str:
+    """A ``detail[]`` entry's ``loc`` rendered as a dotted path, or ``""``.
+
+    Kept identical to
+    :meth:`comfy_sdk.router_exceptions.ValidationErrorDetail.location` so a
+    per-field failure reads the same whichever surface built the summary —
+    ``body.images.0`` where an integer indexes into an array.
+    """
+    if isinstance(raw_loc, Sequence) and not isinstance(raw_loc, (str, bytes)):
+        return ".".join(str(part) for part in raw_loc)
+    return ""
+
+
+def summarise_detail(entries: Any) -> str | None:
+    """A bounded, single-line, printable summary of a Router per-field validation
+    body, or ``None`` when it named nothing.
+
+    ``entries`` is the raw ``detail`` array — a sequence of ``{loc, msg, ...}``
+    mappings. Each entry renders as ``<loc>: <msg>`` (the dotted ``loc`` path and
+    the field's own message), or whichever one of the two it carries; the parts
+    join with ``"; "``. Non-mapping members are skipped rather than coerced: this
+    runs while handling a failure, and one malformed member must not cost the
+    caller the others.
+
+    Including ``loc`` is what makes two ``field required`` entries read as the
+    two fields they name rather than collapsing to an unrecoverable ``field
+    required; field required``. The joined line is then reduced by
+    :func:`clean_body_excerpt` — the same unprintable-category reduction,
+    whitespace collapse and :data:`_BODY_EXCERPT_LIMIT` cap every other
+    server-controlled string headed for a traceback or a log line already gets.
+    Without it a proxy-, provider- or server-supplied ``msg`` carrying newlines,
+    C0/C1 controls, ANSI escapes or bidi overrides would reach ``str(exc)``
+    verbatim and unbounded — the exact thing :data:`_UNPRINTABLE_CATEGORIES`
+    exists to prevent — and enough long entries would make the message
+    arbitrarily large.
+
+    Defined on this lowest layer because both error surfaces summarise the same
+    array off their own response and must produce one string for one wire body:
+    :func:`error_from_envelope` on the awaited ``models.run`` path,
+    ``comfy_sdk.router_exceptions`` on the queued one.
+    """
+    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+        return None
+    parts: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        location = _location(entry.get("loc"))
+        message = _clean(entry.get("msg"))
+        if location and message:
+            parts.append(f"{location}: {message}")
+        elif location:
+            parts.append(location)
+        elif message:
+            parts.append(message)
+    return clean_body_excerpt("; ".join(parts))
 
 
 def error_from_envelope(
@@ -289,11 +352,12 @@ def error_from_envelope(
     Router also spells ``detail`` two ways, and both are read here. A
     request-level failure sends a string, which becomes the message. A per-field
     model-validation failure sends an ARRAY of ``{loc, msg, type, ...}`` entries
-    instead; those land raw on :attr:`ApiError.validation_errors`, and their
-    ``msg`` values — joined with ``"; "`` — become the message. Before that the
-    array read as no message at all, so such a failure reached a caller as a
-    bare ``HTTP 422`` with the raw JSON glued on as a body excerpt, and the
-    per-field reasons the array exists to carry were dropped on the floor.
+    instead; those land raw on :attr:`ApiError.validation_errors`, and
+    :func:`summarise_detail` renders them — each ``<loc>: <msg>``, sanitised and
+    bounded — into the message. Before that the array read as no message at all,
+    so such a failure reached a caller as a bare ``HTTP 422`` with the raw JSON
+    glued on as a body excerpt, and the per-field reasons the array exists to
+    carry were dropped on the floor.
 
     The precedence is: the envelope's ``code`` always wins; then, when the
     response identifies itself as Router's — the ``X-Comfy-Error-Type`` header
@@ -362,15 +426,12 @@ def error_from_envelope(
         # and one malformed member must not cost the caller the others.
         validation_errors = tuple(entry for entry in raw_detail if isinstance(entry, Mapping))
         if not message:
-            # The entries' own messages, joined, rather than the status-derived
-            # default: a body that named every failing field would otherwise
-            # reach a caller as a bare `HTTP 422`.
-            summary = "; ".join(
-                cleaned
-                for cleaned in (_clean(entry.get("msg")) for entry in validation_errors)
-                if cleaned
-            )
-            message = summary or message
+            # The entries summarised — each `<loc>: <msg>`, sanitised and bounded
+            # — rather than the status-derived default: a body that named every
+            # failing field would otherwise reach a caller as a bare `HTTP 422`.
+            # `comfy_sdk.router_exceptions` summarises the same array the same way
+            # off the queued surface, so one wire body yields one message.
+            message = summarise_detail(raw_detail) or message
     if not message:
         # Router names its human-readable string `detail`, not `error.message`.
         message = _clean(raw_detail)

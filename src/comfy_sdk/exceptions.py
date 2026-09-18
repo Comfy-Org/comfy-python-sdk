@@ -240,6 +240,21 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
             request_id=exc.request_id,
         )
     router_cls = _router_only_class(exc.code)
+    if router_cls is None and exc.validation_errors:
+        # The body carried Router's `detail[]` ARRAY, which only Router sends, so
+        # it identifies the Router surface even when the bucket collides with a v2
+        # envelope code (`unauthorized`/`forbidden`/`insufficient_credits`, spelled
+        # identically by both) or is the status-derived `invalid_workflow` guess a
+        # 422 whose `X-Comfy-Error-Type` was stripped falls to. Selecting a
+        # RouterError keeps both the typed entries and the summary; the plain
+        # `_BY_CODE` branch below drops `.errors`, and when the body ALSO carried
+        # `error.message` the summary was lost with them — `message` was already
+        # set, so `error_from_envelope`'s `if not message:` summary block never
+        # ran — leaving the per-field data reachable only through `__cause__`,
+        # against what the `RouterError.errors` docstring promises.
+        from comfy_sdk.router_exceptions import exception_for
+
+        router_cls = exception_for(exc.code)
     if router_cls is not None:
         # Imported here for the same reason `_router_only_class` imports
         # `_BY_ERROR_TYPE` lazily: `router_exceptions` subclasses `ComfyError`
@@ -260,11 +275,13 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
             errors=tuple(_detail_from(entry) for entry in exc.validation_errors),
         )
     cls = _BY_CODE.get(exc.code, ComfyError)
-    # No `errors=` here, deliberately: `.errors` is a `RouterError` attribute
-    # and none of these classes takes the argument. A validation body that
-    # reaches this branch — a `detail[]` under a v2 `error.code`, or under the
-    # status-derived guess when no bucket was sent at all — still gets the
-    # entries' messages, since those became `exc.message` one layer down.
+    # No `errors=` here, deliberately: `.errors` is a `RouterError` attribute and
+    # none of these classes takes the argument. Nothing typed is lost by that: a
+    # body that carried Router's `detail[]` array was already routed to a
+    # RouterError above (the `exc.validation_errors` guard), so this branch is
+    # reached only when the response carried no per-field entries at all — a v2
+    # envelope, an intermediary's reject, or a `detail[]` whose members were none
+    # of them mappings — and there is nothing to forward.
     return cls(
         str(exc),
         code=exc.code,

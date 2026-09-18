@@ -581,9 +581,13 @@ def _assert_validation_surface(exc: InvalidInput) -> None:
     # and which a caller reads to say what the limit actually was.
     assert exc.errors[0].ctx == {"limit_value": 8}
     assert exc.errors[0].input == 50
-    # The human-readable line is the entries' own messages, joined -- not the
-    # `HTTP 422` a caller used to get, and not a Python repr of the array.
-    assert exc.detail == "ensure this value is less than or equal to 8; unknown model variant"
+    # The human-readable line is the entries summarised -- each `<loc>: <msg>`,
+    # the same rendering the queued surface produces -- not the `HTTP 422` a
+    # caller used to get, and not a Python repr of the array.
+    assert exc.detail == (
+        "body.steps: ensure this value is less than or equal to 8; "
+        "body.model: unknown model variant"
+    )
     assert str(exc) == exc.detail
     assert "[" not in exc.detail
     assert exc.error_type == "invalid_input"
@@ -650,6 +654,15 @@ def test_the_run_and_queued_paths_agree_on_one_validation_body(server) -> None:
     )
     assert queued is not None
     assert excinfo.value.errors == queued.errors
+    # ...and the human-readable line, too: both surfaces summarise the array
+    # through one function, so a body that names two fields reads the same on
+    # `run()` and on the queued surface rather than collapsing to a bare join of
+    # the messages on one of them.
+    assert excinfo.value.detail == queued.detail
+    assert excinfo.value.detail == (
+        "body.steps: ensure this value is less than or equal to 8; "
+        "body.model: unknown model variant"
+    )
 
 
 # --- the key survives the failure ----------------------------------------
