@@ -69,13 +69,37 @@ _UNSET = object()
 # blocking iter_lines() forever. (Pass timeout=None to opt out of the timeout.)
 _SSE_IDLE_TIMEOUT = httpx.Timeout(10.0, read=45.0)
 
+#: Comfy Router's own server-side deadline for a model run, mirrored here as the
+#: documented default so the client timeout below can be *derived* to sit safely
+#: ABOVE it. Router aborts a run at this bound and writes a ``504
+#: deadline_exceeded`` carrying ``X-Comfy-Request-Id`` and ``Retry-After``; those
+#: are exactly what a caller needs to reason about the still-running,
+#: already-billed generation. On the Router side this is ``DefaultDeadline`` in
+#: ``routerdeadline/routerdeadline.go`` (10 minutes) and is configurable per
+#: deployment via ``COMFY_ROUTER_DEADLINE`` — a value the *client* cannot read
+#: (it lives in Router's environment, not the caller's), so this is the default
+#: to keep in step by hand: **if you raise Router's deadline, raise this too.**
+ROUTER_DEADLINE = 600.0
+
+#: Headroom kept between Router's deadline and the client read timeout below.
+#: One minute is enough to receive the ``504`` and its headers after Router hits
+#: its bound, without waiting so long past a genuinely dead connection that a
+#: hung run ties up a caller's thread needlessly.
+_MODEL_RUN_TIMEOUT_HEADROOM = 60.0
+
 #: Default timeout for a model run. A run is *awaited server-side*: the server
 #: holds the connection until the generation is complete, polling the upstream
 #: provider itself when that provider is submit/poll. So the client has to be
 #: willing to wait minutes, not the tens of seconds a normal API call gets —
 #: the client's own default (30s) would abort a perfectly healthy generation.
-#: ``connect`` stays short: an unreachable host is not a slow generation.
-MODEL_RUN_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
+#: The read timeout is derived to sit ``_MODEL_RUN_TIMEOUT_HEADROOM`` seconds
+#: ABOVE :data:`ROUTER_DEADLINE` rather than equal to it: at equality the client
+#: can abort at the same instant Router is writing its ``504 deadline_exceeded``,
+#: so the caller gets a bare client-side timeout with no request id, no
+#: ``Retry-After`` and no error body — precisely the outcome the deadline exists
+#: to report cleanly. ``connect`` stays short: an unreachable host is not a slow
+#: generation.
+MODEL_RUN_TIMEOUT = httpx.Timeout(ROUTER_DEADLINE + _MODEL_RUN_TIMEOUT_HEADROOM, connect=10.0)
 
 #: Base URL of Comfy Router — the surface ``post_model_run`` targets, and the
 #: ``servers[0].url`` of ``spec/router-openapi.yaml``. It is a *different host*
