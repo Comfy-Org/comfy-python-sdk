@@ -954,3 +954,72 @@ def test_both_clients_expose_run_detailed(cls: type) -> None:
     # The suffix rule is about sync-vs-async naming, not about a second
     # operation — but both namespaces must still spell the same operations.
     assert hasattr(cls, "run_detailed")
+
+
+def test_run_detailed_surfaces_the_credits_router_reported_for_the_run() -> None:
+    """The body never states a price, so the header is the only disclosure.
+
+    Router stamps ``X-Comfy-Credits-Used`` on a run it priced. Dropping it --
+    as this closed shape did -- left a caller no way to reach it at all: the
+    dataclass is frozen and slotted, so they could not even attach the value
+    themselves from a response they had.
+    """
+    assert _detailed({"X-Comfy-Credits-Used": "0.42"}).credits_used == "0.42"
+
+
+def test_run_detailed_reports_an_unstamped_run_as_not_reported() -> None:
+    # Absent is "not reported", never "free". A large share of real runs carry
+    # no header even where the cost is known server side, so `None` here says
+    # nothing at all about what the call cost — and must not be normalised to a
+    # zero, which would report an unknown cost as a known one.
+    assert _detailed({}).credits_used is None
+
+
+def test_run_detailed_keeps_a_reported_zero_distinguishable_from_an_absent_one() -> None:
+    """``0`` is a real reported cost and must not collapse into "not reported".
+
+    A run Router priced at zero -- a replay, a model that costs nothing -- is a
+    *known* cost, and reporting it as unknown is the failure this pins. The
+    string representation is what keeps the two apart cheaply: ``"0"`` is a
+    non-empty string, so even the sloppy ``if result.credits_used:`` test
+    happens to hold. That is luck, not a contract -- it stops holding the
+    moment a caller parses to ``Decimal("0")`` for their own arithmetic, which
+    is exactly what the docstring tells them to do -- so the rule the SDK
+    documents is presence, and this asserts presence.
+    """
+    reported_zero = _detailed({"X-Comfy-Credits-Used": "0"}).credits_used
+    not_reported = _detailed({}).credits_used
+    assert reported_zero == "0"
+    assert reported_zero is not None
+    assert not_reported is None
+    # The two must be distinguishable by the documented test, not merely unequal.
+    assert (reported_zero is not None) != (not_reported is not None)
+
+
+def test_run_detailed_carries_the_credits_header_off_a_real_response(server) -> None:
+    """The unit stubs hand back a plain dict; a real run hands back httpx.Headers.
+
+    Worth its own pass over the wire: the lift reads one exact header name off
+    whatever ``post_model_run`` returned, and a stub dict would answer the same
+    way whether or not the name survives a real HTTP round trip.
+    """
+    server.state.model_run_response_headers = {"X-Comfy-Credits-Used": "1.25"}
+    with Comfy(retry=NO_RETRY) as client:
+        assert client.models.run_detailed(MODEL, ARGS).credits_used == "1.25"
+
+
+async def test_async_run_detailed_carries_the_credits_header_too(server) -> None:
+    # Both namespaces build their result through the same `_run_result`, but
+    # the async client reaches it down its own transport — so the parity is
+    # asserted rather than assumed.
+    server.state.model_run_response_headers = {"X-Comfy-Credits-Used": "1.25"}
+    async with AsyncComfy(retry=NO_RETRY) as client:
+        got = await client.models.run_detailed(MODEL, ARGS)
+    assert got.credits_used == "1.25"
+
+
+def test_an_ordinary_unstamped_run_over_the_wire_reports_no_credits(server) -> None:
+    # The server stamps nothing, which is the common case today. Nothing in the
+    # lift may invent a value for it.
+    with Comfy(retry=NO_RETRY) as client:
+        assert client.models.run_detailed(MODEL, ARGS).credits_used is None

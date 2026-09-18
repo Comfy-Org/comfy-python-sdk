@@ -206,16 +206,19 @@ class RouterRunResult:
 
     :meth:`Models.run` returns the partner model's native output on its own,
     which is the right default: that document is the thing a caller asked for,
-    and wrapping every run in an envelope to carry two usually-absent headers
-    would tax every caller for the few that need them. This is the opt-in shape
-    for the callers that do -- :meth:`Models.run_detailed`.
+    and wrapping every run in an envelope to carry a handful of usually-absent
+    headers would tax every caller for the few that need them. This is the
+    opt-in shape for the callers that do -- :meth:`Models.run_detailed`.
 
     What it adds is not decoration. On an alt-provider run
     (``model_provider=...``) the response body is translated back to this
     model's native contract, so the body alone looks IDENTICAL whether the call
-    was served by the model's own provider or by an alternate. The two headers
-    below are the only disclosure of the difference, which makes them the only
-    way a caller -- or a test -- can prove which leg actually ran.
+    was served by the model's own provider or by an alternate.
+    :attr:`serving_provider` and :attr:`dropped_params` are the only disclosure
+    of the difference, which makes them the only way a caller -- or a test --
+    can prove which leg actually ran. :attr:`credits_used` is the same story
+    about cost: the body never states what the run was priced at, so the header
+    is the only place it is disclosed at all.
     """
 
     output: dict[str, Any]
@@ -248,6 +251,35 @@ class RouterRunResult:
 
     request_id: str | None
     """``X-Comfy-Request-Id`` -- the id to quote in a support request."""
+
+    credits_used: str | None
+    """``X-Comfy-Credits-Used``: what Router reported this run cost.
+
+    Three things about it, each of which a caller gets wrong by assuming the
+    obvious:
+
+    * **It is a price, not a settled ledger entry.** It is what Router priced
+      this call at as it answered, not a balance, not a running total, and not
+      a charge you can prove was applied. Reconcile against billing rather than
+      treating this as the record.
+    * **Absent means "not reported", never "free".** Router does not stamp
+      every run it knows the cost of, so ``None`` says nothing about whether
+      the call cost anything -- only that this response did not say. A caller
+      that renders a missing value as zero is inventing a number.
+    * **``0`` is a real reported cost, so branch on presence.** ``if
+      result.credits_used is not None``, never on the value being non-zero: a
+      run priced at nothing is a *known* cost, and folding it into the absent
+      case above reports a known cost as unknown. The string form happens to
+      survive a sloppy ``if result.credits_used`` -- ``"0"`` is a non-empty
+      string -- but that is luck and it ends the moment you parse, because
+      ``Decimal("0")`` is falsy.
+
+    Carried as the wire string rather than parsed. The value is a decimal
+    formatted to at most 2dp, and binary ``float`` is the wrong type for a
+    number a caller reconciles money against -- so the digits the server sent
+    are handed over intact and the caller picks the numeric type (``Decimal``)
+    its own reconciliation needs.
+    """
 
 
 def _dropped_params(raw: str | None) -> tuple[str, ...] | None:
@@ -286,6 +318,7 @@ def _run_result(body: dict[str, Any], headers: Mapping[str, str]) -> RouterRunRe
         dropped_params=_dropped_params(headers.get("X-Comfy-Router-Dropped-Params")),
         replayed=headers.get("X-Comfy-Idempotent-Replayed") is not None,
         request_id=headers.get("X-Comfy-Request-Id"),
+        credits_used=headers.get("X-Comfy-Credits-Used"),
     )
 
 

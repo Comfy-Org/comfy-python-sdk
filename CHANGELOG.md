@@ -10,6 +10,14 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Added
+
+- `RouterRunResult.credits_used` — what Comfy Router reported a run cost, lifted from the
+  `X-Comfy-Credits-Used` response header onto what `models.run_detailed()` returns. It is a
+  price rather than a settled ledger entry, absent means "not reported" and never "free", and
+  `0` is a real reported cost — so branch on `credits_used is not None`, not on truthiness.
+  Carried as the wire string; binary `float` is the wrong type to reconcile money against.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added
