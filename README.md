@@ -879,13 +879,13 @@ status on `.http_status`; keep an `except ComfyError` outside the clause above
 if you need to handle those in the same place.
 
 `RouterError` is exported from the package root because it is the handler most
-callers write first. The fifteen per-bucket classes stay in
+callers write first. The eighteen per-bucket classes stay in
 `comfy_sdk.router_exceptions` — `InvalidInput`, `ContentPolicyViolation`,
 `ProviderError`, `ProviderTimeout`, `InsufficientCredits`, `ModelNotFound`,
 `Unauthorized`, `Forbidden`, `ConcurrencyLimitExceeded`, `ClientDisconnected`,
 `InternalError`, `DeadlineExceeded`, `NotEnabled`, `ServiceUnavailable`,
-`RateLimited` — one import path for the whole set rather than half of it here
-and half of it there. A bucket added to Router after your installed version
+`RateLimited`, `Cancelled`, `QueueTimeout`, `RequestNotFound` — one import path
+for the whole set rather than half of it here and half of it there. A bucket added to Router after your installed version
 arrives as `RouterError` itself, with the raw value readable on `.error_type`.
 
 Three of those names — `Unauthorized`, `Forbidden`, `InsufficientCredits` —

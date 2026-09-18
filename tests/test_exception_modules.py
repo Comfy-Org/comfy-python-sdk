@@ -65,7 +65,9 @@ REFUSALS: list[tuple[int, str]] = [
     (403, "not_enabled"),
     (503, "service_unavailable"),
     (429, "rate_limited"),
-    (500, "queue_timeout"),
+    (409, "cancelled"),
+    (504, "queue_timeout"),
+    (404, "request_not_found"),
     (418, "something_invented_later"),
 ]
 

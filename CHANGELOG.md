@@ -45,7 +45,8 @@ the fuller account of each version, including verification notes.
   affected: `raise`, `except` and every attribute a caller reads inside the handler (`.message`,
   `.code`, `.http_status`, `.details`, `.request_id`, `.retry_after`) are unchanged.
 - `RouterError` is exported from the package root, alongside `CancelRefused` and
-  `AlreadyCompleted`. The fifteen per-bucket classes still live in `comfy_sdk.router_exceptions`.
+  `AlreadyCompleted`. The eighteen per-bucket classes still live in
+  `comfy_sdk.router_exceptions`.
 - `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
   body's `error_type`), or `None` when it named none — which is also how the SDK tells which
   surface answered.
