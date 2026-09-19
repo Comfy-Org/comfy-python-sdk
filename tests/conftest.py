@@ -237,8 +237,10 @@ class ServerState:
             "seed": 7,
         }
     )
-    # Status code for the cancel response; 204 exercises the empty-body path.
-    queue_cancel_status: int = 200
+    # Status code for the cancel response. 202 is the contract's own answer
+    # (`spec/router-openapi.yaml`, `cancelRouterModelRequest`); 204 exercises
+    # the legacy empty-body path a deployment may still answer with.
+    queue_cancel_status: int = 202
     # Cancels that answer a transient failure (status, code) before one is
     # accepted — for proving the cleanup cancel after a timeout does not ride
     # the client's retry policy.
@@ -261,19 +263,34 @@ class ServerState:
     # set it to a `401` or a `500` and the refusal must surface rather than read
     # as a detach.
     queue_cancel_refusal: tuple[int, dict[str, Any]] | None = None
-    # The bucket a cancelled request's completion carries. `None` models the
-    # cancel that LOST the race: the answer is still terminal, but the run
-    # finished on its own, so there is a real result behind it rather than a
-    # stop.
-    queue_cancel_error_type: str | None = "client_disconnected"
-    # The queue `status` an ACCEPTED cancel answers with. "COMPLETED" is the
-    # ordinary one -- this queue has no `CANCELED` status and expresses a stop
-    # as COMPLETED plus a bucket. A live value like "IN_PROGRESS" models the
-    # 2xx a request that won the race into flight is answered with: the route
-    # took the message, but the run did not stop.
-    queue_cancel_accept_status: str = "COMPLETED"
-    # Set by a cancel; makes every later status poll report the cancellation.
+    # The bucket the CANCEL RESPONSE's own body carries. `None` is the contract
+    # default: the `202` answers `{request_id, status}` and nothing else, and
+    # the bucket lives on the status route. Set it to model a deployment whose
+    # cancel answers terminal directly -- "client_disconnected" for a stop,
+    # `None` alongside `queue_cancel_accept_status="COMPLETED"` for the cancel
+    # that LOST the race to a run that finished on its own.
+    queue_cancel_error_type: str | None = None
+    # The `status` an ACCEPTED cancel answers with. "CANCELLATION_REQUESTED" is
+    # the contract's own value: the ask was accepted for a request that had not
+    # reached a terminal state, which the route writes BEFORE it answers.
+    # "COMPLETED" models a deployment answering terminal directly, and a live
+    # value models one that echoes a queue state.
+    queue_cancel_accept_status: str = "CANCELLATION_REQUESTED"
+    # Set by a cancel that the server treated as landing -- which the real route
+    # does before it answers its `202`, so both the contract's accept status and
+    # a directly-terminal one set it. Makes every later status poll report the
+    # cancelled row.
     queue_canceled: bool = False
+    # The bucket the status route reports for a cancelled row. "cancelled" is
+    # what the route writes (`error_type=cancelled` on its guarded UPDATE); a
+    # knob so a test can model a deployment that writes a different one.
+    queue_cancelled_error_type: str | None = "cancelled"
+    # When False, an ACCEPTED cancel does NOT mark the row cancelled -- a
+    # server that answered its `202` without the guarded UPDATE having landed,
+    # which the contract's write order forbids. The only way to drive the SDK's
+    # "accepted but did not apply" reading, since a conforming stub cannot
+    # produce it.
+    queue_cancel_applies: bool = True
 
     # --- counters the tests assert on ---
     upload_count: int = 0
@@ -740,8 +757,8 @@ def _make_handler(state: ServerState):
                 return
             if state.queue_canceled:
                 body["status"] = "COMPLETED"
-                if state.queue_cancel_error_type is not None:
-                    body["error_type"] = state.queue_cancel_error_type
+                if state.queue_cancelled_error_type is not None:
+                    body["error_type"] = state.queue_cancelled_error_type
                 body["detail"] = "the request was cancelled"
                 self._json(200, body, headers=headers)
                 return
@@ -795,12 +812,16 @@ def _make_handler(state: ServerState):
                 status, refusal = state.queue_cancel_refusal
                 self._json(status, refusal)
                 return
-            # Only a cancel whose own answer is TERMINAL actually stopped the
-            # request. One answering a live status took the message and left
-            # the run going, so later polls must still see it running --
-            # otherwise the stub decides the very thing the SDK is under test
-            # for reading correctly.
-            state.queue_canceled = state.queue_cancel_accept_status == "COMPLETED"
+            # The real route writes the row terminal (`error_type=cancelled`)
+            # under a guard covering both live states BEFORE it answers its
+            # `202`, so the contract's accept status marks the row cancelled
+            # exactly as a directly-terminal answer does. A cancel echoing a
+            # LIVE queue state took the message and left the run going, so
+            # later polls must still see it running -- otherwise the stub
+            # decides the very thing the SDK is under test for reading.
+            state.queue_canceled = state.queue_cancel_applies and (
+                state.queue_cancel_accept_status in ("CANCELLATION_REQUESTED", "COMPLETED")
+            )
             if state.queue_cancel_status == 204:
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
