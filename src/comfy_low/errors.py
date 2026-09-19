@@ -267,13 +267,23 @@ def _clean(value: Any) -> str | None:
     is not a code and stringifying one would put a Python repr where a caller
     expects a wire value. It is load-bearing for ``detail`` too: a Router
     validation array that produced no summary — every member a non-mapping, or
-    every ``msg`` missing or blank — still reaches this function through the
-    ``message = _clean(raw_detail)`` fallback in :func:`error_from_envelope`, so
-    the ``isinstance(value, str)`` guard below is what keeps a Python list repr
-    out of the caller's message on that path. It is *not* how a populated array
-    is read: :func:`error_from_envelope` runs it through :func:`summarise_detail`
-    before that fallback, because the entries carry both the per-field data and
-    the messages that summarise it.
+    every ``msg`` missing or blank — still reaches that fallback in
+    :func:`error_from_envelope`, which spells it
+    ``message = clean_body_excerpt(raw_detail)``; the guard that keeps a Python
+    list repr out of the caller's message on that path is therefore
+    :func:`clean_body_excerpt`'s own ``isinstance(raw, str)``, which is the same
+    test as the one below and returns the same ``None``. It is *not* how a
+    populated array is read: :func:`error_from_envelope` runs it through
+    :func:`summarise_detail` before that fallback, because the entries carry
+    both the per-field data and the messages that summarise it.
+
+    What is left to this function is the CODE fields — ``error.code``, the
+    Router bucket, a cancel refusal's ``status``. Those are wire *tokens*, not
+    display text: they are compared and branched on, so the whitespace collapse
+    and 256-character cap :func:`clean_body_excerpt` applies would change a
+    value rather than make it safe to print. The display strings
+    (``error.message``, the string ``detail``) go through
+    :func:`clean_body_excerpt` instead.
     """
     if not isinstance(value, str):
         return None
@@ -440,11 +450,24 @@ def error_from_envelope(
     request-level failure sends a string, which becomes the message. A per-field
     model-validation failure sends an ARRAY of ``{loc, msg, type, ...}`` entries
     instead; those land raw on :attr:`ApiError.validation_errors`, and
-    :func:`summarise_detail` renders them — each ``<loc>: <msg>``, sanitised and
-    bounded — into the message. Before that the array read as no message at all,
-    so such a failure reached a caller as a bare ``HTTP 422`` with the raw JSON
-    glued on as a body excerpt, and the per-field reasons the array exists to
-    carry were dropped on the floor.
+    :func:`summarise_detail` renders them — each ``<loc>: <msg>`` — into the
+    message. Before that the array read as no message at all, so such a failure
+    reached a caller as a bare ``HTTP 422`` with the raw JSON glued on as a body
+    excerpt, and the per-field reasons the array exists to carry were dropped on
+    the floor.
+
+    BOTH spellings — the string form and the array summary — are reduced by
+    :func:`clean_body_excerpt` before they become the message, as is the v2
+    envelope's ``error.message``: bounded to :data:`_BODY_EXCERPT_LIMIT`
+    characters, collapsed to a single line, and stripped of the unprintable
+    categories. All three are server-, proxy- or provider-supplied display text
+    headed for ``str(exc)``, a traceback and a log line, so they get exactly
+    what a body excerpt gets and for exactly the same reason — a ``detail``
+    carrying ANSI escapes, a bidi override and ten thousand characters of
+    padding must not repaint the terminal printing it or flood the line it is
+    printed on. A blank or non-string value still reads as absent, so the
+    ``HTTP <status>`` fallback and the ``body_excerpt`` gate below behave as
+    they did.
 
     The precedence is: the envelope's ``code`` always wins; then, when the
     response identifies itself as Router's — the ``X-Comfy-Error-Type`` header
@@ -475,11 +498,16 @@ def error_from_envelope(
     # both the Router bucket and the status table below and a bare 401 yields
     # `ApiError(code="")` instead of `Unauthorized`.
     code = _clean((err or {}).get("code") if isinstance(err, dict) else None)
-    # Through `_clean` like every other string read off the wire: `message` ends
-    # up as `str(exc)`, and a non-string here (a list, a number) would make that
-    # raise `TypeError: __str__ returned non-string` at the one moment — inside
-    # a logger or a traceback — where an exception must not fail.
-    message = _clean((err or {}).get("message") if isinstance(err, dict) else None)
+    # Through `clean_body_excerpt`, not `_clean`: `message` ends up as
+    # `str(exc)`, and this is display text the server (or whatever answered for
+    # it) chose. A non-string still reads as absent — `clean_body_excerpt`
+    # returns `None` for one, same as `_clean` — so a list or a number here
+    # cannot make `str(exc)` raise `TypeError: __str__ returned non-string` at
+    # the one moment, inside a logger or a traceback, where an exception must
+    # not fail. What the excerpt reduction adds is the bound: a hostile or
+    # merely careless `message` reaches the caller printable, on one line, and
+    # capped, instead of verbatim at whatever length it was sent.
+    message = clean_body_excerpt((err or {}).get("message") if isinstance(err, dict) else None)
     details = (err or {}).get("details") if isinstance(err, dict) else None
 
     # Read whether or not `code` already won: the bucket is how a caller tells
@@ -528,7 +556,15 @@ def error_from_envelope(
             message = summarise_detail(raw_detail) or message
     if not message:
         # Router names its human-readable string `detail`, not `error.message`.
-        message = _clean(raw_detail)
+        # Reduced like `error.message` above and like the array summary: one
+        # wire body's human-readable text is bounded, single-line and printable
+        # whichever of the three spellings carried it. A whitespace-only or
+        # non-string `detail` still reads as absent, exactly as under `_clean`,
+        # so the `HTTP <status>` fallback immediately below still fires for it —
+        # including for a validation array that summarised to nothing, which
+        # arrives here as a list and is rejected by the same `isinstance` test
+        # `_clean` used to apply.
+        message = clean_body_excerpt(raw_detail)
     if message:
         # The response stated its cause; the excerpt would be a second copy of
         # it (or of the envelope around it). See the docstring.
