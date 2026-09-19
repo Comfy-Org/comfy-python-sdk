@@ -509,6 +509,23 @@ indefinitely. Each call also sends a fresh `Idempotency-Key`, so an accidental
 exact resend is rejected by the server instead of billing a second generation;
 pass `idempotency_key=` to choose the value yourself.
 
+Holding the connection that long also means holding a *pooled* one: a run
+occupies its slot in the client's httpx connection pool for the whole
+generation. That pool is httpx's default — 100 connections — so a fan-out past
+100 concurrent runs queues the 101st behind a generation finishing, and if
+nothing frees up it waits out the same 10-minute timeout and then raises
+`httpx.PoolTimeout` rather than returning a result. Size the pool up front
+instead of discovering that as a ten-minute stall:
+
+```python
+client = Comfy(limits=httpx.Limits(max_connections=250))
+```
+
+Raising the client's pool is not a licence to exceed the concurrency your
+account is allowed: the server may also bound how many requests a customer has
+in flight at once, and a pool wider than that limit just moves the queue from
+your process to theirs.
+
 ### `models.submit` — queue it, collect it later
 
 `run` holds one connection open until the generation is finished. When the

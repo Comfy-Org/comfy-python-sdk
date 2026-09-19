@@ -10,6 +10,15 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Added
+
+- `Comfy(limits=...)` / `AsyncComfy(limits=...)` — an `httpx.Limits` sizing the connection pool
+  the client's namespaces share. The default is unchanged (httpx's own, 100 connections). Raise
+  `max_connections` when fanning out more than 100 concurrent `models.run` calls: each holds its
+  pooled connection for the whole generation, so past 100 the next call waits on a generation and
+  can end in `httpx.PoolTimeout`. `ComfyLow`/`AsyncComfyLow` take the same keyword; an injected
+  `client=` owns its own pool and ignores it, as it already does `timeout`.
+
 ### Fixed
 
 - **`except RouterError` now catches every Comfy Router refusal.** `insufficient_credits`,
