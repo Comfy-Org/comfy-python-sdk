@@ -166,6 +166,12 @@ class ServerState:
     # fronted by Router, so this is the shape a real deployment's 504 arrives
     # in, and the bucket-keyed collect rule has to read it.
     model_run_router_error_shape: bool = False
+    # The human-readable string a failed run answers with, in place of the
+    # generated `model run error <code>`. Exists so a test can send the kind of
+    # string a server, a proxy or a provider actually can -- one carrying
+    # control characters, escape sequences or kilobytes of padding -- and watch
+    # what the SDK hands a caller after the whole parse chain has run on it.
+    model_run_error_detail: str | None = None
     # Answer the model run with Router's *per-field* validation failure: a
     # `422` whose body is `{"detail": [...]}` -- this list, verbatim -- with the
     # coarse bucket on `X-Comfy-Error-Type` and no `error_type` in the body,
@@ -873,6 +879,8 @@ def _make_handler(state: ServerState):
                 state.model_run_idempotency[key] = "claimed"
 
             def fail(status: int, code: str, message: str) -> None:
+                if state.model_run_error_detail is not None:
+                    message = state.model_run_error_detail
                 claim_if_outcome_unknown(status, code)
                 if state.model_run_replays_lost_result and key and status >= 500:
                     # The generation completed; only the answer was lost. Bill
