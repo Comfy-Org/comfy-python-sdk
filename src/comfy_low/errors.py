@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 #: The leading run of characters a request id may consist of, bounded in the
@@ -106,6 +107,8 @@ class ApiError(Exception):
         retry_after: int | None = None,
         request_id: str | None = None,
         body_excerpt: str | None = None,
+        error_type: str | None = None,
+        validation_errors: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -113,7 +116,48 @@ class ApiError(Exception):
             self.code = code
         self.http_status = http_status
         self.details = details
+        #: The raw, decoded entries of a Router per-field validation body's
+        #: ``detail`` *array*, in wire order and unconverted — every entry that
+        #: decoded as a mapping, and nothing else. Empty for every other
+        #: response, which is all of them on the envelope surface: ``details``
+        #: above is the envelope's own per-node structure and the two never
+        #: describe the same failure.
+        #:
+        #: Kept raw on purpose. The typed view of these entries is
+        #: ``comfy_sdk.router_exceptions.ValidationErrorDetail``, and this layer
+        #: may not import ``comfy_sdk`` (``tests/test_error_contract.py``), so
+        #: the entries ride up untyped and are converted at the translation
+        #: boundary (``comfy_sdk.exceptions.to_sdk_error``) onto
+        #: ``RouterError.errors``. A caller catches the ``comfy_sdk`` exception
+        #: and reads them there; this attribute is the carrier, not the surface.
+        self.validation_errors: tuple[Mapping[str, Any], ...] = tuple(validation_errors)
         self.retry_after = retry_after
+        #: The Router bucket the response named -- ``X-Comfy-Error-Type``, or
+        #: the body's own top-level ``error_type`` -- or ``None`` when the
+        #: response named none. Only Router sends one, so this doubles as the
+        #: answer to "which surface produced this error": a v2 envelope carries
+        #: ``error.code`` and no bucket, and an intermediary's reject carries
+        #: neither.
+        #:
+        #: Kept even when it is the same string as :attr:`code`, because
+        #: ``code`` cannot be read backwards: the three buckets both surfaces
+        #: spell identically (``unauthorized``, ``forbidden``,
+        #: ``insufficient_credits``) leave ``code`` saying nothing about who
+        #: answered. What it buys is at the ``comfy_sdk`` boundary — a bucket
+        #: Router adds after this SDK version was built has no class to map to,
+        #: and this is what lets ``to_sdk_error`` still raise a ``RouterError``
+        #: for it rather than a bare ``ComfyError`` that no Router handler
+        #: catches.
+        #:
+        #: One interaction to know about: ``comfy_sdk.retry.error_bucket_of``
+        #: reads ``error_type`` *before* ``code``, so this attribute is now the
+        #: one it answers with on a bucketed response. That is the same string
+        #: either way — the two contracts are mutually exclusive on the wire
+        #: (Router's body is ``{detail, error_type}`` and carries no
+        #: ``error.code``; a v2 envelope carries ``error.code`` and no bucket),
+        #: so ``code`` is *set from* the bucket whenever there is one. A
+        #: response carrying both would be a shape neither contract defines.
+        self.error_type = error_type
         #: Server-minted id for the call, read off ``X-Comfy-Request-Id``.
         #: ``None`` when the response carried no such header. Surfaced the same
         #: way ``retry_after`` is — a response header kept on the exception,
@@ -218,11 +262,53 @@ def _clean(value: Any) -> str | None:
     Anything else — a missing key, a number, Router's ``detail[]`` list form —
     reads as absent rather than being coerced, so a malformed body degrades to
     the status-derived default instead of producing a nonsense code.
+
+    The list form is still dropped here, and that is still right for the CODE
+    fields: a list is not a code and stringifying one would put a Python repr
+    where a caller expects a wire value. It is no longer how the list ``detail``
+    is *read*, though — :func:`error_from_envelope` handles that shape itself,
+    before it reaches this function, because the entries carry both the
+    per-field data and the messages that summarise it.
     """
     if not isinstance(value, str):
         return None
     stripped = value.strip()
     return stripped or None
+
+
+#: The status a cancel refusal is answered with.
+_CANCEL_REFUSAL_STATUS = 409
+
+#: Body ``status`` -> the ``code`` a cancel refusal is typed by. The cancel
+#: route declines in a shape that fits neither of the two this module already
+#: reads: a ``409`` whose body states a queue ``status`` and names no bucket and
+#: no envelope ``code`` at all. Left to fall through, such a response is a bare
+#: ``ApiError`` whose code is ``http_409``, and the ONLY way to tell "the work
+#: had already finished" from any other ``409`` is to substring-match the
+#: response body — which is how it was being done, and what a second refusal
+#: shape would have to be done twice.
+#:
+#: Narrow on purpose, in both directions. It is consulted only for a ``409``,
+#: and only after the envelope ``code`` and the Router bucket have both come up
+#: empty, so it can never retype a response that identified itself. And it is a
+#: table of exact values rather than a reading of ``status`` in general: a
+#: ``status`` field is not an error code, and treating any value found there as
+#: one would invent buckets out of a body that was only reporting state. A new
+#: refusal shape is one entry here plus one class in
+#: ``comfy_sdk.router_exceptions``.
+_CODE_BY_CANCEL_STATUS: dict[str, str] = {"ALREADY_COMPLETED": "already_completed"}
+
+
+def _cancel_refusal_code(http_status: int, body: dict[str, Any] | None) -> str | None:
+    """The code for a cancel-refusal response, or ``None`` if it is not one."""
+    if http_status != _CANCEL_REFUSAL_STATUS or not isinstance(body, dict):
+        return None
+    # Upper-cased rather than matched verbatim: the value is an enum-like token
+    # (`COMPLETED`, `IN_QUEUE`), so its case carries no meaning, and a
+    # deployment that spells it back in another one should not silently fall
+    # through to an untyped `409`.
+    status = _clean(body.get("status"))
+    return _CODE_BY_CANCEL_STATUS.get(status.upper()) if status else None
 
 
 def error_from_envelope(
@@ -262,6 +348,15 @@ def error_from_envelope(
     no-op against every real Router ``504``. ``error_type`` (the header, passed by the
     caller) and the body's own top-level ``error_type`` are read to prevent that.
 
+    Router also spells ``detail`` two ways, and both are read here. A
+    request-level failure sends a string, which becomes the message. A per-field
+    model-validation failure sends an ARRAY of ``{loc, msg, type, ...}`` entries
+    instead; those land raw on :attr:`ApiError.validation_errors`, and their
+    ``msg`` values — joined with ``"; "`` — become the message. Before that the
+    array read as no message at all, so such a failure reached a caller as a
+    bare ``HTTP 422`` with the raw JSON glued on as a body excerpt, and the
+    per-field reasons the array exists to carry were dropped on the floor.
+
     The precedence is: the envelope's ``code`` always wins; then, when the
     response identifies itself as Router's — the ``X-Comfy-Error-Type`` header
     or a top-level body ``error_type`` is present — that bucket wins for EVERY
@@ -298,10 +393,17 @@ def error_from_envelope(
     message = _clean((err or {}).get("message") if isinstance(err, dict) else None)
     details = (err or {}).get("details") if isinstance(err, dict) else None
 
+    # Read whether or not `code` already won: the bucket is how a caller tells
+    # a Router response from a v2 one, and on the three buckets both surfaces
+    # spell identically the code string cannot answer that. See
+    # `ApiError.error_type`.
+    bucket = _clean(error_type) or _clean(
+        (body or {}).get("error_type") if isinstance(body, dict) else None
+    )
     if code is None:
-        code = _clean(error_type) or _clean(
-            (body or {}).get("error_type") if isinstance(body, dict) else None
-        )
+        code = bucket
+    if code is None:
+        code = _cancel_refusal_code(http_status, body)
     if code is None:
         code = _CODE_BY_STATUS.get(http_status)
     if code is None:
@@ -317,9 +419,30 @@ def error_from_envelope(
         # cannot collide with a wire ``code`` or a Router bucket, none of which
         # are spelled that way.
         code = f"http_{http_status}"
+    raw_detail = body.get("detail") if isinstance(body, dict) else None
+    validation_errors: tuple[Mapping[str, Any], ...] = ()
+    if isinstance(raw_detail, Sequence) and not isinstance(raw_detail, (str, bytes)):
+        # Router's per-field validation body: `detail` is an ARRAY of
+        # `{loc, msg, type, ...}` entries rather than a string. The entries are
+        # the only place the specific, provider-level reason survives — the
+        # coarse bucket on the header cannot express it — so they are carried
+        # up verbatim for the translation boundary to type. Non-mapping members
+        # are dropped rather than coerced: this runs while handling a failure,
+        # and one malformed member must not cost the caller the others.
+        validation_errors = tuple(entry for entry in raw_detail if isinstance(entry, Mapping))
+        if not message:
+            # The entries' own messages, joined, rather than the status-derived
+            # default: a body that named every failing field would otherwise
+            # reach a caller as a bare `HTTP 422`.
+            summary = "; ".join(
+                cleaned
+                for cleaned in (_clean(entry.get("msg")) for entry in validation_errors)
+                if cleaned
+            )
+            message = summary or message
     if not message:
         # Router names its human-readable string `detail`, not `error.message`.
-        message = _clean((body or {}).get("detail") if isinstance(body, dict) else None)
+        message = _clean(raw_detail)
     if message:
         # The response stated its cause; the excerpt would be a second copy of
         # it (or of the envelope around it). See the docstring.
@@ -336,6 +459,8 @@ def error_from_envelope(
         retry_after=retry_after,
         request_id=request_id,
         body_excerpt=body_excerpt,
+        error_type=bucket,
+        validation_errors=validation_errors,
     )
 
 
