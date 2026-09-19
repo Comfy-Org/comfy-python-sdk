@@ -12,7 +12,9 @@ restated here:
   ``post.operationId`` is ``runRouterModel``, and the ``servers[0].url`` it is
   addressed against -- compared against
   :data:`comfy_low.transport._MODEL_RUN_PATH_TEMPLATE` and
-  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL`.
+  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL`;
+* the **response header names** a run result is read from, compared against
+  :data:`comfy_sdk.models._RUN_RESULT_HEADERS`.
 
 Neither is generated, so a Router spec sync is the moment they can drift. The
 failures guarded against are a sync landing a new bucket that then reaches
@@ -38,6 +40,7 @@ import yaml
 
 from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE
 from comfy_sdk import COMFY_ROUTER_BASE_URL
+from comfy_sdk.models import _RUN_RESULT_HEADERS
 from comfy_sdk.router_exceptions import (
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
@@ -271,3 +274,61 @@ def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None
     assert _MODEL_RUN_PATH_TEMPLATE.count("{") == 2
     assert "{provider}" in _MODEL_RUN_PATH_TEMPLATE
     assert "{model}" in _MODEL_RUN_PATH_TEMPLATE
+
+
+# --- the response headers a run result is read from ---------------------
+
+
+def _run_response_headers() -> dict[str, Any]:
+    """The ``headers`` the spec declares on ``runRouterModel``'s 200.
+
+    Reached by searching for the ``operationId`` for the same reason
+    :func:`test_run_path_matches_vendored_spec` does: a lookup of the path this
+    file expects would pass vacuously the day a sync moves it.
+    """
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    for item in (doc.get("paths") or {}).values():
+        post = item.get("post") if isinstance(item, dict) else None
+        if isinstance(post, dict) and post.get("operationId") == "runRouterModel":
+            ok = (post.get("responses") or {}).get("200") or {}
+            return ok.get("headers") or {}
+    return {}
+
+
+@pytest.mark.parametrize("name", _RUN_RESULT_HEADERS)
+def test_the_headers_a_run_result_reads_are_the_spec_s(name: str) -> None:
+    """Every name ``_run_result`` looks up is one ``runRouterModel`` declares.
+
+    This is the check that was missing when ``Idempotent-Replayed`` was read as
+    ``X-Comfy-Idempotent-Replayed``. A wrong header name cannot fail at runtime
+    -- the lookup misses, the field takes its "absent" value, and a genuine
+    replay reports ``replayed=False`` -- so nothing but a comparison against the
+    contract can catch it. Parametrized per name so a failure says which one.
+
+    Declared-but-unread headers are deliberately NOT an error: the 200 also
+    carries ``X-Content-Type-Options`` and the committed-spend trio, which
+    :class:`~comfy_sdk.models.RouterRunResult` does not surface. The invariant
+    is one-way -- everything read is declared -- not set equality.
+    """
+    declared = _run_response_headers()
+    assert declared, (
+        "the vendored spec declares no headers on runRouterModel's 200 -- it was reshaped, "
+        "and this file can no longer pin the names src/comfy_sdk/models.py reads"
+    )
+    assert name in declared, (
+        f"src/comfy_sdk/models.py reads the response header {name!r}, which "
+        f"spec/router-openapi.yaml does not declare on runRouterModel's 200 "
+        f"({sorted(declared)}) -- the SDK is reading a header Router does not send, so the "
+        "field it feeds is silently taking its 'absent' value on every run"
+    )
+
+
+def test_the_replayed_header_carries_no_x_comfy_prefix() -> None:
+    # Named separately from the parametrized case above because this is the
+    # specific regression: `Idempotent-Replayed` is the ONE Router response
+    # header in this set without the `X-Comfy-` prefix its siblings carry, which
+    # is exactly why a prefix got added to it by hand and went unnoticed.
+    from comfy_sdk.models import _HEADER_REPLAYED
+
+    assert _HEADER_REPLAYED == "Idempotent-Replayed"
+    assert not _HEADER_REPLAYED.lower().startswith("x-comfy-")

@@ -200,6 +200,30 @@ class _ModelsBase:
         return f"{type(self).__name__}(base_url={self._low.safe_router_base_url!r})"
 
 
+#: Response headers :func:`_run_result` reads, named once here rather than left
+#: as inline literals. Each is verbatim from ``spec/router-openapi.yaml``'s
+#: ``runRouterModel`` 200 response, and
+#: ``tests/test_router_spec_contract.py::test_the_headers_a_run_result_reads_are_the_spec_s``
+#: pins all four against that file. A wrong name here is INVISIBLE at runtime --
+#: the lookup simply misses, the field takes its "the server did not send it"
+#: value, and nothing raises -- which is exactly how an ``X-Comfy-`` prefix on
+#: ``Idempotent-Replayed`` reported ``replayed=False`` on every genuine replay
+#: until it was noticed by hand. Being read out of the spec is what makes a
+#: future Router sync that renames one fail here instead of going quiet.
+_HEADER_FALLBACK_PROVIDER = "X-Comfy-Router-Fallback-Provider"
+_HEADER_DROPPED_PARAMS = "X-Comfy-Router-Dropped-Params"
+_HEADER_REPLAYED = "Idempotent-Replayed"
+_HEADER_REQUEST_ID = "X-Comfy-Request-Id"
+
+#: The four above as a set, for the spec-contract test to iterate.
+_RUN_RESULT_HEADERS = (
+    _HEADER_FALLBACK_PROVIDER,
+    _HEADER_DROPPED_PARAMS,
+    _HEADER_REPLAYED,
+    _HEADER_REQUEST_ID,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class RouterRunResult:
     """One finished model run, plus what Router disclosed about HOW it ran.
@@ -240,7 +264,7 @@ class RouterRunResult:
     """
 
     replayed: bool
-    """``X-Comfy-Idempotent-Replayed``: served from the key's record, not run again.
+    """``Idempotent-Replayed``: served from the key's record, not run again.
 
     A replay is not billed a second time. The header is absent on a fresh run
     rather than sent as ``false``, so this is derived from its presence.
@@ -279,13 +303,23 @@ def _dropped_params(raw: str | None) -> tuple[str, ...] | None:
 
 
 def _run_result(body: dict[str, Any], headers: Mapping[str, str]) -> RouterRunResult:
-    """Build a :class:`RouterRunResult` from one run's body and response headers."""
+    """Build a :class:`RouterRunResult` from one run's body and response headers.
+
+    ``headers`` is normalized through :class:`httpx.Headers` before any lookup,
+    which makes the four names below case-insensitive the way HTTP itself is.
+    The parameter admits any ``Mapping``, and a plain one -- ``dict(resp.headers)``,
+    which httpx lowercases -- would miss every mixed-case name here and yield
+    ``replayed=False`` and ``request_id=None`` without raising. That is the same
+    silent shape a wrong header name produces, so it is worth not depending on
+    the caller happening to pass an ``httpx.Headers``.
+    """
+    sent = httpx.Headers(headers)
     return RouterRunResult(
         output=body,
-        serving_provider=headers.get("X-Comfy-Router-Fallback-Provider"),
-        dropped_params=_dropped_params(headers.get("X-Comfy-Router-Dropped-Params")),
-        replayed=headers.get("X-Comfy-Idempotent-Replayed") is not None,
-        request_id=headers.get("X-Comfy-Request-Id"),
+        serving_provider=sent.get(_HEADER_FALLBACK_PROVIDER),
+        dropped_params=_dropped_params(sent.get(_HEADER_DROPPED_PARAMS)),
+        replayed=sent.get(_HEADER_REPLAYED) is not None,
+        request_id=sent.get(_HEADER_REQUEST_ID),
     )
 
 
@@ -356,8 +390,12 @@ class Models(_ModelsBase):
 
         Because the server may legitimately hold the connection for minutes,
         ``timeout`` defaults to :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT`
-        (10 minutes) rather than the client's own default, which is sized for
-        ordinary API calls and would abort a healthy run. Pass a number of
+        rather than the client's own default, which is sized for ordinary API
+        calls and would abort a healthy run. Its read bound is Router's own
+        ten-minute deadline plus a minute of headroom, so a run the server gives
+        up on comes back as that server's ``504 deadline_exceeded`` — with a
+        request id and a ``Retry-After`` — instead of as a bare client timeout
+        racing it. Pass a number of
         seconds, an ``httpx.Timeout``, or ``None`` to wait indefinitely.
 
         An ``Idempotency-Key`` is sent on every run; a fresh one is minted per

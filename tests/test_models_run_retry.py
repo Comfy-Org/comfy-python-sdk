@@ -43,7 +43,7 @@ import httpx
 import pytest
 
 from comfy_low.errors import ApiError
-from comfy_low.transport import MODEL_RUN_TIMEOUT
+from comfy_low.transport import MODEL_RUN_TIMEOUT, ROUTER_DEADLINE
 from comfy_sdk import DEFAULT_RETRY, NO_RETRY, AsyncComfy, Comfy, RetryPolicy
 from comfy_sdk.exceptions import ComfyError, IdempotencyKeyReuse
 from comfy_sdk.models import AsyncModels, Models
@@ -939,18 +939,51 @@ def test_the_budget_bounds_the_loop_even_at_the_server_named_pace() -> None:
 
 def test_the_collect_budget_outlasts_a_server_deadline_window() -> None:
     # The decision this asserts, so it cannot drift silently. A `deadline_exceeded`
-    # 504 arrives AT the server's own bound -- the same ten minutes `run` is
-    # already willing to spend on one attempt -- so a collect budget of exactly
-    # one window is spent by the time the 504 lands and the collect attempt it
-    # was sized for never starts. It has to be strictly more than one window,
-    # with room for a collect attempt of its own.
-    deadline_window = MODEL_RUN_TIMEOUT.read
+    # 504 arrives AT Router's own bound -- `ROUTER_DEADLINE`, NOT the client's
+    # read timeout -- so a collect budget of exactly one window is spent by the
+    # time the 504 lands and the collect attempt it was sized for never starts.
+    # It has to be strictly more than one window, with room for a collect attempt
+    # of its own.
+    deadline_window = ROUTER_DEADLINE
     assert deadline_window == 600.0
     assert DEFAULT_RETRY.collect_max_elapsed >= 2 * deadline_window
+
+    # And the client's own read timeout for one attempt is sized ABOVE Router's
+    # deadline, never equal to it: at equality the client can abort at the same
+    # instant Router is writing its 504, discarding the request id and Retry-After
+    # that answer names. The headroom is what lets a single attempt receive them.
+    assert MODEL_RUN_TIMEOUT.read is not None
+    assert MODEL_RUN_TIMEOUT.read > ROUTER_DEADLINE
 
     # And the fast classes do not pay for it: a refused connection still gives
     # up in a minute rather than sitting on a caller's thread for twenty.
     assert DEFAULT_RETRY.max_elapsed == 60.0
+
+
+def test_every_bound_of_the_run_timeout_is_chosen_rather_than_inherited() -> None:
+    """Each of the four is a decision, because a positional argument sets three at once.
+
+    ``httpx.Timeout(<value>, connect=...)`` applies ``<value>`` to ``read``,
+    ``write`` AND ``pool``. Two of those three should not follow a generation:
+
+    * ``write`` bounds pushing the request body up, never waiting for an answer,
+      so it must be well under the generation wait however large a base64 image
+      the arguments carry;
+    * ``pool`` genuinely IS generation-scale here and is asserted so on purpose.
+      Every connection in httpx's default 100 is held for a whole generation and
+      ``Comfy`` exposes no ``limits=``, so the 101st concurrent run is queued
+      behind a generation. Shortening this to ``connect``-scale would convert a
+      legitimate fan-out from a queue that drains into a wall of ``PoolTimeout``.
+      This asserts the trade rather than leaving it to a positional argument.
+    """
+    assert MODEL_RUN_TIMEOUT.read is not None
+    assert MODEL_RUN_TIMEOUT.write is not None
+    assert MODEL_RUN_TIMEOUT.write < MODEL_RUN_TIMEOUT.read
+    # Deliberately generation-scale -- see the constant's own comment. Written as
+    # an equality so that shortening it is a decision someone has to make here.
+    assert MODEL_RUN_TIMEOUT.pool == MODEL_RUN_TIMEOUT.read
+    # An unreachable host is not a slow generation, and never was.
+    assert MODEL_RUN_TIMEOUT.connect == 10.0
 
 
 def test_the_collect_budget_applies_only_to_the_collect_class() -> None:
