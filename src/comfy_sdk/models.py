@@ -721,6 +721,16 @@ class Models(_ModelsBase):
         cancel's own failure on ``.cancel_error`` and ``__cause__``, because a
         cancel that never landed means the run may still be going.
 
+        **The teardown itself is not inside the bound.** ``timeout`` bounds
+        the *wait*; deciding how it ended costs up to three further round
+        trips beyond it, each bounded at ``_CANCEL_TIMEOUT`` (10s): the
+        cleanup cancel, the confirming status read the refusal needs, and —
+        on the completed-during-teardown ending only — the result fetch. So a
+        ``subscribe(timeout=N)`` that ends in a detach can return up to ~30s
+        after ``N`` in the worst case. Overrunning is the deliberate trade:
+        the alternative is telling a caller their run was cancelled without
+        having checked, or discarding a generation they have already paid for.
+
         Use :meth:`submit` instead when the request is *meant* to outlive the
         caller's patience — a detach is the timeout making the best of a run it
         can no longer stop, not a substitute for queueing one deliberately.
@@ -769,7 +779,16 @@ class Models(_ModelsBase):
                         # It completed while the teardown was running. The
                         # generation is finished and billed; a bounded fetch of
                         # its result is a far better answer than discarding it.
-                        return handle._collect(teardown, budget=_CANCEL_TIMEOUT)
+                        #
+                        # The callback is owed this observation like any other.
+                        # It is the terminal one, and on the single timeout
+                        # ending that returns a result it is the only place the
+                        # caller's own state machine can learn the run ended —
+                        # which the docstring promises it ("every change of
+                        # status ... and the completion").
+                        if on_queue_update is not None:
+                            on_queue_update(teardown)
+                        return handle._collect_or_detach(teardown, budget=_CANCEL_TIMEOUT)
                     return teardown
                 completion = update
                 if on_queue_update is not None:
@@ -1005,7 +1024,14 @@ class AsyncModels(_ModelsBase):
                                 handle, timed_out, cancelled=True
                             ) from timed_out
                         if isinstance(teardown, QueueUpdate):
-                            return await handle._collect(teardown, budget=_CANCEL_TIMEOUT)
+                            # Delivered to the callback first, for the reason
+                            # `Models.subscribe` gives — and awaited here, as
+                            # the loop below awaits it.
+                            if on_queue_update is not None:
+                                outcome = on_queue_update(teardown)
+                                if isinstance(outcome, Awaitable):
+                                    await outcome
+                            return await handle._collect_or_detach(teardown, budget=_CANCEL_TIMEOUT)
                         return teardown
                     completion = update
                     if on_queue_update is not None:

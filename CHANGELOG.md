@@ -20,13 +20,33 @@ the fuller account of each version, including verification notes.
 
 ### Changed
 
-- **`models.subscribe(timeout=N)` now returns a `DetachedRequest` instead of raising** when the
-  queue refuses the cleanup cancel because the request is already in flight. Such a run is served
-  and **billed** whatever the caller does, so the timeout is a detach rather than a cancellation
-  and the request stays collectable by `request_id`. Its return type is now
-  `dict[str, Any] | DetachedRequest` — check the type before using the result.
+- **`models.subscribe(timeout=N)` now returns a `DetachedRequest` instead of raising** when its
+  cleanup cancel did not stop the run — the queue refused it because the request was already in
+  flight, or took it and answered with a live status. Such a run is served and **billed** whatever
+  the caller does, so the timeout is a detach rather than a cancellation and the request stays
+  collectable by `request_id`. Its return type is now `dict[str, Any] | DetachedRequest` — check
+  the type before using the result.
 - A `subscribe` timeout that *did* cancel the request raises `SubscribeTimeout` rather than a bare
   `TimeoutError`. It subclasses `TimeoutError`, so `except TimeoutError` is unaffected.
+  `SubscribeTimeout` pickles and copies with its fields intact, so the ids survive reaching another
+  process.
+- **A 2xx on the cleanup cancel is no longer taken as proof the run stopped.** The cancel's own
+  answer is read: terminal with a bucket is a cancellation, terminal without one is a run that
+  finished and is collected, and a live status (a `202`/`CANCELING`, or a request that won the race
+  into flight) is a detach. Only a body-less accepted cancel still reports a cancellation
+  unconfirmed, which is the shape that carries nothing to read.
+- **Only a `409` that names no bucket is read as the in-flight refusal.** A typed `CancelRefused`
+  is recognised by its class; a `409` carrying a documented bucket (`invalid_input`,
+  `concurrency_limit_exceeded`) is not the state refusal and surfaces on
+  `SubscribeTimeout.cancel_error` instead of being reported as a detach.
+- A result fetch that fails during the timeout teardown degrades to a `DetachedRequest` rather than
+  escaping as a raw transport error, so a caller's `except TimeoutError` still sees the ids for a
+  generation that has finished and been billed. A completion carrying its own `error_type` still
+  raises the typed error — that is the run's outcome, not a failure to read it.
+- `on_queue_update` is now called with the completion found during the timeout teardown, which is
+  the terminal observation the docstring promises it.
+- `subscribe`'s teardown can overrun `timeout` by up to ~30s in the worst case (three bounded round
+  trips: the cancel, the confirming poll, the result fetch). Documented on the method.
 - **A cleanup cancel that fails for any other reason is no longer swallowed.** A transport
   failure, a `401` or a `500` on the cancel now reaches the caller on
   `SubscribeTimeout.cancel_error` and `__cause__`, with `.cancelled` `False`, instead of looking

@@ -616,19 +616,32 @@ The three ways the timeout can end, told apart by type and never by a message:
 
 | | |
 |---|---|
-| **cancelled** | the request was still queued and the cancel was accepted. Nothing ran, nothing is billed. Raises `SubscribeTimeout` (a `TimeoutError`) with `.cancelled` `True` |
-| **detached** | the run was already in flight and the cancel was refused. It continues, completes and **is billed**. Returns a `DetachedRequest` |
+| **cancelled** | the request was still queued and the cancel really stopped it. Nothing ran, nothing is billed. Raises `SubscribeTimeout` (a `TimeoutError`) with `.cancelled` `True` |
+| **detached** | the run was already in flight, so the cancel did not stop it. It continues, completes and **is billed**. Returns a `DetachedRequest` |
 | **completed during teardown** | the run finished while the timeout was being torn down. The result exists and is paid for, so it is collected and returned like any other result |
 
+Which one you get is read off the cancel's **answer**, not off the bare fact
+that it returned a 2xx: a cancel the route accepts while reporting a live
+status (a `202`/`CANCELING`, or a request that won the race into flight) is a
+**detach**, because the run did not stop. Only a body-less accepted cancel —
+the shape that carries nothing to read — is reported as a cancellation
+unconfirmed.
+
 A cancel that fails for some *other* reason — a transport failure, a rejected
-credential, a `500` — is **not** treated as a detach and is not swallowed:
+credential, a `500`, or a `409` naming a bucket the contract documents as
+something else — is **not** treated as a detach and is not swallowed:
 `SubscribeTimeout` is raised with `.cancelled` `False` and the cancel's own
 failure on `.cancel_error` (and on `__cause__`). Such a cancel never landed, so
 the run may well still be going; `.request_id` and `.model` reach it.
 
 `SubscribeTimeout` subclasses `TimeoutError`, so an existing
 `except TimeoutError` around `subscribe` keeps catching the cases that still
-raise.
+raise. It also pickles, so those ids survive being handed to another process.
+
+`timeout` bounds the **wait**, not the teardown that follows it: working out
+which of the three endings happened costs up to three further round trips,
+each bounded at 10s, so a `subscribe(timeout=N)` can return up to ~30s after
+`N` in the worst case.
 
 Each `submit` **call** mints one fresh `Idempotency-Key`: two deliberate
 submits of the same input are two requests, while a transport-level retry

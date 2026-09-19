@@ -220,6 +220,12 @@ class ServerState:
     # `error_type` carried by the *result* body only, with the status reporting
     # a clean completion — the other half of "a 200 is not a success".
     queue_result_error_type: str | None = None
+    # When set, the RESULT route fails at the HTTP level with this
+    # `(status, code)` instead of answering a body -- the result document
+    # existing but being unreachable, as distinct from a completion that
+    # carries a failure bucket. The two are answered differently by the
+    # timeout teardown, so the stub has to be able to express both.
+    queue_result_http_error: tuple[int, str] | None = None
     # Extra keys merged into the served result payload — for the case where the
     # provider's OWN native output happens to carry a field the queue envelope
     # also uses (`error_type`), with no queue envelope around it.
@@ -255,8 +261,17 @@ class ServerState:
     # set it to a `401` or a `500` and the refusal must surface rather than read
     # as a detach.
     queue_cancel_refusal: tuple[int, dict[str, Any]] | None = None
-    # The bucket a cancelled request's completion carries.
-    queue_cancel_error_type: str = "client_disconnected"
+    # The bucket a cancelled request's completion carries. `None` models the
+    # cancel that LOST the race: the answer is still terminal, but the run
+    # finished on its own, so there is a real result behind it rather than a
+    # stop.
+    queue_cancel_error_type: str | None = "client_disconnected"
+    # The queue `status` an ACCEPTED cancel answers with. "COMPLETED" is the
+    # ordinary one -- this queue has no `CANCELED` status and expresses a stop
+    # as COMPLETED plus a bucket. A live value like "IN_PROGRESS" models the
+    # 2xx a request that won the race into flight is answered with: the route
+    # took the message, but the run did not stop.
+    queue_cancel_accept_status: str = "COMPLETED"
     # Set by a cancel; makes every later status poll report the cancellation.
     queue_canceled: bool = False
 
@@ -725,7 +740,8 @@ def _make_handler(state: ServerState):
                 return
             if state.queue_canceled:
                 body["status"] = "COMPLETED"
-                body["error_type"] = state.queue_cancel_error_type
+                if state.queue_cancel_error_type is not None:
+                    body["error_type"] = state.queue_cancel_error_type
                 body["detail"] = "the request was cancelled"
                 self._json(200, body, headers=headers)
                 return
@@ -746,6 +762,10 @@ def _make_handler(state: ServerState):
         def _serve_queue_result(self, request_id: str) -> None:
             state.queue_result_count += 1
             state.queue_paths.append(self.path)
+            if state.queue_result_http_error:
+                status, code = state.queue_result_http_error
+                self._router_err(status, code)
+                return
             if state.queue_result_raw is not None:
                 self._json(200, state.queue_result_raw)
                 return
@@ -775,20 +795,24 @@ def _make_handler(state: ServerState):
                 status, refusal = state.queue_cancel_refusal
                 self._json(status, refusal)
                 return
-            state.queue_canceled = True
+            # Only a cancel whose own answer is TERMINAL actually stopped the
+            # request. One answering a live status took the message and left
+            # the run going, so later polls must still see it running --
+            # otherwise the stub decides the very thing the SDK is under test
+            # for reading correctly.
+            state.queue_canceled = state.queue_cancel_accept_status == "COMPLETED"
             if state.queue_cancel_status == 204:
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            self._json(
-                state.queue_cancel_status,
-                {
-                    "request_id": unquote(request_id),
-                    "status": "COMPLETED",
-                    "error_type": state.queue_cancel_error_type,
-                },
-            )
+            accepted: dict[str, Any] = {
+                "request_id": unquote(request_id),
+                "status": state.queue_cancel_accept_status,
+            }
+            if state.queue_cancel_error_type is not None:
+                accepted["error_type"] = state.queue_cancel_error_type
+            self._json(state.queue_cancel_status, accepted)
 
         def _router_err(
             self, status: int, code: str, message: str = "err", retry_after: str | None = None

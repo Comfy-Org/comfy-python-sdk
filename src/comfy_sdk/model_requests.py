@@ -39,6 +39,7 @@ differences follow from the surface rather than from taste:
 from __future__ import annotations
 
 import asyncio
+import enum
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -51,8 +52,8 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow, parse_request_id
 
 from . import _core
 from .exceptions import ComfyError, translating
-from .retry import DEFAULT_RETRY, NO_RETRY, Retrier, RetryPolicy
-from .router_exceptions import RouterError, error_from_completion
+from .retry import DEFAULT_RETRY, NO_RETRY, Retrier, RetryPolicy, error_bucket_of
+from .router_exceptions import CancelRefused, RouterError, error_from_completion
 
 #: The one terminal queue status. Deliberately a single value rather than a
 #: :data:`comfy_sdk._core.TERMINAL`-style set: the server does not express a
@@ -99,14 +100,28 @@ _CANCEL_TIMEOUT = 10.0
 #: reading is what this keys on, deliberately rather than on the refusal's
 #: prose, which no contract pins and which differs between the two.
 #:
-#: It is a STATUS and not an ``error_type`` because the queue names no bucket on
-#: these today: a cancel-after-completion answers ``409`` carrying
-#: ``{"status": "ALREADY_COMPLETED"}`` and no bucket at all, which reaches this
-#: SDK as a bare :class:`~comfy_sdk.exceptions.ComfyError`. When the contract
-#: does name a bucket for the in-flight refusal, this is the one predicate to
-#: widen -- branching on the typed class is strictly better than branching on
-#: the status, and the status branch can then narrow to the legacy shape.
+#: It is the FALLBACK reading, not the first one. Cancel-after-completion is
+#: now typed -- it reaches this SDK as
+#: :class:`~comfy_sdk.router_exceptions.AlreadyCompleted` under the
+#: :class:`~comfy_sdk.router_exceptions.CancelRefused` base -- and
+#: :func:`_refused_on_state` asks that question first, because branching on the
+#: class is strictly better than branching on a status. This status is what
+#: catches the refusal the contract has NOT named yet: the in-flight one, which
+#: today carries no bucket on the header or in the body and so arrives as a
+#: bare :class:`~comfy_sdk.exceptions.ComfyError`. It is matched only when the
+#: response names no bucket at all, so a ``409`` the contract DOES name --
+#: ``invalid_input``, ``concurrency_limit_exceeded`` -- is not swept in with
+#: it. When the in-flight refusal is given a bucket of its own, add the
+#: subclass to :data:`~comfy_sdk.router_exceptions.CANCEL_REFUSALS` and this
+#: status clause can go.
 _CANCEL_REFUSED_STATUS = 409
+
+#: The code :mod:`comfy_low.errors` synthesises for a ``409`` that identified
+#: itself with nothing -- no envelope ``code``, no Router bucket. Reading it as
+#: "named no bucket" is what keeps :func:`_refused_on_state` matching the
+#: in-flight refusal's bucket-less shape while still failing closed on a
+#: ``409`` that names a real one.
+_UNIDENTIFIED_REFUSAL_CODE = f"http_{_CANCEL_REFUSED_STATUS}"
 
 _now = time.monotonic
 
@@ -407,20 +422,141 @@ class SubscribeTimeout(TimeoutError):
         #: timeout has always implied here.
         self.cancel_error = cancel_error
 
+    def __reduce__(
+        self,
+    ) -> tuple[Callable[..., SubscribeTimeout], tuple[Any, ...]]:
+        """Rebuild through the real constructor, keeping every field.
+
+        ``BaseException.__reduce__`` reconstructs from :attr:`args` alone, and
+        ``args`` is just ``(message,)`` here -- so the inherited one rebuilds
+        this as ``SubscribeTimeout(message)`` and dies on the three required
+        keyword-only arguments. That turns a pickle or a ``copy.copy`` into a
+        ``TypeError`` that masks the real failure, in exactly the
+        cross-process workflow this queued surface exists for: submit here,
+        collect in a worker pool or a task queue, where :attr:`request_id` is
+        the only route back to a generation that is still billing.
+        """
+        return (
+            _rebuild_subscribe_timeout,
+            (str(self), self.request_id, self.model, self.cancelled, self.cancel_error),
+        )
+
 
 def _refused_on_state(exc: BaseException) -> bool:
     """Whether a failed cancel was the queue refusing on the REQUEST's state.
 
-    True for the refusals described on :data:`_CANCEL_REFUSED_STATUS` -- an
-    in-flight run the queue will not recall, or one that has already completed
-    -- and false for everything else, which is what keeps a transport failure,
-    a rejected credential and a ``500`` raising instead of being read as a
-    benign detach. ``getattr`` because the transport-level failures in
+    Two ways in, and the typed one is preferred wherever it is available:
+
+    * a :class:`~comfy_sdk.router_exceptions.CancelRefused` -- the cancel
+      route's refusals that this SDK version recognises and types, which today
+      is :class:`~comfy_sdk.router_exceptions.AlreadyCompleted`. Branching on
+      the class is the honest test, and it costs nothing to ask first.
+    * failing that, a :data:`_CANCEL_REFUSED_STATUS` that names **no bucket at
+      all** -- the shape the in-flight refusal has today, which carries no
+      ``error_type`` on the header or in the body and so reaches this SDK as a
+      bare :class:`~comfy_sdk.exceptions.ComfyError`.
+
+    The second clause **fails closed**, which is the whole of the narrowing: a
+    ``409`` that DOES name a bucket is something the contract already has a
+    name for -- ``invalid_input``, or ``concurrency_limit_exceeded`` with its
+    ``Retry-After`` -- and is not the state refusal, so it surfaces on
+    :attr:`SubscribeTimeout.cancel_error` instead of being reported as a detach
+    that asserts the run is in flight and billed. Two nearby precedents read
+    ``409`` the same way: :func:`comfy_sdk.retry.is_collectable` gates it on
+    status *and* bucket, and ``comfy_low.errors._CODE_BY_STATUS`` omits it
+    outright because the status alone is ambiguous.
+
+    "Names no bucket" has two spellings, because the layer below fills the
+    gap rather than leaving it: a response that identified itself with
+    nothing at all is given the synthetic code ``http_<status>``
+    (:mod:`comfy_low.errors`), which is documented there as unable to collide
+    with a wire ``code`` or a Router bucket precisely because nothing real is
+    spelled that way. So both ``None`` and that sentinel mean the same thing
+    here, and anything else is a bucket the server really did name.
+
+    ``getattr`` because the transport-level failures in
     :data:`_CANCEL_FAILURES` are httpx's own classes and carry no
     ``http_status`` at all; those are exactly the ones that must not be
     swallowed, so their absence reading as "not a refusal" is the right answer.
     """
-    return getattr(exc, "http_status", None) == _CANCEL_REFUSED_STATUS
+    if isinstance(exc, CancelRefused):
+        return True
+    if getattr(exc, "http_status", None) != _CANCEL_REFUSED_STATUS:
+        return False
+    bucket = error_bucket_of(exc)
+    return bucket is None or bucket == _UNIDENTIFIED_REFUSAL_CODE
+
+
+def _rebuild_subscribe_timeout(
+    message: str,
+    request_id: str,
+    model: str,
+    cancelled: bool,
+    cancel_error: BaseException | None,
+) -> SubscribeTimeout:
+    """Unpickle a :class:`SubscribeTimeout`; see its ``__reduce__``.
+
+    Module-level because pickle has to be able to name it, and a plain
+    function rather than the class itself because the fields are keyword-only
+    and ``__reduce__``'s callable is applied to a positional tuple.
+    """
+    return SubscribeTimeout(
+        message,
+        request_id=request_id,
+        model=model,
+        cancelled=cancelled,
+        cancel_error=cancel_error,
+    )
+
+
+class _CancelReading(enum.Enum):
+    """What a cancel the route ACCEPTED says about whether the run stopped."""
+
+    #: The run is gone. Nothing is left to collect and nothing more is billed.
+    STOPPED = "stopped"
+    #: The run finished on its own. There IS a result, and it is already paid
+    #: for, so it is collected rather than discarded.
+    FINISHED = "finished"
+    #: The route took the message but the run has NOT stopped -- a ``202``
+    #: naming a ``CANCELING`` status, or a ``200`` on a request that won the
+    #: race into flight. Confirmed against the server, then reported as a
+    #: detach.
+    UNSTOPPED = "unstopped"
+
+
+def _reading_of_accepted_cancel(accepted: QueueUpdate) -> _CancelReading:
+    """Read a 2xx cancel's own body for whether the work actually stopped.
+
+    A 2xx on the cancel route says the server accepted the *message*, which is
+    not the same as the run having stopped -- the binding accepts ``200``,
+    ``202`` and ``204`` alike, and :meth:`cancel`'s docstring already tells its
+    own callers to "read the returned update's status ... rather than assuming
+    the work stopped". The timeout teardown used to discard that body and
+    assert ``cancelled=True`` from the bare fact of a 2xx, which is the one
+    reading the response does not support.
+
+    Three readings, from the update the cancel answered with:
+
+    * no status at all (the body-less ``204`` an accepted cancel usually is) --
+      :attr:`~_CancelReading.STOPPED`. There is nothing to read, and an
+      accepted cancel on an undispatched request is what that shape means;
+      spending another round trip to re-confirm the ordinary case would charge
+      every timeout for the rare one.
+    * a terminal :data:`COMPLETED` carrying an ``error_type`` --
+      :attr:`~_CancelReading.STOPPED` too. Terminal, and the bucket is how this
+      queue expresses a stop (it has no ``CANCELED`` status of its own; see
+      :data:`COMPLETED`).
+    * a terminal :data:`COMPLETED` carrying NO bucket --
+      :attr:`~_CancelReading.FINISHED`. It ran to completion and was billed, so
+      there is a real result behind it.
+    * anything else, which is a non-terminal status on a live request --
+      :attr:`~_CancelReading.UNSTOPPED`.
+    """
+    if not accepted.status:
+        return _CancelReading.STOPPED
+    if not accepted.is_completed:
+        return _CancelReading.UNSTOPPED
+    return _CancelReading.STOPPED if accepted.error_type is not None else _CancelReading.FINISHED
 
 
 def _subscribe_timed_out(
@@ -669,7 +805,7 @@ class RequestHandle(_RequestHandleBase):
             )
         return _update_from(payload, headers, request_id=self._request_id)
 
-    def _cancel_best_effort(self) -> None:
+    def _cancel_best_effort(self) -> QueueUpdate:
         """The cleanup cancel ``models.subscribe`` issues after its own timeout.
 
         One attempt under :data:`~comfy_sdk.retry.NO_RETRY` and a short HTTP
@@ -678,14 +814,20 @@ class RequestHandle(_RequestHandleBase):
         policy could hold that caller for the whole of ``max_elapsed`` — or
         ``collect_max_elapsed``, if the cancel were answered with a paced
         ``429`` — after they had already stopped waiting.
+
+        Returns the update the cancel was answered WITH, rather than discarding
+        it: a 2xx says the route accepted the message, not that the run
+        stopped, and :meth:`_after_accepted_cancel` is what reads the
+        difference. :meth:`cancel` says the same thing to its own callers.
         """
         with translating():
-            self._call(
+            payload, headers = self._call(
                 lambda: self._low.put_model_request_cancel(
                     self._model, self._request_id, timeout=_CANCEL_TIMEOUT
                 ),
                 policy=NO_RETRY,
             )
+        return _update_from(payload, headers, request_id=self._request_id)
 
     def _after_subscribe_timeout(self) -> DetachedRequest | QueueUpdate | None:
         """``models.subscribe``'s timeout teardown: cancel, then say what happened.
@@ -694,19 +836,26 @@ class RequestHandle(_RequestHandleBase):
         outcomes and a caller who has just lost their wait needs to tell them
         apart:
 
-        * ``None`` — the queue ACCEPTED the cancel, which it does only for a
-          request it has not dispatched yet. The run is gone, nothing will be
-          billed for it and there is nothing to collect, so ``subscribe``
-          raises, exactly as it always has.
-        * a :class:`DetachedRequest` — the queue REFUSED the cancel on the
-          request's own state (:data:`_CANCEL_REFUSED_STATUS`) and a confirming
-          poll found the request still going. It was already in flight, so it
+        * ``None`` — the run is gone. Either the queue ACCEPTED the cancel on
+          a request it had not dispatched yet, or the cancel's own body came
+          back terminal; nothing will be billed further and there is nothing
+          to collect, so ``subscribe`` raises, exactly as it always has.
+        * a :class:`DetachedRequest` — the run did NOT stop, and a confirming
+          poll found it still going. Either the queue REFUSED the cancel on
+          the request's own state (:func:`_refused_on_state`), or it took the
+          cancel but answered with a live status
+          (:attr:`~_CancelReading.UNSTOPPED`). It was already in flight, so it
           is served and billed whatever the caller does; the honest report is
           that the caller detached from a run that is still theirs to collect.
-        * a :class:`QueueUpdate` — the same refusal, but the confirming poll
-          found the request ``COMPLETED``. It finished while the teardown was
-          running, so there IS a result, and ``subscribe`` collects it rather
-          than throwing away a generation the caller has been billed for.
+        * a :class:`QueueUpdate` — the request is ``COMPLETED``, found either
+          by the confirming poll or on the cancel's own answer. It finished
+          while the teardown was running, so there IS a result, and
+          ``subscribe`` collects it rather than throwing away a generation the
+          caller has been billed for.
+
+        A 2xx is deliberately NOT read as proof the run stopped; see
+        :func:`_reading_of_accepted_cancel` for what the body has to say
+        before this reports a cancellation.
 
         Any other cancel failure propagates. That is the narrowing this method
         exists for: the timeout path used to swallow every cancel failure
@@ -715,39 +864,84 @@ class RequestHandle(_RequestHandleBase):
         generation had been stopped.
         """
         try:
-            self._cancel_best_effort()
-            return None
+            accepted: QueueUpdate | None = self._cancel_best_effort()
         except _CANCEL_FAILURES as exc:
             if not _refused_on_state(exc):
                 raise
+            # Refused on state: fall through to the confirming poll below,
+            # OUTSIDE this handler, so a failure there is not reported as
+            # having happened "during handling of" the refusal.
+            accepted = None
+        if accepted is not None:
+            reading = _reading_of_accepted_cancel(accepted)
+            if reading is _CancelReading.STOPPED:
+                return None
+            if reading is _CancelReading.FINISHED:
+                return accepted
         return self._detach_report()
 
     def _detach_report(self) -> DetachedRequest | QueueUpdate:
-        """What the refused cancel left behind, confirmed against the server.
+        """What a cancel that did not stop the run left behind, confirmed.
+
+        Reached two ways, which establish the same thing: the queue REFUSED
+        the cancel on the request's state (:func:`_refused_on_state`), or it
+        accepted the message and answered with a live status
+        (:attr:`~_CancelReading.UNSTOPPED`). Either way the run did not stop.
 
         One unretried, short-bounded poll: the caller's deadline has already
         run out, so this is not the place to spend a retry budget. The poll is
         what separates "still running" from "finished while we were tearing
-        down", which the refusal itself does not say — the queue names no
-        bucket on it, and the authoritative state of a request is always the
-        next status read, never what a cancel answered.
+        down", which neither answer says on its own — and the authoritative
+        state of a request is always the next status read, never what a cancel
+        answered.
 
-        A poll that fails does not undo what the refusal established: the
-        request was NOT cancelled. So it still reports a detach, with
+        A poll that fails does not undo what the cancel's answer established:
+        the request was NOT cancelled. So it still reports a detach, with
         :attr:`DetachedRequest.status` left empty to say the state was not
         confirmed, rather than raising and stranding the caller without the
-        handle to the run they are now paying for.
+        handle to the run they are now paying for. An empty ``status`` is
+        therefore the one value that leaves the billing claim UNVERIFIED: the
+        poll may have failed on a rejected credential or a ``404``, and this
+        does not tell those apart from a transient blip.
         """
         try:
             update = self._status(budget=_CANCEL_TIMEOUT, policy=NO_RETRY)
         except _CANCEL_FAILURES:
-            return DetachedRequest(
-                request_id=self._request_id, model=self._model, status="", handle=self
-            )
+            return self._detached("")
         if update.is_completed:
             return update
+        return self._detached(update.status)
+
+    def _collect_or_detach(
+        self, completion: QueueUpdate, *, budget: float | None = None
+    ) -> dict[str, Any] | DetachedRequest:
+        """Collect a completion the timeout teardown found, or detach from it.
+
+        The collect sits after the caller's deadline has already run out, and
+        it can fail on its own — a transport error, a ``5xx``, or the bounded
+        budget expiring. Letting that failure out raw is the stranding the
+        detach report exists to prevent: the caller's ``except TimeoutError``
+        never fires, and nothing hands back the ``request_id`` or the handle
+        for a generation that HAS finished and HAS been billed. So a failed
+        fetch degrades to a :class:`DetachedRequest` over the same handle,
+        which the caller can collect from whenever they like.
+
+        One failure is NOT degraded: a completion that carries its own
+        ``error_type``. That is the run's outcome rather than a failure to
+        read it, and the typed error is the honest answer — reporting a detach
+        there would claim a run that ended is still going and still billing.
+        """
+        try:
+            return self._collect(completion, budget=budget)
+        except _CANCEL_FAILURES:
+            if completion.error_type is not None:
+                raise
+            return self._detached(completion.status)
+
+    def _detached(self, status: str) -> DetachedRequest:
+        """This handle as the detach report ``models.subscribe`` hands back."""
         return DetachedRequest(
-            request_id=self._request_id, model=self._model, status=update.status, handle=self
+            request_id=self._request_id, model=self._model, status=status, handle=self
         )
 
     def _call(
@@ -864,24 +1058,31 @@ class AsyncRequestHandle(_RequestHandleBase):
             )
         return _update_from(payload, headers, request_id=self._request_id)
 
-    async def _cancel_best_effort(self) -> None:
+    async def _cancel_best_effort(self) -> QueueUpdate:
         """Async :meth:`RequestHandle._cancel_best_effort` — one bounded attempt."""
         with translating():
-            await self._call(
+            payload, headers = await self._call(
                 lambda: self._low.put_model_request_cancel(
                     self._model, self._request_id, timeout=_CANCEL_TIMEOUT
                 ),
                 policy=NO_RETRY,
             )
+        return _update_from(payload, headers, request_id=self._request_id)
 
     async def _after_subscribe_timeout(self) -> AsyncDetachedRequest | QueueUpdate | None:
         """Async :meth:`RequestHandle._after_subscribe_timeout` — same three answers."""
         try:
-            await self._cancel_best_effort()
-            return None
+            accepted: QueueUpdate | None = await self._cancel_best_effort()
         except _CANCEL_FAILURES as exc:
             if not _refused_on_state(exc):
                 raise
+            accepted = None
+        if accepted is not None:
+            reading = _reading_of_accepted_cancel(accepted)
+            if reading is _CancelReading.STOPPED:
+                return None
+            if reading is _CancelReading.FINISHED:
+                return accepted
         return await self._detach_report()
 
     async def _detach_report(self) -> AsyncDetachedRequest | QueueUpdate:
@@ -889,13 +1090,26 @@ class AsyncRequestHandle(_RequestHandleBase):
         try:
             update = await self._status(budget=_CANCEL_TIMEOUT, policy=NO_RETRY)
         except _CANCEL_FAILURES:
-            return AsyncDetachedRequest(
-                request_id=self._request_id, model=self._model, status="", handle=self
-            )
+            return self._detached("")
         if update.is_completed:
             return update
+        return self._detached(update.status)
+
+    async def _collect_or_detach(
+        self, completion: QueueUpdate, *, budget: float | None = None
+    ) -> dict[str, Any] | AsyncDetachedRequest:
+        """Async :meth:`RequestHandle._collect_or_detach`."""
+        try:
+            return await self._collect(completion, budget=budget)
+        except _CANCEL_FAILURES:
+            if completion.error_type is not None:
+                raise
+            return self._detached(completion.status)
+
+    def _detached(self, status: str) -> AsyncDetachedRequest:
+        """Async :meth:`RequestHandle._detached`."""
         return AsyncDetachedRequest(
-            request_id=self._request_id, model=self._model, status=update.status, handle=self
+            request_id=self._request_id, model=self._model, status=status, handle=self
         )
 
     async def _call(
@@ -933,6 +1147,12 @@ class _DetachedBase:
     #: ``"IN_PROGRESS"`` on the ordinary detach. ``""`` when that poll itself
     #: failed, which says the state was not confirmed, never that the request
     #: stopped: the refused cancel had already established that it did not.
+    #:
+    #: An empty value is the one case where this report's "still running, and
+    #: still billing" reading is UNVERIFIED. The poll behind it is allowed to
+    #: fail for any reason and they are not told apart — a rejected credential
+    #: or a ``404`` saying the request is gone reads the same as a transient
+    #: blip. Re-read :meth:`RequestHandle.status` before acting on the charge.
     status: str
 
 
