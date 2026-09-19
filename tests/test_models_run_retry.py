@@ -960,6 +960,32 @@ def test_the_collect_budget_outlasts_a_server_deadline_window() -> None:
     assert DEFAULT_RETRY.max_elapsed == 60.0
 
 
+def test_every_bound_of_the_run_timeout_is_chosen_rather_than_inherited() -> None:
+    """Each of the four is a decision, because a positional argument sets three at once.
+
+    ``httpx.Timeout(<value>, connect=...)`` applies ``<value>`` to ``read``,
+    ``write`` AND ``pool``. Two of those three should not follow a generation:
+
+    * ``write`` bounds pushing the request body up, never waiting for an answer,
+      so it must be well under the generation wait however large a base64 image
+      the arguments carry;
+    * ``pool`` genuinely IS generation-scale here and is asserted so on purpose.
+      Every connection in httpx's default 100 is held for a whole generation and
+      ``Comfy`` exposes no ``limits=``, so the 101st concurrent run is queued
+      behind a generation. Shortening this to ``connect``-scale would convert a
+      legitimate fan-out from a queue that drains into a wall of ``PoolTimeout``.
+      This asserts the trade rather than leaving it to a positional argument.
+    """
+    assert MODEL_RUN_TIMEOUT.read is not None
+    assert MODEL_RUN_TIMEOUT.write is not None
+    assert MODEL_RUN_TIMEOUT.write < MODEL_RUN_TIMEOUT.read
+    # Deliberately generation-scale -- see the constant's own comment. Written as
+    # an equality so that shortening it is a decision someone has to make here.
+    assert MODEL_RUN_TIMEOUT.pool == MODEL_RUN_TIMEOUT.read
+    # An unreachable host is not a slow generation, and never was.
+    assert MODEL_RUN_TIMEOUT.connect == 10.0
+
+
 def test_the_collect_budget_applies_only_to_the_collect_class() -> None:
     # Two budgets, one origin. The same `Retrier` answers a collectable failure
     # against the long budget and everything else against the short one, so the

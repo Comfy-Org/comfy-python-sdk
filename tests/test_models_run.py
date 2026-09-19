@@ -1085,6 +1085,28 @@ def test_run_detailed_reports_a_replay_end_to_end_against_the_server(server) -> 
     assert server.state.model_run_generations == 1
 
 
+def test_run_detailed_reads_the_headers_case_insensitively() -> None:
+    """HTTP header names are case-insensitive, so the lookups must be too.
+
+    ``_run_result`` is annotated ``Mapping[str, str]`` and every name it reads
+    is mixed-case, so on a plain mapping a case-sensitive ``get`` would miss all
+    four -- and miss them SILENTLY, reporting ``replayed=False`` and
+    ``request_id=None`` exactly as a wrong header name does. ``dict(resp.headers)``
+    is the realistic way a caller produces one: httpx lowercases on the way out.
+    """
+    lowercased = {
+        "idempotent-replayed": "true",
+        "x-comfy-request-id": "req_abc",
+        "x-comfy-router-fallback-provider": "fal",
+        "x-comfy-router-dropped-params": '["seed"]',
+    }
+    detailed = _detailed(lowercased)
+    assert detailed.replayed is True
+    assert detailed.request_id == "req_abc"
+    assert detailed.serving_provider == "fal"
+    assert detailed.dropped_params == ("seed",)
+
+
 def test_run_returns_the_bare_body_so_the_default_surface_is_unchanged() -> None:
     low = _HeaderLow({"X-Comfy-Router-Fallback-Provider": "fal"})
     assert Models(cast(Any, low)).run(MODEL, ARGS) == low.result
