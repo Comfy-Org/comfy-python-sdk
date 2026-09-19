@@ -697,35 +697,47 @@ class Models(_ModelsBase):
         no server-side meaning: the queue's own timeouts are the server's.
         When it runs out this makes a best-effort
         :meth:`~comfy_sdk.model_requests.RequestHandle.cancel`, and **what that
-        cancel is answered decides how the call ends.** The queue honours a
-        cancel only while a request is still waiting to be dispatched; a run it
-        has already started is served and **billed** whatever the caller does.
-        So there are three endings, told apart by type and never by a message:
+        cancel is answered — and then what the request's own state says —
+        decides how the call ends.** The route takes a cancel in either live
+        state and answers ``202 CANCELLATION_REQUESTED``, which says the ask
+        landed and nothing more; a generation already on the wire may complete
+        anyway, and one that completes is **billed** whatever the caller does.
+        So one confirming status read settles it, and there are three endings,
+        told apart by type and never by a message:
 
-        * **Cancelled** — the cancel was accepted, the request never ran, and
-          nothing will be billed for it. Raises
+        * **Cancelled** — the request's row came back ``COMPLETED`` carrying
+          the ``cancelled`` bucket. Raises
           :class:`~comfy_sdk.model_requests.SubscribeTimeout` (a
-          ``TimeoutError``) with ``cancelled=True``.
-        * **Detached** — the queue refused the cancel because the run was
-          already in flight. Nothing has gone wrong: the generation continues,
-          completes and is billed, and it stays collectable. **Returns** a
+          ``TimeoutError``) with ``cancelled=True``. A request cancelled while
+          still ``IN_QUEUE`` was never dispatched and cannot be charged; one
+          cancelled after admission may still be, and this ending does not
+          claim otherwise.
+        * **Detached** — the confirming poll found the run still going
+          (``IN_PROGRESS``, or a live status this SDK cannot place). Nothing
+          has gone wrong: the generation continues, completes and is billed,
+          and it stays collectable. **Returns** a
           :class:`~comfy_sdk.model_requests.DetachedRequest` carrying the
           ``request_id``, the model id and a live handle, rather than raising.
-        * **Completed during teardown** — the refusal turned out to be a
-          request that had just finished. The result exists and has been paid
-          for, so it is collected and returned like any other result.
+        * **Completed during teardown** — the run had just finished on its
+          own. The result exists and has been paid for, so it is collected and
+          returned like any other result.
 
         A cancel that fails for any *other* reason — a transport failure, a
         rejected credential, a ``500`` — is not benign and is not swallowed:
         the ``SubscribeTimeout`` is raised with ``cancelled=False`` and the
         cancel's own failure on ``.cancel_error`` and ``__cause__``, because a
-        cancel that never landed means the run may still be going.
+        cancel that never landed means the run may still be going. The same
+        goes for a cancel the route ACCEPTED whose row is nevertheless still
+        ``IN_QUEUE`` — an ordering the route's own write order forbids: the
+        ``cancel_error`` is coded ``cancel_not_applied``, because an
+        ``IN_QUEUE`` request cannot have been charged and a detach would claim
+        it was.
 
         **The teardown itself is not inside the bound.** ``timeout`` bounds
         the *wait*; deciding how it ended costs up to three further round
         trips beyond it, each bounded at ``_CANCEL_TIMEOUT`` (10s): the
-        cleanup cancel, the confirming status read the refusal needs, and —
-        on the completed-during-teardown ending only — the result fetch. So a
+        cleanup cancel, the status read that confirms what it did, and — on
+        the completed-during-teardown ending only — the result fetch. So a
         ``subscribe(timeout=N)`` that ends in a detach can return up to ~30s
         after ``N`` in the worst case. Overrunning is the deliberate trade:
         the alternative is telling a caller their run was cancelled without

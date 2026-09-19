@@ -71,6 +71,8 @@ from .exceptions import (
 from .jobs import AsyncJob, Job, JobWorkflow
 from .model_requests import (
     COMPLETED,
+    IN_PROGRESS,
+    IN_QUEUE,
     AsyncDetachedRequest,
     AsyncRequestHandle,
     DetachedRequest,
@@ -118,6 +120,8 @@ __all__ = [
     "AsyncRequestHandle",
     "QueueUpdate",
     "COMPLETED",
+    "IN_QUEUE",
+    "IN_PROGRESS",
     "DetachedRequest",
     "AsyncDetachedRequest",
     "SubscribeTimeout",
