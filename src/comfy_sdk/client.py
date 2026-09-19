@@ -43,6 +43,8 @@ import time
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
+
 from comfy_low.errors import ApiError
 from comfy_low.transport import ROUTER_BASE_URL, AsyncComfyLow, ComfyLow, origin
 
@@ -230,6 +232,15 @@ class Comfy:
     It does not govern this client's own ``submit``/``run`` (the workflow
     surface), whose 429 handling follows the server's own ``Retry-After``
     instead.
+
+    ``limits`` configures the httpx connection pool every namespace on this
+    client shares; the default is httpx's own (100 connections, 20 kept
+    alive). Raise ``max_connections`` when fanning out more than 100
+    concurrent ``models.run`` calls, because each one holds its pooled
+    connection for the whole generation — past that the next call waits for a
+    generation to finish and eventually fails with ``httpx.PoolTimeout``::
+
+        Comfy(limits=httpx.Limits(max_connections=250))
     """
 
     def __init__(
@@ -237,6 +248,7 @@ class Comfy:
         *,
         api_key: str | None = None,
         timeout: float | None = 30.0,
+        limits: httpx.Limits | None = None,
         client_info: str | None = None,
         retry: RetryPolicy = DEFAULT_RETRY,
     ) -> None:
@@ -246,6 +258,7 @@ class Comfy:
             base_url,
             key,
             timeout=timeout,
+            limits=limits,
             client_info=client_info,
             router_base_url=_resolve_router_base_url(),
         )
@@ -394,6 +407,14 @@ class AsyncComfy:
     Same credential resolution (explicit ``api_key`` → ``COMFY_API_KEY`` →
     :class:`~comfy_sdk.exceptions.MissingApiKey` on Comfy Cloud) and the same
     key-free ``repr``.
+
+    ``limits`` configures the shared httpx connection pool exactly as on
+    :class:`Comfy`, and matters more here: fanning out past httpx's default of
+    100 connections is easier to do with ``asyncio.gather`` than with threads,
+    and every awaited ``models.run`` holds its connection for the whole
+    generation::
+
+        AsyncComfy(limits=httpx.Limits(max_connections=250))
     """
 
     def __init__(
@@ -401,6 +422,7 @@ class AsyncComfy:
         *,
         api_key: str | None = None,
         timeout: float | None = 30.0,
+        limits: httpx.Limits | None = None,
         client_info: str | None = None,
         retry: RetryPolicy = DEFAULT_RETRY,
     ) -> None:
@@ -410,6 +432,7 @@ class AsyncComfy:
             base_url,
             key,
             timeout=timeout,
+            limits=limits,
             client_info=client_info,
             router_base_url=_resolve_router_base_url(),
         )
