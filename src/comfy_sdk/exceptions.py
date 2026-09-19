@@ -4,6 +4,24 @@ These wrap the protocol-level ``comfy_low.ApiError`` codes with names an
 integrator catches directly (``JobFailed``, ``QueueFull``, ...). ``to_sdk_error``
 maps a raised ``ApiError`` to the right subclass; anything unmapped stays a
 ``ComfyError`` carrying the original code.
+
+**This module and :mod:`comfy_sdk.router_exceptions` share classes, they do not
+shadow each other.** Every name the two modules both export is one class object
+re-exported, never two classes wearing one name -- so
+``comfy_sdk.exceptions.InsufficientCredits is
+comfy_sdk.router_exceptions.InsufficientCredits``, and an
+``except InsufficientCredits`` written against either import catches whatever
+the other one does. ``tests/test_exception_modules.py`` enumerates both
+modules' exports and fails on any shared name that is not the same object, so
+this cannot drift back apart.
+
+It did drift apart once, and the failure mode is why the rule is now a test:
+the classes ``to_sdk_error`` raised for a Router refusal were this module's, and
+this module's did not descend from
+:class:`~comfy_sdk.router_exceptions.RouterError`. ``except RouterError`` --
+the obvious catch-all, and the one a careful caller reaches for over
+``except Exception`` -- therefore caught nothing at all on the buckets whose
+names the two modules shared.
 """
 
 from __future__ import annotations
@@ -15,91 +33,21 @@ from typing import Any, TypeVar
 
 import httpx
 
-from comfy_low.errors import ApiError
+from comfy_low.errors import _CANCEL_REFUSAL_STATUS, ApiError
 from comfy_low.models import JobError
 
-
-class ComfyError(Exception):
-    """Base for every SDK-level error."""
-
-    #: The ``Idempotency-Key`` the failed call was made under. Populated by
-    #: :meth:`comfy_sdk.models.Models.run` and
-    #: :meth:`comfy_sdk.models.Models.submit` and their async twins, and by
-    #: :meth:`comfy_sdk.client.Comfy.submit` /
-    #: :meth:`comfy_sdk.client.AsyncComfy.submit` on every failure of the
-    #: ``POST /jobs`` attempt itself — and so by the submit phase of
-    #: ``Comfy.run`` / ``AsyncComfy.run``. A failure while ``run`` polls the
-    #: job afterwards (a ``JobFailed``, a wait timeout) carries none: by then
-    #: the job exists and its id is the handle. It is ``None`` everywhere
-    #: else: on an operation that sends no key, on an asset upload (which
-    #: mints a key per handle and does not record it), and on an exception
-    #: constructed by hand. So ``None`` means "this SDK did not record a key
-    #: for you", never "no key reached the server": do not infer from it that
-    #: a resend is safe.
-    #:
-    #: What the key is *good for* differs by surface, so read it with the
-    #: operation in mind: ``models.run`` and ``models.submit`` send it to a
-    #: surface that replays a claimed key, so the key is a handle on the
-    #: generation you were already billed for. ``POST /jobs`` instead
-    #: *rejects* a reused key with ``422 idempotency_key_reuse``, so on a
-    #: ``Comfy.submit`` failure the key is the one this attempt was made
-    #: under, not a replay handle: after an ambiguous failure poll or list for
-    #: the job the first attempt may have created rather than resubmitting
-    #: under it, while a failure the server never saw (a connect failure, an
-    #: exhausted ``QueueFull``) leaves the key unclaimed.
-    #:
-    #: Declared on the base rather than set per subclass so that a bucket this
-    #: SDK version has never heard of — which arrives as a bare
-    #: :class:`~comfy_sdk.router_exceptions.RouterError` — still carries it.
-    idempotency_key: str | None = None
-
-    #: Server-minted id for the call, from ``X-Comfy-Request-Id``, or ``None``
-    #: when the response carried no such header (and on a failure with no
-    #: response at all). The id a user quotes in a support request.
-    request_id: str | None = None
-
-    #: Seconds the server asked the caller to wait before asking again, from
-    #: ``Retry-After``, or ``None`` when it named no pace. Carried on the base
-    #: because the header is not the throttled buckets' alone — a
-    #: ``deadline_exceeded`` ``504`` names the pace at which a replay of the
-    #: same ``Idempotency-Key`` may be attempted, and a caller told to wait for
-    #: it needs somewhere to read it. :class:`QueueFull` narrows it to a
-    #: required ``int``.
-    retry_after: int | None = None
-
-    #: ``True`` only on the failure :meth:`comfy_sdk.models.Models.run` re-raises
-    #: after a same-key resend was refused — the original failure, with the key
-    #: refusal on ``__cause__``. It exists for outer retry wrappers: a wrapper
-    #: keyed on ``http_status >= 500`` alone would retry this error, and every
-    #: re-entry into ``run()`` mints a *fresh* key, which is the second billed
-    #: generation the one-key rule exists to prevent. Read it before retrying
-    #: anything out of ``run()``::
-    #:
-    #:     if getattr(exc, "resend_refused", False):
-    #:         raise  # the key is spent; a retry can only bill again
-    #:
-    #: ``False`` everywhere else, including on a first-attempt failure that was
-    #: never resent. Declared on the base, and defaulted onto the no-response
-    #: failures by :func:`_stamp`, so the attribute is always readable.
-    resend_refused: bool = False
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        code: str | None = None,
-        http_status: int | None = None,
-        details: dict[str, Any] | None = None,
-        request_id: str | None = None,
-        retry_after: int | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.message = message
-        self.code = code
-        self.http_status = http_status
-        self.details = details
-        self.request_id = request_id
-        self.retry_after = retry_after
+from ._errors import ComfyError
+from .router_exceptions import (
+    _BY_CANCEL_REFUSAL,
+    _BY_ERROR_TYPE,
+    AlreadyCompleted,
+    CancelRefused,
+    Forbidden,
+    InsufficientCredits,
+    RouterError,
+    Unauthorized,
+    _detail_from,
+)
 
 
 class MissingApiKey(ComfyError):
@@ -111,19 +59,6 @@ class MissingApiKey(ComfyError):
     server rejecting a key that *was* sent. The message names the environment
     variable, and never contains a key (there is none to contain).
     """
-
-
-class Unauthorized(ComfyError):
-    """The surface rejected the request for lack of a valid key.
-
-    Comfy Cloud and serverless require a key; a self-hosted proxy needs none.
-    Its local counterpart is :class:`MissingApiKey` — no key at all, caught at
-    construction rather than on the wire.
-    """
-
-
-class Forbidden(ComfyError):
-    pass
 
 
 class NotFound(ComfyError):
@@ -156,10 +91,6 @@ class IdempotencyKeyReuse(ComfyError):
     duplicate, or the same key with a different body — is rejected."""
 
 
-class InsufficientCredits(ComfyError):
-    pass
-
-
 class QueueFull(ComfyError):
     """Backpressure: the queue is full. ``retry_after`` is seconds to wait."""
 
@@ -180,6 +111,19 @@ class JobFailed(ComfyError):
         self.error = error
 
 
+#: Wire ``code`` -> the class this SDK raises for it. Only the codes the v2
+#: envelope owns are listed here; the Router buckets are looked up in
+#: :data:`comfy_sdk.router_exceptions._BY_ERROR_TYPE` instead, so that table
+#: stays the single copy of the contract's closed set.
+#:
+#: Three entries -- ``insufficient_credits``, ``unauthorized``, ``forbidden`` --
+#: name classes that live in :mod:`comfy_sdk.router_exceptions` and descend from
+#: :class:`~comfy_sdk.router_exceptions.RouterError`. That is deliberate and it
+#: is the fix: both surfaces spell those buckets identically, the wire ``code``
+#: alone cannot say which surface answered, and raising a class that is *not* a
+#: ``RouterError`` for a Router refusal is what made ``except RouterError`` a
+#: dead handler. One class per bucket, reachable from both modules, is the only
+#: shape where neither ``except`` clause is wrong.
 _BY_CODE: dict[str, type[ComfyError]] = {
     "invalid_workflow": InvalidWorkflow,
     "workflow_format_ui": WorkflowFormatUi,
@@ -200,27 +144,53 @@ _BY_CODE: dict[str, type[ComfyError]] = {
 }
 
 
-def _router_only_class(code: str) -> type[Any] | None:
-    """The typed RouterError subclass for a code only Router produces, or None.
+def _class_for(exc: ApiError) -> type[ComfyError]:
+    """The class ``exc`` becomes, from its wire ``code`` and its surface.
 
-    The low layer now preserves Router's wire bucket as the ``code`` for every
-    status, so this is what turns a preserved ``not_enabled`` into the
-    :class:`~comfy_sdk.router_exceptions.NotEnabled` a pre-launch caller
-    catches, instead of a bare ``ComfyError``.
+    Three lookups in precedence order, then a fallback that depends on which
+    surface answered:
 
-    Deliberately scoped to buckets the v2 envelope does NOT also use:
-    ``unauthorized``, ``forbidden`` and ``insufficient_credits`` are spelled
-    identically by both surfaces, and the code string alone cannot say which
-    answered — retyping those would break every jobs-surface ``except
-    Forbidden`` handler to fix none, since their v2 classes fire on the router
-    surface too. Imported lazily because :mod:`comfy_sdk.router_exceptions`
-    subclasses :class:`ComfyError` from this module.
+    1. :data:`_BY_CODE` -- the v2 envelope's codes, plus the three buckets both
+       surfaces spell the same way.
+    2. :data:`~comfy_sdk.router_exceptions._BY_ERROR_TYPE` -- the Router
+       contract's closed set. The low layer preserves Router's bucket as the
+       ``code`` for every status, so this is what turns a preserved
+       ``not_enabled`` into the :class:`~comfy_sdk.router_exceptions.NotEnabled`
+       a pre-launch caller catches.
+    3. :data:`~comfy_sdk.router_exceptions._BY_CANCEL_REFUSAL` -- the cancel
+       route's refusals, which the contract's bucket list does not name because
+       they are not run-route buckets. Consulted only for a ``409``: the lookup
+       is on ``code``, and ``code`` is also whatever a v2 envelope's
+       ``error.code`` said, on any route at any status, so without the status
+       gate an unrelated failure that happened to spell ``already_completed``
+       inherited :class:`~comfy_sdk.router_exceptions.AlreadyCompleted` and the
+       benign "still collectable" reading that class documents.
+
+    The fallback is where the *surface* matters.
+    :attr:`comfy_low.errors.ApiError.error_type` is set only when the response
+    identified itself as Router's, so a bucket added to Router after this SDK
+    version was built still reaches the caller as a
+    :class:`~comfy_sdk.router_exceptions.RouterError` -- the forward-compatible
+    answer :func:`~comfy_sdk.router_exceptions.exception_for` already gives on
+    the queued surface, and without it ``except RouterError`` would still have a
+    hole on exactly the refusals nobody could have enumerated in advance.
+    Anything else stays a bare ``ComfyError`` carrying the original code.
     """
-    from comfy_sdk.router_exceptions import _BY_ERROR_TYPE as _ROUTER_BY_TYPE
-
-    if code in _BY_CODE or code == "queue_full":
-        return None
-    return _ROUTER_BY_TYPE.get(code)
+    cls = _BY_CODE.get(exc.code) or _BY_ERROR_TYPE.get(exc.code)
+    if cls is None and exc.http_status == _CANCEL_REFUSAL_STATUS:
+        # Gated on the STATUS as well as the code, which the low layer already
+        # does for the body-shape half (`_cancel_refusal_code` returns None off
+        # `409`). `_BY_CANCEL_REFUSAL` names refusals the CANCEL route answers
+        # `409` with and nothing else, but the lookup is on `exc.code`, and
+        # `code` is also whatever an envelope's `error.code` said — on any route
+        # and any status. Without this gate a `200`-adjacent `4xx` from a job or
+        # asset route whose envelope happened to say `already_completed` became
+        # `AlreadyCompleted`, which this SDK documents as benign and "the result
+        # is still collectable". That is a promise those routes never made.
+        cls = _BY_CANCEL_REFUSAL.get(exc.code)
+    if cls is not None:
+        return cls
+    return RouterError if exc.error_type is not None else ComfyError
 
 
 def to_sdk_error(exc: ApiError) -> ComfyError:
@@ -239,31 +209,35 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
             details=exc.details,
             request_id=exc.request_id,
         )
-    router_cls = _router_only_class(exc.code)
-    if router_cls is not None:
-        # Imported here for the same reason `_router_only_class` imports
-        # `_BY_ERROR_TYPE` lazily: `router_exceptions` subclasses `ComfyError`
-        # from this module. This is the conversion the layering rule forces —
-        # `comfy_low` carries a Router validation body's `detail[]` entries up
-        # raw because it may not import `comfy_sdk`, and this is the boundary
-        # that can type them. Without it `.errors` was empty on the whole
-        # `models.run` path while the documented contract says it is populated
-        # whenever the response carried the array.
-        from comfy_sdk.router_exceptions import _detail_from
-
-        return router_cls(
+    cls = _class_for(exc)
+    if issubclass(cls, RouterError):
+        # `RouterError` spells the bucket `error_type` rather than `code` (it
+        # sets `code` from it), and takes `detail` positionally as the
+        # human-readable string. `details` — the per-field dict the v2 envelope
+        # carries — is forwarded too: nothing about a shared bucket says the
+        # response cannot have sent one.
+        #
+        # `errors=` is the conversion the layering rule forces: `comfy_low`
+        # carries a Router validation body's `detail[]` entries up raw because
+        # it may not import `comfy_sdk`, and this is the boundary that can type
+        # them. Without it `.errors` was empty on the whole `models.run` path
+        # while the documented contract says it is populated whenever the
+        # response carried the array. `_detail_from` is a plain module-level
+        # import now that `ComfyError` lives in `comfy_sdk._errors` — the cycle
+        # that forced the lazy one is what this change removed.
+        return cls(
             str(exc),
             error_type=exc.code,
             http_status=exc.http_status,
+            details=exc.details,
             request_id=exc.request_id,
             retry_after=exc.retry_after,
             errors=tuple(_detail_from(entry) for entry in exc.validation_errors),
         )
-    cls = _BY_CODE.get(exc.code, ComfyError)
-    # No `errors=` here, deliberately: `.errors` is a `RouterError` attribute
-    # and none of these classes takes the argument. A validation body that
-    # reaches this branch — a `detail[]` under a v2 `error.code`, or under the
-    # status-derived guess when no bucket was sent at all — still gets the
+    # No `errors=` below, deliberately: `.errors` is a `RouterError` attribute
+    # and none of the remaining classes takes the argument. A validation body
+    # that reaches this branch — a `detail[]` under a v2 `error.code`, or under
+    # the status-derived guess when no bucket was sent at all — still gets the
     # entries' messages, since those became `exc.message` one layer down.
     return cls(
         str(exc),
@@ -375,3 +349,33 @@ def translating(*, idempotency_key: str | None = None) -> Iterator[None]:
         # all.
         _stamp(exc, idempotency_key)
         raise
+
+
+#: Explicit because several of these names are re-exports rather than
+#: definitions: :class:`~comfy_sdk.router_exceptions.RouterError` and the three
+#: buckets both surfaces spell the same way are defined in
+#: :mod:`comfy_sdk.router_exceptions`, and ``ComfyError`` in
+#: :mod:`comfy_sdk._errors` -- one class object each, so a name this module and
+#: that one share is the *same* class and either import catches what the other
+#: does. ``tests/test_exception_modules.py`` reads this list to assert it.
+__all__ = [
+    "AlreadyCompleted",
+    "BlobNotFound",
+    "CancelRefused",
+    "ComfyError",
+    "Forbidden",
+    "HashMismatch",
+    "IdempotencyKeyReuse",
+    "InsufficientCredits",
+    "InvalidWorkflow",
+    "JobFailed",
+    "MissingApiKey",
+    "MissingAsset",
+    "NotFound",
+    "QueueFull",
+    "RouterError",
+    "Unauthorized",
+    "WorkflowFormatUi",
+    "to_sdk_error",
+    "translating",
+]

@@ -461,12 +461,20 @@ def test_no_headers_at_all_still_produces_an_exception() -> None:
     assert exc.http_status == 500
 
 
-# -- the workflow-surface classes are a separate hierarchy -------------------
+# -- the shared names are ONE hierarchy, not two -----------------------------
 
 
-def test_the_shared_names_are_not_the_workflow_surface_classes() -> None:
-    # comfy_sdk.Unauthorized is the workflow surface's. The router ones are
-    # imported from this module on purpose -- one name cannot be two classes.
+def test_the_shared_names_are_the_workflow_surface_classes() -> None:
+    # These three buckets are spelled identically by both surfaces, and both
+    # modules export them -- so they have to be the same class object. They
+    # were not, and that is the whole of the defect this asserts against: the
+    # class `to_sdk_error` raised for a router refusal was the `exceptions`
+    # one, which did not descend from `RouterError`, so the broad catch every
+    # careful caller writes fired for none of them.
+    #
+    # `tests/test_exception_modules.py` is the general form of this -- it
+    # enumerates both modules rather than naming three classes. This stays
+    # because these three are the ones that actually collided.
     from comfy_sdk import exceptions as workflow_exceptions
 
     for router_cls, workflow_cls in (
@@ -474,8 +482,7 @@ def test_the_shared_names_are_not_the_workflow_surface_classes() -> None:
         (Forbidden, workflow_exceptions.Forbidden),
         (InsufficientCredits, workflow_exceptions.InsufficientCredits),
     ):
-        assert router_cls is not workflow_cls
-        assert not issubclass(router_cls, workflow_cls)
+        assert router_cls is workflow_cls
         assert issubclass(router_cls, RouterError)
 
 
