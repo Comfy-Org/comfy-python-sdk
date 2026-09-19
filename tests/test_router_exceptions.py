@@ -552,3 +552,14 @@ def test_the_default_policy_retries_a_throttled_bucket_that_named_a_pace() -> No
     assert isinstance(paced, RateLimited)
     assert policy.should_retry(paced) is True
     assert policy.should_retry(unpaced) is False
+
+
+def test_the_location_rendering_is_shared_with_the_summariser() -> None:
+    """`.location` and the summary must never disagree about a field's name."""
+    from comfy_low.errors import summarise_detail
+    from comfy_sdk.router_exceptions import _detail_from
+
+    # A non-scalar `loc` member is dropped by both, so neither renders a repr.
+    entry = {"loc": ["body", ["a", "b"], 0], "msg": "bad"}
+    assert _detail_from(entry).location == "body.0"
+    assert summarise_detail([entry]) == "body.0: bad"
