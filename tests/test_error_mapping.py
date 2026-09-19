@@ -1,7 +1,8 @@
 """How an error response on the wire becomes a typed exception.
 
-`to_sdk_error` mapping the server's 404 codes to the typed `NotFound`, and
-`error_from_envelope` reading the two body shapes this API answers in.
+`to_sdk_error` mapping the server's 404 codes to the typed `NotFound`,
+`error_from_envelope` reading the two body shapes this API answers in, and
+which statuses may be decoded to a typed code when the response named none.
 """
 
 from __future__ import annotations
@@ -12,14 +13,16 @@ import pytest
 import comfy_low.transport as low_transport
 from comfy_low.errors import (
     ApiError,
+    AssetInUse,
+    HashMismatch,
     QueueFull,
     Unauthorized,
     clean_body_excerpt,
     error_from_envelope,
 )
-from comfy_low.errors import AssetInUse as LowAssetInUse
-from comfy_low.errors import HashMismatch as LowHashMismatch
-from comfy_sdk.exceptions import AssetInUse, ComfyError, HashMismatch, NotFound, to_sdk_error
+from comfy_sdk.exceptions import AssetInUse as SdkAssetInUse
+from comfy_sdk.exceptions import ComfyError, NotFound, to_sdk_error
+from comfy_sdk.exceptions import HashMismatch as SdkHashMismatch
 from comfy_sdk.exceptions import Unauthorized as SdkUnauthorized
 from comfy_sdk.retry import RetryPolicy, error_bucket_of, is_collectable
 
@@ -108,17 +111,136 @@ def test_a_bucketless_429_still_means_queue_full() -> None:
     assert err.retry_after == 3
 
 
-def test_a_router_validation_body_degrades_rather_than_coercing_its_detail() -> None:
+# --- which statuses the status table may decode, and which it may not ---
+#
+# The table is consulted only for a response that named no code of its own, so
+# it never sees the compliant envelope surface -- it sees Router-shaped bodies
+# and intermediaries, which can answer a status for anything. A typed guess is
+# therefore admissible only when every meaning the contract gives a status asks
+# the caller for the SAME action. 409 fails that: the contract spells it both
+# `hash_mismatch` (POST /assets) -- re-upload the bytes -- and `asset_in_use`
+# (DELETE /assets/{id}), which is not a bytes problem at all.
+
+
+def test_a_bucketless_409_is_not_guessed_to_be_a_hash_mismatch() -> None:
+    err = error_from_envelope(409, None)
+    assert type(err) is ApiError
+    assert not isinstance(err, HashMismatch)
+    # `http_409` is #141's name for "no verdict was reached", not a code the
+    # contract defines -- the point is that it is not `hash_mismatch`.
+    assert err.code == "http_409"
+    assert err.http_status == 409
+    # `HashMismatch` tells the caller to re-upload bytes, which is why this
+    # status cannot be guessed: it is a distinct action, not a vaguer wording
+    # of the same one.
+    sdk_err = to_sdk_error(err)
+    assert type(sdk_err) is ComfyError
+    assert not isinstance(sdk_err, SdkHashMismatch)
+    assert sdk_err.http_status == 409
+
+
+def test_a_bucketless_409_keeps_the_message_the_server_sent() -> None:
+    # Dropping the guessed code must not drop what the server actually said:
+    # the reason for the conflict is the only thing left that explains it, so
+    # it has to survive to the surface the caller reads.
+    err = error_from_envelope(409, {"error": {"message": "asset is still referenced"}})
+    assert err.code == "http_409"
+    assert err.http_status == 409
+    assert err.message == "asset is still referenced"
+    assert to_sdk_error(err).message == "asset is still referenced"
+
+
+def test_an_empty_envelope_code_reads_as_absent_not_as_a_code() -> None:
+    # `""` is not None, so without `_clean` it would short-circuit both the
+    # Router bucket and the status table and survive as the code itself --
+    # turning a bare 401 into `ApiError(code="")` instead of `Unauthorized`.
+    for blank in ("", "   "):
+        err = error_from_envelope(401, {"error": {"code": blank}})
+        assert err.code == "unauthorized", blank
+        assert isinstance(err, Unauthorized), blank
+        assert type(to_sdk_error(err)) is SdkUnauthorized, blank
+
+
+def test_a_bucketless_409_still_carries_the_pace_the_server_named() -> None:
+    # Dropping the code must not drop the header: a conflict that named a
+    # `Retry-After` is still telling the caller when to ask again.
+    err = error_from_envelope(409, None, retry_after=7)
+    assert err.retry_after == 7
+    assert to_sdk_error(err).retry_after == 7
+
+
+def test_an_enveloped_409_is_still_a_hash_mismatch() -> None:
+    # The assets path is unaffected whenever the body decodes: a real hash
+    # mismatch names itself, and `error.code` wins outright.
+    err = error_from_envelope(409, {"error": {"code": "hash_mismatch", "message": "m"}})
+    assert type(err) is HashMismatch
+    assert err.code == "hash_mismatch"
+    assert type(to_sdk_error(err)) is SdkHashMismatch
+
+
+def test_a_bodyless_401_still_maps_to_unauthorized() -> None:
+    # Only 409 was dropped -- the rest of the table decodes exactly as before.
+    err = error_from_envelope(401, None)
+    assert err.code == "unauthorized"
+    assert isinstance(err, Unauthorized)
+
+
+def test_a_router_validation_body_is_read_rather_than_coerced_into_the_message() -> None:
     # Router's per-field validation body is the FastAPI `detail[]` shape. A
-    # list is not a message: stringifying it would put a Python repr in front of
-    # a caller, so the status-derived message answers instead.
+    # list is still not a message -- stringifying it would put a Python repr in
+    # front of a caller -- so the entries are read instead: they ride up raw for
+    # the translation boundary to type, and their own `msg` values become the
+    # message.
     err = error_from_envelope(
         500,
         {"detail": [{"loc": ["body", "steps"], "msg": "too large", "type": "value_error"}]},
         error_type="internal_error",
     )
     assert err.code == "internal_error"
-    assert err.message == "HTTP 500"
+    assert err.message == "too large"
+    # The intent the old status-derived message protected, unchanged: whatever
+    # reaches `str(exc)` is prose, never a repr of the array.
+    assert "[" not in err.message
+    assert err.validation_errors == (
+        {"loc": ["body", "steps"], "msg": "too large", "type": "value_error"},
+    )
+
+
+def test_a_validation_body_whose_entries_state_no_message_still_degrades() -> None:
+    # The entries decoded, so they are carried; none of them named a reason, so
+    # there is nothing to say but the status. Both halves matter: a caller that
+    # branches on `.errors` still gets them, and the message never becomes an
+    # empty string.
+    err = error_from_envelope(
+        422,
+        {"detail": [{"loc": ["body", "steps"]}, {"msg": "   "}]},
+        error_type="invalid_input",
+    )
+    assert err.message == "HTTP 422"
+    assert err.validation_errors == ({"loc": ["body", "steps"]}, {"msg": "   "})
+
+
+def test_a_string_detail_still_wins_over_the_array_reading() -> None:
+    # The request-level shape is untouched: `detail` as a string is the message
+    # and carries no entries.
+    err = error_from_envelope(403, {"detail": "not enabled"}, error_type="not_enabled")
+    assert err.message == "not enabled"
+    assert err.validation_errors == ()
+
+
+def test_an_envelope_message_outranks_the_validation_entries() -> None:
+    # Precedence is unchanged by the new reading: `error.message` is the
+    # envelope's own statement of the cause and still wins. The entries are
+    # carried regardless -- they are data, not a fallback for the message.
+    err = error_from_envelope(
+        422,
+        {
+            "error": {"code": "invalid_workflow", "message": "the graph is invalid"},
+            "detail": [{"loc": ["body", "steps"], "msg": "too large"}],
+        },
+    )
+    assert err.message == "the graph is invalid"
+    assert err.validation_errors == ({"loc": ["body", "steps"], "msg": "too large"},)
 
 
 @pytest.mark.parametrize("body", [None, {}, {"error": None}, {"error_type": "   "}, {"detail": 7}])
@@ -221,6 +343,21 @@ def test_a_message_the_server_actually_sent_is_not_joined_to_the_excerpt() -> No
         503, {"detail": "router is draining"}, body_excerpt='{"detail": "router is draining"}'
     )
     assert str(err) == "router is draining"
+    assert err.body_excerpt is None
+
+
+def test_a_validation_array_that_states_a_message_drops_the_excerpt_too() -> None:
+    # The same rule reached through the array: the entries stated the cause, so
+    # the raw JSON stops being glued onto `str(exc)`. That gluing was the whole
+    # of what a caller used to see for a per-field failure.
+    raw = '{"detail": [{"loc": ["body", "steps"], "msg": "too large"}]}'
+    err = error_from_envelope(
+        422,
+        {"detail": [{"loc": ["body", "steps"], "msg": "too large"}]},
+        error_type="invalid_input",
+        body_excerpt=raw,
+    )
+    assert str(err) == "too large"
     assert err.body_excerpt is None
 
 
@@ -401,8 +538,8 @@ def test_an_undecodable_success_body_keeps_what_was_served_instead() -> None:
 
 # --- the two documented 409s are different failures -------------------------
 #
-# `spec/openapi.yaml` gives `POST /v2/assets` a `hash_mismatch` 409 and
-# `DELETE /v2/assets/{id}` an `asset_in_use` one. Both are enveloped, so the
+# `spec/openapi.yaml` gives `POST /api/v2/assets` a `hash_mismatch` 409 and
+# `DELETE /api/v2/assets/{id}` an `asset_in_use` one. Both are enveloped, so the
 # `code` is what tells them apart -- and until each has a class of its own a
 # caller who wants to handle only the delete conflict has to string-compare
 # `.code`, which is the protocol detail the typed surface exists to hide.
@@ -413,11 +550,11 @@ def test_an_enveloped_delete_conflict_is_typed_at_the_protocol_layer() -> None:
         409,
         {"error": {"code": "asset_in_use", "message": "still referenced by a job"}},
     )
-    assert isinstance(err, LowAssetInUse)
+    assert isinstance(err, AssetInUse)
     assert err.code == "asset_in_use"
     assert err.message == "still referenced by a job"
     # Not the upload conflict: the two 409s are siblings, not subclasses.
-    assert not isinstance(err, LowHashMismatch)
+    assert not isinstance(err, HashMismatch)
 
 
 def test_an_enveloped_delete_conflict_is_typed_at_the_sdk_layer() -> None:
@@ -427,18 +564,18 @@ def test_an_enveloped_delete_conflict_is_typed_at_the_sdk_layer() -> None:
             {"error": {"code": "asset_in_use", "message": "still referenced by a job"}},
         )
     )
-    assert isinstance(err, AssetInUse)
+    assert isinstance(err, SdkAssetInUse)
     assert err.code == "asset_in_use"
     assert err.http_status == 409
     # The point of the class: `except AssetInUse` replaces `if exc.code == ...`,
     # and a caller who only wants the delete conflict does not also catch the
     # upload one.
-    assert not isinstance(err, HashMismatch)
+    assert not isinstance(err, SdkHashMismatch)
 
 
 def test_the_upload_conflict_is_unchanged_by_the_new_delete_class() -> None:
     err = to_sdk_error(
         error_from_envelope(409, {"error": {"code": "hash_mismatch", "message": "bad bytes"}})
     )
-    assert isinstance(err, HashMismatch)
-    assert not isinstance(err, AssetInUse)
+    assert isinstance(err, SdkHashMismatch)
+    assert not isinstance(err, SdkAssetInUse)

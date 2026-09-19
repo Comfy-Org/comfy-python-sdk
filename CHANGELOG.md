@@ -5,10 +5,8 @@ All notable changes to `comfy-sdk` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Entries for `v0.1.0` through `v0.1.8` were reconstructed from the published
-[GitHub Releases](https://github.com/Comfy-Org/comfy-python-sdk/releases); those
-release notes remain the fuller account, including the end-to-end verification
-notes for each version.
+The [GitHub Releases](https://github.com/Comfy-Org/comfy-python-sdk/releases) carry
+the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
@@ -24,409 +22,216 @@ notes for each version.
   both layers (`comfy_sdk.AssetInUse`, `comfy_low.AssetInUse`) and exported
   from both packages.
 
+### Fixed
+
+- **`except RouterError` now catches every Comfy Router refusal.** `insufficient_credits`,
+  `unauthorized` and `forbidden` raised a class that was *not* a `RouterError`, so the obvious
+  catch-all around a `client.models.*` call caught nothing for them. Those three buckets are now
+  one class each, exported from both `comfy_sdk.exceptions` and `comfy_sdk.router_exceptions` —
+  `comfy_sdk.exceptions.InsufficientCredits is comfy_sdk.router_exceptions.InsufficientCredits`,
+  so either import catches what the other does. A Router bucket this version does not know now
+  raises `RouterError` rather than a bare `ComfyError`.
+- A cancel the server refuses raises a named exception instead of an untyped `409`:
+  `AlreadyCompleted` (the `{"status": "ALREADY_COMPLETED"}` answer to cancelling finished work),
+  under the `CancelRefused` base. Nothing has to match on the response body text any more.
+  Only the refusal shapes this version recognises are typed, and `ALREADY_COMPLETED` is the whole
+  of that list today: a refusal that names no bucket and no code stays an untyped `ComfyError`,
+  because nothing in such a response identifies it as a refusal at all.
+- `models.run` now populates `RouterError.errors` from a Router 422's per-field `detail[]` and
+  uses the entries' messages as `detail`, instead of `HTTP 422`; `comfy_low.ApiError.validation_errors`
+  carries the raw entries.
+
+### Changed
+
+- **Because those three buckets are now one class each, they descend from `RouterError` on the
+  workflow surface too**: a `POST /jobs` call that fails `401`/`403`/`402` raises a `RouterError`
+  subclass. `except Unauthorized` / `except Forbidden` / `except InsufficientCredits` (from either
+  module) and `except ComfyError` are unchanged; only `except RouterError` sees more than its name
+  suggests.
+- **Breaking, for code that *constructs* those three classes.** `Unauthorized`, `Forbidden` and
+  `InsufficientCredits` are now `RouterError` subclasses, so they take `RouterError`'s
+  constructor: the human-readable string is the positional `detail`, and the bucket is
+  `error_type=`. There is no `message=` or `code=` keyword any more, so a hand-built
+  `Unauthorized(message="...", code="unauthorized")` — in a test double, a re-raise, or a
+  subclass — now raises `TypeError` and becomes `Unauthorized("...")`. Only construction is
+  affected: `raise`, `except` and every attribute a caller reads inside the handler (`.message`,
+  `.code`, `.http_status`, `.details`, `.request_id`, `.retry_after`) are unchanged.
+- `RouterError` is exported from the package root, alongside `CancelRefused` and
+  `AlreadyCompleted`. The eighteen per-bucket classes still live in
+  `comfy_sdk.router_exceptions`.
+- `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
+  body's `error_type`), or `None` when it named none — which is also how the SDK tells which
+  surface answered.
+
+## [0.3.0] - 2026-09-14
+
+### Added
+
+- Queued model surface: `models.submit()`, `models.subscribe()`, `models.handle()`, and the
+  `RequestHandle` they return (`status()`, `get()`, `cancel()`, `iter_events()`). Sync and async.
+  Gated server side — a caller it is not enabled for gets `403` `NotEnabled`.
+- `ComfyError.resend_refused` — `True` only on the failure re-raised after a refused same-key
+  resend. Check it before letting an outer retry wrapper re-enter `run()`, which would mint a
+  fresh key and bill a second generation.
+- `retry.may_have_claimed_key(exc)` — whether a failure could have left the key claimed.
+- `router_exceptions.error_from_completion()` — the typed exception a completed-but-failed queued
+  request reports, or `None`.
+
+### Changed
+
+- **`models.run` now raises the failure that *claimed the key*** when a same-key retry is refused
+  `422 idempotency_key_reuse`, with the refusal chained on `__cause__` and `.resend_refused` set.
+  **`except IdempotencyKeyReuse` no longer catches this** — catch the real failure (or
+  `ComfyError`) and inspect `__cause__`.
+- The substitution only applies when a claim-capable failure preceded the refusal. After a
+  never-delivered transport error or a released `429`, a `422` is a genuine refusal and is raised
+  as itself. Among eligible failures the most recent wins, not the first.
+
+### Fixed
+
+- A `409` naming no error code raises plain `ComfyError` instead of guessing `HashMismatch`.
+  Enveloped `hash_mismatch` and Router-bucketed `409`s are unaffected.
+
 ## [0.2.0] - 2026-09-10
 
 ### Added
 
-- **The queued model surface** — `client.models.submit()`, `client.models.subscribe()`
-  and `client.models.handle()`, plus the `RequestHandle` they hand back
-  (`status()`, `get()`, `cancel()`, `iter_events()`). `models.run` holds one
-  connection open until the generation is finished; `submit` returns as soon as
-  the server accepts the request, and the generation is collected later —
-  including from another process, since `client.models.handle(model,
-  request_id)` rebuilds the handle from nothing but the two ids. `subscribe` is
-  submit plus polling plus collection in one call, with an `on_queue_update=`
-  callback for progress and a client-side `timeout=` that makes a best-effort
-  cancel before it raises. `AsyncComfy` awaits the same method names with the
-  same arguments in the same order — there is no `submit_async`, for the reason
-  there is no `run_async`. Three properties are contract rather than
-  implementation: polling is authoritative and paced by the server's own
-  `Retry-After` when it names one; a `COMPLETED` status carrying an
-  `error_type` — which is how the server reports a failed *or* a cancelled
-  request — raises the typed `RouterError` subclass rather than being returned
-  as a successful result; and each `submit` **call** mints one fresh
-  `Idempotency-Key`, so two deliberate submits are two requests while a
-  transport retry inside one call replays the original. The queue itself stays
-  entirely server-owned: ordering, admission, retries, timeouts, billing and
-  expiry are not reimplemented here. The surface is gated server side — a
-  caller it is not switched on for is answered `403 not_enabled`, which arrives
-  as `comfy_sdk.router_exceptions.NotEnabled`. `client.models.run` is unchanged
-  in behaviour and signature.
-- `comfy_sdk.router_exceptions.error_from_completion()` — the typed exception a
-  completed-but-failed queued request reports, or `None`. Public because the
-  rule it encodes ("a `200` is not the same thing as a success on this
-  surface") is one a caller reading a raw payload has to apply too.
-- `Asset.get_download_url()` / `AsyncAsset.get_download_url()` — a
-  directly-fetchable URL for an *uploaded* asset's bytes, mirroring
-  `Output.get_download_url()` (same `DownloadUrl`, commits the asset first if
-  needed). On Comfy Cloud / serverless it is a short-lived signed URL any
-  fetcher can read until `expires_at`, which is what lets a local image be
-  passed to a URL-taking image-to-image model via `client.models.run()`:
-  upload the file as an asset, resolve its URL, put the URL in the model's
-  input. The README's "Image to image — upload an asset first" section walks
-  through the flow.
-
-- `ApiError.body_excerpt` — a bounded, single-line excerpt of a response body
-  that stated no message of its own, and `str(exc)` now shows it beside the
-  bare status: `HTTP 503: no healthy upstream`. The `ComfyError` it is
-  translated to carries the same string as its message, so the cause reaches
-  the exception an integrator actually catches and logs. A `503` answered by a
-  load balancer in front of the deployment arrives as plain text with no JSON
-  and no `X-Comfy-Request-Id`, and that text — `no healthy upstream`, `upstream
-  connect error or disconnect/reset before headers` — is the only thing that
-  names the cause. It used to be discarded with the response, so the cause was
-  unrecoverable from any log. The excerpt is whitespace-collapsed, has control,
-  format (bidi override, zero-width), private-use and surrogate characters
-  replaced by spaces, and is capped at 256 characters (an HTML error page is
-  the realistic case). It is `None` whenever the response *did* state a message
-  — an envelope's `error.message`, Router's `detail` — where `message` already
-  carries the cause; a JSON object that is not an envelope (`{"message": "no
-  healthy upstream"}`) keeps its excerpt. The `invalid_response` error — a
-  success status whose body would not decode, i.e. a proxy interstitial served
-  as a `200` — carries and shows it too, for the same reason: the message says
-  the body would not decode, and only the excerpt says what answered instead.
+- `Asset.get_download_url()` / `AsyncAsset.get_download_url()` — a fetchable URL for an uploaded
+  asset, mirroring `Output.get_download_url()`. This is how a local image reaches a URL-taking
+  image-to-image model.
+- `ApiError.body_excerpt` — a bounded, sanitized excerpt of a response body that stated no message
+  of its own, so a bare `HTTP 503: no healthy upstream` from a load balancer survives into logs.
+  `None` when the response did state a message.
 
 ### Changed
 
-- An error response nothing in the stack recognised now carries the code
-  `http_<status>` — `http_503`, `http_500` — instead of `"error"`. It is reached
-  only after the envelope's own `code`, Router's `X-Comfy-Error-Type` bucket and
-  the status table have all declined, so a bare `401` still maps to
-  `Unauthorized` and every documented code is untouched. `"error"` was the class
-  default an exception built by hand carries, so it was indistinguishable from
-  "nobody set a code" and told a caller nothing about a response that had
-  already lost its body. Read `http_<status>` as *answered by something in front
-  of Router rather than by the service itself, so no service verdict was
-  reached; retry per your own policy* — nothing about what the SDK retries
-  changed, and such a `5xx` is still not retried automatically.
+- An unrecognised error response now carries code `http_<status>` instead of `"error"`. Reached
+  only after the envelope code, Router bucket and status table all decline. Nothing about what is
+  retried changed.
 
 ## [0.1.9] - 2026-09-01
 
 ### Added
 
-- Every exception a failed `POST /jobs` attempt inside `client.submit()`
-  raises — and so the submit phase of `client.run()` — now carries the
-  `Idempotency-Key` it was made under, on `.idempotency_key`, matching
-  `client.models.run()`: the mapped `ComfyError` subclasses, a `QueueFull`
-  raised once the 429 retry budget is exhausted (the same key on every retried
-  attempt), and a transport failure with no response at all (a dropped
-  connection, a read timeout), which previously escaped `submit()` untranslated
-  and now reads `.request_id` and `.retry_after` as `None` rather than raising
-  `AttributeError`. A failure raised before the request exists (a UI-format
-  workflow, an asset that would not upload) or while `run()` polls the job
-  afterwards carries none. Cancelling an in-flight `AsyncComfy.submit()`
-  (`task.cancel()`) yields the key too, and the cancellation still propagates
-  unchanged; an `asyncio.wait_for` timeout raises its own `TimeoutError`, which
-  does not. The semantics differ from `models.run`'s and the difference
-  matters: `POST /jobs` **rejects** a reused key with
-  `422 idempotency_key_reuse` rather than replaying it, so the key on a
-  `submit()` error is the one this attempt was made under, not a replay handle:
-  after an ambiguous failure poll or list for the job the first attempt may
-  already have created; a failure the server never saw (a connect failure, an
-  exhausted `QueueFull`) leaves it unclaimed. Nothing about what is retried or
-  what goes on the wire changed.
-- `client.submit(idempotency_key=...)` now validates a caller-supplied key the
-  way `client.models.run()` does: an empty, over-long (> 255), or
-  non-printable-ASCII key raises `ValueError` locally, before any request.
-  Previously `""` fell into the mint-a-fresh-key branch — disabling the
-  caller's dedup and, with the stamp above, reporting a key the caller never
-  passed — and an invalid key failed at the transport after the round trip.
-
-- Every exception `client.models.run()` raises **for a failed call** now
-  carries the `Idempotency-Key` it was made under, on `.idempotency_key` — the
-  typed `RouterError` buckets, a `RouterError` whose `error_type` this version
-  does not recognise, any other `ComfyError`, and a transport failure with no
-  response at all (a dropped connection, a read timeout), and a cancelled
-  `await` of `AsyncModels.run` — the `asyncio.wait_for` a caller wraps a
-  ten-minute call in abandons a generation that may already be dispatched and
-  billed, and the cancellation still propagates unchanged. "Failed call" is the
-  boundary, not "every exception": a programming error escaping the call is not
-  a failed request, a key means nothing on it, and it reaches you untouched —
-  as does `KeyboardInterrupt`. `run` mints that key itself unless you pass
-  `idempotency_key=`, and it used to be a local of the call: when the call
-  raised, the key went with it. Since collecting a generation you were already
-  billed for after a lost response means asking again under the *same* key,
-  that made the auto-minted case uncollectable — only callers who chose and
-  stored their own key could recover. The recovery idiom is now
-  `client.models.run(model, arguments, idempotency_key=exc.idempotency_key)`;
-  see the README. Nothing about what is retried, or what goes on the wire,
-  changed.
-- `ComfyError.request_id` — the server's `X-Comfy-Request-Id` for the failed
-  call, when the response carried that header, on every SDK exception rather
-  than only on `RouterError`. It is the id to quote in a support request, and it
-  was previously unreachable once the response object was gone. `None` when the
-  response named none, or when there was no response — including on a transport
-  failure, where the attribute now reads as `None` rather than being absent, so
-  a handler never has to guard the access. The header is bounded and filtered
-  before it is stored (it is server-controlled and the id is meant to be
-  displayed and pasted into support tickets), identically on both error
-  surfaces.
-- `ComfyError.retry_after` — seconds the server asked the caller to wait, from
-  `Retry-After`, now forwarded for every error code rather than only for
-  `queue_full`. The replay documented above tells a caller to ask again "after
-  the `Retry-After` the server named", and a `deadline_exceeded` `504` that
-  carried one had nowhere to surface it, so the caller had nothing to wait on.
-  `None` when the server named no pace.
-
-### Fixed
-
-- A Router error now keeps its own bucket on **every** status, and
-  `client.models.run()` raises the matching typed `RouterError` subclass for
-  it. Previously the status table won for any status it named, so a `403`
-  `not_enabled` surfaced as `Forbidden` — `except NotEnabled`, the handler
-  every pre-launch caller writes, never fired — a `422` `invalid_input` as
-  `InvalidWorkflow`, and a `404` `model_not_found` as plain `NotFound`. The
-  retype only touches responses that carry a bucket (the `X-Comfy-Error-Type`
-  header or Router's top-level body `error_type`), which only Router sends:
-  the v2 envelope's `error.code` still always wins, a bucket-less response
-  still decodes off the status table (a bare `429` is still `QueueFull`), and
-  the three buckets both surfaces spell identically (`unauthorized`,
-  `forbidden`, `insufficient_credits`) keep their existing classes, which
-  catch on both surfaces. `Retry-After` pacing is keyed on the status and
-  survives unchanged.
-- A Router `409` now keeps the bucket the contract names instead of decoding
-  to `HashMismatch` off the status table. The synced contract declares two
-  `409`s on the run route — `invalid_input` for a key that cannot serve this
-  request (use a new key) and `concurrency_limit_exceeded` for a key whose
-  call is still in flight — and the collect retry now fires on the second,
-  paced by `Retry-After`, in both the envelope and the Router wire shape. The
-  never-contracted `generation_in_progress` bucket is gone.
-- An explicit `idempotency_key` is validated locally (1-255 printable ASCII
-  characters) before any bytes move. The empty string is the load-bearing
-  case: it used to fall into the mint-a-fresh-key branch, silently dispatching
-  a second billed generation on what the caller meant as a collect.
-- A success status whose body will not decode (a proxy interstitial served
-  under a `200`, a response truncated mid-stream) now raises a translated SDK
-  error instead of letting `json.JSONDecodeError` escape from outside the
-  translated surface. On `models.run` that is a generation that ran and was
-  billed with the result lost — precisely the failure the `Idempotency-Key`
-  has to ride out on, and it previously carried no key.
-- Automatic retry for `client.models.run`, on by default, with the
-  `Idempotency-Key` sent unconditionally on **every** attempt of one logical
-  call — a new call mints a new key. That is what keeps a retry from being
-  billed as a second generation, and it is also what decides which failures are
-  retried at all: the key is single-use and reject-on-duplicate with no
-  response replay, so only failures that leave it unclaimed are worth another
-  attempt. Retried by default: connect-phase transport failures (the request
-  never reached the server), and a `429` carrying `Retry-After` (a reject that
-  started no work, so the key is released) — paced by the `Retry-After` the
-  server sent rather than a blind backoff. Not retried: every other 4xx, since
-  a deterministic refusal such as `content_policy_violation`, `404`, `409` or
-  `422` cannot change on the second ask. Not retried unless
-  `retry_possibly_in_flight=True`: anything whose outcome is unknown — a 5xx
-  response, or a client-side timeout on a run the server may still be
-  generating — because the key stays claimed across those and a same-key retry
-  would come back `422 idempotency_key_reuse` in place of the real error. Turn
-  the opt-in on for a deployment that replays a repeated key. The budget is 60
-  seconds of **total elapsed time** from the first attempt rather than an
-  attempt count, and it bounds when the last attempt may *start*: an attempt
-  already running is never interrupted, so a slow generation is never abandoned
-  half-way. Backoff is 0.5s doubling to a 15s ceiling with full jitter, clamped
-  to whatever is left of the budget. Configure with
-  `Comfy(retry=RetryPolicy(...))` or switch it off with
-  `Comfy(retry=NO_RETRY)`; `client.models.retry` reads back the policy in
-  force. `RetryPolicy`, `DEFAULT_RETRY` and `NO_RETRY` are exported from
-  `comfy_sdk`.
-- `client.models.run(model, arguments)` on both `Comfy` and `AsyncComfy` — one
-  call that returns the completed generation. Where the platform has to
-  submit-and-poll an upstream provider, that polling happens server side inside
-  the call, so the client contract stays a single request. The result is the
-  provider's native payload, returned as-is rather than wrapped. The awaitable
-  form is `AsyncComfy`, not a `run_async()` suffix — there is deliberately no
-  suffixed variant, and a test asserts its absence. Runs use their own
-  10-minute timeout (the client's default is sized for ordinary API calls) and
-  send an `Idempotency-Key` on every call.
-- Credential resolution with a documented order: the explicit `api_key=`
-  argument first, then the `COMFY_API_KEY` environment variable. Against Comfy
-  Cloud, which always requires a key, neither raises the new `MissingApiKey`
-  locally at construction — naming `COMFY_API_KEY` in the message — instead of
-  costing a round trip to be told `401`. Both sources are trimmed, and a blank
-  value counts as unset. Comfy Cloud is recognized by normalized origin (scheme,
-  host, effective port) and path rather than by string, so a `COMFY_BASE_URL`
-  that spells it differently — `https://cloud.comfy.org:443/`, or with a
-  mixed-case host — gets the same local error rather than a server `401`.
-- `MissingApiKey` (a `ComfyError`, `code="missing_api_key"`) and
-  `API_KEY_ENV_VAR` are exported from `comfy_sdk`.
-- `Comfy`/`AsyncComfy` now have an explicit `repr()` reporting the base URL and
-  `authenticated=True|False`. The key is never rendered, logged, or included in
-  an exception message. A credential embedded in the base URL itself
-  (`COMFY_BASE_URL=https://user:token@proxy.example`, for a deployment behind an
-  authenticating proxy) is redacted to `***@host` in every `repr()` — the
-  client, its transport and its `models` namespace — while requests still go out
-  against the URL exactly as given.
+- `models.run()` on `Comfy` and `AsyncComfy` — one call returning the completed generation, with
+  server-side polling and the provider's native payload returned as-is. 10-minute timeout.
+- Automatic retry for `models.run`, on by default, sending the same `Idempotency-Key` on every
+  attempt of one logical call. Retried: connect-phase transport failures, and `429` with
+  `Retry-After`. Not retried: other 4xx. Not retried without `retry_possibly_in_flight=True`:
+  5xx and client-side timeouts. Budget is 60s total elapsed, backoff 0.5s→15s with jitter.
+  Configure via `Comfy(retry=RetryPolicy(...))` or `NO_RETRY`.
+- Every exception from a failed `models.run()` and `submit()` call carries `.idempotency_key`,
+  so a lost response can be collected by passing it back. `submit()`'s key is the attempt's key,
+  not a replay handle — `POST /jobs` rejects reuse rather than replaying.
+- `ComfyError.request_id` (from `X-Comfy-Request-Id`) and `ComfyError.retry_after` on every
+  exception, not just some.
+- `MissingApiKey` raised locally at construction against Comfy Cloud instead of costing a `401`
+  round trip. Credentials resolve `api_key=` then `COMFY_API_KEY`.
+- `repr()` on `Comfy`/`AsyncComfy` reporting base URL and `authenticated=`. Keys are never
+  rendered; a credential embedded in the base URL is redacted.
 
 ### Changed
 
-- **`client.models.run` posts to Comfy Router.** It sends
-  `POST {COMFY_ROUTER_BASE_URL}/v2/models/{provider}/{model}` — the route
-  `spec/router-openapi.yaml` declares as `runRouterModel` — with the partner
-  model's **own native JSON input** as the body, forwarded to the provider
-  unchanged. The vendored `spec/router-openapi.yaml` is pinned to that contract
-  and `scripts/check_drift.py` keeps the two together. The whole `models`
-  surface is new in this release, so nothing published ever spoke a different
-  shape: during development the call went to `{COMFY_BASE_URL}/api/v2/models/run`
-  with a `{"model": ..., "arguments": {...}}` envelope, and briefly to Router's
-  `/v1/models`, neither of which anything serves — the `/api/v2` surface is jobs
-  and assets, and the model-ID-addressed invocation routes are Router's, now at
-  `/v2`. **If you tracked `main` and pointed `COMFY_BASE_URL` at a Router host to
-  make model runs work, point `COMFY_ROUTER_BASE_URL` there instead**, and set
-  `COMFY_BASE_URL` back at your v2 deployment (or unset it for Comfy Cloud).
-- The `model` argument to `client.models.run` is now the canonical
-  `{provider}/{model}` id, because it *is* the two path segments the route is
-  addressed by. Exactly two non-empty segments are accepted; a one-segment id, a
-  three-segment `{provider}/{model}/{variant}` id (that form is not addressable
-  on this route yet), and any `.`/`..` segment now raise `ValueError` locally
-  before a request is made, and a non-string raises `TypeError`. Each segment is
-  percent-encoded into exactly one path segment. Previously any string was
-  accepted and travelled in the body. Mirrors the TypeScript SDK's
-  `parseModelId`, so the two SDKs accept and reject the same ids.
-- `COMFY_ROUTER_BASE_URL` (default `https://api.comfy.org`) selects the Router
-  deployment, deliberately separate from `COMFY_BASE_URL` — one variable
-  pointed at both surfaces would send jobs to Router or model runs to the v2
-  API. Same validation and read-per-construction rules as `COMFY_BASE_URL`, and
-  the same name as the TypeScript SDK's. `COMFY_ROUTER_BASE_URL` and
-  `ROUTER_BASE_URL_ENV_VAR` are exported from `comfy_sdk`.
-- `client.models.base_url` (and the namespace's `repr`) now reports the Router
-  base URL rather than the client's `COMFY_BASE_URL`, since that is the host
-  model runs actually reach. The client's own `base_url` is unchanged.
-- The client's API key is attached to *both* of its configured origins — the
-  `COMFY_BASE_URL` deployment and the `COMFY_ROUTER_BASE_URL` Router — and to no
-  third origin. Both are set by the caller (a constant or an environment
-  variable), never by a server response, so a server-returned absolute
-  follow-up link pointing anywhere else still receives no credential.
-- A client targeting a deployment named by `COMFY_BASE_URL` is unchanged: with
-  no key resolved it is still built without one and still sends no credentials,
-  which is what a self-hosted ComfyUI behind the API proxy needs. Only the Comfy
-  Cloud default gained the local error.
+- **`models.run` posts to Comfy Router**: `POST {COMFY_ROUTER_BASE_URL}/v2/models/{provider}/{model}`
+  with the model's native JSON as the body. If you tracked `main` and pointed `COMFY_BASE_URL` at a
+  Router host, point `COMFY_ROUTER_BASE_URL` there instead.
+- **Breaking:** the `model` argument is now the canonical `{provider}/{model}` id. Exactly two
+  non-empty segments; anything else raises `ValueError` locally. Matches the TypeScript SDK.
+- `COMFY_ROUTER_BASE_URL` (default `https://api.comfy.org`) selects the Router deployment,
+  separate from `COMFY_BASE_URL`. `models.base_url` reports it.
+- The API key is attached to both configured origins and no third one.
+
+### Fixed
+
+- Router errors keep their own bucket on every status, so `403 not_enabled` raises `NotEnabled`
+  rather than `Forbidden`. Previously the status table won and `except NotEnabled` never fired.
+- A Router `409` keeps its contract bucket instead of decoding to `HashMismatch`;
+  `concurrency_limit_exceeded` now drives the collect retry.
+- An explicit `idempotency_key` is validated locally (1–255 printable ASCII). The empty string
+  used to mint a fresh key, silently dispatching a second billed generation.
+- A success status whose body will not decode raises a translated SDK error instead of letting
+  `json.JSONDecodeError` escape.
 
 ## [0.1.8] - 2026-08-13
 
 ### Added
 
-- `Job.get_workflow()` / `AsyncJob.get_workflow()` — fetch the workflow behind a
-  job, including one rehydrated by id. Returns the graph and a `format`
-  discriminator: `save` (the authoring workflow at the version the job ran, with
-  canvas layout and editor-only nodes intact) or `api` (the executed API-format
-  graph). Jobs submitted through this SDK always get `api` today.
-- Asset deletion — `Asset.delete()` and `assets.delete(id)`. Thanks to
-  [@jab416171](https://github.com/jab416171) for the implementation. Requires
-  backend support: Comfy Cloud has it; self-hosted needs a `comfy-api-proxy` new
-  enough to serve `DELETE /api/v2/assets/{id}`, older proxies return
-  `405 Method Not Allowed`.
-- `job_id` on outputs and assets, so you can get from an output file back to the
-  job that produced it without a side table. Absent for uploaded assets, which
-  have no producing job.
-- `expires_at` on assets.
+- `Job.get_workflow()` / `AsyncJob.get_workflow()` — the workflow behind a job, with a `save` or
+  `api` format discriminator.
+- Asset deletion: `Asset.delete()` and `assets.delete(id)`. Thanks to
+  [@jab416171](https://github.com/jab416171). Needs a proxy serving `DELETE /api/v2/assets/{id}`.
+- `job_id` on outputs and assets; `expires_at` on assets.
 
 ### Fixed
 
-- `job_id` and `expires_at` were present on the wire but not exposed by the
-  public wrapper classes, so they were unreachable without touching a private
-  attribute.
+- `job_id` and `expires_at` were on the wire but unreachable from the public classes.
 
 ## [0.1.7] - 2026-08-12
 
-There is no 0.1.6 on PyPI — that number was consumed by a release-pipeline
-failure and never published.
+There is no 0.1.6 on PyPI — that number was consumed by a release-pipeline failure.
 
 ### Changed
 
-- **Breaking:** the base URL moves from a constructor argument to the
-  `COMFY_BASE_URL` environment variable. `Comfy()` / `AsyncComfy()` target Comfy
-  Cloud by default; point the client at another deployment by setting
-  `COMFY_BASE_URL`. The variable is read on each construction (not at import),
-  must be an `http(s)` URL, and unset-or-blank means Comfy Cloud.
-- **Breaking:** `api_key` is keyword-only, so the old positional form raises
-  `TypeError` rather than quietly reading a URL as a key.
-- `comfy_low`, the documented escape hatch the clients are built on, still takes
-  a base URL directly and is unchanged.
+- **Breaking:** the base URL moves from a constructor argument to the `COMFY_BASE_URL` environment
+  variable. Unset or blank means Comfy Cloud. Read per construction, must be `http(s)`.
+- **Breaking:** `api_key` is keyword-only, so the old positional form raises `TypeError`.
+- `comfy_low` still takes a base URL directly and is unchanged.
 
 ## [0.1.5] - 2026-07-30
 
-Maintenance release. No API changes — existing code needs no updates.
+Maintenance release. No API changes.
 
 ### Fixed
 
-- Ship `py.typed` (PEP 561), so type checkers in consuming projects actually see
-  the SDK's type information. Previously the annotations were shipped but ignored.
-- Derive `__version__` from installed distribution metadata instead of a
-  hardcoded string, so it can no longer drift from the released version.
+- Ship `py.typed` (PEP 561), so consumers actually see the SDK's types.
+- Derive `__version__` from distribution metadata so it cannot drift.
 
 ### Changed
 
-- Ship an MIT license (the package previously declared none) and fill in the
-  empty package metadata.
-- Stop sweeping local dev droppings into the sdist — it now contains only what is
-  needed to build and run the tests.
-- The repository moved from `Comfy-Org/ComfyPythonSDK` to
-  `Comfy-Org/comfy-python-sdk`. GitHub redirects the old URLs and the PyPI
-  package name is unchanged (`comfy-sdk`). This is the first release to carry
-  the corrected repository/issues URLs in its published metadata.
-- Docstrings for the public methods that had none; README aligned with the
-  TypeScript and Swift SDK READMEs.
+- Ship an MIT license and fill in the empty package metadata.
+- Trim local dev droppings from the sdist.
+- Repository moved to `Comfy-Org/comfy-python-sdk`. PyPI name unchanged.
+- Docstrings for public methods; README aligned with the other SDKs.
 
 ## [0.1.4] - 2026-07-28
 
-Comfy Cloud now serves the v2 API on `cloud.comfy.org`. `api.comfy.org`
-continues to serve the node registry.
+Comfy Cloud now serves the v2 API on `cloud.comfy.org`; `api.comfy.org` serves the node registry.
 
 ### Changed
 
-- **Breaking:** `api.comfy.org/api/v2/*` no longer responds. If you pass that
-  host explicitly, requests 404 until you update.
-- `base_url` now defaults to `https://cloud.comfy.org`, so `Comfy(api_key=...)`
-  targets Comfy Cloud with no host argument. `COMFY_CLOUD_BASE_URL` is exported
-  for callers who want the value.
-- Spec server URL, README, and docstrings updated to the new host.
-- Passing an explicit `base_url` still wins — self-hosted and serverless callers
-  are unaffected.
+- **Breaking:** `api.comfy.org/api/v2/*` no longer responds. Passing that host explicitly 404s.
+- `base_url` defaults to `https://cloud.comfy.org`. An explicit `base_url` still wins.
 
 ## [0.1.3] - 2026-07-27
 
 ### Fixed
 
-- Serverless gateway: follow-up links no longer 404 after submit. A gateway
-  serving the v2 API under a mount prefix (e.g. `/deployment/{id}/api/v2`)
-  returns `job.urls.*` links that already include that prefix; resolving them
-  against a `base_url` carrying the same prefix doubled it, so the first
-  `Job.refresh()` after a successful submit raised `NotFound`. Server-returned
-  links (leading slash, containing `/api/`) now resolve against the origin —
-  the link is authoritative about its own path. Internal shorthand paths still
-  resolve under `base_url`; Comfy Cloud and self-hosted behavior is unchanged.
+- Serverless gateway: follow-up links no longer 404 after submit. A gateway serving under a mount
+  prefix returned links already carrying it, and resolving against `base_url` doubled the prefix.
+  Server-returned links now resolve against the origin.
 
 ### Added
 
-- An env-gated live integration suite (`tests/integration/test_gateway_e2e.py`)
-  covering upload → blake3 dedup fast path → img2img submit → poll → output
-  download against a real gateway. Skipped unless `COMFY_BASE_URL` /
-  `COMFY_API_KEY` are set.
+- Env-gated live integration suite covering upload → dedup → img2img → poll → download.
 
 ## [0.1.2] - 2026-07-23
 
 ### Added
 
-- `Output.get_download_url()` — get a fetchable URL for an output instead of
-  streaming the bytes through your process. On Comfy Cloud / serverless it is a
-  short-lived, self-authorizing signed storage URL (with `expires_at`); on a
-  self-hosted proxy it is the content endpoint (`expires_at=None`). Available on
-  both `Output` and `AsyncOutput`.
-- The client now identifies itself via a `User-Agent` header; pass `client_info=`
-  to attribute your own integration's traffic.
+- `Output.get_download_url()` — a fetchable URL instead of streaming bytes through your process.
+- A `User-Agent` header; pass `client_info=` to attribute your own traffic.
 
 ### Fixed
 
-- SSE: a read-idle timeout, so a stalled stream can no longer hang `events()`.
-- Map entity-specific 404s (`job_not_found` / `asset_not_found`) to `NotFound`.
+- SSE read-idle timeout, so a stalled stream cannot hang `events()`.
+- Map `job_not_found` / `asset_not_found` to `NotFound`.
 
 ## [0.1.1] - 2026-07-21
 
 ### Added
 
-- Optional `api_key=` parameter on `submit()` / `run()` (sync and async) that
-  authenticates partner (API) nodes in a workflow, sent as
-  `extra_data.api_key_comfy_org`. Omit it (or pass `""`) and no `extra_data` is
-  sent. The key is never logged or persisted and does not participate in
-  idempotency.
+- Optional `api_key=` on `submit()` / `run()` authenticating partner (API) nodes, sent as
+  `extra_data.api_key_comfy_org`. Never logged, and not part of idempotency.
 
 ## [0.1.0] - 2026-07-21
 
@@ -434,12 +239,12 @@ First public release of the Comfy API v2 Python SDK (`comfy-sdk`).
 
 ### Added
 
-- Run ComfyUI workflows across self-hosted, Comfy Cloud, and serverless from one
-  typed client: upload/dedup inputs, submit a workflow, follow it (poll or SSE),
-  and download outputs.
+- Run ComfyUI workflows across self-hosted, Comfy Cloud and serverless from one typed client:
+  upload/dedup inputs, submit, follow (poll or SSE), download outputs.
 - Sync and async clients. Python 3.10+.
 
-[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.9...HEAD
+[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.7...v0.1.8

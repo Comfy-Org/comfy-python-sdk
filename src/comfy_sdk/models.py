@@ -42,14 +42,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, cast
 
 import httpx
 
 from comfy_low.errors import ApiError
+from comfy_low.errors import IdempotencyKeyReuse as ProtocolIdempotencyKeyReuse
 from comfy_low.transport import (
     MODEL_RUN_TIMEOUT,
     AsyncComfyLow,
@@ -59,7 +62,7 @@ from comfy_low.transport import (
 )
 
 from ._core import new_idempotency_key, validate_idempotency_key
-from .exceptions import translating
+from .exceptions import IdempotencyKeyReuse, _stamp, to_sdk_error, translating
 from .model_requests import (
     _CANCEL_FAILURES,
     _CANCEL_TIMEOUT,
@@ -70,7 +73,7 @@ from .model_requests import (
     _remaining,
     _request_id_of,
 )
-from .retry import DEFAULT_RETRY, Retrier, RetryPolicy
+from .retry import DEFAULT_RETRY, Retrier, RetryPolicy, may_have_claimed_key
 from .router_exceptions import RouterError
 
 #: Failures the policy is even asked about. A protocol ``ApiError`` is a
@@ -89,7 +92,74 @@ from .router_exceptions import RouterError
 #: raising them, with no test failing.
 _CANDIDATE_FAILURES = (ApiError, RouterError, httpx.TransportError)
 
+#: The answer that means the resend was never going to work: the server refused
+#: the *key*, not the request. ``422`` is the v2 jobs rule
+#: (single-use, reject-on-duplicate), which a deployment named by
+#: ``COMFY_ROUTER_BASE_URL`` may apply to this route even though the router
+#: contract does not.
+_KEY_REUSE_STATUS = 422
+_KEY_REUSE_CODE = "idempotency_key_reuse"
+
 _now = time.monotonic
+
+
+def _is_key_reuse(exc: BaseException) -> bool:
+    """Whether ``exc`` is the server refusing a repeated ``Idempotency-Key``.
+
+    Matched on the wire facts — ``422`` plus the ``idempotency_key_reuse``
+    code — rather than on a class alone, because the retry loop runs *inside*
+    ``translating()``: what it catches is the raw
+    :class:`comfy_low.errors.ApiError`, and only the copy that leaves the block
+    is the idiomatic :class:`~comfy_sdk.exceptions.IdempotencyKeyReuse`. Either
+    layer's typed class is accepted outright so the answer does not depend on
+    which one raised.
+
+    The SDK-level :class:`~comfy_sdk.exceptions.IdempotencyKeyReuse` arm is
+    deliberately defensive, not reachable from the retry loops as written:
+    that class derives from ``ComfyError`` alone, so the ``except
+    _CANDIDATE_FAILURES`` clauses that call this can only ever bind the
+    protocol copy. It is kept so this predicate stays correct if it is ever
+    called from outside those clauses.
+    """
+    if isinstance(exc, (IdempotencyKeyReuse, ProtocolIdempotencyKeyReuse)):
+        return True
+    return (
+        getattr(exc, "http_status", None) == _KEY_REUSE_STATUS
+        and getattr(exc, "code", None) == _KEY_REUSE_CODE
+    )
+
+
+def _as_sdk_error(exc: BaseException, idempotency_key: str) -> BaseException:
+    """``exc`` on the surface a caller catches, carrying ``idempotency_key``.
+
+    ``translating()`` converts and stamps the exception it is *handed*, and
+    nothing else — so an ``ApiError`` chained onto that one as ``__cause__``
+    would reach the caller as a raw protocol type this SDK otherwise never
+    shows. Both halves of the substitution below therefore go through here
+    first. Anything already idiomatic (a ``RouterError``, an ``httpx`` failure
+    with no response to translate) is only stamped.
+
+    The translated copy inherits the original's traceback, so the chain still
+    points at the attempt that produced each half rather than at the one line
+    of this module that re-raised them.
+    """
+    if not isinstance(exc, ApiError):
+        return _stamp(exc, idempotency_key)
+    return _stamp(to_sdk_error(exc).with_traceback(exc.__traceback__), idempotency_key)
+
+
+def _resend_refused(exc: BaseException) -> BaseException:
+    """Mark ``exc`` as the failure whose same-key resend the server refused.
+
+    Set on the error that is raised, never on the ``__cause__``. An outer retry
+    wrapper keyed on ``http_status`` alone cannot tell this 5xx apart from a
+    fresh one, and re-entering :meth:`Models.run` mints a *new* key — the second
+    billed generation. The flag is the cheap way to tell them apart without
+    walking ``__cause__``; see
+    :attr:`comfy_sdk.exceptions.ComfyError.resend_refused`.
+    """
+    exc.resend_refused = True  # type: ignore[attr-defined]
+    return exc
 
 
 class _ModelsBase:
@@ -130,6 +200,95 @@ class _ModelsBase:
         return f"{type(self).__name__}(base_url={self._low.safe_router_base_url!r})"
 
 
+@dataclass(frozen=True, slots=True)
+class RouterRunResult:
+    """One finished model run, plus what Router disclosed about HOW it ran.
+
+    :meth:`Models.run` returns the partner model's native output on its own,
+    which is the right default: that document is the thing a caller asked for,
+    and wrapping every run in an envelope to carry two usually-absent headers
+    would tax every caller for the few that need them. This is the opt-in shape
+    for the callers that do -- :meth:`Models.run_detailed`.
+
+    What it adds is not decoration. On an alt-provider run
+    (``model_provider=...``) the response body is translated back to this
+    model's native contract, so the body alone looks IDENTICAL whether the call
+    was served by the model's own provider or by an alternate. The two headers
+    below are the only disclosure of the difference, which makes them the only
+    way a caller -- or a test -- can prove which leg actually ran.
+    """
+
+    output: dict[str, Any]
+    """The partner model's native JSON output, exactly what :meth:`Models.run` returns."""
+
+    serving_provider: str | None
+    """``X-Comfy-Router-Fallback-Provider``: the provider that ultimately served this call.
+
+    Present ONLY when ``fallback_provider`` retried against a second provider
+    and that retry succeeded -- never a provider that was attempted and also
+    failed. ``None`` therefore means "the provider asked for served it", which
+    is the common case; it does not mean "unknown".
+    """
+
+    dropped_params: tuple[str, ...] | None
+    """``X-Comfy-Router-Dropped-Params``: native fields translation could not carry.
+
+    Present only when ``model_provider`` translated the body
+    (``strict_mode=False``, the default) and one or more native fields could not
+    be expressed exactly on the alternate provider's schema; each entry names the
+    field and why. ``None`` when no translation ran or it dropped nothing.
+    """
+
+    replayed: bool
+    """``X-Comfy-Idempotent-Replayed``: served from the key's record, not run again.
+
+    A replay is not billed a second time. The header is absent on a fresh run
+    rather than sent as ``false``, so this is derived from its presence.
+    """
+
+    request_id: str | None
+    """``X-Comfy-Request-Id`` -- the id to quote in a support request."""
+
+
+def _dropped_params(raw: str | None) -> tuple[str, ...] | None:
+    """Parse the ``X-Comfy-Router-Dropped-Params`` header value.
+
+    The spec describes this header as "a JSON array of strings" in prose while
+    declaring ``schema: {type: array, items: {type: string}}``, which in OpenAPI
+    means the SIMPLE comma-delimited form instead. The two disagree, and the
+    spec's own example settles which one the server actually sends: its single
+    entry is ``moderation (fal applies its own, non-configurable safety
+    filtering)`` -- which contains a comma. Splitting on commas would tear that
+    one entry into two meaningless fragments, so the prose is right and the
+    declared schema is the part that is wrong.
+
+    So: parse as JSON, and fall back to the raw value as a single entry rather
+    than guessing at delimiters. The fallback is deliberately not a comma split
+    -- on a malformed value, one intact entry a human can read beats two
+    confident fragments. (The spec bug is filed separately against the server's
+    own openapi.yml, which this vendored copy is synced from; correcting it
+    here would be reverted by the next sync.)
+    """
+    if raw is None:
+        return None
+    with contextlib.suppress(ValueError, TypeError):
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+            return tuple(parsed)
+    return (raw,)
+
+
+def _run_result(body: dict[str, Any], headers: Mapping[str, str]) -> RouterRunResult:
+    """Build a :class:`RouterRunResult` from one run's body and response headers."""
+    return RouterRunResult(
+        output=body,
+        serving_provider=headers.get("X-Comfy-Router-Fallback-Provider"),
+        dropped_params=_dropped_params(headers.get("X-Comfy-Router-Dropped-Params")),
+        replayed=headers.get("X-Comfy-Idempotent-Replayed") is not None,
+        request_id=headers.get("X-Comfy-Request-Id"),
+    )
+
+
 class Models(_ModelsBase):
     """``client.models`` on :class:`~comfy_sdk.client.Comfy`.
 
@@ -141,14 +300,17 @@ class Models(_ModelsBase):
         self._low = low
         self._retry = retry
 
-    def run(
+    def _run(
         self,
         model: str,
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
         """Run ``model`` with ``arguments`` and return the completed result.
 
         ``model`` is the canonical ``{provider}/{model}`` id — exactly the two
@@ -164,6 +326,22 @@ class Models(_ModelsBase):
         forwarded to the provider unchanged — there is no Comfy-shaped envelope
         around it, so whatever the partner documents as its request body is
         what goes here.
+
+        ``model_provider`` selects an alternate serving provider for this model
+        (Comfy Router's ``model_provider`` query param); omitted, the model runs
+        on its default provider and the request is byte-for-byte what it always
+        was. Under the default ``strict_mode`` (``False``) the ``arguments`` you
+        pass stay this model's own native input, and Router translates them to
+        the alternate provider's schema on the way in and the response back to
+        native on the way out; ``strict_mode=True`` sends and returns that
+        provider's own raw shape unchanged, so no translation happens either
+        way. ``fallback_provider`` controls the retry-against-another-provider
+        behavior — pass ``False`` (or ``"false"``) to opt out. Each is sent only
+        when set. Note that the off switch is the only value that means
+        anything: Router reads *any* other value, and omission, as fallback ON,
+        which is why a ``bool`` here is normalised to ``"true"``/``"false"``
+        rather than str()-ed into the capitalised ``"False"`` that would read as
+        "on".
 
         One call, one result. It blocks until the generation is finished —
         including for a provider the platform has to submit-and-poll, where the
@@ -210,6 +388,45 @@ class Models(_ModelsBase):
         ``RetryPolicy(retry_possibly_in_flight=True)``. See
         :mod:`comfy_sdk.retry`, and ``Comfy(retry=NO_RETRY)`` to switch it off.
 
+        **When a resend is refused because the key was already claimed
+        (``422`` ``idempotency_key_reuse``), what is raised is the failure that
+        claimed it** — the ``504``, the ``500`` — with the key refusal chained
+        onto it as ``__cause__`` and ``.resend_refused`` set to ``True``. That
+        refusal is an artefact of this retry loop rather than an answer about
+        the request, so surfacing it in place of the real failure would hide the
+        only error worth diagnosing. Every other terminal failure is raised
+        exactly as the server sent it, first or last.
+
+        Two things narrow which failure that is, and both exist so the
+        substitution never buries a *genuine* key refusal:
+
+        * Only a failure that **could have claimed the key** is eligible. A
+          never-delivered transport failure (``ConnectError``, ``ConnectTimeout``,
+          ``PoolTimeout``, ``ProxyError``) never reached a server, and a ``429``
+          is rejected without starting work and explicitly releases the key — so
+          a ``422`` following one of those is the server refusing a key that was
+          consumed somewhere else entirely, and it is raised as itself. Without
+          that gate a caller-supplied key already spent elsewhere would surface
+          as a transport blip, and a wrapper retrying transport blips would loop
+          forever on a key that can never succeed.
+        * Among eligible failures the **most recent** is kept, not the first.
+          In a mixed run — a ``429`` that started nothing, then a ``504`` that
+          left a generation running, then the ``422`` — the ``504`` is the one
+          that describes the state the refusal implies. Raising the ``429``
+          would tell the caller nothing was started and invite a fresh-key
+          retry, which is the second billed generation.
+
+        ``.resend_refused`` is there for outer retry wrappers, which typically
+        key on ``http_status`` and never look at ``__cause__``; re-entering this
+        method mints a fresh key, so retrying a refused resend bills twice.
+
+        A ``deadline_exceeded`` ``504`` normally names a ``Retry-After`` and the
+        advice is to resend under the same key. That advice does not survive an
+        ``IdempotencyKeyReuse`` on ``__cause__``: this loop already followed it
+        and the server refused the key. Treat that pairing as "stop resending" —
+        the generation is unreachable under this key — rather than waiting out
+        ``retry_after`` for a resend that can only be refused again.
+
         **Every exception this raises carries the key it sent** on
         ``.idempotency_key`` (and the server's ``.request_id`` when the response
         named one), so a caller who lost the response — a ``deadline_exceeded``
@@ -221,6 +438,23 @@ class Models(_ModelsBase):
         ``exc.retry_after`` naming when to ask again when the server sent a
         ``Retry-After``. Without that attribute an auto-minted key died with the
         call and the paid-for generation was uncollectable.
+
+        **Resend the alt-provider controls with it.** A key's identity covers the
+        query as well as the method and body, and ``model_provider`` /
+        ``strict_mode`` / ``fallback_provider`` are query parameters — so a
+        recovery call that drops them presents the same key under a DIFFERENT
+        query and is refused, leaving the very generation it was meant to collect
+        uncollectable. This bites at the server default too: ``strict_mode=False``
+        is sent as ``strict_mode=false``, which is a different query from omitting
+        it. Pass the call back exactly as it was made::
+
+            client.models.run(
+                model, arguments,
+                idempotency_key=exc.idempotency_key,
+                model_provider=model_provider,
+                strict_mode=strict_mode,
+                fallback_provider=fallback_provider,
+            )
 
         Note that a dropped connection surfaces as an ``httpx`` error rather
         than a :class:`~comfy_sdk.ComfyError` — it never reached a response to
@@ -261,20 +495,110 @@ class Models(_ModelsBase):
         # the wire, so everything legal in it is deep-copyable.
         payload = deepcopy(dict(arguments))
         retrier = Retrier(self._retry, now=_now)
+        # The first retryable failure, kept so a key refusal on a later attempt
+        # cannot bury it. Only the first: every later one is the same call
+        # failing again, and the one the caller has to diagnose is the one that
+        # started the retrying.
+        claimed: BaseException | None = None
         # The key is stamped onto whatever this raises: it is a local of this
         # frame, so an exception that propagates past it would otherwise take
         # the caller's only route back to an already-billed generation with it.
         with translating(idempotency_key=key):
             while True:
                 try:
-                    return low.post_model_run(model, payload, idempotency_key=key, timeout=timeout)
+                    return low.post_model_run(
+                        model,
+                        payload,
+                        idempotency_key=key,
+                        model_provider=model_provider,
+                        strict_mode=strict_mode,
+                        fallback_provider=fallback_provider,
+                        timeout=timeout,
+                    )
                 except _CANDIDATE_FAILURES as exc:
+                    if claimed is not None and _is_key_reuse(exc):
+                        # The resend could never have succeeded — the server
+                        # refused the key, not the request — so raising it
+                        # would replace the real failure with an artefact of
+                        # this loop. Chained, not discarded: the 422 stays
+                        # reachable on `__cause__` and in the traceback.
+                        raise _resend_refused(_as_sdk_error(claimed, key)) from _as_sdk_error(
+                            exc, key
+                        )
                     delay = retrier.delay_before_retry(exc)
                     if delay is None:
                         raise
+                    if may_have_claimed_key(exc):
+                        claimed = exc
                     time.sleep(delay)
 
     # -- the queued form: submit, hold a handle, collect ------------------
+    def run(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
+        timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Run ``model`` with ``arguments`` and return the partner's native output.
+
+        See :meth:`_run` for the full contract; this is that call, answering the
+        result document alone.
+
+        ``run`` answers the native output because that document is what a caller
+        asked for; ``run_detailed`` answers a :class:`RouterRunResult`, which
+        carries that same output plus what Router disclosed about HOW the call
+        ran. The split exists because an alt-provider response is translated
+        back to this model's native contract, so the body alone cannot tell an
+        alt-provider run from a native one -- only the headers can, and most
+        callers should not pay an envelope for them.
+        """
+        return self._run(
+            model,
+            arguments,
+            idempotency_key=idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+            timeout=timeout,
+        )[0]
+
+    def run_detailed(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
+        timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
+    ) -> RouterRunResult:
+        """:meth:`run`, plus what Router disclosed about how the call ran.
+
+        ``run`` answers the native output because that document is what a caller
+        asked for; ``run_detailed`` answers a :class:`RouterRunResult`, which
+        carries that same output plus what Router disclosed about HOW the call
+        ran. The split exists because an alt-provider response is translated
+        back to this model's native contract, so the body alone cannot tell an
+        alt-provider run from a native one -- only the headers can, and most
+        callers should not pay an envelope for them.
+        """
+        body, headers = self._run(
+            model,
+            arguments,
+            idempotency_key=idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+            timeout=timeout,
+        )
+        return _run_result(body, headers)
+
     def submit(
         self,
         model: str,
@@ -446,20 +770,24 @@ class AsyncModels(_ModelsBase):
         self._low = low
         self._retry = retry
 
-    async def run(
+    async def _run(
         self,
         model: str,
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
         """Awaitable :meth:`Models.run` — same arguments, same result shape.
 
         This *is* the async form of ``run``: awaiting it on ``AsyncComfy`` is
         the whole difference from the sync client — including the model-id
-        rule, the retry policy, the one-key-per-call rule, and the
-        ``.idempotency_key`` every exception it raises carries for the replay.
+        rule, the retry policy, the one-key-per-call rule, the failure raised
+        when a resend is refused for key reuse, and the ``.idempotency_key``
+        every exception it raises carries for the replay.
         See :meth:`Models.run`.
         """
         low = cast(AsyncComfyLow, self._low)
@@ -474,6 +802,9 @@ class AsyncModels(_ModelsBase):
         # nested values included.
         payload = deepcopy(dict(arguments))
         retrier = Retrier(self._retry, now=_now)
+        # The most recent failure that could have claimed the key — see
+        # :meth:`Models.run`.
+        claimed: BaseException | None = None
         # The key is stamped onto whatever this raises: it is a local of this
         # frame, so an exception that propagates past it would otherwise take
         # the caller's only route back to an already-billed generation with it.
@@ -481,15 +812,75 @@ class AsyncModels(_ModelsBase):
             while True:
                 try:
                     return await low.post_model_run(
-                        model, payload, idempotency_key=key, timeout=timeout
+                        model,
+                        payload,
+                        idempotency_key=key,
+                        model_provider=model_provider,
+                        strict_mode=strict_mode,
+                        fallback_provider=fallback_provider,
+                        timeout=timeout,
                     )
                 except _CANDIDATE_FAILURES as exc:
+                    if claimed is not None and _is_key_reuse(exc):
+                        # The rejected resend replaces nothing — see
+                        # :meth:`Models.run`.
+                        raise _resend_refused(_as_sdk_error(claimed, key)) from _as_sdk_error(
+                            exc, key
+                        )
                     delay = retrier.delay_before_retry(exc)
                     if delay is None:
                         raise
+                    if may_have_claimed_key(exc):
+                        claimed = exc
                     await asyncio.sleep(delay)
 
     # -- the queued form: submit, hold a handle, collect ------------------
+    async def run(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
+        timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Awaitable :meth:`Models.run` — same arguments, same result shape."""
+        body, _ = await self._run(
+            model,
+            arguments,
+            idempotency_key=idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+            timeout=timeout,
+        )
+        return body
+
+    async def run_detailed(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
+        timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
+    ) -> RouterRunResult:
+        """Awaitable :meth:`Models.run_detailed` — same arguments, same result shape."""
+        body, headers = await self._run(
+            model,
+            arguments,
+            idempotency_key=idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+            timeout=timeout,
+        )
+        return _run_result(body, headers)
+
     async def submit(
         self,
         model: str,

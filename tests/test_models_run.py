@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import re
 from collections.abc import Mapping
 from typing import Any, cast
@@ -24,6 +25,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from comfy_low.errors import ApiError as LowApiError
 from comfy_low.transport import (
     MODEL_RUN_TIMEOUT,
     ROUTER_BASE_URL,
@@ -45,7 +47,9 @@ from comfy_sdk.models import AsyncModels, Models
 from comfy_sdk.router_exceptions import (
     ERROR_TYPE_HEADER,
     DeadlineExceeded,
+    InvalidInput,
     RouterError,
+    error_from_completion,
     error_from_response,
 )
 
@@ -128,6 +132,79 @@ def test_the_sans_io_request_builder_agrees_with_the_wire() -> None:
     assert path == "/v2/models/acme/flux-dev"
     assert body == ARGS
     assert headers == {"Idempotency-Key": "k-1"}
+
+
+def test_the_alt_provider_controls_are_query_params_sent_only_when_set() -> None:
+    # Omitted -> no query at all, so a call that names none of the controls is
+    # byte-for-byte the request this route has always made.
+    assert model_run_request(MODEL, ARGS, None)[0] == "/v2/models/acme/flux-dev"
+    # Each control is a query param on the run path; `strict_mode` renders as the
+    # spec's `true`/`false` rather than Python's `True`/`False`.
+    assert (
+        model_run_request(MODEL, ARGS, None, model_provider="fal")[0]
+        == "/v2/models/acme/flux-dev?model_provider=fal"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, strict_mode=True)[0]
+        == "/v2/models/acme/flux-dev?strict_mode=true"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, strict_mode=False)[0]
+        == "/v2/models/acme/flux-dev?strict_mode=false"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider="false")[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=false"
+    )
+    # All three together, in the order the builder emits them; the body and the
+    # Idempotency-Key are untouched by the query.
+    path, body, headers = model_run_request(
+        MODEL,
+        ARGS,
+        "k-1",
+        model_provider="fal",
+        strict_mode=False,
+        fallback_provider="false",
+    )
+    assert path == (
+        "/v2/models/acme/flux-dev?model_provider=fal&strict_mode=false&fallback_provider=false"
+    )
+    assert body == ARGS
+    assert headers == {"Idempotency-Key": "k-1"}
+
+
+def test_a_bool_fallback_provider_renders_the_spec_spelling_not_pythons() -> None:
+    """``fallback_provider=False`` must turn fallback OFF, not silently leave it on.
+
+    The spec reads this parameter as "omitted, or any value other than
+    ``false``, turns fallback on". Python's ``str(False)`` is the capitalised
+    ``"False"``, which is *a value other than* ``false`` -- so passing the
+    boolean through unnormalised would put fallback ON for the one caller who
+    explicitly asked for it OFF, and do it silently, with a 200 that looks
+    exactly like the intended one. That is the whole reason this normalisation
+    exists, so it is pinned here rather than left to the type hint.
+    """
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider=False)[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=false"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider=True)[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=true"
+    )
+    # A str still passes through as given: "false" keeps working, and a future
+    # non-boolean vocabulary on this parameter needs no change to the builder.
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider="false")[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=false"
+    )
+    # The capitalised spelling is what a caller gets ONLY by asking for it as a
+    # string, and it is left alone -- normalising a str would be this function
+    # second-guessing a value the spec says to forward verbatim.
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider="False")[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=False"
+    )
 
 
 @pytest.mark.parametrize(
@@ -465,6 +542,116 @@ def test_an_unmapped_failure_still_lands_as_a_comfy_error(server) -> None:
     assert excinfo.value.http_status == 503
 
 
+# --- a per-field validation failure, end to end --------------------------
+#
+# Router answers a model whose schema rejected the input with a `422` whose
+# body is a `detail` ARRAY, one entry per failing field, and the coarse bucket
+# on `X-Comfy-Error-Type` -- that body carries no `error_type` of its own. The
+# entries are the only place the provider-level reason survives, and
+# `RouterError.errors` is documented as populated whenever the response carried
+# them. Getting there means crossing the layer boundary: `comfy_low` decodes
+# the response but may not import `comfy_sdk`, so it carries the entries raw
+# and `to_sdk_error` types them.
+
+#: Two failing fields, the shape `spec/router-openapi.yaml` documents.
+VALIDATION_DETAIL: list[Any] = [
+    {
+        "loc": ["body", "steps"],
+        "msg": "ensure this value is less than or equal to 8",
+        "type": "less_than_equal",
+        "ctx": {"limit_value": 8},
+        "input": 50,
+    },
+    {
+        "loc": ["body", "model"],
+        "msg": "unknown model variant",
+        "type": "value_error",
+    },
+]
+
+
+def _assert_validation_surface(exc: InvalidInput) -> None:
+    """The whole contract of a per-field failure, asserted identically on both
+    clients so the sync and async paths cannot diverge on it."""
+    assert len(exc.errors) == 2
+    assert exc.errors[1].loc == ("body", "model")
+    assert exc.errors[1].msg == "unknown model variant"
+    assert exc.errors[1].type == "value_error"
+    # The bound the first entry carries, which the coarse bucket cannot express
+    # and which a caller reads to say what the limit actually was.
+    assert exc.errors[0].ctx == {"limit_value": 8}
+    assert exc.errors[0].input == 50
+    # The human-readable line is the entries' own messages, joined -- not the
+    # `HTTP 422` a caller used to get, and not a Python repr of the array.
+    assert exc.detail == "ensure this value is less than or equal to 8; unknown model variant"
+    assert str(exc) == exc.detail
+    assert "[" not in exc.detail
+    assert exc.error_type == "invalid_input"
+    assert exc.http_status == 422
+    # The raw entries on the protocol error underneath: the carrier the
+    # layering rule forces, readable through `__cause__` for anyone debugging
+    # the boundary itself.
+    cause = exc.__cause__
+    assert isinstance(cause, LowApiError)
+    assert cause.validation_errors == tuple(VALIDATION_DETAIL)
+
+
+def test_a_per_field_validation_failure_populates_errors(server) -> None:
+    server.state.model_run_validation_detail = VALIDATION_DETAIL
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            client.models.run(MODEL, ARGS)
+    _assert_validation_surface(excinfo.value)
+
+
+async def test_an_async_per_field_validation_failure_populates_errors_too(server) -> None:
+    server.state.model_run_validation_detail = VALIDATION_DETAIL
+    async with AsyncComfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            await client.models.run(MODEL, ARGS)
+    _assert_validation_surface(excinfo.value)
+
+
+def test_a_validation_body_of_non_mappings_degrades_and_never_raises(server) -> None:
+    # A `detail` array whose members are not objects at all. Nothing can be
+    # typed out of them, so `.errors` is empty and the message falls back to
+    # the status -- decoding an error response must never replace a diagnosable
+    # failure with an undiagnosable one.
+    server.state.model_run_validation_detail = [1, "x"]
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert excinfo.value.errors == ()
+    assert excinfo.value.http_status == 422
+    # `HTTP 422` plus the body excerpt, which is exactly the pre-existing rule
+    # for a body that stated no message -- the excerpt is dropped only where a
+    # message WAS found, and none was here. Nothing about this case changed,
+    # and it is the response for which the raw text is the only description of
+    # what the server objected to.
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, LowApiError)
+    assert cause.message == "HTTP 422"
+    assert cause.validation_errors == ()
+    assert excinfo.value.detail == 'HTTP 422: {"detail": [1, "x"]}'
+
+
+def test_the_run_and_queued_paths_agree_on_one_validation_body(server) -> None:
+    # The queued surface builds its exception from the completion payload
+    # (`error_from_completion`) and the awaited one from the HTTP response, so
+    # the two reach `.errors` by different code entirely. One wire body has to
+    # produce one set of entries, or a caller's branch works on `submit()` and
+    # silently does not on `run()`.
+    server.state.model_run_validation_detail = VALIDATION_DETAIL
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            client.models.run(MODEL, ARGS)
+    queued = error_from_completion(
+        {"error_type": "invalid_input", "detail": VALIDATION_DETAIL},
+    )
+    assert queued is not None
+    assert excinfo.value.errors == queued.errors
+
+
 # --- the key survives the failure ----------------------------------------
 #
 # The router's replay contract lets a caller who lost a response resend the
@@ -495,6 +682,7 @@ class _RaisingLow:
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
+        **_: Any,
     ) -> dict[str, Any]:
         self.keys.append(idempotency_key)
         raise self._exc
@@ -508,6 +696,7 @@ class _AsyncRaisingLow(_RaisingLow):
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
+        **_: Any,
     ) -> dict[str, Any]:
         self.keys.append(idempotency_key)
         raise self._exc
@@ -804,3 +993,77 @@ def test_an_undecodable_success_body_is_a_stamped_sdk_error(server) -> None:
     assert excinfo.value.idempotency_key is not None
     assert excinfo.value.http_status == 200
     assert excinfo.value.code == "invalid_response"
+
+
+# --- run_detailed: what Router disclosed about HOW the run ran ---------------
+
+
+class _HeaderLow:
+    """A stub whose ``post_model_run`` answers one canned (body, headers) pair."""
+
+    def __init__(self, headers: dict[str, str]) -> None:
+        self._headers = headers
+        self.result: dict[str, Any] = {"images": [{"url": "http://example.invalid/x.png"}]}
+
+    def post_model_run(
+        self, model: str, arguments: Mapping[str, Any], **_: Any
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
+        return self.result, self._headers
+
+
+def _detailed(headers: dict[str, str]) -> Any:
+    low = _HeaderLow(headers)
+    return Models(cast(Any, low)).run_detailed(MODEL, ARGS)
+
+
+def test_run_detailed_surfaces_the_provider_that_actually_served_the_call() -> None:
+    """The body cannot answer this, which is the whole reason the header exists.
+
+    An alt-provider response is translated back to the model's own native
+    contract, so a fal-served run and a natively-served one produce the SAME
+    document. ``X-Comfy-Router-Fallback-Provider`` is the only disclosure that
+    they differed, so dropping it -- as returning the bare body did -- left a
+    caller no way to tell which leg ran.
+    """
+    assert _detailed({"X-Comfy-Router-Fallback-Provider": "fal"}).serving_provider == "fal"
+    # Absent means "the provider asked for served it", the common case — NOT
+    # "unknown", so it must not be reported as a missing value.
+    assert _detailed({}).serving_provider is None
+
+
+def test_run_detailed_parses_dropped_params_as_json_not_as_a_comma_split() -> None:
+    """The spec's own example entry contains a comma, so a comma split is wrong.
+
+    The header is described in prose as "a JSON array of strings" while its
+    declared schema (``type: array``) means OpenAPI's simple comma-delimited
+    form. The example settles it: one entry reading ``moderation (fal applies
+    its own, non-configurable safety filtering)`` has a comma INSIDE it, and a
+    comma split would tear that single entry into two meaningless fragments.
+    """
+    entry = "moderation (fal applies its own, non-configurable safety filtering)"
+    got = _detailed({"X-Comfy-Router-Dropped-Params": json.dumps([entry])})
+    assert got.dropped_params == (entry,)
+    assert _detailed({}).dropped_params is None
+    # A value that is not JSON at all is kept whole rather than guessed at: one
+    # intact entry a human can read beats two confident fragments.
+    assert _detailed({"X-Comfy-Router-Dropped-Params": "not json"}).dropped_params == ("not json",)
+
+
+def test_run_detailed_reports_a_replay_from_the_headers_presence() -> None:
+    # The header is absent on a fresh run rather than sent as `false`, so this
+    # branches on presence — reading it as a boolean would make "absent" and
+    # "false" indistinguishable from a bug that stopped sending it.
+    assert _detailed({"X-Comfy-Idempotent-Replayed": "true"}).replayed is True
+    assert _detailed({}).replayed is False
+
+
+def test_run_returns_the_bare_body_so_the_default_surface_is_unchanged() -> None:
+    low = _HeaderLow({"X-Comfy-Router-Fallback-Provider": "fal"})
+    assert Models(cast(Any, low)).run(MODEL, ARGS) == low.result
+
+
+@pytest.mark.parametrize("cls", [Models, AsyncModels])
+def test_both_clients_expose_run_detailed(cls: type) -> None:
+    # The suffix rule is about sync-vs-async naming, not about a second
+    # operation — but both namespaces must still spell the same operations.
+    assert hasattr(cls, "run_detailed")
