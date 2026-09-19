@@ -14,16 +14,22 @@ What each group here is for:
   ``error_type`` raises the typed router exception from every path that hands
   back a result, whether the bucket arrives on the status or on the result;
 * the **Idempotency-Key** contract — one fresh key per ``submit`` call;
-* ``subscribe``'s client-side timeout, which cancels before it raises;
+* ``subscribe``'s client-side timeout and its three endings — cancelled when
+  the queue accepted the cleanup cancel, detached when it refused one it had
+  already dispatched, and an ordinary result when the run finished during the
+  teardown;
 * and that ``models.run`` is untouched by all of it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
+import pickle
 import time
 from typing import Any
 
+import httpx
 import pytest
 
 from comfy_low.transport import (
@@ -35,9 +41,18 @@ from comfy_low.transport import (
 )
 from comfy_sdk import AsyncComfy, Comfy, QueueUpdate
 from comfy_sdk.exceptions import ComfyError
-from comfy_sdk.model_requests import COMPLETED, AsyncRequestHandle, RequestHandle
+from comfy_sdk.model_requests import (
+    COMPLETED,
+    AsyncDetachedRequest,
+    AsyncRequestHandle,
+    DetachedRequest,
+    RequestHandle,
+    SubscribeTimeout,
+    _refused_on_state,
+)
 from comfy_sdk.retry import NO_RETRY
 from comfy_sdk.router_exceptions import (
+    AlreadyCompleted,
     ContentPolicyViolation,
     NotEnabled,
     RouterError,
@@ -828,3 +843,544 @@ async def test_async_subscribe_cancellation_requests_a_remote_cancel(server, mon
             await task
 
     assert server.state.queue_cancel_count == 1
+
+
+# --- the timeout's three endings: cancelled, detached, completed ------------
+#
+# The queue honours a cancel only before it dispatches a request: a run already
+# in flight is served and billed whatever the caller does, and the cancel
+# `subscribe` fires on its own timeout is refused. These pin the three ways
+# that timeout can now end, and — just as load-bearing — that everything which
+# is NOT that benign refusal still raises.
+
+#: The refusal a dispatched run's cancel is answered with. A `409` carrying
+#: prose and no error bucket, which is the shape the queue's state refusals
+#: have today.
+IN_FLIGHT_REFUSAL = (409, {"detail": "in-flight tasks cannot be cancelled"})
+
+
+def _no_sleep(monkeypatch) -> None:
+    monkeypatch.setattr("comfy_sdk.model_requests.time.sleep", lambda _s: None)
+
+
+def test_a_refused_in_flight_cancel_detaches_instead_of_raising(server, monkeypatch) -> None:
+    """Acceptance: the timeout hands the run back rather than erroring out."""
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+    server.state.queue_cancel_refusal = IN_FLIGHT_REFUSAL
+
+    with _client() as client:
+        outcome = client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert isinstance(outcome, DetachedRequest)
+    assert outcome.request_id == server.state.queue_request_id
+    assert outcome.model == MODEL
+    # Confirmed against the server rather than inferred from the refusal.
+    assert outcome.status == server.state.queue_pending_status
+    assert isinstance(outcome.handle, RequestHandle)
+    assert outcome.handle.request_id == outcome.request_id
+    # The cancel was attempted exactly as before; only its refusal is read
+    # differently.
+    assert server.state.queue_cancel_count == 1
+
+
+async def test_async_refused_in_flight_cancel_detaches_instead_of_raising(
+    server, monkeypatch
+) -> None:
+    """Acceptance, awaitable half: the same three endings, the async handle."""
+
+    async def _sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _sleep)
+    server.state.queue_polls_to_complete = 10_000
+    server.state.queue_cancel_refusal = IN_FLIGHT_REFUSAL
+
+    async with AsyncComfy(api_key="comfyui-test-key") as client:
+        outcome = await client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert isinstance(outcome, AsyncDetachedRequest)
+    assert outcome.request_id == server.state.queue_request_id
+    assert outcome.model == MODEL
+    assert isinstance(outcome.handle, AsyncRequestHandle)
+    assert server.state.queue_cancel_count == 1
+
+
+def test_an_accepted_cancel_keeps_the_cancelled_semantics(server, monkeypatch) -> None:
+    """Acceptance: a request still in the queue really is cancelled, and raises."""
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+
+    with _client() as client:
+        with pytest.raises(SubscribeTimeout) as excinfo:
+            client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert isinstance(excinfo.value, TimeoutError)
+    assert excinfo.value.cancelled is True
+    assert excinfo.value.cancel_error is None
+    assert excinfo.value.request_id == server.state.queue_request_id
+    assert excinfo.value.model == MODEL
+    assert server.state.queue_cancel_count == 1
+    # No confirming poll: an accepted cancel needs no second opinion.
+    assert server.state.queue_status_count == 1
+
+
+async def test_async_accepted_cancel_keeps_the_cancelled_semantics(server, monkeypatch) -> None:
+    async def _sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _sleep)
+    server.state.queue_polls_to_complete = 10_000
+
+    async with AsyncComfy(api_key="comfyui-test-key") as client:
+        with pytest.raises(SubscribeTimeout) as excinfo:
+            await client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert excinfo.value.cancelled is True
+
+
+def test_cancelled_and_detached_are_told_apart_without_reading_a_message(
+    server, monkeypatch
+) -> None:
+    """Acceptance: the distinction is carried by the type, not by prose.
+
+    The same call, the same arguments, the same timeout — only what the cancel
+    route answers differs — and a caller branches on ``isinstance`` alone.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+
+    with _client() as client:
+        with pytest.raises(SubscribeTimeout) as excinfo:
+            client.models.subscribe(MODEL, ARGS, timeout=0.0)
+        cancelled = excinfo.value
+
+        server.state.queue_canceled = False
+        server.state.queue_cancel_refusal = IN_FLIGHT_REFUSAL
+        detached = client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert cancelled.cancelled is True
+    assert isinstance(detached, DetachedRequest)
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        (401, {"detail": "the credential was rejected"}),
+        (500, {"detail": "the queue fell over"}),
+    ],
+    ids=["unauthorized", "server-error"],
+)
+def test_a_cancel_that_fails_for_any_other_reason_still_raises(
+    server, monkeypatch, refusal
+) -> None:
+    """Acceptance: only the in-flight refusal is benign.
+
+    A cancel that failed for a reason of its own says nothing about whether the
+    run stopped, so it must not be read as a detach — and it must not be
+    silently swallowed either, which is what it was before the three endings.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+    server.state.queue_cancel_refusal = refusal
+
+    with _client(retry=NO_RETRY) as client:
+        with pytest.raises(SubscribeTimeout) as excinfo:
+            client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert excinfo.value.cancelled is False
+    assert isinstance(excinfo.value.cancel_error, ComfyError)
+    assert excinfo.value.cancel_error.http_status == refusal[0]
+    assert excinfo.value.__cause__ is excinfo.value.cancel_error
+
+
+def test_a_cancel_that_fails_on_the_transport_still_raises(server, monkeypatch) -> None:
+    """A failure with no response at all carries no status to mistake for 409."""
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+
+    def _unreachable(*_a: Any, **_k: Any) -> None:
+        raise httpx.ConnectError("the queue is unreachable")
+
+    with _client(retry=NO_RETRY) as client:
+        client._low.put_model_request_cancel = _unreachable  # type: ignore[method-assign]
+        with pytest.raises(SubscribeTimeout) as excinfo:
+            client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert excinfo.value.cancelled is False
+    assert isinstance(excinfo.value.cancel_error, httpx.ConnectError)
+
+
+def test_a_detached_request_is_collectable_by_request_id(server, monkeypatch, fast_poll) -> None:
+    """Acceptance: re-attaching to the detached run returns its result.
+
+    Through ``models.handle`` and the two ids alone — not through the object
+    the detach handed back — because the point of a detach is that the run
+    outlives the process that started it.
+    """
+    _no_sleep(monkeypatch)
+    # One poll inside the subscribe, one confirming poll after the refusal, and
+    # the run completes on the one after that.
+    server.state.queue_polls_to_complete = 3
+    server.state.queue_cancel_refusal = IN_FLIGHT_REFUSAL
+
+    with _client() as client:
+        detached = client.models.subscribe(MODEL, ARGS, timeout=0.0)
+        assert isinstance(detached, DetachedRequest)
+
+        rebuilt = client.models.handle(MODEL, detached.request_id)
+        assert rebuilt.request_id == detached.request_id
+        assert rebuilt.get() == server.state.queue_result
+
+
+def test_a_request_that_completes_during_teardown_returns_its_result(server, monkeypatch) -> None:
+    """The third ending: the refusal was a run that had just finished.
+
+    It has been generated and billed, so discarding it and raising would throw
+    away a result the caller has already paid for.
+    """
+    _no_sleep(monkeypatch)
+    # The subscribe's own poll is the last pending one; the confirming poll
+    # after the refused cancel finds it COMPLETED.
+    server.state.queue_polls_to_complete = 1
+    server.state.queue_cancel_refusal = (409, {"status": "ALREADY_COMPLETED"})
+
+    with _client() as client:
+        assert client.models.subscribe(MODEL, ARGS, timeout=0.0) == server.state.queue_result
+
+
+def test_a_confirming_poll_that_fails_still_reports_a_detach(server, monkeypatch) -> None:
+    """The refusal already established the run was not cancelled.
+
+    Raising here would strand the caller without the ids for a generation they
+    are now certainly being billed for, so the detach stands and the
+    unconfirmed status says so by being empty.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+    server.state.queue_cancel_refusal = IN_FLIGHT_REFUSAL
+
+    with _client(retry=NO_RETRY) as client:
+        handle = client.models.submit(MODEL, ARGS)
+        # Only the confirming poll fails: the subscribe below submits its own
+        # request, and this one is torn down by hand.
+        server.state.queue_status_error = (503, "service_unavailable")
+        outcome = handle._detach_report()
+
+    assert isinstance(outcome, DetachedRequest)
+    assert outcome.request_id == handle.request_id
+    assert outcome.status == ""
+
+
+async def test_async_cancel_that_fails_for_any_other_reason_still_raises(
+    server, monkeypatch
+) -> None:
+    """The narrowing is the async half's too — only the refusal is benign."""
+
+    async def _sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _sleep)
+    server.state.queue_polls_to_complete = 10_000
+    server.state.queue_cancel_refusal = (500, {"detail": "the queue fell over"})
+
+    async with AsyncComfy(api_key="comfyui-test-key", retry=NO_RETRY) as client:
+        with pytest.raises(SubscribeTimeout) as excinfo:
+            await client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert excinfo.value.cancelled is False
+    assert isinstance(excinfo.value.cancel_error, ComfyError)
+    assert excinfo.value.cancel_error.http_status == 500
+
+
+async def test_async_request_that_completes_during_teardown_returns_its_result(
+    server, monkeypatch
+) -> None:
+    async def _sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _sleep)
+    server.state.queue_polls_to_complete = 1
+    server.state.queue_cancel_refusal = (409, {"status": "ALREADY_COMPLETED"})
+
+    async with AsyncComfy(api_key="comfyui-test-key") as client:
+        outcome = await client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert outcome == server.state.queue_result
+
+
+async def test_async_detached_request_is_collectable_by_request_id(
+    server, monkeypatch, fast_poll
+) -> None:
+    """The awaitable half of the re-attach: the two ids are all it takes."""
+
+    async def _sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _sleep)
+    server.state.queue_polls_to_complete = 3
+    server.state.queue_cancel_refusal = IN_FLIGHT_REFUSAL
+
+    async with AsyncComfy(api_key="comfyui-test-key") as client:
+        detached = await client.models.subscribe(MODEL, ARGS, timeout=0.0)
+        assert isinstance(detached, AsyncDetachedRequest)
+
+        rebuilt = await client.models.handle(MODEL, detached.request_id)
+        assert await rebuilt.get() == server.state.queue_result
+
+
+# --- a 2xx cancel is not proof the run stopped ------------------------------
+
+
+def test_a_cancel_accepted_on_a_live_status_detaches_rather_than_claiming_a_stop(
+    server, monkeypatch
+) -> None:
+    """A 2xx says the route took the message, not that the work stopped.
+
+    The binding accepts ``200``, ``202`` and ``204`` alike, so a request that
+    won the race into flight — answered ``202``/``CANCELING``, or ``200`` on a
+    run already dispatched — used to come back as ``cancelled=True``: the one
+    reading the response does not support, and the exact claim (nothing ran,
+    nothing is billed) that is most expensive to get wrong.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+    server.state.queue_cancel_status = 202
+    server.state.queue_cancel_accept_status = "CANCELING"
+    server.state.queue_cancel_error_type = None
+
+    with _client(retry=NO_RETRY) as client:
+        outcome = client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert isinstance(outcome, DetachedRequest)
+    assert outcome.status == server.state.queue_pending_status
+    assert server.state.queue_cancel_count == 1
+
+
+async def test_async_cancel_accepted_on_a_live_status_detaches(server, monkeypatch) -> None:
+    """The async half reads a live accept the same way."""
+
+    async def _sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _sleep)
+    server.state.queue_polls_to_complete = 10_000
+    server.state.queue_cancel_status = 202
+    server.state.queue_cancel_accept_status = "CANCELING"
+    server.state.queue_cancel_error_type = None
+
+    async with AsyncComfy(api_key="comfyui-test-key", retry=NO_RETRY) as client:
+        outcome = await client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert isinstance(outcome, AsyncDetachedRequest)
+    assert outcome.status == server.state.queue_pending_status
+
+
+def test_a_cancel_that_lost_the_race_returns_the_result_it_was_billed_for(
+    server, monkeypatch
+) -> None:
+    """Terminal, but carrying no bucket: the run finished on its own.
+
+    This queue expresses a stop as ``COMPLETED`` plus an ``error_type``, so a
+    ``COMPLETED`` with no bucket is a generation that completed and was billed.
+    Reporting it as a cancellation would throw that result away AND tell the
+    caller nothing was charged.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+    server.state.queue_cancel_error_type = None
+
+    with _client() as client:
+        assert client.models.subscribe(MODEL, ARGS, timeout=0.0) == server.state.queue_result
+
+
+def test_a_body_less_accepted_cancel_still_reports_a_cancellation(server, monkeypatch) -> None:
+    """The ordinary accepted cancel is a ``204``, and it is unchanged.
+
+    Nothing in an empty body contradicts the accept, and charging every
+    timeout an extra round trip to re-confirm the common case would be the
+    wrong trade.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+    server.state.queue_cancel_status = 204
+
+    with _client() as client:
+        with pytest.raises(SubscribeTimeout) as excinfo:
+            client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert excinfo.value.cancelled is True
+    assert server.state.queue_cancel_count == 1
+
+
+# --- which 409s are the state refusal ---------------------------------------
+
+
+def test_a_409_naming_a_bucket_is_not_read_as_the_state_refusal(server, monkeypatch) -> None:
+    """Fail closed: only a ``409`` that names NOTHING is the in-flight refusal.
+
+    ``invalid_input`` and ``concurrency_limit_exceeded`` are buckets the
+    vendored contract already documents on this route. Reading them as the
+    state refusal would report a detach — asserting the run is in flight and
+    billed — for a cancel that failed for an entirely different reason.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+    server.state.queue_cancel_refusal = (
+        409,
+        {"detail": "bad request id", "error_type": "invalid_input"},
+    )
+
+    with _client(retry=NO_RETRY) as client:
+        with pytest.raises(SubscribeTimeout) as excinfo:
+            client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert excinfo.value.cancelled is False
+    assert isinstance(excinfo.value.cancel_error, ComfyError)
+
+
+def test_the_typed_cancel_refusal_is_recognised_by_its_class(server, monkeypatch) -> None:
+    """``AlreadyCompleted`` reaches the predicate as a class, not as a status.
+
+    The refusal the contract DOES name arrives typed, and branching on the
+    class is what the status clause is a fallback for.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 10_000
+
+    with _client(retry=NO_RETRY) as client:
+        handle = client.models.submit(MODEL, ARGS)
+        server.state.queue_cancel_refusal = (409, {"status": "ALREADY_COMPLETED"})
+        with pytest.raises(AlreadyCompleted) as excinfo:
+            handle.cancel()
+
+    assert _refused_on_state(excinfo.value) is True
+
+
+# --- a failed collect must not strand the caller ----------------------------
+
+
+def test_a_failing_teardown_collect_degrades_to_a_detach(server, monkeypatch) -> None:
+    """The result fetch runs after the deadline, and it can fail on its own.
+
+    Letting that out raw means the caller's ``except TimeoutError`` never
+    fires and nothing hands back the ids for a generation that HAS finished
+    and HAS been billed — the very stranding the detach report exists to stop.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 1
+    server.state.queue_cancel_refusal = (409, {"status": "ALREADY_COMPLETED"})
+    server.state.queue_result_http_error = (503, "service_unavailable")
+
+    with _client(retry=NO_RETRY) as client:
+        outcome = client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+    assert isinstance(outcome, DetachedRequest)
+    assert outcome.request_id == server.state.queue_request_id
+    assert outcome.status == COMPLETED
+
+
+def test_a_teardown_completion_that_carries_a_bucket_still_raises(server, monkeypatch) -> None:
+    """A run that ended BADLY is not degraded to "still running".
+
+    The typed error is the run's own outcome rather than a failure to read it,
+    so it is the honest answer; a detach there would claim a finished run is
+    still going and still billing.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 1
+    server.state.queue_cancel_refusal = (409, {"status": "ALREADY_COMPLETED"})
+    server.state.queue_error_type = "content_policy_violation"
+
+    with _client(retry=NO_RETRY) as client:
+        with pytest.raises(ContentPolicyViolation):
+            client.models.subscribe(MODEL, ARGS, timeout=0.0)
+
+
+# --- the callback is owed the terminal observation --------------------------
+
+
+def test_the_teardown_completion_reaches_the_queue_update_callback(server, monkeypatch) -> None:
+    """``on_queue_update`` is promised "every change of status ... and the completion".
+
+    On the one timeout ending that returns a result, it is the only place a
+    caller driving a state machine off the callback can learn the run ended.
+    """
+    _no_sleep(monkeypatch)
+    server.state.queue_polls_to_complete = 1
+    server.state.queue_cancel_refusal = (409, {"status": "ALREADY_COMPLETED"})
+    seen: list[QueueUpdate] = []
+
+    with _client() as client:
+        client.models.subscribe(MODEL, ARGS, timeout=0.0, on_queue_update=seen.append)
+
+    assert seen, "the callback saw nothing at all"
+    assert seen[-1].is_completed
+
+
+async def test_async_teardown_completion_reaches_the_callback(server, monkeypatch) -> None:
+    """The awaitable half awaits the callback here, as its loop does."""
+
+    async def _sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _sleep)
+    server.state.queue_polls_to_complete = 1
+    server.state.queue_cancel_refusal = (409, {"status": "ALREADY_COMPLETED"})
+    seen: list[QueueUpdate] = []
+
+    async def _record(update: QueueUpdate) -> None:
+        seen.append(update)
+
+    async with AsyncComfy(api_key="comfyui-test-key") as client:
+        await client.models.subscribe(MODEL, ARGS, timeout=0.0, on_queue_update=_record)
+
+    assert seen, "the awaited callback saw nothing at all"
+    assert seen[-1].is_completed
+
+
+# --- the report survives leaving the process --------------------------------
+
+
+def test_a_subscribe_timeout_survives_a_round_trip_through_pickle() -> None:
+    """The ids are the only route back to a billed run, so they must travel.
+
+    ``BaseException.__reduce__`` rebuilds from ``args`` alone, which here is
+    just the message — so the inherited one dies on the required keyword-only
+    fields and masks the real error in exactly the cross-process workflow this
+    surface exists for.
+    """
+    original = SubscribeTimeout(
+        "timed out",
+        request_id="req_1",
+        model=MODEL,
+        cancelled=False,
+        cancel_error=None,
+    )
+
+    restored = pickle.loads(pickle.dumps(original))
+
+    assert isinstance(restored, SubscribeTimeout)
+    assert isinstance(restored, TimeoutError)
+    assert str(restored) == "timed out"
+    assert restored.request_id == "req_1"
+    assert restored.model == MODEL
+    assert restored.cancelled is False
+    assert restored.cancel_error is None
+
+
+def test_a_subscribe_timeout_copies_with_its_cancel_error() -> None:
+    """``copy.copy`` goes through the same hook, and the chained failure rides along."""
+    original = SubscribeTimeout(
+        "timed out",
+        request_id="req_1",
+        model=MODEL,
+        cancelled=False,
+        cancel_error=ComfyError("the credential was rejected", http_status=401),
+    )
+
+    restored = copy.copy(original)
+
+    assert restored.cancelled is False
+    assert isinstance(restored.cancel_error, ComfyError)
+    assert restored.cancel_error.http_status == 401
