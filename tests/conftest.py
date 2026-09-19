@@ -158,7 +158,9 @@ class ServerState:
     # disclosure headers the body cannot carry (X-Comfy-Credits-Used,
     # X-Comfy-Router-Fallback-Provider, ...). Empty by default, because Router
     # sends none of them on an ordinary run and "absent" is a case the SDK has
-    # to get right in its own name.
+    # to get right in its own name. Applied to a replayed 200 as well as a
+    # fresh one -- a replay carries `Idempotent-Replayed` on top of these
+    # rather than instead of them.
     model_run_response_headers: dict[str, str] = field(default_factory=dict)
     # Answer a repeated model-run key with the v2 jobs rule (422
     # idempotency_key_reuse) instead of the router contract's replay-or-409.
@@ -820,10 +822,18 @@ def _make_handler(state: ServerState):
             # rather than rejecting the resend, and the model does not run
             # again — which is the whole point of asking under the same key.
             if key and key in state.model_run_replay_store:
+                # `model_run_response_headers` is merged in here as well as on
+                # the fresh-run path below, because a replay is the canonical
+                # reported-zero and the only response where `credits_used` and
+                # `replayed` are both meaningful at once. Stamped first, so the
+                # replay marker itself cannot be overwritten by a test's dict.
                 self._json(
                     200,
                     state.model_run_replay_store[key],
-                    headers={"Idempotent-Replayed": "true"},
+                    headers={
+                        **state.model_run_response_headers,
+                        "Idempotent-Replayed": "true",
+                    },
                 )
                 return
 

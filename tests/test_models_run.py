@@ -43,7 +43,7 @@ from comfy_sdk import (
     RetryPolicy,
 )
 from comfy_sdk.exceptions import ComfyError, NotFound, Unauthorized
-from comfy_sdk.models import AsyncModels, Models
+from comfy_sdk.models import AsyncModels, Models, RouterRunResult
 from comfy_sdk.router_exceptions import (
     ERROR_TYPE_HEADER,
     DeadlineExceeded,
@@ -1053,8 +1053,46 @@ def test_run_detailed_reports_a_replay_from_the_headers_presence() -> None:
     # The header is absent on a fresh run rather than sent as `false`, so this
     # branches on presence — reading it as a boolean would make "absent" and
     # "false" indistinguishable from a bug that stopped sending it.
-    assert _detailed({"X-Comfy-Idempotent-Replayed": "true"}).replayed is True
+    assert _detailed({"Idempotent-Replayed": "true"}).replayed is True
     assert _detailed({}).replayed is False
+    # The contract spells the header bare. The `X-Comfy-` prefixed spelling the
+    # lift used to read is not a second name for it — it is not sent at all, so
+    # it must not be honoured as an alias either. Accepting it would keep the
+    # old bug alive under a test that looked like it covered the fix.
+    assert _detailed({"X-Comfy-Idempotent-Replayed": "true"}).replayed is False
+
+
+def test_run_detailed_reports_a_replay_off_a_real_replayed_response(server) -> None:
+    """The header name is the whole of this field, so pin it over the wire.
+
+    The unit test above hand-feeds a dict and would pass against whatever
+    spelling the lift happened to read — which is exactly how the lift came to
+    read `X-Comfy-Idempotent-Replayed`, a name the vendored contract does not
+    use, leaving `replayed` permanently `False` against a real deployment. Here
+    the stub answers a re-sent key the way the contract says Router does, so
+    the name has to match something the SDK did not choose.
+    """
+    with Comfy(retry=NO_RETRY) as client:
+        key = "replay-name-pin"
+        server.state.model_run_replay_store[key] = server.state.model_run_result
+        got = client.models.run_detailed(MODEL, ARGS, idempotency_key=key)
+    assert got.replayed is True
+
+
+def test_a_replayed_run_can_report_its_credits_too(server) -> None:
+    # A replay is the canonical reported-zero: it is answered from the record
+    # and not billed again. `credits_used` and `replayed` are only ever both
+    # meaningful on this one response, so pin the combination rather than
+    # assuming the two lifts compose.
+    server.state.model_run_response_headers = {"X-Comfy-Credits-Used": "0"}
+    with Comfy(retry=NO_RETRY) as client:
+        key = "replay-with-credits"
+        server.state.model_run_replay_store[key] = server.state.model_run_result
+        got = client.models.run_detailed(MODEL, ARGS, idempotency_key=key)
+    assert got.replayed is True
+    # Reported zero, not absent — the distinction the field exists to keep.
+    assert got.credits_used == "0"
+    assert got.credits_used is not None
 
 
 def test_run_returns_the_bare_body_so_the_default_surface_is_unchanged() -> None:
@@ -1129,6 +1167,57 @@ async def test_async_run_detailed_carries_the_credits_header_too(server) -> None
     async with AsyncComfy(retry=NO_RETRY) as client:
         got = await client.models.run_detailed(MODEL, ARGS)
     assert got.credits_used == "1.25"
+
+
+def test_credits_used_is_optional_so_the_public_shape_stays_constructible() -> None:
+    """`RouterRunResult` is public and re-exported, so this had to stay additive.
+
+    A field with no default turns into a required constructor argument, and
+    every out-of-tree fake, fixture or adapter that builds the result from the
+    five fields it had before would start raising `TypeError` — a breaking
+    change filed under "Added".
+    """
+    built = RouterRunResult(
+        output={"ok": True},
+        serving_provider=None,
+        dropped_params=None,
+        replayed=False,
+        request_id=None,
+    )
+    assert built.credits_used is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",  # header sent empty
+        "   ",  # whitespace only
+        "1.25, 1.25",  # repeated header, joined by httpx.Headers.get
+        "NaN",  # Decimal accepts it silently, then poisons every comparison
+        "Infinity",
+        "-Infinity",
+        "not a number",
+    ],
+)
+def test_run_detailed_reports_an_unusable_credits_value_as_not_reported(raw: str) -> None:
+    """A value that cannot be parsed must not pass the presence test.
+
+    The field documents a two-step contract — branch on presence, then parse to
+    `Decimal` — and each of these clears step one only to raise
+    `InvalidOperation` (or, for the non-finite pair, to parse and then wreck
+    the arithmetic) in step two. "Reported" is made to mean "reportable".
+    """
+    assert _detailed({"X-Comfy-Credits-Used": raw}).credits_used is None
+
+
+def test_run_detailed_hands_a_usable_credits_value_over_untouched() -> None:
+    # Normalising the unusable cases must not reformat the usable ones: the
+    # digits the server sent are the point, so nothing is re-rendered through
+    # Decimal on the way out.
+    for raw in ("0", "0.00", "0.42", "1.25", "12"):
+        assert _detailed({"X-Comfy-Credits-Used": raw}).credits_used == raw
+    # Surrounding whitespace is trimmed rather than treated as unusable.
+    assert _detailed({"X-Comfy-Credits-Used": " 1.25 "}).credits_used == "1.25"
 
 
 def test_an_ordinary_unstamped_run_over_the_wire_reports_no_credits(server) -> None:

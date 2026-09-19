@@ -17,9 +17,20 @@ the fuller account of each version, including verification notes.
   price rather than a settled ledger entry, absent means "not reported" and never "free", and
   `0` is a real reported cost — so branch on `credits_used is not None`, not on truthiness.
   Carried as the wire string; binary `float` is the wrong type to reconcile money against.
+  A value that is not a finite decimal — an empty header, a repeated one (`httpx` joins those
+  with `", "`), `NaN`/`Infinity` — reports as `None` rather than passing through to break the
+  `Decimal()` parse the field documents. The field defaults to `None`, so this stays additive
+  for anything that constructs a `RouterRunResult` by hand.
 
 ### Fixed
 
+- **`RouterRunResult.replayed` was always `False` against a real deployment.** It was lifted
+  from `X-Comfy-Idempotent-Replayed`; the header Comfy Router actually sends — and the only
+  spelling `spec/router-openapi.yaml` declares, on the `200` as on the `400`/`409`/`422` — is
+  `Idempotent-Replayed`, with no `X-Comfy-` prefix. A replayed, unbilled response was reported
+  as a fresh generation. The prefixed spelling is *not* honoured as an alias, because Router
+  does not send it. `tests/test_router_spec_contract.py` now pins every header `run_detailed`
+  lifts against the name the vendored contract declares, and pins that the lift reads it.
 - **`except RouterError` now catches every Comfy Router refusal.** `insufficient_credits`,
   `unauthorized` and `forbidden` raised a class that was *not* a `RouterError`, so the obvious
   catch-all around a `client.models.*` call caught nothing for them. Those three buckets are now
