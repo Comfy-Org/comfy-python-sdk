@@ -617,12 +617,13 @@ def test_a_detail_array_of_non_mappings_never_leaks_a_list_repr() -> None:
     assert err.validation_errors == ()
 
 
-# --- a `detail[]` array identifies the Router surface even under a bucket the
-#     v2 envelope also spells, or the status-derived guess a stripped header
-#     falls to: the typed entries must not be dropped by the non-Router branch.
+# --- a `detail[]` array identifies the Router surface even under the
+#     status-derived guess a stripped header falls to, or a code this version
+#     does not know: the typed entries must not be dropped by the non-Router
+#     branch.
 
 
-def test_a_validation_array_under_a_colliding_bucket_stays_a_router_error() -> None:
+def test_a_validation_array_under_a_shared_bucket_keeps_its_entries() -> None:
     import comfy_sdk.router_exceptions as rx
 
     low = error_from_envelope(
@@ -631,50 +632,90 @@ def test_a_validation_array_under_a_colliding_bucket_stays_a_router_error() -> N
         error_type="unauthorized",
     )
     err = to_sdk_error(low)
-    # A `detail[]` array only Router sends, so it resolves the collision.
+    # `unauthorized` is one of the three buckets both surfaces spell alike. They
+    # are a single class now (#157), re-exported from both modules, so there is
+    # no longer a collision to resolve -- `except RouterError` and
+    # `except comfy_sdk.Unauthorized` both catch this. What this test pins is the
+    # part that is still this change's: the array's typed entries survive the
+    # mapping instead of being dropped on the non-Router branch.
     assert isinstance(err, rx.Unauthorized)
     assert isinstance(err, rx.RouterError)
-    assert not isinstance(err, SdkUnauthorized)
+    assert rx.Unauthorized is SdkUnauthorized
     assert [e.msg for e in err.errors] == ["field required"]
     assert err.errors[0].location == "body.key"
 
 
-def test_a_stripped_422_header_validation_array_still_carries_its_entries() -> None:
+def test_a_stripped_422_header_validation_array_keeps_its_v2_class() -> None:
     import comfy_sdk.router_exceptions as rx
+    from comfy_sdk.exceptions import InvalidWorkflow
 
     # No `error_type`: the 422 falls to the status-derived `invalid_workflow`
-    # guess, which is not a Router bucket -- but the array is still Router's.
+    # guess. The `detail[]` array must NOT retype it into the Router hierarchy
+    # -- the array is a body shape any proxy or gateway can send, and the module
+    # rule is that only a response carrying a BUCKET gets retyped. Rerouting on
+    # the array would silently stop `except InvalidWorkflow` from firing.
     low = error_from_envelope(422, {"detail": [{"loc": ["body", "steps"], "msg": "too large"}]})
     assert low.code == "invalid_workflow"
     err = to_sdk_error(low)
-    assert isinstance(err, rx.RouterError)
-    assert [e.msg for e in err.errors] == ["too large"]
+    assert isinstance(err, InvalidWorkflow)
+    assert not isinstance(err, rx.RouterError)
+    # The per-field reasons still reach the caller: `summarise_detail` made them
+    # the message one layer down, which is what this change fixed.
+    assert "body.steps: too large" in str(err)
 
 
-def test_a_colliding_bucket_with_an_envelope_message_keeps_the_entries() -> None:
+def test_a_v2_envelope_with_an_array_keeps_its_class_details_and_summary() -> None:
     import comfy_sdk.router_exceptions as rx
+    from comfy_sdk.exceptions import InvalidWorkflow
 
-    # The exact body test_an_envelope_message_outranks_the_validation_entries
-    # builds: an `error.message` AND a `detail[]` array. The message being set
-    # means the summary block never ran, so before the fix both the summary and
-    # `.errors` were lost -- the per-field data reachable only through
-    # `__cause__`, against what the RouterError.errors docstring promises.
+    # An `error.message` AND a `detail[]` array, under a v2 envelope code. The
+    # class stays the one integrators catch, and `details` -- the per-node
+    # diagnostics `InvalidWorkflow` documents -- is still forwarded.
     low = error_from_envelope(
         422,
         {
-            "error": {"code": "invalid_workflow", "message": "the graph is invalid"},
+            "error": {
+                "code": "invalid_workflow",
+                "message": "the graph is invalid",
+                "details": {"node_errors": {"3": "bad"}},
+            },
             "detail": [{"loc": ["body", "steps"], "msg": "too large"}],
         },
     )
     err = to_sdk_error(low)
-    assert isinstance(err, rx.RouterError)
-    assert [e.msg for e in err.errors] == ["too large"]
-    # The envelope's own message still wins as the human-readable detail.
-    assert err.detail == "the graph is invalid"
+    assert isinstance(err, InvalidWorkflow)
+    assert not isinstance(err, rx.RouterError)
+    assert err.details == {"node_errors": {"3": "bad"}}
+    # The envelope's own message still wins as the human-readable string.
+    assert "the graph is invalid" in str(err)
 
 
-def test_a_colliding_bucket_without_an_array_still_keeps_its_v2_class() -> None:
-    # The array is the discriminator, not the code: a bare `unauthorized` with no
-    # `detail[]` stays the v2 class every jobs-surface handler catches.
+def test_a_loc_member_that_is_not_a_scalar_never_leaks_a_repr() -> None:
+    # `str(part)` on a nested member would render `['a', 'b']: bad` into the
+    # user-visible message -- the same list-repr leak `_clean`'s isinstance
+    # guard exists to stop, and `clean_body_excerpt` does not strip brackets.
+    err = error_from_envelope(
+        422,
+        {"detail": [{"loc": ["body", ["a", "b"], 0], "msg": "bad"}]},
+        error_type="invalid_input",
+    )
+    assert "[" not in err.message
+    assert err.message == "body.0: bad"
+
+
+def test_a_huge_detail_array_stops_accumulating_at_the_excerpt_budget() -> None:
+    from comfy_low.errors import _BODY_EXCERPT_LIMIT
+
+    # The cap must not be reached by rendering the whole server-controlled array
+    # and slicing the tail off: describing a body costs the same whether it is
+    # small or huge.
+    entries = [{"msg": "x" * 100} for _ in range(10_000)]
+    err = error_from_envelope(422, {"detail": entries}, error_type="invalid_input")
+    assert len(err.message) == _BODY_EXCERPT_LIMIT
+
+
+def test_a_shared_bucket_without_an_array_still_maps_by_code() -> None:
+    # The array is not what types a shared bucket: a bare `unauthorized` with no
+    # `detail[]` still maps by code to the one class both surfaces export.
     err = to_sdk_error(ApiError("no", code="unauthorized", http_status=401))
     assert isinstance(err, SdkUnauthorized)

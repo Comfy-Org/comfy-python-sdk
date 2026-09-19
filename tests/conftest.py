@@ -244,6 +244,13 @@ class ServerState:
     queue_result_raw: Any = None
     # The status read answers a body naming no `status` at all.
     queue_status_omits_status: bool = False
+    # When set, a cancel is REFUSED with this (status, body) instead of being
+    # accepted -- the shape the route declines in, which is neither of the two
+    # the error reader already knows: no `X-Comfy-Error-Type` header, no
+    # `error_type` in the body, and no v2 `{error: {code}}` envelope either.
+    # Just a status and a queue `status` value. The default models a cancel
+    # that arrived after the work finished.
+    queue_cancel_refusal: tuple[int, dict[str, Any]] | None = None
     # The bucket a cancelled request's completion carries.
     queue_cancel_error_type: str = "client_disconnected"
     # Set by a cancel; makes every later status poll report the cancellation.
@@ -759,6 +766,10 @@ def _make_handler(state: ServerState):
                 state.queue_cancel_fail_times -= 1
                 status, code = state.queue_cancel_transient_error
                 self._router_err(status, code, retry_after=state.queue_cancel_transient_retry_after)
+                return
+            if state.queue_cancel_refusal is not None:
+                status, refusal = state.queue_cancel_refusal
+                self._json(status, refusal)
                 return
             state.queue_canceled = True
             if state.queue_cancel_status == 204:
