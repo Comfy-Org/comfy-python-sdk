@@ -81,6 +81,18 @@ class HashMismatch(ComfyError):
     """Uploaded bytes did not match the declared ``expected_hash``."""
 
 
+class AssetInUse(ComfyError):
+    """The asset could not be deleted: the platform still depends on the record.
+
+    The ``409`` on ``client.assets.delete()`` / ``Asset.delete()`` (and their
+    async twins). Which hold applies — a job's outputs still reference the
+    record, a moderation workflow requires it kept — is deliberately not stated
+    by the response, so this is a signal that the delete will not succeed by
+    being retried, not something to inspect ``details`` for. The other
+    documented ``409`` is :class:`HashMismatch`, on upload.
+    """
+
+
 class BlobNotFound(ComfyError):
     """from-hash / existence probe found no blob the caller can mint from."""
 
@@ -129,6 +141,7 @@ _BY_CODE: dict[str, type[ComfyError]] = {
     "workflow_format_ui": WorkflowFormatUi,
     "missing_asset": MissingAsset,
     "hash_mismatch": HashMismatch,
+    "asset_in_use": AssetInUse,
     "blob_not_found": BlobNotFound,
     "idempotency_key_reuse": IdempotencyKeyReuse,
     "insufficient_credits": InsufficientCredits,
@@ -360,6 +373,7 @@ def translating(*, idempotency_key: str | None = None) -> Iterator[None]:
 #: does. ``tests/test_exception_modules.py`` reads this list to assert it.
 __all__ = [
     "AlreadyCompleted",
+    "AssetInUse",
     "BlobNotFound",
     "CancelRefused",
     "ComfyError",

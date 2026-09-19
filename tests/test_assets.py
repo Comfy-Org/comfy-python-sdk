@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from comfy_sdk import AsyncComfy, Comfy, DownloadUrl, HashMismatch, NotFound
+from comfy_sdk import AssetInUse, AsyncComfy, Comfy, DownloadUrl, HashMismatch, NotFound
 
 
 def test_dedup_fast_path_skips_upload(server, tmp_path) -> None:
@@ -158,6 +158,49 @@ def test_delete_uncommitted_asset_raises(server) -> None:
             asset.delete()
 
     assert server.state.delete_count == 0
+
+
+# A delete the platform refuses is the contract's other 409: `asset_in_use`,
+# raised when something still depends on the record. It reaches a caller as its
+# own class rather than as a bare ComfyError to be told apart by `.code` --
+# which also keeps it distinct from `hash_mismatch`, the 409 an *upload* gets.
+
+
+def test_delete_refused_while_in_use_raises_the_typed_error(server) -> None:
+    server.state.reject_delete_in_use = True
+
+    with Comfy() as client:
+        with pytest.raises(AssetInUse) as excinfo:
+            client.assets.delete("asset_uuid_01")
+
+    assert excinfo.value.code == "asset_in_use"
+    assert excinfo.value.http_status == 409
+    assert not isinstance(excinfo.value, HashMismatch)
+    assert server.state.delete_count == 1
+
+
+def test_delete_refused_on_an_asset_instance_keeps_the_handle(server) -> None:
+    with Comfy() as client:
+        asset = client.assets.from_bytes(b"still-referenced", filename="photo.png")
+        asset_id = asset.commit()
+        server.state.reject_delete_in_use = True
+        with pytest.raises(AssetInUse):
+            asset.delete()
+
+    # The record was not deleted, so the handle still points at it -- a caller
+    # can retry once the hold clears without re-uploading.
+    assert asset.id == asset_id
+
+
+async def test_async_delete_refused_while_in_use_raises_the_typed_error(server) -> None:
+    server.state.reject_delete_in_use = True
+
+    async with AsyncComfy() as client:
+        with pytest.raises(AssetInUse) as excinfo:
+            await client.assets.delete("asset_uuid_01")
+
+    assert excinfo.value.code == "asset_in_use"
+    assert excinfo.value.http_status == 409
 
 
 # -- get_download_url: a fetchable URL for an *uploaded* asset ---------------

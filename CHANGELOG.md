@@ -10,6 +10,18 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Added
+
+- `AssetInUse` — the typed exception for the `409 asset_in_use` a delete is
+  refused with when the platform still depends on the record (a job's outputs
+  reference it, a moderation workflow requires it kept; the response
+  deliberately never says which hold applies). It was reaching callers as a
+  bare `ComfyError` whose `.code` had to be string-compared, which is the
+  protocol detail the typed errors exist to hide — and it is the second of the
+  contract's two documented `409`s, beside `HashMismatch` on upload. Added at
+  both layers (`comfy_sdk.AssetInUse`, `comfy_low.AssetInUse`) and exported
+  from both packages.
+
 ### Fixed
 
 - **`except RouterError` now catches every Comfy Router refusal.** `insufficient_credits`,
