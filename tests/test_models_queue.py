@@ -852,7 +852,7 @@ async def test_async_subscribe_cancellation_requests_a_remote_cancel(server, mon
 #: The refusal a dispatched run's cancel is answered with. A `409` carrying
 #: prose and no error bucket, which is the shape the queue's state refusals
 #: have today.
-IN_FLIGHT_REFUSAL = (409, "in-flight tasks cannot be cancelled")
+IN_FLIGHT_REFUSAL = (409, {"detail": "in-flight tasks cannot be cancelled"})
 
 
 def _no_sleep(monkeypatch) -> None:
@@ -961,7 +961,10 @@ def test_cancelled_and_detached_are_told_apart_without_reading_a_message(
 
 @pytest.mark.parametrize(
     "refusal",
-    [(401, "the credential was rejected"), (500, "the queue fell over")],
+    [
+        (401, {"detail": "the credential was rejected"}),
+        (500, {"detail": "the queue fell over"}),
+    ],
     ids=["unauthorized", "server-error"],
 )
 def test_a_cancel_that_fails_for_any_other_reason_still_raises(
@@ -1036,7 +1039,7 @@ def test_a_request_that_completes_during_teardown_returns_its_result(server, mon
     # The subscribe's own poll is the last pending one; the confirming poll
     # after the refused cancel finds it COMPLETED.
     server.state.queue_polls_to_complete = 1
-    server.state.queue_cancel_refusal = (409, "the request has already completed")
+    server.state.queue_cancel_refusal = (409, {"status": "ALREADY_COMPLETED"})
 
     with _client() as client:
         assert client.models.subscribe(MODEL, ARGS, timeout=0.0) == server.state.queue_result
@@ -1075,7 +1078,7 @@ async def test_async_cancel_that_fails_for_any_other_reason_still_raises(
 
     monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _sleep)
     server.state.queue_polls_to_complete = 10_000
-    server.state.queue_cancel_refusal = (500, "the queue fell over")
+    server.state.queue_cancel_refusal = (500, {"detail": "the queue fell over"})
 
     async with AsyncComfy(api_key="comfyui-test-key", retry=NO_RETRY) as client:
         with pytest.raises(SubscribeTimeout) as excinfo:
@@ -1094,7 +1097,7 @@ async def test_async_request_that_completes_during_teardown_returns_its_result(
 
     monkeypatch.setattr("comfy_sdk.model_requests.asyncio.sleep", _sleep)
     server.state.queue_polls_to_complete = 1
-    server.state.queue_cancel_refusal = (409, "the request has already completed")
+    server.state.queue_cancel_refusal = (409, {"status": "ALREADY_COMPLETED"})
 
     async with AsyncComfy(api_key="comfyui-test-key") as client:
         outcome = await client.models.subscribe(MODEL, ARGS, timeout=0.0)

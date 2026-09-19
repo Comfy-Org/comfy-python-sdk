@@ -42,9 +42,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, cast
 
 import httpx
@@ -201,6 +203,95 @@ class _ModelsBase:
         return f"{type(self).__name__}(base_url={self._low.safe_router_base_url!r})"
 
 
+@dataclass(frozen=True, slots=True)
+class RouterRunResult:
+    """One finished model run, plus what Router disclosed about HOW it ran.
+
+    :meth:`Models.run` returns the partner model's native output on its own,
+    which is the right default: that document is the thing a caller asked for,
+    and wrapping every run in an envelope to carry two usually-absent headers
+    would tax every caller for the few that need them. This is the opt-in shape
+    for the callers that do -- :meth:`Models.run_detailed`.
+
+    What it adds is not decoration. On an alt-provider run
+    (``model_provider=...``) the response body is translated back to this
+    model's native contract, so the body alone looks IDENTICAL whether the call
+    was served by the model's own provider or by an alternate. The two headers
+    below are the only disclosure of the difference, which makes them the only
+    way a caller -- or a test -- can prove which leg actually ran.
+    """
+
+    output: dict[str, Any]
+    """The partner model's native JSON output, exactly what :meth:`Models.run` returns."""
+
+    serving_provider: str | None
+    """``X-Comfy-Router-Fallback-Provider``: the provider that ultimately served this call.
+
+    Present ONLY when ``fallback_provider`` retried against a second provider
+    and that retry succeeded -- never a provider that was attempted and also
+    failed. ``None`` therefore means "the provider asked for served it", which
+    is the common case; it does not mean "unknown".
+    """
+
+    dropped_params: tuple[str, ...] | None
+    """``X-Comfy-Router-Dropped-Params``: native fields translation could not carry.
+
+    Present only when ``model_provider`` translated the body
+    (``strict_mode=False``, the default) and one or more native fields could not
+    be expressed exactly on the alternate provider's schema; each entry names the
+    field and why. ``None`` when no translation ran or it dropped nothing.
+    """
+
+    replayed: bool
+    """``X-Comfy-Idempotent-Replayed``: served from the key's record, not run again.
+
+    A replay is not billed a second time. The header is absent on a fresh run
+    rather than sent as ``false``, so this is derived from its presence.
+    """
+
+    request_id: str | None
+    """``X-Comfy-Request-Id`` -- the id to quote in a support request."""
+
+
+def _dropped_params(raw: str | None) -> tuple[str, ...] | None:
+    """Parse the ``X-Comfy-Router-Dropped-Params`` header value.
+
+    The spec describes this header as "a JSON array of strings" in prose while
+    declaring ``schema: {type: array, items: {type: string}}``, which in OpenAPI
+    means the SIMPLE comma-delimited form instead. The two disagree, and the
+    spec's own example settles which one the server actually sends: its single
+    entry is ``moderation (fal applies its own, non-configurable safety
+    filtering)`` -- which contains a comma. Splitting on commas would tear that
+    one entry into two meaningless fragments, so the prose is right and the
+    declared schema is the part that is wrong.
+
+    So: parse as JSON, and fall back to the raw value as a single entry rather
+    than guessing at delimiters. The fallback is deliberately not a comma split
+    -- on a malformed value, one intact entry a human can read beats two
+    confident fragments. (The spec bug is filed separately against the server's
+    own openapi.yml, which this vendored copy is synced from; correcting it
+    here would be reverted by the next sync.)
+    """
+    if raw is None:
+        return None
+    with contextlib.suppress(ValueError, TypeError):
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+            return tuple(parsed)
+    return (raw,)
+
+
+def _run_result(body: dict[str, Any], headers: Mapping[str, str]) -> RouterRunResult:
+    """Build a :class:`RouterRunResult` from one run's body and response headers."""
+    return RouterRunResult(
+        output=body,
+        serving_provider=headers.get("X-Comfy-Router-Fallback-Provider"),
+        dropped_params=_dropped_params(headers.get("X-Comfy-Router-Dropped-Params")),
+        replayed=headers.get("X-Comfy-Idempotent-Replayed") is not None,
+        request_id=headers.get("X-Comfy-Request-Id"),
+    )
+
+
 class Models(_ModelsBase):
     """``client.models`` on :class:`~comfy_sdk.client.Comfy`.
 
@@ -212,14 +303,17 @@ class Models(_ModelsBase):
         self._low = low
         self._retry = retry
 
-    def run(
+    def _run(
         self,
         model: str,
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
         """Run ``model`` with ``arguments`` and return the completed result.
 
         ``model`` is the canonical ``{provider}/{model}`` id — exactly the two
@@ -235,6 +329,22 @@ class Models(_ModelsBase):
         forwarded to the provider unchanged — there is no Comfy-shaped envelope
         around it, so whatever the partner documents as its request body is
         what goes here.
+
+        ``model_provider`` selects an alternate serving provider for this model
+        (Comfy Router's ``model_provider`` query param); omitted, the model runs
+        on its default provider and the request is byte-for-byte what it always
+        was. Under the default ``strict_mode`` (``False``) the ``arguments`` you
+        pass stay this model's own native input, and Router translates them to
+        the alternate provider's schema on the way in and the response back to
+        native on the way out; ``strict_mode=True`` sends and returns that
+        provider's own raw shape unchanged, so no translation happens either
+        way. ``fallback_provider`` controls the retry-against-another-provider
+        behavior — pass ``False`` (or ``"false"``) to opt out. Each is sent only
+        when set. Note that the off switch is the only value that means
+        anything: Router reads *any* other value, and omission, as fallback ON,
+        which is why a ``bool`` here is normalised to ``"true"``/``"false"``
+        rather than str()-ed into the capitalised ``"False"`` that would read as
+        "on".
 
         One call, one result. It blocks until the generation is finished —
         including for a provider the platform has to submit-and-poll, where the
@@ -332,6 +442,23 @@ class Models(_ModelsBase):
         ``Retry-After``. Without that attribute an auto-minted key died with the
         call and the paid-for generation was uncollectable.
 
+        **Resend the alt-provider controls with it.** A key's identity covers the
+        query as well as the method and body, and ``model_provider`` /
+        ``strict_mode`` / ``fallback_provider`` are query parameters — so a
+        recovery call that drops them presents the same key under a DIFFERENT
+        query and is refused, leaving the very generation it was meant to collect
+        uncollectable. This bites at the server default too: ``strict_mode=False``
+        is sent as ``strict_mode=false``, which is a different query from omitting
+        it. Pass the call back exactly as it was made::
+
+            client.models.run(
+                model, arguments,
+                idempotency_key=exc.idempotency_key,
+                model_provider=model_provider,
+                strict_mode=strict_mode,
+                fallback_provider=fallback_provider,
+            )
+
         Note that a dropped connection surfaces as an ``httpx`` error rather
         than a :class:`~comfy_sdk.ComfyError` — it never reached a response to
         translate — so a handler written for the replay has to catch both; see
@@ -382,7 +509,15 @@ class Models(_ModelsBase):
         with translating(idempotency_key=key):
             while True:
                 try:
-                    return low.post_model_run(model, payload, idempotency_key=key, timeout=timeout)
+                    return low.post_model_run(
+                        model,
+                        payload,
+                        idempotency_key=key,
+                        model_provider=model_provider,
+                        strict_mode=strict_mode,
+                        fallback_provider=fallback_provider,
+                        timeout=timeout,
+                    )
                 except _CANDIDATE_FAILURES as exc:
                     if claimed is not None and _is_key_reuse(exc):
                         # The resend could never have succeeded — the server
@@ -401,6 +536,72 @@ class Models(_ModelsBase):
                     time.sleep(delay)
 
     # -- the queued form: submit, hold a handle, collect ------------------
+    def run(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
+        timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Run ``model`` with ``arguments`` and return the partner's native output.
+
+        See :meth:`_run` for the full contract; this is that call, answering the
+        result document alone.
+
+        ``run`` answers the native output because that document is what a caller
+        asked for; ``run_detailed`` answers a :class:`RouterRunResult`, which
+        carries that same output plus what Router disclosed about HOW the call
+        ran. The split exists because an alt-provider response is translated
+        back to this model's native contract, so the body alone cannot tell an
+        alt-provider run from a native one -- only the headers can, and most
+        callers should not pay an envelope for them.
+        """
+        return self._run(
+            model,
+            arguments,
+            idempotency_key=idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+            timeout=timeout,
+        )[0]
+
+    def run_detailed(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
+        timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
+    ) -> RouterRunResult:
+        """:meth:`run`, plus what Router disclosed about how the call ran.
+
+        ``run`` answers the native output because that document is what a caller
+        asked for; ``run_detailed`` answers a :class:`RouterRunResult`, which
+        carries that same output plus what Router disclosed about HOW the call
+        ran. The split exists because an alt-provider response is translated
+        back to this model's native contract, so the body alone cannot tell an
+        alt-provider run from a native one -- only the headers can, and most
+        callers should not pay an envelope for them.
+        """
+        body, headers = self._run(
+            model,
+            arguments,
+            idempotency_key=idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+            timeout=timeout,
+        )
+        return _run_result(body, headers)
+
     def submit(
         self,
         model: str,
@@ -604,14 +805,17 @@ class AsyncModels(_ModelsBase):
         self._low = low
         self._retry = retry
 
-    async def run(
+    async def _run(
         self,
         model: str,
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
         """Awaitable :meth:`Models.run` — same arguments, same result shape.
 
         This *is* the async form of ``run``: awaiting it on ``AsyncComfy`` is
@@ -643,7 +847,13 @@ class AsyncModels(_ModelsBase):
             while True:
                 try:
                     return await low.post_model_run(
-                        model, payload, idempotency_key=key, timeout=timeout
+                        model,
+                        payload,
+                        idempotency_key=key,
+                        model_provider=model_provider,
+                        strict_mode=strict_mode,
+                        fallback_provider=fallback_provider,
+                        timeout=timeout,
                     )
                 except _CANDIDATE_FAILURES as exc:
                     if claimed is not None and _is_key_reuse(exc):
@@ -660,6 +870,52 @@ class AsyncModels(_ModelsBase):
                     await asyncio.sleep(delay)
 
     # -- the queued form: submit, hold a handle, collect ------------------
+    async def run(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
+        timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Awaitable :meth:`Models.run` — same arguments, same result shape."""
+        body, _ = await self._run(
+            model,
+            arguments,
+            idempotency_key=idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+            timeout=timeout,
+        )
+        return body
+
+    async def run_detailed(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
+        timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
+    ) -> RouterRunResult:
+        """Awaitable :meth:`Models.run_detailed` — same arguments, same result shape."""
+        body, headers = await self._run(
+            model,
+            arguments,
+            idempotency_key=idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+            timeout=timeout,
+        )
+        return _run_result(body, headers)
+
     async def submit(
         self,
         model: str,

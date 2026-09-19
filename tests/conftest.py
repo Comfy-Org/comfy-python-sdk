@@ -166,6 +166,16 @@ class ServerState:
     # fronted by Router, so this is the shape a real deployment's 504 arrives
     # in, and the bucket-keyed collect rule has to read it.
     model_run_router_error_shape: bool = False
+    # Answer the model run with Router's *per-field* validation failure: a
+    # `422` whose body is `{"detail": [...]}` -- this list, verbatim -- with the
+    # coarse bucket on `X-Comfy-Error-Type` and no `error_type` in the body,
+    # which is the one error shape Router sends that carries no bucket of its
+    # own. Set to a list to enable; `None` leaves the run alone. Checked before
+    # the other failure knobs, since it describes the whole response rather
+    # than a (status, code) pair the shared `fail()` helper can render.
+    model_run_validation_detail: list[Any] | None = None
+    # The bucket sent on `X-Comfy-Error-Type` alongside it.
+    model_run_validation_error_type: str = "invalid_input"
 
     # --- the queued model surface (submit / status / result / cancel) ---
     # POST .../requests answers this status with a body naming a request id.
@@ -234,18 +244,21 @@ class ServerState:
     queue_result_raw: Any = None
     # The status read answers a body naming no `status` at all.
     queue_status_omits_status: bool = False
+    # When set, a cancel is REFUSED with this (status, body) instead of being
+    # accepted -- the shape the route declines in, which is neither of the two
+    # the error reader already knows: no `X-Comfy-Error-Type` header, no
+    # `error_type` in the body, and no v2 `{error: {code}}` envelope either.
+    # Just a status and a queue `status` value. The default models a cancel
+    # that arrived after the work finished.
+    #
+    # Also the way to drive a cancel that fails for a reason that is NOT benign:
+    # set it to a `401` or a `500` and the refusal must surface rather than read
+    # as a detach.
+    queue_cancel_refusal: tuple[int, dict[str, Any]] | None = None
     # The bucket a cancelled request's completion carries.
     queue_cancel_error_type: str = "client_disconnected"
     # Set by a cancel; makes every later status poll report the cancellation.
     queue_canceled: bool = False
-    # When set, the cancel route REFUSES: `(status, detail)`, answered with no
-    # error bucket at all and leaving the request running. That code-less shape
-    # is the one the queue's state refusals have today — the documented
-    # cancel-after-completion answers `409` with `{"status": "ALREADY_COMPLETED"}`
-    # and names no bucket — so it is what the SDK has to cope with. Also the way
-    # to drive a cancel that fails for a reason that is NOT benign: set it to a
-    # `401` or a `500` and the refusal must surface rather than read as a detach.
-    queue_cancel_refusal: tuple[int, str] | None = None
 
     # --- counters the tests assert on ---
     upload_count: int = 0
@@ -759,10 +772,8 @@ def _make_handler(state: ServerState):
                 self._router_err(status, code, retry_after=state.queue_cancel_transient_retry_after)
                 return
             if state.queue_cancel_refusal is not None:
-                status, detail = state.queue_cancel_refusal
-                # No `error_type`, on the header or in the body: the refusal
-                # the SDK sees carries only a status and prose.
-                self._json(status, {"detail": detail})
+                status, refusal = state.queue_cancel_refusal
+                self._json(status, refusal)
                 return
             state.queue_canceled = True
             if state.queue_cancel_status == 204:
@@ -894,6 +905,17 @@ def _make_handler(state: ServerState):
                     headers=headers or None,
                 )
 
+            if state.model_run_validation_detail is not None:
+                # Router's per-field validation body. Deliberately built here
+                # rather than through `fail()`: that helper always emits an
+                # `{error: {code, message}}` envelope or a `{detail, error_type}`
+                # string body, and the shape under test is neither.
+                self._json(
+                    422,
+                    {"detail": state.model_run_validation_detail},
+                    headers={"X-Comfy-Error-Type": state.model_run_validation_error_type},
+                )
+                return
             if state.model_run_fail_times > 0:
                 state.model_run_fail_times -= 1
                 status, code = state.model_run_transient_error
