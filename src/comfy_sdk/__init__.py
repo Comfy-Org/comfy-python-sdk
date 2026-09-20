@@ -32,7 +32,15 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
 from .assets import Asset, AssetFactory, AsyncAsset, AsyncAssetFactory
-from .client import API_KEY_ENV_VAR, BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL, AsyncComfy, Comfy
+from .client import (
+    API_KEY_ENV_VAR,
+    BASE_URL_ENV_VAR,
+    COMFY_CLOUD_BASE_URL,
+    COMFY_ROUTER_BASE_URL,
+    ROUTER_BASE_URL_ENV_VAR,
+    AsyncComfy,
+    Comfy,
+)
 from .events import (
     Event,
     Log,
@@ -42,7 +50,9 @@ from .events import (
     StatusChange,
 )
 from .exceptions import (
+    AlreadyCompleted,
     BlobNotFound,
+    CancelRefused,
     ComfyError,
     Forbidden,
     HashMismatch,
@@ -54,10 +64,12 @@ from .exceptions import (
     MissingAsset,
     NotFound,
     QueueFull,
+    RouterError,
     Unauthorized,
     WorkflowFormatUi,
 )
 from .jobs import AsyncJob, Job, JobWorkflow
+from .model_requests import COMPLETED, AsyncRequestHandle, QueueUpdate, RequestHandle
 from .outputs import AsyncOutput, DownloadUrl, Output
 from .retry import DEFAULT_RETRY, NO_RETRY, RetryPolicy
 from .workflows import Workflow, WorkflowFactory
@@ -70,13 +82,19 @@ try:
 except PackageNotFoundError:  # running from a source tree, not installed
     __version__ = "0+unknown"
 
+from .models import RouterRunResult
+
 __all__ = [
     # clients
     "Comfy",
     "COMFY_CLOUD_BASE_URL",
     "BASE_URL_ENV_VAR",
+    "COMFY_ROUTER_BASE_URL",
+    "ROUTER_BASE_URL_ENV_VAR",
     "API_KEY_ENV_VAR",
     "AsyncComfy",
+    # model runs
+    "RouterRunResult",
     # assets / workflows / jobs / outputs
     "Asset",
     "AsyncAsset",
@@ -87,6 +105,11 @@ __all__ = [
     "Job",
     "AsyncJob",
     "JobWorkflow",
+    # queued model requests
+    "RequestHandle",
+    "AsyncRequestHandle",
+    "QueueUpdate",
+    "COMPLETED",
     "Output",
     "AsyncOutput",
     "DownloadUrl",
@@ -112,6 +135,15 @@ __all__ = [
     "MissingApiKey",
     "Unauthorized",
     "Forbidden",
+    # Comfy Router failures. `RouterError` is the base of every one of them and
+    # is lifted here because it is the broad catch a caller writes first; the
+    # per-bucket classes stay in `comfy_sdk.router_exceptions`, which is one
+    # import path for the whole closed set rather than half of it here and half
+    # of it there. `AlreadyCompleted` / `CancelRefused` are the cancel route's
+    # refusals, which that closed set does not name.
+    "RouterError",
+    "CancelRefused",
+    "AlreadyCompleted",
     # retry policy
     "RetryPolicy",
     "DEFAULT_RETRY",

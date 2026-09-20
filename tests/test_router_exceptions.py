@@ -18,6 +18,7 @@ from comfy_sdk.router_exceptions import (
     REQUEST_ID_HEADER,
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
+    Cancelled,
     ClientDisconnected,
     ConcurrencyLimitExceeded,
     ContentPolicyViolation,
@@ -30,7 +31,9 @@ from comfy_sdk.router_exceptions import (
     NotEnabled,
     ProviderError,
     ProviderTimeout,
+    QueueTimeout,
     RateLimited,
+    RequestNotFound,
     RouterError,
     ServiceUnavailable,
     Unauthorized,
@@ -64,11 +67,17 @@ CASES: list[tuple[str, int, type[RouterError]]] = [
     ("not_enabled", 403, NotEnabled),
     ("service_unavailable", 503, ServiceUnavailable),
     ("rate_limited", 429, RateLimited),
+    ("cancelled", 409, Cancelled),
+    ("queue_timeout", 504, QueueTimeout),
+    ("request_not_found", 404, RequestNotFound),
 ]
 
-# Deliberately not in the set this SDK version knows: later milestones add them,
-# and until then each must arrive as the base class rather than crash a client.
-DEFERRED_ERROR_TYPES = ["file_download_error", "cancelled", "queue_timeout"]
+# Deliberately not in the set this SDK version knows: a later milestone adds it,
+# and until then it must arrive as the base class rather than crash a client.
+# `cancelled` and `queue_timeout` used to sit here too; the vendored Router spec
+# now declares them (x-comfy-error-types), so they are typed above rather than
+# deferred -- a bucket in the contract is one the SDK types.
+DEFERRED_ERROR_TYPES = ["file_download_error"]
 
 
 def stub_error_response(
@@ -165,7 +174,7 @@ def test_an_unrecognised_error_type_raises_the_base_class(error_type: str) -> No
 
 def test_exception_for_maps_known_and_unknown_values() -> None:
     assert exception_for("content_policy_violation") is ContentPolicyViolation
-    assert exception_for("queue_timeout") is RouterError
+    assert exception_for("file_download_error") is RouterError
     assert exception_for(None) is RouterError
 
 
@@ -452,12 +461,20 @@ def test_no_headers_at_all_still_produces_an_exception() -> None:
     assert exc.http_status == 500
 
 
-# -- the workflow-surface classes are a separate hierarchy -------------------
+# -- the shared names are ONE hierarchy, not two -----------------------------
 
 
-def test_the_shared_names_are_not_the_workflow_surface_classes() -> None:
-    # comfy_sdk.Unauthorized is the workflow surface's. The router ones are
-    # imported from this module on purpose -- one name cannot be two classes.
+def test_the_shared_names_are_the_workflow_surface_classes() -> None:
+    # These three buckets are spelled identically by both surfaces, and both
+    # modules export them -- so they have to be the same class object. They
+    # were not, and that is the whole of the defect this asserts against: the
+    # class `to_sdk_error` raised for a router refusal was the `exceptions`
+    # one, which did not descend from `RouterError`, so the broad catch every
+    # careful caller writes fired for none of them.
+    #
+    # `tests/test_exception_modules.py` is the general form of this -- it
+    # enumerates both modules rather than naming three classes. This stays
+    # because these three are the ones that actually collided.
     from comfy_sdk import exceptions as workflow_exceptions
 
     for router_cls, workflow_cls in (
@@ -465,8 +482,7 @@ def test_the_shared_names_are_not_the_workflow_surface_classes() -> None:
         (Forbidden, workflow_exceptions.Forbidden),
         (InsufficientCredits, workflow_exceptions.InsufficientCredits),
     ):
-        assert router_cls is not workflow_cls
-        assert not issubclass(router_cls, workflow_cls)
+        assert router_cls is workflow_cls
         assert issubclass(router_cls, RouterError)
 
 
@@ -536,3 +552,14 @@ def test_the_default_policy_retries_a_throttled_bucket_that_named_a_pace() -> No
     assert isinstance(paced, RateLimited)
     assert policy.should_retry(paced) is True
     assert policy.should_retry(unpaced) is False
+
+
+def test_the_location_rendering_is_shared_with_the_summariser() -> None:
+    """`.location` and the summary must never disagree about a field's name."""
+    from comfy_low.errors import summarise_detail
+    from comfy_sdk.router_exceptions import _detail_from
+
+    # A non-scalar `loc` member is dropped by both, so neither renders a repr.
+    entry = {"loc": ["body", ["a", "b"], 0], "msg": "bad"}
+    assert _detail_from(entry).location == "body.0"
+    assert summarise_detail([entry]) == "body.0: bad"

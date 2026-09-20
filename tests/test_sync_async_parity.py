@@ -54,7 +54,7 @@ import pytest
 import comfy_low
 import comfy_sdk
 from comfy_sdk import AsyncComfy, Comfy
-from comfy_sdk.client import BASE_URL_ENV_VAR
+from comfy_sdk.client import BASE_URL_ENV_VAR, ROUTER_BASE_URL_ENV_VAR
 
 #: The packages whose public classes make up the surface under test.
 _PACKAGES = (comfy_sdk, comfy_low)
@@ -207,13 +207,19 @@ def _default_deployment() -> Iterator[None]:
     fixture could adjust the environment. Inheriting an ambient value would let
     a stray export in a developer's shell turn this whole module into a
     collection error that has nothing to do with parity.
+
+    Both target variables, for exactly the same reason:
+    ``_resolve_router_base_url()`` raises the same way on a malformed
+    ``COMFY_ROUTER_BASE_URL``, and a client construction reads both.
     """
-    saved = os.environ.pop(BASE_URL_ENV_VAR, None)
+    names = (BASE_URL_ENV_VAR, ROUTER_BASE_URL_ENV_VAR)
+    saved = {name: os.environ.pop(name, None) for name in names}
     try:
         yield
     finally:
-        if saved is not None:
-            os.environ[BASE_URL_ENV_VAR] = saved
+        for name, value in saved.items():
+            if value is not None:
+                os.environ[name] = value
 
 
 def _run(coro: Any) -> None:
@@ -580,8 +586,15 @@ def test_the_models_namespace_is_covered() -> None:
     models_pairs = [pair for pair in _PAIRS if pair[1] is _SYNC_NAMESPACES["models"]]
     assert models_pairs, "the models namespace produced no pair to compare"
     _label, sync_models, async_models = models_pairs[0]
-    assert "run" in _methods(sync_models), f"{sync_models.__name__}.run is not being compared"
-    assert "run" in _methods(async_models), f"{async_models.__name__}.run is not being compared"
+    # Every operation the namespace publishes, named outright. `run` is the one
+    # this test was written for; the queued trio joined it, and a namespace
+    # method that silently dropped out of the walk would otherwise leave the
+    # generic comparisons above passing on a smaller surface than they claim.
+    for name in ("run", "submit", "subscribe", "handle"):
+        assert name in _methods(sync_models), f"{sync_models.__name__}.{name} is not being compared"
+        assert name in _methods(async_models), (
+            f"{async_models.__name__}.{name} is not being compared"
+        )
 
 
 def test_introspection_is_not_vacuous() -> None:

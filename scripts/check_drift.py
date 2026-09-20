@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail if the committed tree drifts from the vendored specs.
 
-Two checks, one job:
+Three checks, one job:
 
 1. **Models vs ``spec/openapi.yaml``.** Regenerates the models into a temp file
    and diffs against the committed one, so a spec edit without a regen (or a
@@ -13,9 +13,21 @@ Two checks, one job:
    that matters there is a bucket the spec declares and the SDK has no class
    for, which would reach callers as an untyped ``RouterError``. This compares
    the spec's ``x-comfy-error-types`` list against ``ROUTER_ERROR_TYPES``,
-   which is what makes the next vendored Router sync a real diff review.
+   which is what makes the next vendored Router sync a real diff review. It
+   then compares each entry's ``meaning`` against the ``_spec_meaning_digest``
+   read marker on that bucket's class, because values and order say nothing
+   about the prose: a sync that rewrites a bucket's retry guidance and nothing
+   else would otherwise pass with the docstring left stale.
+3. **The bound model-run route vs ``spec/router-openapi.yaml``.** Same reason,
+   different artifact: ``comfy_low.transport`` posts a model run to a
+   hand-written path constant and a hand-written host constant. The spec
+   declares both -- the path whose ``post.operationId`` is ``runRouterModel``,
+   and ``servers[0].url``. A sync that *moves* the route (the ``/v1`` -> ``/v2``
+   move already on the roadmap) while those constants stay put would leave the
+   SDK posting to a route the contract no longer declares, with nothing else in
+   CI noticing.
 
-``tests/test_router_spec_contract.py`` asserts the same thing from the test
+``tests/test_router_spec_contract.py`` asserts the same things from the test
 suite. Both exist on purpose: the suite is where a contributor sees it, and
 this script is the job that fails a spec-only PR that never ran pytest.
 """
@@ -62,8 +74,19 @@ def _generate(out: Path) -> None:
     )
 
 
-def _declared_router_error_types() -> list[str]:
-    """The router spec's ``x-comfy-error-types`` values, in declaration order.
+def _declared_router_error_types() -> list[dict[str, str]]:
+    """The router spec's ``x-comfy-error-types`` entries, in declaration order.
+
+    Each entry is narrowed to three fields -- ``value``, ``tier`` and
+    ``meaning`` -- rather than to the value alone: the digest pass needs the
+    prose, and validating them here keeps every "the sync reshaped the
+    extension" message in one place.
+
+    Only ``value`` and ``meaning`` are READ by the two passes below. ``tier``
+    is validated and carried but never consulted, deliberately: a vendored
+    sync that introduces a third tier is a spec change this job should stop
+    on, not absorb silently, and the closed-set check is the only thing that
+    would notice. See ``spec/README.md`` for what to do when it fires.
 
     Raises :class:`ValueError` rather than letting a ``KeyError``/``TypeError``
     escape: a sync that reshapes or drops the extension should fail this job
@@ -99,22 +122,144 @@ def _declared_router_error_types() -> list[str]:
         node = node[key]
     if not isinstance(node, list) or not node:
         raise ValueError(f"{ROUTER_SPEC.name}'s x-comfy-error-types is not a non-empty list")
-    values: list[str] = []
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
     for entry in node:
         if not isinstance(entry, dict) or not isinstance(entry.get("value"), str):
             raise ValueError(f"{ROUTER_SPEC.name} has an x-comfy-error-types entry with no value")
+        value = entry["value"]
+        # `.strip()`, matching `meaning` below: a whitespace-only value would
+        # otherwise pass here and through the dedup set, then be reported as
+        # "declared in the spec, no class in the SDK: " with a blank-looking
+        # name. The message differs from the missing/non-string one above on
+        # purpose -- two distinct malformations that print identically are two
+        # CI failures an operator cannot tell apart.
+        if not value.strip():
+            raise ValueError(
+                f"{ROUTER_SPEC.name} has an x-comfy-error-types entry whose value is empty "
+                "or whitespace"
+            )
         # Rejected here rather than downstream: `ROUTER_ERROR_TYPES` is built
         # from a dict and so is deduplicated, and a repeated value would make
         # the two lists differ only in length -- reported below as "same values,
         # different order", sending the operator hunting for an ordering diff
         # that does not exist.
-        if entry["value"] in values:
+        if value in seen:
             raise ValueError(
-                f"{ROUTER_SPEC.name} declares x-comfy-error-types value "
-                f"{entry['value']!r} more than once"
+                f"{ROUTER_SPEC.name} declares x-comfy-error-types value {value!r} more than once"
             )
-        values.append(entry["value"])
-    return values
+        seen.add(value)
+        tier = entry.get("tier")
+        if not isinstance(tier, str) or tier not in ("request", "transport"):
+            raise ValueError(
+                f"{ROUTER_SPEC.name}'s x-comfy-error-types entry {value!r} declares tier "
+                f"{tier!r}, which is neither 'request' nor 'transport'"
+            )
+        meaning = entry.get("meaning")
+        # `.strip()` and not just a type check: a bucket whose prose is blank
+        # would otherwise get a digest of the empty string -- a stable value
+        # that would sail past the digest pass forever, which is the one
+        # outcome a read marker must never have.
+        if not isinstance(meaning, str) or not meaning.strip():
+            raise ValueError(
+                f"{ROUTER_SPEC.name}'s x-comfy-error-types entry {value!r} has no "
+                "non-empty string meaning"
+            )
+        entries.append({"value": value, "tier": tier, "meaning": meaning})
+    return entries
+
+
+def _declared_run_route() -> tuple[str, str]:
+    """The spec's ``(runRouterModel path, servers[0].url)``.
+
+    Same failure policy as :func:`_declared_router_error_types`: every way the
+    file can be unusable becomes a ``ValueError`` with a sentence someone can
+    act on, rather than a traceback that reads like a bug in the checker.
+    """
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - depends on the install extra
+        raise ValueError(
+            f"PyYAML is not installed, so {ROUTER_SPEC.name} cannot be read "
+            "(pip install -e '.[dev]')"
+        ) from exc
+
+    try:
+        doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"{ROUTER_SPEC.name} could not be read: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{ROUTER_SPEC.name} is not valid YAML: {exc}") from exc
+
+    if not isinstance(doc, dict):
+        raise ValueError(f"{ROUTER_SPEC.name} is not a mapping at the top level")
+    paths = doc.get("paths")
+    if not isinstance(paths, dict):
+        raise ValueError(f"{ROUTER_SPEC.name} has no paths object")
+    # Searched by operationId rather than looked up by the path we expect: a
+    # lookup would silently find nothing the day the path moves, which is the
+    # one day this check exists for.
+    declared = [
+        path
+        for path, item in paths.items()
+        if isinstance(item, dict)
+        and isinstance(item.get("post"), dict)
+        and item["post"].get("operationId") == "runRouterModel"
+    ]
+    if len(declared) != 1:
+        raise ValueError(
+            f"{ROUTER_SPEC.name} declares {len(declared)} paths with "
+            f"post.operationId 'runRouterModel' (expected exactly 1): {declared}"
+        )
+    servers = doc.get("servers")
+    if not isinstance(servers, list) or not servers or not isinstance(servers[0], dict):
+        raise ValueError(f"{ROUTER_SPEC.name} has no servers[0]")
+    host = servers[0].get("url")
+    if not isinstance(host, str) or not host:
+        raise ValueError(f"{ROUTER_SPEC.name}'s servers[0].url is not a non-empty string")
+    return declared[0], host
+
+
+def _check_router_run_route() -> int:
+    if not ROUTER_SPEC.exists():
+        print(f"ERROR: {ROUTER_SPEC.name} is missing from spec/", file=sys.stderr)
+        return 1
+    sys.path.insert(0, str(ROOT / "src"))
+    try:
+        from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE, ROUTER_BASE_URL
+    except Exception as exc:
+        print(f"ERROR: comfy_low.transport does not import: {exc!r}", file=sys.stderr)
+        return 1
+
+    try:
+        declared_path, declared_host = _declared_run_route()
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    failed = False
+    if declared_path != _MODEL_RUN_PATH_TEMPLATE:
+        print(
+            f"ERROR: the bound model-run route has drifted from {ROUTER_SPEC.name}.\n"
+            f"  spec (runRouterModel): {declared_path}\n"
+            f"  sdk  (_MODEL_RUN_PATH_TEMPLATE): {_MODEL_RUN_PATH_TEMPLATE}\n"
+            "  Update comfy_low.transport._MODEL_RUN_PATH_TEMPLATE to the spec's path.",
+            file=sys.stderr,
+        )
+        failed = True
+    if declared_host != ROUTER_BASE_URL:
+        print(
+            f"ERROR: the default router host has drifted from {ROUTER_SPEC.name}.\n"
+            f"  spec (servers[0].url): {declared_host}\n"
+            f"  sdk  (ROUTER_BASE_URL): {ROUTER_BASE_URL}\n"
+            "  Update comfy_low.transport.ROUTER_BASE_URL to the spec's server URL.",
+            file=sys.stderr,
+        )
+        failed = True
+    if failed:
+        return 1
+    print(f"OK: the SDK posts a model run to {declared_host}{declared_path}, as the spec declares")
+    return 0
 
 
 def _check_models() -> int:
@@ -143,7 +288,11 @@ def _check_router_error_types() -> int:
     # runs (and still reports) when the package itself will not import.
     sys.path.insert(0, str(ROOT / "src"))
     try:
-        from comfy_sdk.router_exceptions import ROUTER_ERROR_TYPES
+        from comfy_sdk.router_exceptions import (
+            ROUTER_ERROR_TYPES,
+            _meaning_digest,
+            exception_for,
+        )
     except Exception as exc:
         # This check supervises that very module, so a syntax or import error
         # in it is the failure to report, not a traceback to leak.
@@ -151,43 +300,98 @@ def _check_router_error_types() -> int:
         return 1
 
     try:
-        declared = _declared_router_error_types()
+        entries = _declared_router_error_types()
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    declared = [entry["value"] for entry in entries]
     known = list(ROUTER_ERROR_TYPES)
-    if declared == known:
+    if declared != known:
+        missing = [value for value in declared if value not in known]
+        extra = [value for value in known if value not in declared]
         print(
-            f"OK: comfy_sdk.router_exceptions covers all {len(declared)} error types "
-            "in spec/router-openapi.yaml"
+            "ERROR: the router exception table has drifted from spec/router-openapi.yaml.",
+            file=sys.stderr,
         )
-        return 0
+        if missing:
+            print(
+                f"  declared in the spec, no class in the SDK: {', '.join(missing)}\n"
+                "  Add one RouterError subclass per value to src/comfy_sdk/router_exceptions.py,\n"
+                "  named as the PascalCase of the wire value, with the spec's `meaning`\n"
+                "  as its docstring, then set `_spec_meaning_digest` on it -- the digest\n"
+                "  pass below runs once these lists match and will fail on the next run\n"
+                "  without it.",
+                file=sys.stderr,
+            )
+        if extra:
+            print(
+                f"  a class in the SDK, not declared in the spec: {', '.join(extra)}",
+                file=sys.stderr,
+            )
+        if not missing and not extra:
+            print(
+                f"  same values, different order.\n    spec: {declared}\n    sdk:  {known}",
+                file=sys.stderr,
+            )
+        return 1
 
-    missing = [value for value in declared if value not in known]
-    extra = [value for value in known if value not in declared]
+    # The values and the order match, so every bucket has a class and the
+    # lookup below always finds one. What is still unchecked at this point is
+    # the PROSE: `meaning` is where the difference between two buckets sharing
+    # a status is written down, and a sync that rewrites one leaves the class
+    # docstring stale with everything above green. So each class carries a
+    # `_spec_meaning_digest` read marker -- the digest of the `meaning` its
+    # docstring was written against. This never compares the digest to the
+    # docstring: the docstrings reword the prose into reST, so equality is
+    # impossible by design. It only asks whether the prose moved since someone
+    # last read it.
+    stale: list[tuple[str, str | None, str]] = []
+    for entry in entries:
+        cls = exception_for(entry["value"])
+        # `cls.__dict__.get(...)` rather than `getattr`: the invariant is that
+        # a class carries its OWN marker, and `getattr` walks the MRO. That is
+        # harmless only while every bucket derives directly from `RouterError`,
+        # which declares no default -- a future bucket derived from another
+        # bucket would silently inherit that class's blessing for prose nobody
+        # read. Reading the class dict enforces the rule as written.
+        blessed = cls.__dict__.get("_spec_meaning_digest")
+        expected = _meaning_digest(entry["meaning"])
+        if blessed != expected:
+            stale.append((entry["value"], blessed, expected))
+    if stale:
+        print(
+            f"ERROR: spec/router-openapi.yaml's `meaning` for {len(stale)} error "
+            f"{'type' if len(stale) == 1 else 'types'} is not the prose the SDK docstring "
+            "was written against, so that docstring may now be wrong.",
+            file=sys.stderr,
+        )
+        for value, blessed, expected in stale:
+            name = exception_for(value).__name__
+            # `blessed is None` is the other half of this check: not a changed
+            # `meaning` but a class that never recorded one, which is what a
+            # freshly added bucket looks like. Same fix, different sentence --
+            # telling someone their prose "changed" when they simply have not
+            # blessed it yet sends them diffing a spec that did not move.
+            if blessed is None:
+                head = f"  {value}: {name} carries no _spec_meaning_digest"
+            else:
+                head = f"  {value}: {name} is blessed against {blessed!r}"
+            print(
+                f"{head}, and the spec's `meaning` hashes to {expected!r}.\n"
+                f"  Re-read {name}'s docstring in src/comfy_sdk/router_exceptions.py against "
+                "that entry's `meaning`\n"
+                "  and update the docstring if the semantics moved, then set\n"
+                f'      _spec_meaning_digest: str = "{expected}"\n'
+                "  on that class to record that this docstring was written against that prose.",
+                file=sys.stderr,
+            )
+        return 1
+
     print(
-        "ERROR: the router exception table has drifted from spec/router-openapi.yaml.",
-        file=sys.stderr,
+        f"OK: comfy_sdk.router_exceptions covers all {len(declared)} error types "
+        "in spec/router-openapi.yaml, each blessed against that entry's `meaning`"
     )
-    if missing:
-        print(
-            f"  declared in the spec, no class in the SDK: {', '.join(missing)}\n"
-            "  Add one RouterError subclass per value to src/comfy_sdk/router_exceptions.py,\n"
-            "  named as the PascalCase of the wire value, with the spec's `meaning`\n"
-            "  as its docstring.",
-            file=sys.stderr,
-        )
-    if extra:
-        print(
-            f"  a class in the SDK, not declared in the spec: {', '.join(extra)}",
-            file=sys.stderr,
-        )
-    if not missing and not extra:
-        print(
-            f"  same values, different order.\n    spec: {declared}\n    sdk:  {known}",
-            file=sys.stderr,
-        )
-    return 1
+    return 0
 
 
 def _run(name: str, check: Callable[[], int]) -> int:
@@ -208,12 +412,13 @@ def _run(name: str, check: Callable[[], int]) -> int:
 
 
 def main() -> int:
-    # Both run every time: reporting only the first failure would hide the
-    # second one behind a fix for the first. `max` over both results rather
-    # than a short-circuit for the same reason.
+    # All three run every time: reporting only the first failure would hide the
+    # others behind a fix for it. `max` over the results rather than a
+    # short-circuit for the same reason.
     return max(
         _run("models", _check_models),
         _run("router error types", _check_router_error_types),
+        _run("router run route", _check_router_run_route),
     )
 
 

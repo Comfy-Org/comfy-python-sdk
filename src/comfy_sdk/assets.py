@@ -27,6 +27,7 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow
 
 from . import _core, _hashing
 from .exceptions import translating
+from .outputs import DownloadUrl
 
 Opener = Callable[[], "tuple[BinaryIO, int | None]"]
 Hasher = Callable[[], str]
@@ -42,7 +43,6 @@ class _Source:
     file_path: str
     hasher: Hasher
     opener: Opener
-    expires_in: int | None = None
 
 
 def _guess_content_type(name: str | None) -> str:
@@ -61,7 +61,6 @@ class _AssetBase:
         self._file_path = source.file_path
         self._hasher = source.hasher
         self._opener = source.opener
-        self._expires_in = source.expires_in
         self._hash: str | None = None
         self._id: str | None = None
         self._created_new: bool | None = None
@@ -129,9 +128,7 @@ class Asset(_AssetBase):
         digest = self.hash
         with translating():
             if self._low.head_asset_by_hash(digest):
-                asset = self._low.asset_from_hash(
-                    digest, file_path=self._file_path, expires_in=self._expires_in
-                )
+                asset = self._low.asset_from_hash(digest, file_path=self._file_path)
             else:
                 fh, size = self._opener()
                 try:
@@ -142,7 +139,6 @@ class Asset(_AssetBase):
                         expected_hash=digest,
                         idempotency_key=self._idempotency_key,
                         file_size=size,
-                        expires_in=self._expires_in,
                     )
                 finally:
                     fh.close()
@@ -164,6 +160,33 @@ class Asset(_AssetBase):
         assert self._id is not None
         return _core.asset_reference(self._id, hash=self._hash, file_path=self._file_path)
 
+    def get_download_url(self) -> DownloadUrl:
+        """A directly-fetchable URL for this asset's bytes (commits first if
+        needed).
+
+        The counterpart of ``Output.get_download_url`` for an *uploaded* asset:
+        hand the URL to anything that fetches by URL instead of streaming the
+        bytes through your process — e.g. a Comfy Router model whose input
+        takes an image URL. On a Cloud/serverless backend it is a short-lived,
+        self-authorizing signed URL readable with no further auth; on a
+        self-hosted backend it is the content endpoint itself, where normal
+        auth still applies, so an external service cannot fetch it.
+
+        The returned ``expires_at`` is the signed URL's own expiry, read from
+        the URL when the SDK recognizes the signature format (today: GCS-style
+        ``X-Goog-Date``/``X-Goog-Expires`` query parameters). It is ``None``
+        whenever there is no expiry to read — always on a self-hosted backend,
+        and also for a signed URL in a format this SDK does not parse — so
+        treat ``None`` as "unknown", not "never expires". It is unrelated to
+        this handle's ``expires_at`` property, which is the asset's *retention*
+        deadline.
+        """
+        self.commit()
+        assert self._id is not None
+        with translating():
+            url, expires_at = self._low.get_asset_content_url(self._id)
+        return DownloadUrl(url=url, expires_at=expires_at)
+
 
 class AsyncAsset(_AssetBase):
     """A lazy asset handle bound to the asynchronous client."""
@@ -178,9 +201,7 @@ class AsyncAsset(_AssetBase):
         digest = self.hash
         with translating():
             if await self._low.head_asset_by_hash(digest):
-                asset = await self._low.asset_from_hash(
-                    digest, file_path=self._file_path, expires_in=self._expires_in
-                )
+                asset = await self._low.asset_from_hash(digest, file_path=self._file_path)
             else:
                 fh, size = self._opener()
                 try:
@@ -191,7 +212,6 @@ class AsyncAsset(_AssetBase):
                         expected_hash=digest,
                         idempotency_key=self._idempotency_key,
                         file_size=size,
-                        expires_in=self._expires_in,
                     )
                 finally:
                     fh.close()
@@ -212,11 +232,20 @@ class AsyncAsset(_AssetBase):
         assert self._id is not None
         return _core.asset_reference(self._id, hash=self._hash, file_path=self._file_path)
 
+    async def get_download_url(self) -> DownloadUrl:
+        """See the sync ``Asset.get_download_url`` for the redirect/inline
+        split."""
+        await self.commit()
+        assert self._id is not None
+        with translating():
+            url, expires_at = await self._low.get_asset_content_url(self._id)
+        return DownloadUrl(url=url, expires_at=expires_at)
+
 
 # ---- source builders (shared, sans-IO except explicit reads) ------------
 
 
-def _file_source(path: str | PathLike[str], *, expires_in: int | None = None) -> _Source:
+def _file_source(path: str | PathLike[str]) -> _Source:
     p = str(path)
     name = basename(p)
     return _Source(
@@ -224,7 +253,6 @@ def _file_source(path: str | PathLike[str], *, expires_in: int | None = None) ->
         file_path=name,
         hasher=lambda: _hashing.hash_file(p),
         opener=lambda: (open(p, "rb"), getsize(p)),
-        expires_in=expires_in,
     )
 
 
@@ -244,8 +272,8 @@ class AssetFactory:
     def __init__(self, low: ComfyLow) -> None:
         self._low = low
 
-    def from_file(self, path: str | PathLike[str], *, expires_in: int | None = None) -> Asset:
-        return Asset(self._low, _file_source(path, expires_in=expires_in))
+    def from_file(self, path: str | PathLike[str]) -> Asset:
+        return Asset(self._low, _file_source(path))
 
     def from_bytes(
         self,
@@ -297,8 +325,8 @@ class AsyncAssetFactory:
     def __init__(self, low: AsyncComfyLow) -> None:
         self._low = low
 
-    def from_file(self, path: str | PathLike[str], *, expires_in: int | None = None) -> AsyncAsset:
-        return AsyncAsset(self._low, _file_source(path, expires_in=expires_in))
+    def from_file(self, path: str | PathLike[str]) -> AsyncAsset:
+        return AsyncAsset(self._low, _file_source(path))
 
     def from_bytes(
         self,

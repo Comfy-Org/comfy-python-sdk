@@ -3,7 +3,16 @@
 Keeps the SDK's own test suite independent of a real v2 server or proxy. Each
 test configures ``server.state`` to drive a specific scenario (dedup hit, hash
 mismatch, queue-full-then-ok, SSE reconnect, ...); the ``server`` fixture points
-the SDK at the stub by setting ``COMFY_BASE_URL``.
+the SDK at the stub by setting ``COMFY_BASE_URL`` *and*
+``COMFY_ROUTER_BASE_URL``.
+
+Both, because the SDK speaks to two surfaces: the ``/api/v2`` deployment (jobs,
+assets) and Comfy Router (``/v2/models/{provider}/{model}``), which is a
+different host in production. This one stub answers three route families — the
+``/api/v2`` paths, the awaited model run, and the queued model routes under
+``.../requests`` — so a test that exercises any of them gets a single server
+— while a test that is *about*
+the two being separate points ``COMFY_ROUTER_BASE_URL`` at ``second_server``.
 """
 
 from __future__ import annotations
@@ -15,10 +24,11 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import unquote
 
 import pytest
 
-from comfy_sdk import API_KEY_ENV_VAR, BASE_URL_ENV_VAR
+from comfy_sdk import API_KEY_ENV_VAR, BASE_URL_ENV_VAR, ROUTER_BASE_URL_ENV_VAR
 
 
 @dataclass
@@ -83,7 +93,7 @@ class ServerState:
     job_workflow_format: str = "api"
     job_workflow_not_found: bool = False
 
-    # --- POST /models/run (the awaited model run) ---
+    # --- POST /v2/models/{provider}/{model} (the awaited model run) ---
     # The provider's native payload the run resolves to. Deliberately not a
     # Comfy-shaped envelope: the SDK must hand it back untouched.
     model_run_result: dict[str, Any] = field(
@@ -99,7 +109,7 @@ class ServerState:
     model_run_delay: float = 0.0
     # (status, code) answered instead of the result.
     model_run_error: tuple[int, str] | None = None
-    # POST /models/run fails this many times before serving the result — the
+    # A model run fails this many times before serving the result — the
     # transient-failure-then-success path a retry policy exists for. Decremented
     # per request, and checked *before* `model_run_error`, which is the
     # permanent-failure knob.
@@ -144,12 +154,115 @@ class ServerState:
     # Sent as X-Comfy-Request-Id alongside a failed run. `None` sends no header,
     # which is the response an intermediary that never reached the router gives.
     model_run_request_id: str | None = None
+    # Extra response headers stamped on a SUCCESSFUL model run, for the
+    # disclosure headers the body cannot carry (X-Comfy-Credits-Used,
+    # X-Comfy-Router-Fallback-Provider, ...). Empty by default, because Router
+    # sends none of them on an ordinary run and "absent" is a case the SDK has
+    # to get right in its own name. Applied to a replayed 200 as well as a
+    # fresh one -- a replay carries `Idempotent-Replayed` on top of these
+    # rather than instead of them.
+    model_run_response_headers: dict[str, str] = field(default_factory=dict)
+    # Answer a repeated model-run key with the v2 jobs rule (422
+    # idempotency_key_reuse) instead of the router contract's replay-or-409.
+    # Default False: the run route's vendored contract answers a consumed,
+    # non-replayable key 409 invalid_input in Router's own shape. True models
+    # the deployment `COMFY_ROUTER_BASE_URL` can name that applies the v2 rule.
+    model_run_v2_key_rule: bool = False
     # Answer model-run failures in Router's own error shape -- the coarse bucket
     # on `X-Comfy-Error-Type` plus a `{detail, error_type}` body -- instead of
-    # the v2 `{error: {code, message}}` envelope. `POST /api/v2/models/run` is
+    # the v2 `{error: {code, message}}` envelope. The model-run route is
     # fronted by Router, so this is the shape a real deployment's 504 arrives
     # in, and the bucket-keyed collect rule has to read it.
     model_run_router_error_shape: bool = False
+    # Answer the model run with Router's *per-field* validation failure: a
+    # `422` whose body is `{"detail": [...]}` -- this list, verbatim -- with the
+    # coarse bucket on `X-Comfy-Error-Type` and no `error_type` in the body,
+    # which is the one error shape Router sends that carries no bucket of its
+    # own. Set to a list to enable; `None` leaves the run alone. Checked before
+    # the other failure knobs, since it describes the whole response rather
+    # than a (status, code) pair the shared `fail()` helper can render.
+    model_run_validation_detail: list[Any] | None = None
+    # The bucket sent on `X-Comfy-Error-Type` alongside it.
+    model_run_validation_error_type: str = "invalid_input"
+
+    # --- the queued model surface (submit / status / result / cancel) ---
+    # POST .../requests answers this status with a body naming a request id.
+    queue_submit_status: int = 200
+    # (status, code) answered instead of accepting the submit — permanent.
+    queue_submit_error: tuple[int, str] | None = None
+    # Submits that fail transiently before one is accepted, and the (status,
+    # code) each answers with. Checked *before* `queue_submit_error`, exactly as
+    # `model_run_fail_times` is checked before `model_run_error`.
+    queue_submit_fail_times: int = 0
+    queue_submit_transient_error: tuple[int, str] = (429, "rate_limited")
+    queue_submit_transient_retry_after: str | None = "1"
+    # Answer the submit with a body carrying no `request_id` at all — accepted
+    # work the caller has no way to reach.
+    queue_submit_omits_request_id: bool = False
+    # The id the queue hands back, and the one every later route answers for.
+    queue_request_id: str = "req_stub_01"
+    # Status polls that report a non-terminal state before the request reaches
+    # COMPLETED. 0 means the very first poll is already complete.
+    queue_polls_to_complete: int = 2
+    # Non-terminal status reported by those polls, and the queue position they
+    # report (decremented per poll, floored at 0).
+    queue_pending_status: str = "IN_QUEUE"
+    queue_start_position: int = 2
+    # Sent as Retry-After on every *successful* status poll — the server naming
+    # its own poll pace, which the SDK honours over its local backoff.
+    queue_status_retry_after: str | None = None
+    # (status, code) answered by every status poll instead of the queue state
+    # — the permanent-failure knob.
+    queue_status_error: tuple[int, str] | None = None
+    # Status polls that fail transiently before answering normally, and the
+    # (status, code) each of those answers with. Checked *before*
+    # `queue_status_error`, exactly as `model_run_fail_times` is.
+    queue_status_fail_times: int = 0
+    queue_status_transient_error: tuple[int, str] = (429, "rate_limited")
+    # Retry-After sent alongside a transient status failure.
+    queue_status_transient_retry_after: str | None = "1"
+    # `error_type` carried by the COMPLETED status — how the server reports a
+    # failed or cancelled request. `None` is the ordinary success path.
+    queue_error_type: str | None = None
+    queue_error_detail: str | None = "the model refused the request"
+    # `error_type` carried by the *result* body only, with the status reporting
+    # a clean completion — the other half of "a 200 is not a success".
+    queue_result_error_type: str | None = None
+    # Extra keys merged into the served result payload — for the case where the
+    # provider's OWN native output happens to carry a field the queue envelope
+    # also uses (`error_type`), with no queue envelope around it.
+    queue_result_extra: dict[str, Any] = field(default_factory=dict)
+    # The provider's native payload served by GET .../requests/{id}.
+    queue_result: dict[str, Any] = field(
+        default_factory=lambda: {
+            "images": [{"url": "http://example.invalid/queued.png"}],
+            "seed": 7,
+        }
+    )
+    # Status code for the cancel response; 204 exercises the empty-body path.
+    queue_cancel_status: int = 200
+    # Cancels that answer a transient failure (status, code) before one is
+    # accepted — for proving the cleanup cancel after a timeout does not ride
+    # the client's retry policy.
+    queue_cancel_fail_times: int = 0
+    queue_cancel_transient_error: tuple[int, str] = (429, "rate_limited")
+    queue_cancel_transient_retry_after: str | None = "1"
+    # When set, the result read answers this JSON document verbatim instead of
+    # `queue_result` — for a provider whose native output is not an object.
+    queue_result_raw: Any = None
+    # The status read answers a body naming no `status` at all.
+    queue_status_omits_status: bool = False
+    # When set, a cancel is REFUSED with this (status, body) instead of being
+    # accepted -- the shape the route declines in, which is neither of the two
+    # the error reader already knows: no `X-Comfy-Error-Type` header, no
+    # `error_type` in the body, and no v2 `{error: {code}}` envelope either.
+    # Just a status and a queue `status` value. The default models a cancel
+    # that arrived after the work finished.
+    queue_cancel_refusal: tuple[int, dict[str, Any]] | None = None
+    # The bucket a cancelled request's completion carries.
+    queue_cancel_error_type: str = "client_disconnected"
+    # Set by a cancel; makes every later status poll report the cancellation.
+    queue_canceled: bool = False
 
     # --- counters the tests assert on ---
     upload_count: int = 0
@@ -167,6 +280,11 @@ class ServerState:
     # Idempotency-Key -> job id of the first (accepted) request, so a reuse of
     # the same key can be detected and rejected (single-use, no replay).
     idempotency: dict[str, str] = field(default_factory=dict)
+    # Every Idempotency-Key seen on POST /jobs, in arrival order (`None`
+    # records a submit that arrived without the header at all). Distinct from
+    # `idempotency`, which only records the keys an *accepted* request claimed
+    # — a test about a failed submit needs the key the server actually saw.
+    jobs_idempotency_keys: list[str | None] = field(default_factory=list)
     # Raw bytes of the last POST /assets multipart body (so tests can inspect
     # the parts actually sent — e.g. how many `tags` fields were included).
     last_upload_body: bytes = b""
@@ -175,12 +293,22 @@ class ServerState:
     last_auth_header: str | None = None
     last_user_agent: str | None = None
     model_run_count: int = 0
+    # The raw JSON body of the last model run — the partner model's *native*
+    # input, with no `{model, arguments}` envelope around it, exactly as Router
+    # forwards it upstream.
     last_model_run_body: dict[str, Any] | None = None
-    # Every Idempotency-Key seen on POST /models/run, in arrival order (`None`
+    # The two path segments of the last model run, percent-DECODED, so a test
+    # asserts the id the caller passed rather than a particular encoding of it.
+    last_model_run_provider: str | None = None
+    last_model_run_model: str | None = None
+    # ...and the raw, still-encoded request path, for the tests that are about
+    # the encoding itself.
+    last_model_run_path: str | None = None
+    # Every Idempotency-Key seen on a model run, in arrival order (`None`
     # records a run that arrived without the header at all).
     model_run_idempotency_keys: list[str | None] = field(default_factory=list)
-    # Keys POST /models/run has *claimed*, so a reuse can be rejected exactly
-    # as POST /jobs rejects one. Kept apart from `idempotency` only so a model
+    # Keys a model run has *claimed*, so a reuse can be rejected exactly as
+    # POST /jobs rejects one. Kept apart from `idempotency` only so a model
     # test cannot perturb a workflow test's bookkeeping.
     model_run_idempotency: dict[str, str] = field(default_factory=dict)
     # Idempotency-Key -> the result recorded for it under
@@ -192,6 +320,26 @@ class ServerState:
     # and does not increment this, which is what lets a test tell a real replay
     # apart from a second generation that merely returns an equal payload.
     model_run_generations: int = 0
+    queue_submit_count: int = 0
+    queue_status_count: int = 0
+    # Status polls that were actually *answered with a queue state*, as
+    # distinct from polls that arrived (`queue_status_count`). A poll answered
+    # with a transient failure must not advance the request towards completion,
+    # or a retry test would silently shorten the queue it is testing.
+    queue_status_served: int = 0
+    queue_result_count: int = 0
+    queue_cancel_count: int = 0
+    # The HTTP method each cancel arrived with.
+    queue_cancel_methods: list[str] = field(default_factory=list)
+    # Every Idempotency-Key seen on a queue submit, in arrival order.
+    queue_submit_idempotency_keys: list[str | None] = field(default_factory=list)
+    # The native body of the last queue submit, and the two decoded id segments.
+    last_queue_submit_body: dict[str, Any] | None = None
+    last_queue_provider: str | None = None
+    last_queue_model: str | None = None
+    # Every raw path the queue routes answered, in order — for the tests that
+    # are about the routes themselves rather than about what came back.
+    queue_paths: list[str] = field(default_factory=list)
 
 
 def _asset_json(asset_id: str, hash_: str, created_new: bool, size: int) -> dict:
@@ -351,6 +499,18 @@ def _make_handler(state: ServerState):
                     return
                 self._json(200, _asset_json(m.group(1), state.server_hash, False, 33))
                 return
+            # Comfy Router's queued model routes — the status poll and the
+            # result collection. Matched before the two-segment run route
+            # patterns for the same reason they are anchored: a request id is
+            # a path segment, not a model name.
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests/([^/]+)/status$", self.path)
+            if m:
+                self._serve_queue_status(m.group(3))
+                return
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests/([^/]+)$", self.path)
+            if m:
+                self._serve_queue_result(m.group(3))
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)/events$", self.path)
             if m:
                 self._serve_events(m.group(1))
@@ -455,6 +615,23 @@ def _make_handler(state: ServerState):
             frame("status", {"status": state.terminal_status})
 
         # -- POST --
+        def do_PUT(self) -> None:
+            if not self._auth_ok():
+                self._read_body()
+                self._err(401, "unauthorized", "no key")
+                return
+            # Comfy Router's queue cancel is a PUT (the contract's
+            # `cancelRouterModelRequest`), so it is served here and nowhere
+            # else: a POST to the same path is the wrong verb and gets a 404
+            # like any other unrouted request.
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests/([^/]+)/cancel$", self.path)
+            if m:
+                self._read_body()
+                self._put_queue_cancel(m.group(3))
+                return
+            self._read_body()
+            self._err(404, "not_found")
+
         def do_POST(self) -> None:
             if not self._auth_ok():
                 self._read_body()
@@ -470,8 +647,18 @@ def _make_handler(state: ServerState):
             if self.path == "/api/v2/jobs":
                 self._post_jobs()
                 return
-            if self.path == "/api/v2/models/run":
-                self._post_model_run()
+            # Comfy Router's invocation route — a different surface from the
+            # `/api/v2` paths above (a different host in production; the same
+            # stub here, with `COMFY_ROUTER_BASE_URL` pointed at it). The two
+            # segments are the model id, so they are matched rather than
+            # compared to a fixed string.
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)$", self.path)
+            if m:
+                self._post_model_run(m.group(1), m.group(2))
+                return
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/requests$", self.path)
+            if m:
+                self._post_queue_submit(m.group(1), m.group(2))
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
@@ -497,8 +684,135 @@ def _make_handler(state: ServerState):
             else:
                 self._err(404, "blob_not_found", "no such blob")
 
-        def _post_model_run(self) -> None:
+        # -- the queued model surface --
+        def _post_queue_submit(self, provider: str, model: str) -> None:
+            state.queue_submit_count += 1
+            state.queue_paths.append(self.path)
+            state.last_queue_provider = unquote(provider)
+            state.last_queue_model = unquote(model)
+            state.last_queue_submit_body = json.loads(self._read_body() or b"{}")
+            state.queue_submit_idempotency_keys.append(self.headers.get("Idempotency-Key"))
+            if state.queue_submit_fail_times > 0:
+                state.queue_submit_fail_times -= 1
+                status, code = state.queue_submit_transient_error
+                self._router_err(status, code, retry_after=state.queue_submit_transient_retry_after)
+                return
+            if state.queue_submit_error:
+                status, code = state.queue_submit_error
+                self._router_err(status, code)
+                return
+            body: dict[str, Any] = {"status": state.queue_pending_status}
+            if not state.queue_submit_omits_request_id:
+                body["request_id"] = state.queue_request_id
+            self._json(state.queue_submit_status, body)
+
+        def _serve_queue_status(self, request_id: str) -> None:
+            state.queue_status_count += 1
+            state.queue_paths.append(self.path)
+            if state.queue_status_fail_times > 0:
+                state.queue_status_fail_times -= 1
+                status, code = state.queue_status_transient_error
+                self._router_err(status, code, retry_after=state.queue_status_transient_retry_after)
+                return
+            if state.queue_status_error:
+                status, code = state.queue_status_error
+                self._router_err(status, code)
+                return
+            headers = (
+                {"Retry-After": state.queue_status_retry_after}
+                if state.queue_status_retry_after
+                else {}
+            )
+            body: dict[str, Any] = {"request_id": unquote(request_id)}
+            if state.queue_status_omits_status:
+                self._json(200, body, headers=headers)
+                return
+            if state.queue_canceled:
+                body["status"] = "COMPLETED"
+                body["error_type"] = state.queue_cancel_error_type
+                body["detail"] = "the request was cancelled"
+                self._json(200, body, headers=headers)
+                return
+            served = state.queue_status_served
+            state.queue_status_served += 1
+            if served < state.queue_polls_to_complete:
+                body["status"] = state.queue_pending_status
+                body["queue_position"] = max(state.queue_start_position - served, 0)
+                self._json(200, body, headers=headers)
+                return
+            body["status"] = "COMPLETED"
+            if state.queue_error_type:
+                body["error_type"] = state.queue_error_type
+                if state.queue_error_detail is not None:
+                    body["detail"] = state.queue_error_detail
+            self._json(200, body, headers=headers)
+
+        def _serve_queue_result(self, request_id: str) -> None:
+            state.queue_result_count += 1
+            state.queue_paths.append(self.path)
+            if state.queue_result_raw is not None:
+                self._json(200, state.queue_result_raw)
+                return
+            if state.queue_result_error_type:
+                self._json(
+                    200,
+                    {
+                        "request_id": unquote(request_id),
+                        "status": "COMPLETED",
+                        "error_type": state.queue_result_error_type,
+                        "detail": "the result body carried the failure",
+                    },
+                )
+                return
+            self._json(200, {**state.queue_result, **state.queue_result_extra})
+
+        def _put_queue_cancel(self, request_id: str) -> None:
+            state.queue_cancel_count += 1
+            state.queue_paths.append(self.path)
+            state.queue_cancel_methods.append(self.command)
+            if state.queue_cancel_fail_times > 0:
+                state.queue_cancel_fail_times -= 1
+                status, code = state.queue_cancel_transient_error
+                self._router_err(status, code, retry_after=state.queue_cancel_transient_retry_after)
+                return
+            if state.queue_cancel_refusal is not None:
+                status, refusal = state.queue_cancel_refusal
+                self._json(status, refusal)
+                return
+            state.queue_canceled = True
+            if state.queue_cancel_status == 204:
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._json(
+                state.queue_cancel_status,
+                {
+                    "request_id": unquote(request_id),
+                    "status": "COMPLETED",
+                    "error_type": state.queue_cancel_error_type,
+                },
+            )
+
+        def _router_err(
+            self, status: int, code: str, message: str = "err", retry_after: str | None = None
+        ) -> None:
+            """Router's own error shape: the bucket on the header and in the body."""
+            headers = {"X-Comfy-Error-Type": code}
+            if retry_after:
+                headers["Retry-After"] = retry_after
+            self._json(status, {"detail": message, "error_type": code}, headers=headers)
+
+        def _post_model_run(self, provider: str, model: str) -> None:
             state.model_run_count += 1
+            # Decoded, because the SDK percent-encodes each segment and a real
+            # origin server decodes it before routing — asserting the encoded
+            # form everywhere would pin tests to an encoding rather than to the
+            # id the caller passed. `last_model_run_path` keeps the raw form
+            # for the tests that are about the encoding.
+            state.last_model_run_provider = unquote(provider)
+            state.last_model_run_model = unquote(model)
+            state.last_model_run_path = self.path
             state.last_model_run_body = json.loads(self._read_body() or b"{}")
             key = self.headers.get("Idempotency-Key")
             state.model_run_idempotency_keys.append(key)
@@ -508,18 +822,38 @@ def _make_handler(state: ServerState):
             # rather than rejecting the resend, and the model does not run
             # again — which is the whole point of asking under the same key.
             if key and key in state.model_run_replay_store:
+                # `model_run_response_headers` is merged in here as well as on
+                # the fresh-run path below, because a replay is the canonical
+                # reported-zero and the only response where `credits_used` and
+                # `replayed` are both meaningful at once. Stamped first, so the
+                # replay marker itself cannot be overwritten by a test's dict.
                 self._json(
                     200,
                     state.model_run_replay_store[key],
-                    headers={"Idempotent-Replayed": "true"},
+                    headers={
+                        **state.model_run_response_headers,
+                        "Idempotent-Replayed": "true",
+                    },
                 )
                 return
 
-            # The same reject-on-duplicate rule `_post_jobs` implements, for
-            # the same reason: a stub more permissive than the contract would
-            # let a retry design that the real server rejects pass its tests.
+            # The run route's own reuse answer (spec/router-openapi.yaml):
+            # a consumed key whose record cannot be replayed is refused 409
+            # invalid_input in Router's shape — never 422. The v2 jobs rule
+            # stays reachable behind `model_run_v2_key_rule` for the test that
+            # models a non-Router deployment.
             if key and key in state.model_run_idempotency:
-                self._err(422, "idempotency_key_reuse", "Idempotency-Key already used")
+                if state.model_run_v2_key_rule:
+                    self._err(422, "idempotency_key_reuse", "Idempotency-Key already used")
+                    return
+                self._json(
+                    409,
+                    {
+                        "detail": "Idempotency-Key already consumed; use a new key",
+                        "error_type": "invalid_input",
+                    },
+                    headers={"X-Comfy-Error-Type": "invalid_input"},
+                )
                 return
 
             if state.model_run_delay:
@@ -583,6 +917,17 @@ def _make_handler(state: ServerState):
                     headers=headers or None,
                 )
 
+            if state.model_run_validation_detail is not None:
+                # Router's per-field validation body. Deliberately built here
+                # rather than through `fail()`: that helper always emits an
+                # `{error: {code, message}}` envelope or a `{detail, error_type}`
+                # string body, and the shape under test is neither.
+                self._json(
+                    422,
+                    {"detail": state.model_run_validation_detail},
+                    headers={"X-Comfy-Error-Type": state.model_run_validation_error_type},
+                )
+                return
             if state.model_run_fail_times > 0:
                 state.model_run_fail_times -= 1
                 status, code = state.model_run_transient_error
@@ -602,7 +947,11 @@ def _make_handler(state: ServerState):
                     "text/html",
                 )
                 return
-            self._json(state.model_run_status, state.model_run_result)
+            self._json(
+                state.model_run_status,
+                state.model_run_result,
+                headers=state.model_run_response_headers or None,
+            )
 
         def _post_jobs(self) -> None:
             state.submit_count += 1
@@ -610,6 +959,7 @@ def _make_handler(state: ServerState):
             state.last_workflow = body.get("workflow")
             state.last_jobs_body = body
             key = self.headers.get("Idempotency-Key")
+            state.jobs_idempotency_keys.append(key)
 
             if key and key in state.idempotency:
                 # Reject-on-duplicate (single-use keys, no replay): any reuse of
@@ -697,6 +1047,10 @@ def _no_ambient_base_url(request, monkeypatch):
     if "integration" in request.path.parts:
         return
     monkeypatch.delenv(BASE_URL_ENV_VAR, raising=False)
+    # The Router target too: a developer with `COMFY_ROUTER_BASE_URL` exported
+    # would otherwise send every `models.run` test at their own host — and the
+    # default-value assertions would pass or fail on their shell, not the code.
+    monkeypatch.delenv(ROUTER_BASE_URL_ENV_VAR, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -719,6 +1073,12 @@ def server(monkeypatch):
     # Clients read their target from the environment, so pointing them at the
     # stub is part of standing it up: tests just construct ``Comfy()``.
     monkeypatch.setenv(BASE_URL_ENV_VAR, srv.base_url)
+    # Both targets, because the SDK has two: jobs and assets resolve under
+    # `COMFY_BASE_URL`, model runs under `COMFY_ROUTER_BASE_URL`. The one stub
+    # serves both route families, so pointing both here keeps a `models.run`
+    # test a single-server test — the *separate*-origin cases point this second
+    # variable at `second_server` themselves.
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, srv.base_url)
     try:
         yield srv
     finally:

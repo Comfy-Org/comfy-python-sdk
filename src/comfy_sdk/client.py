@@ -11,6 +11,14 @@ Both clients target Comfy Cloud. Another deployment — a self-hosted proxy or a
 serverless one — is selected through the ``COMFY_BASE_URL`` environment
 variable; there is no base-URL constructor parameter.
 
+``client.models`` is the exception, and deliberately so: model runs are
+model-ID-addressed routes on **Comfy Router**, a different host, so they follow
+``COMFY_ROUTER_BASE_URL`` (default ``https://api.comfy.org``) instead. One
+variable pointed at both surfaces would send jobs to Router or model runs to
+the v2 API; neither serves the other's routes. The credential is the same one
+either way — this client's own bearer token, attached to both of its configured
+origins and to no third one.
+
 Credentials resolve in a fixed order at construction: the explicit ``api_key``
 argument, then the ``COMFY_API_KEY`` environment variable, then — targeting
 Comfy Cloud, which always requires a key — a local :class:`MissingApiKey`
@@ -36,11 +44,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from comfy_low.errors import ApiError
-from comfy_low.transport import AsyncComfyLow, ComfyLow, origin
+from comfy_low.transport import ROUTER_BASE_URL, AsyncComfyLow, ComfyLow, origin
 
 from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
-from .exceptions import MissingApiKey, WorkflowFormatUi, to_sdk_error
+from .exceptions import MissingApiKey, WorkflowFormatUi, to_sdk_error, translating
 from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory
 from .models import AsyncModels, Models
 from .retry import DEFAULT_RETRY, RetryPolicy
@@ -52,6 +60,20 @@ _QUEUE_RETRY_BUDGET = 60.0
 COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"
 #: Environment variable that redirects a client at another deployment.
 BASE_URL_ENV_VAR = "COMFY_BASE_URL"
+#: Base URL of Comfy Router — where ``client.models`` sends its requests. A
+#: *separate* target from :data:`COMFY_CLOUD_BASE_URL`: the ``/api/v2`` surface
+#: serves jobs and assets, Router serves the model-ID-addressed invocation
+#: routes, and they are different hosts. The literal lives in
+#: :mod:`comfy_low.transport` (the layer that owns the wire) and is re-exported
+#: here so it sits beside the constant it is most often confused with.
+COMFY_ROUTER_BASE_URL = ROUTER_BASE_URL
+#: Environment variable that redirects *model runs* at another Router
+#: deployment. Deliberately a second variable rather than a reuse of
+#: :data:`BASE_URL_ENV_VAR`: one variable pointed at both surfaces would send
+#: jobs to Router, or model runs to the v2 API, and neither serves the other's
+#: routes. Spelled the same as the TypeScript SDK's, so a test environment sets
+#: one variable for both.
+ROUTER_BASE_URL_ENV_VAR = "COMFY_ROUTER_BASE_URL"
 #: Environment variable read when no ``api_key`` is passed to the constructor.
 API_KEY_ENV_VAR = "COMFY_API_KEY"
 
@@ -77,17 +99,21 @@ def _retry_delay(exc: ApiError, deadline: float) -> float | None:
     return max(0.0, min(raw_delay, remaining))
 
 
-def _resolve_base_url() -> str:
-    """Comfy Cloud, unless ``COMFY_BASE_URL`` names another deployment.
+def _resolve_env_url(var: str, default: str) -> str:
+    """``var``'s value if it names a usable target, else ``default``.
 
     Read per construction rather than at import so a process can point
     successive clients at different deployments. An unset-or-blank variable
-    means Comfy Cloud, so ``COMFY_BASE_URL=`` in a shell profile or ``.env``
+    means the default, so ``COMFY_BASE_URL=`` in a shell profile or ``.env``
     is not an error.
+
+    Shared by both targets so the two cannot validate differently — a rule that
+    held for the v2 base URL and not for the Router one would be a rule nobody
+    could state.
     """
-    raw = os.environ.get(BASE_URL_ENV_VAR, "").strip()
+    raw = os.environ.get(var, "").strip()
     if not raw:
-        return COMFY_CLOUD_BASE_URL
+        return default
     parsed = urlsplit(raw)
     try:
         # urlsplit defers the port check, so a non-numeric or out-of-range one
@@ -106,10 +132,27 @@ def _resolve_base_url() -> str:
         valid = False
     if not valid:
         raise ValueError(
-            f"{BASE_URL_ENV_VAR} must be an http(s) URL with no query or fragment "
+            f"{var} must be an http(s) URL with no query or fragment "
             f"(e.g. 'http://127.0.0.1:8189'); got {raw!r}"
         )
     return raw
+
+
+def _resolve_base_url() -> str:
+    """Comfy Cloud, unless ``COMFY_BASE_URL`` names another deployment."""
+    return _resolve_env_url(BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL)
+
+
+def _resolve_router_base_url() -> str:
+    """Comfy Router, unless ``COMFY_ROUTER_BASE_URL`` names another one.
+
+    Same validation as :func:`_resolve_base_url`, and the same
+    read-per-construction rule. The trailing slash is stripped here as well as
+    in the transport, because this value is *concatenated* with a path that
+    already starts with ``/`` — ``https://api.comfy.org//v2/models/...`` is a
+    different path to an origin server than the one the spec declares.
+    """
+    return _resolve_env_url(ROUTER_BASE_URL_ENV_VAR, COMFY_ROUTER_BASE_URL).rstrip("/")
 
 
 def _same_deployment(url: str, other: str) -> bool:
@@ -184,8 +227,9 @@ class Comfy:
     ``retry`` is the policy ``client.models`` calls fail under —
     :data:`~comfy_sdk.retry.DEFAULT_RETRY` unless replaced, and
     :data:`~comfy_sdk.retry.NO_RETRY` to make every call exactly one attempt.
-    It does not govern ``submit``/``run``, whose 429 handling follows the
-    server's own ``Retry-After`` instead.
+    It does not govern this client's own ``submit``/``run`` (the workflow
+    surface), whose 429 handling follows the server's own ``Retry-After``
+    instead.
     """
 
     def __init__(
@@ -198,7 +242,13 @@ class Comfy:
     ) -> None:
         base_url = _resolve_base_url()
         key = _resolve_api_key(api_key, base_url)
-        self._low = ComfyLow(base_url, key, timeout=timeout, client_info=client_info)
+        self._low = ComfyLow(
+            base_url,
+            key,
+            timeout=timeout,
+            client_info=client_info,
+            router_base_url=_resolve_router_base_url(),
+        )
         self.assets = AssetFactory(self._low)
         self.workflows = WorkflowFactory()
         self.jobs = JobFactory(self._low)
@@ -261,6 +311,26 @@ class Comfy:
         reused key is *rejected*, not replayed: on reuse, catch the error and
         poll/list for the job the first attempt already created.
 
+        A caller-supplied ``idempotency_key`` is validated the way
+        ``models.run`` validates its own — an empty, over-long, or
+        non-printable-ASCII key raises ``ValueError`` here, before any request
+        — so an explicit ``""`` never silently mints a fresh key.
+
+        Every exception the ``POST /jobs`` attempt itself raises carries the
+        key it was made under on ``.idempotency_key``: the mapped
+        ``ComfyError``, a ``QueueFull`` once the retry budget is spent, and a
+        transport failure that never reached a response (``httpx.ConnectError``,
+        a read timeout), which reads ``.request_id`` and ``.retry_after`` as
+        ``None`` rather than raising. A failure raised before the request
+        exists — a UI-format workflow, an asset that would not upload — carries
+        none. Because a reused key is rejected rather than replayed, the key is
+        not a replay handle. Whether the server ever saw it depends on the
+        failure: a connect failure never delivered it and a ``QueueFull`` was
+        refused on every attempt, so the key is unclaimed and resubmitting
+        under it is fine; after an ambiguous failure (a read timeout, a
+        connection dropped mid-request) poll or list for the job the first
+        attempt may already have created rather than resubmitting under it.
+
         ``api_key`` authenticates partner (API) nodes embedded in the workflow
         (e.g. Gemini) — unrelated to idempotency and unrelated to the bearer
         token this client was constructed with. It is never persisted or
@@ -268,21 +338,33 @@ class Comfy:
         only when supplied; omitted from the request entirely otherwise.
         """
         _guard_ui_format(workflow)
+        # Validated before any bytes move, like `models.run`: `""` used to
+        # fall into the mint-a-fresh-key branch and disable the caller's dedup.
+        key = (
+            _core.validate_idempotency_key(idempotency_key)
+            if idempotency_key is not None
+            else _core.new_idempotency_key()
+        )
         graph = self._materialize(workflow)
-        key = idempotency_key or _core.new_idempotency_key()
         extra_data = _core.extra_data_for(api_key)
         deadline = _now() + _QUEUE_RETRY_BUDGET
-        while True:
-            try:
-                model = self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
-                return Job(self._low, model)
-            except ApiError as exc:
-                err = to_sdk_error(exc)
-                delay = _retry_delay(exc, deadline)
-                if delay is None:
-                    raise err from exc
-                time.sleep(delay)
-                continue
+        # The key is a local of this frame, so anything that propagates past
+        # here takes the caller's only record of what was sent with it. The
+        # inner handler still owns what is retried and what surfaces; this
+        # stamps the key onto whatever it lets out — including a transport
+        # failure that never reached a response to translate.
+        with translating(idempotency_key=key):
+            while True:
+                try:
+                    model = self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
+                    return Job(self._low, model)
+                except ApiError as exc:
+                    err = to_sdk_error(exc)
+                    delay = _retry_delay(exc, deadline)
+                    if delay is None:
+                        raise err from exc
+                    time.sleep(delay)
+                    continue
 
     def run(
         self,
@@ -324,7 +406,13 @@ class AsyncComfy:
     ) -> None:
         base_url = _resolve_base_url()
         key = _resolve_api_key(api_key, base_url)
-        self._low = AsyncComfyLow(base_url, key, timeout=timeout, client_info=client_info)
+        self._low = AsyncComfyLow(
+            base_url,
+            key,
+            timeout=timeout,
+            client_info=client_info,
+            router_base_url=_resolve_router_base_url(),
+        )
         self.assets = AsyncAssetFactory(self._low)
         self.workflows = WorkflowFactory()
         self.jobs = AsyncJobFactory(self._low)
@@ -367,21 +455,30 @@ class AsyncComfy:
         import asyncio
 
         _guard_ui_format(workflow)
+        key = (
+            _core.validate_idempotency_key(idempotency_key)
+            if idempotency_key is not None
+            else _core.new_idempotency_key()
+        )
         graph = await self._materialize(workflow)
-        key = idempotency_key or _core.new_idempotency_key()
         extra_data = _core.extra_data_for(api_key)
         deadline = _now() + _QUEUE_RETRY_BUDGET
-        while True:
-            try:
-                model = await self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
-                return AsyncJob(self._low, model)
-            except ApiError as exc:
-                err = to_sdk_error(exc)
-                delay = _retry_delay(exc, deadline)
-                if delay is None:
-                    raise err from exc
-                await asyncio.sleep(delay)
-                continue
+        # See :meth:`Comfy.submit` — same stamp, and here it also rides out on
+        # the cancellation of an in-flight `post_jobs`.
+        with translating(idempotency_key=key):
+            while True:
+                try:
+                    model = await self._low.post_jobs(
+                        graph, idempotency_key=key, extra_data=extra_data
+                    )
+                    return AsyncJob(self._low, model)
+                except ApiError as exc:
+                    err = to_sdk_error(exc)
+                    delay = _retry_delay(exc, deadline)
+                    if delay is None:
+                        raise err from exc
+                    await asyncio.sleep(delay)
+                    continue
 
     async def run(
         self,

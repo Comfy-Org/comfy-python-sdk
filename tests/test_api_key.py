@@ -27,6 +27,7 @@ from comfy_sdk import (
     API_KEY_ENV_VAR,
     BASE_URL_ENV_VAR,
     COMFY_CLOUD_BASE_URL,
+    ROUTER_BASE_URL_ENV_VAR,
     AsyncComfy,
     Comfy,
     ComfyError,
@@ -299,8 +300,13 @@ def test_base_url_userinfo_is_redacted_in_every_repr(monkeypatch, client_cls) ->
     out of. Only what is *rendered* is redacted — the transport still resolves
     requests against the URL it was given, so the proxy credential keeps
     working.
+
+    Both targets carry the URL, because both can carry userinfo: a fronting
+    proxy is as legitimate in front of Comfy Router as in front of the v2
+    deployment, and ``repr(client.models)`` renders the *router* URL.
     """
     monkeypatch.setenv(BASE_URL_ENV_VAR, PROXY_BASE_URL)
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, PROXY_BASE_URL)
     with constructed(client_cls) as client:
         for rendered in (
             repr(client),
@@ -313,15 +319,18 @@ def test_base_url_userinfo_is_redacted_in_every_repr(monkeypatch, client_cls) ->
             assert "proxy-user" not in rendered
             assert "***@proxy.example" in rendered
         assert client._low.base_url == PROXY_BASE_URL
+        assert client._low.router_base_url == PROXY_BASE_URL
 
 
 @CLIENTS
 def test_a_base_url_without_userinfo_is_rendered_unchanged(monkeypatch, client_cls) -> None:
     """Redaction stays invisible in the ordinary case — the target reads plainly."""
     monkeypatch.setenv(BASE_URL_ENV_VAR, LOCAL)
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, LOCAL)
     with constructed(client_cls) as client:
         assert f"base_url={LOCAL!r}" in repr(client)
         assert f"base_url={LOCAL!r}" in repr(client._low)
+        assert f"base_url={LOCAL!r}" in repr(client.models)
 
 
 def test_environment_key_reaches_the_server(server, monkeypatch) -> None:

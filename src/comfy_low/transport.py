@@ -10,11 +10,28 @@ escape hatches the hand-written ``comfy_sdk`` layer builds on:
 * **per-request timeout / abort** — every method takes ``timeout`` and the raw
   httpx cancellation applies.
 
-One binding is *not* backed by an ``operationId``: ``post_model_run``. The
-vendored contract declares no model routes yet, so it is hand-written against
-the agreed wire shape, kept out of ``comfy_low.OPERATION_IDS``, and confined to
-``model_run_request`` / ``_MODEL_RUN_PATH`` so vendoring the real route later is
-a one-place change.
+One family of bindings is *not* backed by an ``operationId`` *in this module's
+sense*: the model bindings. ``post_model_run`` targets a different surface —
+Comfy Router, on its own host
+(:data:`ROUTER_BASE_URL`) — rather than the ``/api/v2`` deployment the rest
+of these methods speak to, and it is declared by a *second* vendored contract,
+``spec/router-openapi.yaml`` (``operationId: runRouterModel``, path
+``/v2/models/{provider}/{model}``). Nothing is generated from that second file
+yet, so the binding is still hand-written; what changed is that it is no longer
+hand-*invented*. It stays out of ``comfy_low.OPERATION_IDS`` (which is the
+``spec/openapi.yaml`` set, exactly) and stays confined to ``model_run_request``
+/ :data:`_MODEL_RUN_PATH_TEMPLATE`, so a Router spec sync is a one-place change
+— and ``tests/test_router_spec_contract.py`` plus ``scripts/check_drift.py``
+fail if that constant and the vendored path disagree.
+
+The four ``post_model_submit`` / ``get_model_request_status`` /
+``get_model_request_result`` / ``put_model_request_cancel`` bindings are the
+same story one step earlier: they are the *queued* form of that one operation,
+and the contract declaring them is authored but held, so the vendored Router
+spec does not carry them yet and there is nothing for the contract test to pin
+them against. Their routes are confined to the ``_MODEL_REQUEST*`` constants
+for exactly the reason the run path was, and they are the one part of this
+change a spec sync is expected to correct.
 
 This layer contains no orchestration, retries, hashing, or reconnection — those
 live in ``comfy_sdk``.
@@ -32,12 +49,12 @@ from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any, BinaryIO
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 
 from . import _multipart
-from .errors import ApiError, clean_request_id, error_from_envelope
+from .errors import ApiError, clean_body_excerpt, clean_request_id, error_from_envelope
 from .models import Asset, Job, JobWorkflowResponse
 from .sse import RawEvent, SSEDecoder
 
@@ -60,37 +77,257 @@ _SSE_IDLE_TIMEOUT = httpx.Timeout(10.0, read=45.0)
 #: ``connect`` stays short: an unreachable host is not a slow generation.
 MODEL_RUN_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 
-#: Route for a model run. NOT an ``operationId`` from ``spec/openapi.yaml`` —
-#: the vendored v2 contract declares no model routes, so this binding is
-#: hand-written and is deliberately absent from ``comfy_low.OPERATION_IDS``
-#: (the spec-coverage test asserts that set equals the spec's, exactly).
+#: Base URL of Comfy Router — the surface ``post_model_run`` targets, and the
+#: ``servers[0].url`` of ``spec/router-openapi.yaml``. It is a *different host*
+#: from the ``/api/v2`` deployment ``base_url`` names: the v2 surface serves
+#: jobs and assets, Router serves the model-ID-addressed invocation routes. A
+#: caller redirects it with ``COMFY_ROUTER_BASE_URL`` (see
+#: :data:`comfy_sdk.client.ROUTER_BASE_URL_ENV_VAR`), which is deliberately a
+#: second variable rather than a reuse of ``COMFY_BASE_URL`` — pointing one
+#: variable at both would send jobs to Router or model runs to the v2 API.
+ROUTER_BASE_URL = "https://api.comfy.org"
+
+#: Route for a model run, verbatim from ``spec/router-openapi.yaml`` — the path
+#: whose ``post.operationId`` is ``runRouterModel``. It is NOT an ``operationId``
+#: from ``spec/openapi.yaml`` (a different contract), so this binding is
+#: deliberately absent from ``comfy_low.OPERATION_IDS`` (the spec-coverage test
+#: asserts that set equals *that* spec's, exactly) and is still hand-bound
+#: rather than generated — nothing generates from the Router spec yet.
 #: Everything about the wire shape is confined to this constant and
-#: :func:`model_run_request` so it is one place to reconcile when the route is
-#: vendored into the spec and the models are regenerated from it.
-_MODEL_RUN_PATH = "/models/run"
+#: :func:`model_run_request`, and ``tests/test_router_spec_contract.py`` /
+#: ``scripts/check_drift.py`` fail when the vendored spec's path moves and this
+#: constant does not follow it.
+_MODEL_RUN_PATH_TEMPLATE = "/v2/models/{provider}/{model}"
+
+#: Routes for the *queued* form of a model request — submit, poll, collect,
+#: cancel. They extend :data:`_MODEL_RUN_PATH_TEMPLATE` with a ``requests``
+#: collection under the same model-ID-addressed prefix, because a queued
+#: request is the same operation on the same model, reached without holding the
+#: connection open for it.
+#:
+#: **These four are not in the vendored contract yet.** The queue operations
+#: are authored upstream but held, and the one-way sync into
+#: ``spec/router-openapi.yaml`` strips a held operation — so unlike
+#: :data:`_MODEL_RUN_PATH_TEMPLATE`, which
+#: ``tests/test_router_spec_contract.py`` pins against the vendored file, these
+#: are hand-bound with nothing to pin them to. They are gathered here, in one
+#: place and nowhere else, precisely so the sync that publishes them is a
+#: four-line diff plus the assertion that pins them — exactly as the run path
+#: was hand-bound before its own spec arrived.
+_MODEL_REQUESTS_PATH_TEMPLATE = _MODEL_RUN_PATH_TEMPLATE + "/requests"
+_MODEL_REQUEST_PATH_TEMPLATE = _MODEL_REQUESTS_PATH_TEMPLATE + "/{request_id}"
+_MODEL_REQUEST_STATUS_PATH_TEMPLATE = _MODEL_REQUEST_PATH_TEMPLATE + "/status"
+_MODEL_REQUEST_CANCEL_PATH_TEMPLATE = _MODEL_REQUEST_PATH_TEMPLATE + "/cancel"
+
+#: Longest request id accepted into a path. The contract mints UUIDs (36
+#: characters); the bound exists so a server-controlled value that is NOT one
+#: cannot reach the public handle, a log line or an exception message unbounded.
+_MAX_REQUEST_ID_LENGTH = 256
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def parse_model_id(model: str) -> tuple[str, str]:
+    """Split a canonical ``{provider}/{model}`` id into its two path segments.
+
+    Mirrors the TypeScript SDK's ``parseModelId`` so the same id is accepted,
+    and rejected, identically on both. The id is not an opaque string here: it
+    *is* the tail of the request path (``/v2/models/{provider}/{model}``), so a
+    malformed one has to fail locally rather than be pasted into a URL and
+    answered by whatever route it happens to land on.
+
+    Raises ``TypeError`` when ``model`` is not a ``str`` (a wrong *type*) and
+    ``ValueError`` when it is a string of the wrong shape (a wrong *value*) —
+    Python's own split of the two, so ``except ValueError`` around a call that
+    formats user input does not also swallow a plain programming error.
+    """
+    if not isinstance(model, str):
+        raise TypeError(f"model id must be a str, got {type(model).__name__}")
+    segments = model.split("/")
+    shape = (
+        f"model id must be '{{provider}}/{{model}}' — exactly two non-empty "
+        f"segments separated by '/'; got {model!r}"
+    )
+    # Emptiness first: 'a//b' splits into three segments, and reporting it as
+    # the variant case below would send the caller looking for a variant they
+    # never wrote.
+    if not all(segments):
+        raise ValueError(shape)
+    if len(segments) == 3:
+        raise ValueError(
+            f"model id {model!r} carries a variant segment, which is not addressable on "
+            f"POST {_MODEL_RUN_PATH_TEMPLATE} yet — that route takes the two-segment "
+            f"'{{provider}}/{{model}}' id. Pass the id the catalog lists."
+        )
+    if len(segments) != 2:
+        raise ValueError(shape)
+    provider, name = segments
+    # Refused rather than encoded: `quote` leaves `.` alone (it is unreserved),
+    # so a `.`/`..` segment would survive into the path and let an id walk the
+    # route — `acme/..` resolving to `/v2/models/acme` on any intermediary that
+    # normalizes dot segments, which most do.
+    if provider in (".", "..") or name in (".", ".."):
+        raise ValueError(
+            f"model id segments must not be '.' or '..' — they would traverse the "
+            f"request path rather than name a model; got {model!r}"
+        )
+    return provider, name
+
+
+def _router_run_query(
+    model_provider: str | None,
+    strict_mode: bool | None,
+    fallback_provider: bool | str | None,
+) -> str:
+    """The Comfy Router alt-provider query string for a model run, or ``""``.
+
+    Each field is sent only when the caller set it (``None`` means "send
+    nothing"), so a call that names none is byte-for-byte the request this route
+    has always made -- the server applies its own defaults rather than being
+    handed ``model_provider=default`` / ``strict_mode=false`` spelled out on the
+    wire.
+
+    ``strict_mode`` and ``fallback_provider`` are both rendered ``true``/
+    ``false`` from a ``bool``, and that is a correctness requirement rather than
+    a convenience on ``fallback_provider``. The spec reads it as "omitted, or
+    ANY value other than ``false``, turns fallback on", so Python's ``str(False)``
+    -- ``"False"``, capitalised -- is not the off switch a caller writing
+    ``fallback_provider=False`` is plainly asking for: it is a value other than
+    ``false``, so it would leave fallback ON, the exact opposite, and silently.
+    Normalising here is what makes the boolean spelling mean what it reads as.
+    A ``str`` still passes through as given, so ``"false"`` keeps working and a
+    future non-boolean vocabulary on this parameter needs no change here.
+    """
+    params: list[tuple[str, str]] = []
+    if model_provider is not None:
+        params.append(("model_provider", model_provider))
+    if strict_mode is not None:
+        params.append(("strict_mode", "true" if strict_mode else "false"))
+    if fallback_provider is not None:
+        params.append(
+            (
+                "fallback_provider",
+                ("true" if fallback_provider else "false")
+                if isinstance(fallback_provider, bool)
+                else fallback_provider,
+            )
+        )
+    return urlencode(params)
 
 
 def model_run_request(
     model: str,
     arguments: Mapping[str, Any],
     idempotency_key: str | None,
+    *,
+    model_provider: str | None = None,
+    strict_mode: bool | None = None,
+    fallback_provider: bool | str | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, str]]:
     """Sans-IO ``(path, json_body, headers)`` for one model run.
 
-    The model id travels in the *body*, not the path: ids are commonly
-    provider-namespaced and contain ``/`` (``vendor/family/variant``), which in
-    a path segment needs percent-encoding that intermediaries normalize
-    inconsistently. A named body field also leaves room for sibling fields
-    later without moving the route.
+    The model id *addresses* the request: it is the two path segments of
+    ``/v2/models/{provider}/{model}``, not a body field. That is Router's
+    contract — the request body is the partner model's OWN native JSON input,
+    forwarded to the provider unchanged, so there is no room in it for a
+    Comfy-shaped ``{model, arguments}`` envelope. A caller can therefore move
+    between the partner's API and Router by changing the host, which is the
+    whole point of the surface.
+
+    Each segment is percent-encoded with ``safe=""`` so nothing in it can add a
+    path segment, a query, or a fragment. The path is still the one the
+    vendored spec declares — see :data:`_MODEL_RUN_PATH_TEMPLATE`.
 
     ``arguments`` is copied into a plain dict so any ``Mapping`` is accepted and
     the caller's object is never handed to the JSON encoder directly.
     """
-    body: dict[str, Any] = {"model": model, "arguments": dict(arguments)}
+    provider, name = parse_model_id(model)
+    path = _MODEL_RUN_PATH_TEMPLATE.format(
+        provider=quote(provider, safe=""), model=quote(name, safe="")
+    )
+    query = _router_run_query(model_provider, strict_mode, fallback_provider)
+    if query:
+        path = f"{path}?{query}"
+    body: dict[str, Any] = dict(arguments)
     headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
-    return _MODEL_RUN_PATH, body, headers
+    return path, body, headers
+
+
+def parse_request_id(request_id: str) -> str:
+    """``request_id`` unchanged, or an error for one that cannot address a route.
+
+    A queued request's id is the last segment of
+    ``/v2/models/{provider}/{model}/requests/{request_id}``, so it is subject to
+    exactly the discipline :func:`parse_model_id` applies to the two segments
+    before it: a wrong *type* raises ``TypeError``, a wrong *value* raises
+    ``ValueError``, and both fail locally rather than being pasted into a URL
+    and answered by whatever route they land on. ``.``/``..`` are refused rather
+    than encoded for the same reason they are there — ``quote`` leaves ``.``
+    alone, so a dot segment would survive into the path and walk the route on
+    any intermediary that normalizes it.
+    """
+    if not isinstance(request_id, str):
+        raise TypeError(f"request id must be a str, got {type(request_id).__name__}")
+    if not request_id:
+        raise ValueError("request id must not be empty")
+    if "/" in request_id:
+        raise ValueError(
+            f"request id must be a single path segment — it addresses "
+            f"{_MODEL_REQUEST_PATH_TEMPLATE}; got {request_id!r}"
+        )
+    if request_id in (".", ".."):
+        raise ValueError(
+            f"request id must not be '.' or '..' — it would traverse the request path "
+            f"rather than name a request; got {request_id!r}"
+        )
+    if len(request_id) > _MAX_REQUEST_ID_LENGTH:
+        raise ValueError(
+            f"request id must be at most {_MAX_REQUEST_ID_LENGTH} characters; got {len(request_id)}"
+        )
+    if not request_id.isprintable():
+        # It is displayed and interpolated into exception messages as well as
+        # into the path, so a control character is refused rather than encoded.
+        raise ValueError(f"request id must not contain control characters; got {request_id!r}")
+    return request_id
+
+
+def model_submit_request(
+    model: str,
+    arguments: Mapping[str, Any],
+    idempotency_key: str | None,
+) -> tuple[str, dict[str, Any], dict[str, str]]:
+    """Sans-IO ``(path, json_body, headers)`` for one *queued* model request.
+
+    Identical in shape to :func:`model_run_request` — the model id addresses the
+    request and the body is the partner model's own native JSON input, verbatim
+    — differing only in the route it targets. That sameness is deliberate: a
+    caller moves between the awaited and the queued form by choosing a method,
+    not by rewriting the request.
+    """
+    provider, name = parse_model_id(model)
+    path = _MODEL_REQUESTS_PATH_TEMPLATE.format(
+        provider=quote(provider, safe=""), model=quote(name, safe="")
+    )
+    body: dict[str, Any] = dict(arguments)
+    headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
+    return path, body, headers
+
+
+def model_request_path(model: str, request_id: str, template: str) -> str:
+    """Sans-IO path for one queued request, from ``template``.
+
+    ``template`` is one of the ``_MODEL_REQUEST_*`` constants; passing it in
+    rather than branching on an operation name keeps every route this family
+    reaches spelled in exactly one place. Each of the three segments is
+    percent-encoded with ``safe=""`` so nothing in it can add a path segment, a
+    query or a fragment.
+    """
+    provider, name = parse_model_id(model)
+    return template.format(
+        provider=quote(provider, safe=""),
+        model=quote(name, safe=""),
+        request_id=quote(parse_request_id(request_id), safe=""),
+    )
 
 
 def _build_user_agent(client_info: str | None) -> str:
@@ -183,7 +420,13 @@ def redact_userinfo(url: str) -> str:
 class _Prepared:
     """Sans-IO request building shared by both transports."""
 
-    def __init__(self, base_url: str, api_key: str | None, client_info: str | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str | None,
+        client_info: str | None = None,
+        router_base_url: str = ROUTER_BASE_URL,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         #: ``base_url`` with any userinfo redacted — what every ``repr`` shows.
@@ -191,6 +434,20 @@ class _Prepared:
         self._base_origin = origin(self.base_url)
         parts = urlsplit(self.base_url)
         self._origin_url = f"{parts.scheme}://{parts.netloc}"
+        #: Comfy Router's base URL — a *second* target, used only by
+        #: ``post_model_run``, which builds an absolute URL against it rather
+        #: than going through :meth:`url` (that method prepends ``/api/v2``,
+        #: which is the other surface's mount prefix, not Router's).
+        self.router_base_url = router_base_url.rstrip("/")
+        # Checked here rather than left to httpx: `url()` passes a string
+        # through only when it starts with `http`, so a non-http router base
+        # would silently fall through to the `base_url + /api/v2 + ...` branch
+        # and send the run to the wrong surface under a mangled URL instead of
+        # failing with a sentence that names the setting.
+        if not self.router_base_url.startswith(("http://", "https://")):
+            raise ValueError(f"router_base_url must be an http(s) URL; got {router_base_url!r}")
+        self.safe_router_base_url = redact_userinfo(self.router_base_url)
+        self._router_origin = origin(self.router_base_url)
         self._user_agent = _build_user_agent(client_info)
 
     def __repr__(self) -> str:
@@ -219,11 +476,21 @@ class _Prepared:
         h: dict[str, str] = {"User-Agent": self._user_agent}
         # Only authenticate when a key is set: a local proxy fronts a ComfyUI
         # with no auth, so we never leak credentials it does not want. And only
-        # attach it when the resolved request URL is same-origin as base_url:
-        # server-returned absolute follow-up links (job.urls.self/cancel/events)
-        # must not carry the key to a different scheme/host/port. Relative paths
-        # are always resolved under base_url, so they are unaffected.
-        if self.api_key and origin(url) == self._base_origin:
+        # attach it when the resolved request URL is same-origin as one of this
+        # client's own *configured* targets: server-returned absolute follow-up
+        # links (job.urls.self/cancel/events) must not carry the key to a
+        # different scheme/host/port. Relative paths are always resolved under
+        # base_url, so they are unaffected.
+        #
+        # There are two configured targets rather than one because the SDK
+        # speaks to two surfaces: the ``/api/v2`` deployment (`base_url`) and
+        # Comfy Router (`router_base_url`), which is a different host by
+        # default. Both come from the client's own construction — a constant, or
+        # an environment variable the operator set — never from a server
+        # response, so trusting the router origin does not widen what a
+        # malicious server can point the credential at. A third origin still
+        # gets nothing; ``tests/test_transport_security.py`` asserts it.
+        if self.api_key and origin(url) in (self._base_origin, self._router_origin):
             h["Authorization"] = f"Bearer {self.api_key}"
         if extra:
             h.update(extra)
@@ -248,6 +515,10 @@ class _Prepared:
                     code="invalid_response",
                     http_status=resp.status_code,
                     request_id=_request_id(resp),
+                    # Whatever was served instead is the only description of
+                    # what answered — the interstitial's own text names the
+                    # proxy, and it is discarded with the response otherwise.
+                    body_excerpt=_body_excerpt(resp),
                 ) from exc
         body: dict[str, Any] | None
         try:
@@ -264,7 +535,36 @@ class _Prepared:
             # Passing it here is what keeps the bucket alive across the layer
             # boundary; see `error_from_envelope`.
             error_type=resp.headers.get("X-Comfy-Error-Type"),
+            # Passed for every error response; `error_from_envelope` keeps it
+            # only when it found no message in the body, because it is the one
+            # place that knows — `{"message": "no healthy upstream"}` is a JSON
+            # object and still not an envelope. For such a response the text is
+            # the only statement of the cause it made.
+            body_excerpt=_body_excerpt(resp),
         )
+
+
+def _body_excerpt(resp: httpx.Response) -> str | None:
+    """A bounded, single-line excerpt of ``resp``'s body text, or ``None``.
+
+    Read off every error response and off a success whose body would not
+    decode, and kept (by ``error_from_envelope``) only where the body stated no
+    message of its own — there the text served is the sole statement of what
+    answered: a load balancer in front of the deployment answering a ``503``
+    with ``no healthy upstream`` or ``upstream connect error or disconnect/reset
+    before headers``, as plain text with no JSON and no ``X-Comfy-Request-Id``;
+    a proxy interstitial served with a success status. Both used to discard
+    that text with the response.
+
+    Never raises, for the same reason the ``resp.json()`` above is guarded:
+    ``resp.text`` decodes the *buffered* body and raises ``ResponseNotRead`` on a
+    streaming response nothing has read yet, and a failure while composing an
+    error message must not replace the error it was describing.
+    """
+    try:
+        return clean_body_excerpt(resp.text)
+    except Exception:
+        return None
 
 
 def parse_expiry(url: str) -> datetime | None:
@@ -322,8 +622,9 @@ class ComfyLow:
         client: httpx.Client | None = None,
         timeout: float | None = 30.0,
         client_info: str | None = None,
+        router_base_url: str = ROUTER_BASE_URL,
     ) -> None:
-        self._p = _Prepared(base_url, api_key, client_info)
+        self._p = _Prepared(base_url, api_key, client_info, router_base_url)
         self._own_client = client is None
         self._client = client or httpx.Client(timeout=timeout, follow_redirects=True)
 
@@ -341,6 +642,21 @@ class ComfyLow:
     def safe_base_url(self) -> str:
         """:attr:`base_url` with any userinfo redacted — the form safe to log."""
         return self._p.safe_base_url
+
+    @property
+    def router_base_url(self) -> str:
+        """Comfy Router's base URL — where :meth:`post_model_run` sends its request.
+
+        A second target, not a view of :attr:`base_url`: model runs are
+        model-ID-addressed routes on Router's own host, while jobs and assets
+        are ``/api/v2`` routes on the deployment :attr:`base_url` names.
+        """
+        return self._p.router_base_url
+
+    @property
+    def safe_router_base_url(self) -> str:
+        """:attr:`router_base_url` with any userinfo redacted — safe to log."""
+        return self._p.safe_router_base_url
 
     @property
     def timeout(self) -> httpx.Timeout:
@@ -435,7 +751,6 @@ class ComfyLow:
         tags: list[str] | None = None,
         idempotency_key: str | None = None,
         file_size: int | None = None,
-        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         """POST /api/v2/assets — streaming multipart upload."""
@@ -451,8 +766,6 @@ class ComfyLow:
             # One part per tag — repeating the field name is the multipart/form
             # convention for a list, and a dict would silently drop all but one.
             fields.extend(("tags", t) for t in tags)
-        if expires_in is not None:
-            fields.append(("expires_in", str(expires_in)))
         boundary = _new_boundary()
         body, length = _multipart.build_multipart(
             boundary,
@@ -477,7 +790,6 @@ class ComfyLow:
         *,
         file_path: str | None = None,
         tags: list[str] | None = None,
-        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         """POST /api/v2/assets/from-hash — dedup mint over existing bytes."""
@@ -486,8 +798,6 @@ class ComfyLow:
             payload["file_path"] = file_path
         if tags is not None:
             payload["tags"] = tags
-        if expires_in is not None:
-            payload["expires_in"] = expires_in
         resp = self.raw_request("POST", "/assets/from-hash", json=payload, timeout=timeout)
         data = self._p.parse_or_raise(resp, (200, 201))
         return Asset.model_validate(data)
@@ -647,9 +957,17 @@ class ComfyLow:
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
-        """POST /api/v2/models/run — run a model, awaited server-side.
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
+        """POST ``{router_base_url}/v2/models/{provider}/{model}`` — awaited server-side.
+
+        Addressed to Comfy Router, not to the ``/api/v2`` deployment
+        :attr:`base_url` names: the URL is built absolute against
+        :attr:`router_base_url` precisely so it does not pick up the ``/api/v2``
+        prefix ``_Prepared.url`` adds to a relative path.
 
         One request, one response: the server does not answer until the
         generation is complete, so the decoded body *is* the finished result.
@@ -657,13 +975,128 @@ class ComfyLow:
         side, inside this call, which is why the default ``timeout`` is
         :data:`MODEL_RUN_TIMEOUT` rather than the client's own.
 
-        The body is returned verbatim — the provider's native payload, with no
-        model class layered over it. This is not a spec operation; see
-        :data:`_MODEL_RUN_PATH`.
+        ``arguments`` is sent as the body verbatim (the partner model's native
+        JSON input) and the response body is returned verbatim (its native
+        output), with no model class layered over either. This is not an
+        ``operationId`` of ``spec/openapi.yaml``; it is ``runRouterModel`` of
+        ``spec/router-openapi.yaml``, hand-bound — see
+        :data:`_MODEL_RUN_PATH_TEMPLATE`.
+
+        Returns ``(body, headers)`` rather than the bare body, matching the four
+        ``*_model_request*`` queue methods beside it. The response headers are
+        not incidental on this route: ``X-Comfy-Router-Fallback-Provider`` is the
+        ONLY disclosure that a fallback retry served the call rather than the
+        provider asked for, and ``X-Comfy-Router-Dropped-Params`` the only
+        disclosure that translating a native body onto an alternate provider's
+        schema could not carry every field. Returning the body alone discarded
+        both, so a caller could not tell an alt-provider run from a native one.
+
+        Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
+        any request when ``model`` is not a ``{provider}/{model}`` id.
         """
-        path, body, headers = model_run_request(model, arguments, idempotency_key)
-        resp = self.raw_request("POST", path, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200, 201))
+        path, body, headers = model_run_request(
+            model,
+            arguments,
+            idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+        )
+        url = self._p.router_base_url + path
+        resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 201)), resp.headers
+
+    # -- models: the queued form ------------------------------------------
+    #
+    # These four return the response HEADERS alongside the decoded body, which
+    # nothing else in this transport does. The reason is specific to the queue
+    # rather than a change of house style: a poll's whole job is to say when to
+    # ask again, and the server says it on `Retry-After` — a header, on a
+    # SUCCESS response, which `parse_or_raise` has no way to hand back. Reading
+    # it is what makes the layer above pace itself against the server's own
+    # answer instead of only against a local backoff schedule. The same channel
+    # carries `X-Comfy-Request-Id`, which is what a failure reported inside a
+    # 200 body has to be attributable by.
+    def post_model_submit(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = _UNSET,
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """POST ``{router_base_url}/v2/models/{provider}/{model}/requests`` — queued.
+
+        The queued sibling of :meth:`post_model_run`: same host, same
+        model-ID-addressed prefix, same verbatim body, but the server answers as
+        soon as the request is *accepted* rather than holding the connection
+        until the generation is finished. The response names the request id
+        every later call in this family is addressed by.
+
+        The timeout is therefore the client's ordinary default rather than
+        :data:`MODEL_RUN_TIMEOUT` — nothing here waits on a generation.
+
+        Returns ``(body, headers)`` rather than the bare body, matching the four
+        ``*_model_request*`` queue methods beside it. The response headers are
+        not incidental on this route: ``X-Comfy-Router-Fallback-Provider`` is the
+        ONLY disclosure that a fallback retry served the call rather than the
+        provider asked for, and ``X-Comfy-Router-Dropped-Params`` the only
+        disclosure that translating a native body onto an alternate provider's
+        schema could not carry every field. Returning the body alone discarded
+        both, so a caller could not tell an alt-provider run from a native one.
+
+        Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
+        any request when ``model`` is not a ``{provider}/{model}`` id.
+        """
+        path, body, headers = model_submit_request(model, arguments, idempotency_key)
+        url = self._p.router_base_url + path
+        resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 201, 202)), resp.headers
+
+    def get_model_request_status(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """GET the queue status of one submitted request — the authoritative read.
+
+        This is the source of truth for how far a queued request has got, and
+        the only one: there is no stream to reconcile against on this surface.
+        """
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_STATUS_PATH_TEMPLATE
+        )
+        resp = self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    def get_model_request_result(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """GET the finished result of one submitted request.
+
+        The body is the provider's own payload, exactly as
+        :meth:`post_model_run` returns it — this route is where a queued
+        request's result is collected, not a differently-shaped one.
+        """
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_PATH_TEMPLATE
+        )
+        resp = self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    def put_model_request_cancel(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """PUT a cancellation for one submitted request.
+
+        A request, not a guarantee — a deployment that answers ``204`` gives an
+        empty body, which ``parse_or_raise`` returns as ``{}``. The
+        authoritative state is whatever :meth:`get_model_request_status` says
+        next, exactly as it is for a job.
+        """
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_CANCEL_PATH_TEMPLATE
+        )
+        resp = self.raw_request("PUT", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 202, 204)), resp.headers
 
 
 class AsyncComfyLow:
@@ -677,8 +1110,9 @@ class AsyncComfyLow:
         client: httpx.AsyncClient | None = None,
         timeout: float | None = 30.0,
         client_info: str | None = None,
+        router_base_url: str = ROUTER_BASE_URL,
     ) -> None:
-        self._p = _Prepared(base_url, api_key, client_info)
+        self._p = _Prepared(base_url, api_key, client_info, router_base_url)
         self._own_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout, follow_redirects=True)
 
@@ -692,6 +1126,16 @@ class AsyncComfyLow:
     def safe_base_url(self) -> str:
         """:attr:`base_url` with any userinfo redacted — the form safe to log."""
         return self._p.safe_base_url
+
+    @property
+    def router_base_url(self) -> str:
+        """Comfy Router's base URL — mirrors :attr:`ComfyLow.router_base_url`."""
+        return self._p.router_base_url
+
+    @property
+    def safe_router_base_url(self) -> str:
+        """:attr:`router_base_url` with any userinfo redacted — safe to log."""
+        return self._p.safe_router_base_url
 
     @property
     def timeout(self) -> httpx.Timeout:
@@ -777,7 +1221,6 @@ class AsyncComfyLow:
         tags: list[str] | None = None,
         idempotency_key: str | None = None,
         file_size: int | None = None,
-        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         if file_size is None:
@@ -791,8 +1234,6 @@ class AsyncComfyLow:
         if tags:
             # One part per tag — see the sync ``post_assets`` for why a dict is wrong.
             fields.extend(("tags", t) for t in tags)
-        if expires_in is not None:
-            fields.append(("expires_in", str(expires_in)))
         boundary = _new_boundary()
         body, length = _multipart.build_multipart(
             boundary,
@@ -827,7 +1268,6 @@ class AsyncComfyLow:
         *,
         file_path: str | None = None,
         tags: list[str] | None = None,
-        expires_in: int | None = None,
         timeout: Any = _UNSET,
     ) -> Asset:
         payload: dict[str, Any] = {"hash": hash}
@@ -835,8 +1275,6 @@ class AsyncComfyLow:
             payload["file_path"] = file_path
         if tags is not None:
             payload["tags"] = tags
-        if expires_in is not None:
-            payload["expires_in"] = expires_in
         resp = await self.raw_request("POST", "/assets/from-hash", json=payload, timeout=timeout)
         data = self._p.parse_or_raise(resp, (200, 201))
         return Asset.model_validate(data)
@@ -967,12 +1405,68 @@ class AsyncComfyLow:
         arguments: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        model_provider: str | None = None,
+        strict_mode: bool | None = None,
+        fallback_provider: bool | str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
         """Async :meth:`ComfyLow.post_model_run`."""
-        path, body, headers = model_run_request(model, arguments, idempotency_key)
-        resp = await self.raw_request("POST", path, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200, 201))
+        path, body, headers = model_run_request(
+            model,
+            arguments,
+            idempotency_key,
+            model_provider=model_provider,
+            strict_mode=strict_mode,
+            fallback_provider=fallback_provider,
+        )
+        url = self._p.router_base_url + path
+        resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 201)), resp.headers
+
+    # -- models: the queued form ------------------------------------------
+    async def post_model_submit(
+        self,
+        model: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout: Any = _UNSET,
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """Async :meth:`ComfyLow.post_model_submit`."""
+        path, body, headers = model_submit_request(model, arguments, idempotency_key)
+        url = self._p.router_base_url + path
+        resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 201, 202)), resp.headers
+
+    async def get_model_request_status(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """Async :meth:`ComfyLow.get_model_request_status`."""
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_STATUS_PATH_TEMPLATE
+        )
+        resp = await self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    async def get_model_request_result(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """Async :meth:`ComfyLow.get_model_request_result`."""
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_PATH_TEMPLATE
+        )
+        resp = await self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    async def put_model_request_cancel(
+        self, model: str, request_id: str, *, timeout: Any = _UNSET
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """Async :meth:`ComfyLow.put_model_request_cancel`."""
+        url = self._p.router_base_url + model_request_path(
+            model, request_id, _MODEL_REQUEST_CANCEL_PATH_TEMPLATE
+        )
+        resp = await self.raw_request("PUT", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200, 202, 204)), resp.headers
 
 
 def _looks_like_path(s: str) -> bool:

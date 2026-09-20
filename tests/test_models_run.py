@@ -3,7 +3,9 @@
 Covers the whole contract of the headline model API on both clients: the sync
 call blocks and returns the finished result, the async call awaits to the same
 shape, the awaitable form is the *async client* rather than a suffixed method
-(asserted, not merely absent), the wait is sized for a server that polls
+(asserted, not merely absent), the run is addressed to Comfy Router by the
+model's two id segments with the model's own native JSON as the body, the
+result is that model's native output, the wait is sized for a server that polls
 upstream inside the call, an ``Idempotency-Key`` is plumbed onto the wire and rides
 out on whatever the call raises, and the result handed back is the provider's
 own payload rather than a wrapper.
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import re
 from collections.abc import Mapping
 from typing import Any, cast
@@ -22,18 +25,38 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from comfy_low.transport import MODEL_RUN_TIMEOUT, AsyncComfyLow, ComfyLow, model_run_request
-from comfy_sdk import NO_RETRY, AsyncComfy, Comfy, RetryPolicy
+from comfy_low.errors import ApiError as LowApiError
+from comfy_low.transport import (
+    MODEL_RUN_TIMEOUT,
+    ROUTER_BASE_URL,
+    AsyncComfyLow,
+    ComfyLow,
+    model_run_request,
+    parse_model_id,
+)
+from comfy_sdk import (
+    COMFY_ROUTER_BASE_URL,
+    NO_RETRY,
+    ROUTER_BASE_URL_ENV_VAR,
+    AsyncComfy,
+    Comfy,
+    RetryPolicy,
+)
 from comfy_sdk.exceptions import ComfyError, NotFound, Unauthorized
-from comfy_sdk.models import AsyncModels, Models
+from comfy_sdk.models import AsyncModels, Models, RouterRunResult
 from comfy_sdk.router_exceptions import (
     ERROR_TYPE_HEADER,
     DeadlineExceeded,
+    InvalidInput,
     RouterError,
+    error_from_completion,
     error_from_response,
 )
 
-MODEL = "acme/flux/dev"
+#: The canonical two-segment ``{provider}/{model}`` id the route is addressed
+#: by — the same shape ``spec/router-openapi.yaml``'s ``RouterModelId`` pattern
+#: declares, and the id the catalog lists.
+MODEL = "acme/flux-dev"
 ARGS = {"prompt": "a cat", "steps": 4}
 
 
@@ -78,10 +101,184 @@ def test_a_created_shaped_success_is_also_a_result(server) -> None:
         assert client.models.run(MODEL, ARGS) == server.state.model_run_result
 
 
-def test_run_sends_the_model_and_arguments(server) -> None:
+# --- the model id addresses the route; the body is the model's own input ----
+
+
+def test_run_addresses_the_model_by_path_and_sends_the_native_body(server) -> None:
+    # The wire shape Router declares: the id is the two path segments of
+    # `/v2/models/{provider}/{model}`, and the body is the partner model's OWN
+    # native JSON input, forwarded unchanged — no `{model, arguments}` envelope.
     with Comfy() as client:
         client.models.run(MODEL, ARGS)
-    assert server.state.last_model_run_body == {"model": MODEL, "arguments": ARGS}
+    assert server.state.last_model_run_path == "/v2/models/acme/flux-dev"
+    assert server.state.last_model_run_provider == "acme"
+    assert server.state.last_model_run_model == "flux-dev"
+    assert server.state.last_model_run_body == ARGS
+    assert "model" not in server.state.last_model_run_body
+    assert "arguments" not in server.state.last_model_run_body
+
+
+async def test_the_async_client_addresses_the_route_the_same_way(server) -> None:
+    async with AsyncComfy() as client:
+        await client.models.run(MODEL, ARGS)
+    assert server.state.last_model_run_path == "/v2/models/acme/flux-dev"
+    assert server.state.last_model_run_body == ARGS
+
+
+def test_the_sans_io_request_builder_agrees_with_the_wire() -> None:
+    # The one place the wire shape is decided, asserted directly so a change to
+    # it cannot hide behind the stub's own routing.
+    path, body, headers = model_run_request(MODEL, ARGS, "k-1")
+    assert path == "/v2/models/acme/flux-dev"
+    assert body == ARGS
+    assert headers == {"Idempotency-Key": "k-1"}
+
+
+def test_the_alt_provider_controls_are_query_params_sent_only_when_set() -> None:
+    # Omitted -> no query at all, so a call that names none of the controls is
+    # byte-for-byte the request this route has always made.
+    assert model_run_request(MODEL, ARGS, None)[0] == "/v2/models/acme/flux-dev"
+    # Each control is a query param on the run path; `strict_mode` renders as the
+    # spec's `true`/`false` rather than Python's `True`/`False`.
+    assert (
+        model_run_request(MODEL, ARGS, None, model_provider="fal")[0]
+        == "/v2/models/acme/flux-dev?model_provider=fal"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, strict_mode=True)[0]
+        == "/v2/models/acme/flux-dev?strict_mode=true"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, strict_mode=False)[0]
+        == "/v2/models/acme/flux-dev?strict_mode=false"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider="false")[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=false"
+    )
+    # All three together, in the order the builder emits them; the body and the
+    # Idempotency-Key are untouched by the query.
+    path, body, headers = model_run_request(
+        MODEL,
+        ARGS,
+        "k-1",
+        model_provider="fal",
+        strict_mode=False,
+        fallback_provider="false",
+    )
+    assert path == (
+        "/v2/models/acme/flux-dev?model_provider=fal&strict_mode=false&fallback_provider=false"
+    )
+    assert body == ARGS
+    assert headers == {"Idempotency-Key": "k-1"}
+
+
+def test_a_bool_fallback_provider_renders_the_spec_spelling_not_pythons() -> None:
+    """``fallback_provider=False`` must turn fallback OFF, not silently leave it on.
+
+    The spec reads this parameter as "omitted, or any value other than
+    ``false``, turns fallback on". Python's ``str(False)`` is the capitalised
+    ``"False"``, which is *a value other than* ``false`` -- so passing the
+    boolean through unnormalised would put fallback ON for the one caller who
+    explicitly asked for it OFF, and do it silently, with a 200 that looks
+    exactly like the intended one. That is the whole reason this normalisation
+    exists, so it is pinned here rather than left to the type hint.
+    """
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider=False)[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=false"
+    )
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider=True)[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=true"
+    )
+    # A str still passes through as given: "false" keeps working, and a future
+    # non-boolean vocabulary on this parameter needs no change to the builder.
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider="false")[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=false"
+    )
+    # The capitalised spelling is what a caller gets ONLY by asking for it as a
+    # string, and it is left alone -- normalising a str would be this function
+    # second-guessing a value the spec says to forward verbatim.
+    assert (
+        model_run_request(MODEL, ARGS, None, fallback_provider="False")[0]
+        == "/v2/models/acme/flux-dev?fallback_provider=False"
+    )
+
+
+@pytest.mark.parametrize(
+    "model, path",
+    [
+        # `.`, `_` and `-` are all legal *inside* a segment per the spec's
+        # `RouterModelSegment` pattern, and none of them is percent-encoded:
+        # they are unreserved (or sub-delims) in a path segment, so the URL the
+        # caller reads in a log is the id they passed.
+        ("bfl/flux-2-pro", "/v2/models/bfl/flux-2-pro"),
+        ("acme/sd_xl.turbo", "/v2/models/acme/sd_xl.turbo"),
+        ("acme_labs/v1.5", "/v2/models/acme_labs/v1.5"),
+        # ...while anything that would change the *structure* of the path is
+        # encoded rather than passed through.
+        ("acme/a b", "/v2/models/acme/a%20b"),
+        ("acme/a?b", "/v2/models/acme/a%3Fb"),
+        ("acme/a#b", "/v2/models/acme/a%23b"),
+    ],
+)
+def test_each_segment_is_percent_encoded_into_exactly_one_path_segment(
+    model: str, path: str
+) -> None:
+    assert model_run_request(model, {}, None)[0] == path
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "flux-dev",  # one segment — no provider
+        "acme/flux/dev",  # three — the variant form, not addressable here
+        "acme/flux/dev/fp8",  # four
+        "acme/..",  # traversal
+        "../flux-dev",
+        "./flux-dev",
+        "acme/.",
+        "a//b",  # an empty middle segment
+        "/flux-dev",  # empty provider
+        "acme/",  # empty model
+        "",
+        "/",
+    ],
+)
+def test_a_malformed_model_id_is_refused_locally(bad: str) -> None:
+    # Refused before any request: the id *is* the path, so a malformed one
+    # would otherwise be pasted into a URL and answered by whatever route it
+    # landed on — a 404 that looks like "no such model" rather than "you passed
+    # a bad id".
+    with pytest.raises(ValueError):
+        model_run_request(bad, {}, None)
+    with pytest.raises(ValueError):
+        parse_model_id(bad)
+
+
+def test_a_three_segment_id_says_the_variant_is_not_addressable_yet() -> None:
+    # The message matters: a `{provider}/{model}/{variant}` id is a real id
+    # shape, just not one this route takes, and "invalid model id" would send
+    # the caller looking for a typo.
+    with pytest.raises(ValueError, match="variant"):
+        parse_model_id("acme/flux/dev")
+
+
+def test_a_non_string_model_id_is_a_type_error_not_a_value_error() -> None:
+    # Python's own split: a wrong *type* is a programming error, and folding it
+    # into ValueError would let `except ValueError` around user input swallow it.
+    for bad in (None, 3, ["acme", "flux-dev"]):
+        with pytest.raises(TypeError):
+            parse_model_id(bad)  # type: ignore[arg-type]
+
+
+def test_a_malformed_id_never_reaches_the_server(server) -> None:
+    with Comfy() as client:
+        with pytest.raises(ValueError):
+            client.models.run("acme/flux/dev", ARGS)
+    assert server.state.model_run_count == 0
 
 
 def test_run_accepts_any_mapping_and_does_not_alias_the_callers_object(server) -> None:
@@ -90,10 +287,74 @@ def test_run_accepts_any_mapping_and_does_not_alias_the_callers_object(server) -
     caller_args = {"prompt": "a dog"}
     with Comfy() as client:
         client.models.run(MODEL, MappingProxyType(caller_args))
-    assert server.state.last_model_run_body == {"model": MODEL, "arguments": {"prompt": "a dog"}}
+    assert server.state.last_model_run_body == {"prompt": "a dog"}
     _path, body, _headers = model_run_request(MODEL, caller_args, None)
-    body["arguments"]["prompt"] = "mutated"
+    body["prompt"] = "mutated"
     assert caller_args == {"prompt": "a dog"}
+
+
+# --- which host the run is addressed to ---------------------------------
+
+
+def test_the_default_router_base_url_is_the_public_one() -> None:
+    assert COMFY_ROUTER_BASE_URL == ROUTER_BASE_URL == "https://api.comfy.org"
+    assert ROUTER_BASE_URL_ENV_VAR == "COMFY_ROUTER_BASE_URL"
+
+
+def test_a_client_defaults_to_the_public_router(monkeypatch) -> None:
+    # No `server` fixture here on purpose: that fixture is what points the
+    # router at the stub, so this asserts the *unconfigured* default.
+    monkeypatch.delenv(ROUTER_BASE_URL_ENV_VAR, raising=False)
+    with Comfy(api_key="comfyui-test") as client:
+        assert client.models.base_url == "https://api.comfy.org"
+        assert client._low.router_base_url == "https://api.comfy.org"
+
+
+def test_the_router_env_var_redirects_model_runs(monkeypatch, server) -> None:
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "http://127.0.0.1:9/router")
+    with Comfy() as client:
+        assert client.models.base_url == "http://127.0.0.1:9/router"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_router_env_var_means_the_default(monkeypatch, blank: str) -> None:
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, blank)
+    with Comfy(api_key="comfyui-test") as client:
+        assert client.models.base_url == COMFY_ROUTER_BASE_URL
+
+
+def test_a_trailing_slash_on_the_router_env_var_is_stripped(monkeypatch) -> None:
+    # It is concatenated with a path that already starts with `/`, so a kept
+    # slash would request `//v2/models/...` — a different path to an origin
+    # server than the one the vendored spec declares.
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "https://router.example/")
+    with Comfy(api_key="comfyui-test") as client:
+        assert client.models.base_url == "https://router.example"
+
+
+@pytest.mark.parametrize("bad", ["not-a-url", "ftp://h", "https://h?x=1", "https://h#f"])
+def test_a_malformed_router_env_var_is_rejected(monkeypatch, bad: str) -> None:
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, bad)
+    with pytest.raises(ValueError, match=ROUTER_BASE_URL_ENV_VAR):
+        Comfy(api_key="comfyui-test")
+
+
+def test_the_models_namespace_reports_the_router_not_the_v2_deployment(monkeypatch, server) -> None:
+    # The distinction this whole binding rests on: jobs and assets resolve
+    # under COMFY_BASE_URL, model runs under COMFY_ROUTER_BASE_URL, and they
+    # are different hosts by default.
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "https://router.example")
+    with Comfy() as client:
+        assert client.models.base_url == "https://router.example"
+        assert client._low.base_url == server.base_url
+        assert repr(client.models) == "Models(base_url='https://router.example')"
+
+
+async def test_the_async_namespace_reports_the_router_too(monkeypatch, server) -> None:
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "https://router.example")
+    async with AsyncComfy() as client:
+        assert client.models.base_url == "https://router.example"
+        assert repr(client.models) == "AsyncModels(base_url='https://router.example')"
 
 
 # --- the awaitable form is AsyncClient, not a run_async() suffix ---------
@@ -225,6 +486,32 @@ def test_run_carries_the_host_clients_credentials(server) -> None:
     assert server.state.last_auth_header == "Bearer k-run"
 
 
+def test_the_key_reaches_the_router_when_it_is_a_separate_origin(
+    monkeypatch, server, second_server
+) -> None:
+    # The production shape: `COMFY_BASE_URL` and `COMFY_ROUTER_BASE_URL` are
+    # different hosts. The client's own credential goes to *both* of its
+    # configured targets — otherwise every real model run would be a 401.
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, second_server.base_url)
+    with Comfy(api_key="k-router") as client:
+        client.models.run(MODEL, ARGS)
+    assert second_server.state.last_auth_header == "Bearer k-router"
+    assert second_server.state.model_run_count == 1
+    # ...and the run went to the router, not to the v2 deployment.
+    assert server.state.model_run_count == 0
+
+
+def test_the_key_is_not_sent_to_a_third_origin(monkeypatch, server, second_server) -> None:
+    # Neither configured target: a server-returned absolute follow-up link
+    # pointing at `second_server` must still get nothing, and widening the
+    # credential rule to cover the router origin must not have widened it to
+    # "any absolute URL".
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, "https://router.example")
+    with Comfy(api_key="k-not-yours") as client:
+        client._low.get_job(f"{second_server.base_url}/api/v2/jobs/whatever")
+    assert second_server.state.last_auth_header == ""
+
+
 # --- errors stay on the SDK's own surface --------------------------------
 
 
@@ -253,6 +540,129 @@ def test_an_unmapped_failure_still_lands_as_a_comfy_error(server) -> None:
             client.models.run(MODEL, ARGS)
     assert excinfo.value.code == "model_unavailable"
     assert excinfo.value.http_status == 503
+
+
+# --- a per-field validation failure, end to end --------------------------
+#
+# Router answers a model whose schema rejected the input with a `422` whose
+# body is a `detail` ARRAY, one entry per failing field, and the coarse bucket
+# on `X-Comfy-Error-Type` -- that body carries no `error_type` of its own. The
+# entries are the only place the provider-level reason survives, and
+# `RouterError.errors` is documented as populated whenever the response carried
+# them. Getting there means crossing the layer boundary: `comfy_low` decodes
+# the response but may not import `comfy_sdk`, so it carries the entries raw
+# and `to_sdk_error` types them.
+
+#: Two failing fields, the shape `spec/router-openapi.yaml` documents.
+VALIDATION_DETAIL: list[Any] = [
+    {
+        "loc": ["body", "steps"],
+        "msg": "ensure this value is less than or equal to 8",
+        "type": "less_than_equal",
+        "ctx": {"limit_value": 8},
+        "input": 50,
+    },
+    {
+        "loc": ["body", "model"],
+        "msg": "unknown model variant",
+        "type": "value_error",
+    },
+]
+
+
+def _assert_validation_surface(exc: InvalidInput) -> None:
+    """The whole contract of a per-field failure, asserted identically on both
+    clients so the sync and async paths cannot diverge on it."""
+    assert len(exc.errors) == 2
+    assert exc.errors[1].loc == ("body", "model")
+    assert exc.errors[1].msg == "unknown model variant"
+    assert exc.errors[1].type == "value_error"
+    # The bound the first entry carries, which the coarse bucket cannot express
+    # and which a caller reads to say what the limit actually was.
+    assert exc.errors[0].ctx == {"limit_value": 8}
+    assert exc.errors[0].input == 50
+    # The human-readable line is the entries summarised -- each `<loc>: <msg>`,
+    # the same rendering the queued surface produces -- not the `HTTP 422` a
+    # caller used to get, and not a Python repr of the array.
+    assert exc.detail == (
+        "body.steps: ensure this value is less than or equal to 8; "
+        "body.model: unknown model variant"
+    )
+    assert str(exc) == exc.detail
+    assert "[" not in exc.detail
+    assert exc.error_type == "invalid_input"
+    assert exc.http_status == 422
+    # The raw entries on the protocol error underneath: the carrier the
+    # layering rule forces, readable through `__cause__` for anyone debugging
+    # the boundary itself.
+    cause = exc.__cause__
+    assert isinstance(cause, LowApiError)
+    assert cause.validation_errors == tuple(VALIDATION_DETAIL)
+
+
+def test_a_per_field_validation_failure_populates_errors(server) -> None:
+    server.state.model_run_validation_detail = VALIDATION_DETAIL
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            client.models.run(MODEL, ARGS)
+    _assert_validation_surface(excinfo.value)
+
+
+async def test_an_async_per_field_validation_failure_populates_errors_too(server) -> None:
+    server.state.model_run_validation_detail = VALIDATION_DETAIL
+    async with AsyncComfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            await client.models.run(MODEL, ARGS)
+    _assert_validation_surface(excinfo.value)
+
+
+def test_a_validation_body_of_non_mappings_degrades_and_never_raises(server) -> None:
+    # A `detail` array whose members are not objects at all. Nothing can be
+    # typed out of them, so `.errors` is empty and the message falls back to
+    # the status -- decoding an error response must never replace a diagnosable
+    # failure with an undiagnosable one.
+    server.state.model_run_validation_detail = [1, "x"]
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            client.models.run(MODEL, ARGS)
+    assert excinfo.value.errors == ()
+    assert excinfo.value.http_status == 422
+    # `HTTP 422` plus the body excerpt, which is exactly the pre-existing rule
+    # for a body that stated no message -- the excerpt is dropped only where a
+    # message WAS found, and none was here. Nothing about this case changed,
+    # and it is the response for which the raw text is the only description of
+    # what the server objected to.
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, LowApiError)
+    assert cause.message == "HTTP 422"
+    assert cause.validation_errors == ()
+    assert excinfo.value.detail == 'HTTP 422: {"detail": [1, "x"]}'
+
+
+def test_the_run_and_queued_paths_agree_on_one_validation_body(server) -> None:
+    # The queued surface builds its exception from the completion payload
+    # (`error_from_completion`) and the awaited one from the HTTP response, so
+    # the two reach `.errors` by different code entirely. One wire body has to
+    # produce one set of entries, or a caller's branch works on `submit()` and
+    # silently does not on `run()`.
+    server.state.model_run_validation_detail = VALIDATION_DETAIL
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(InvalidInput) as excinfo:
+            client.models.run(MODEL, ARGS)
+    queued = error_from_completion(
+        {"error_type": "invalid_input", "detail": VALIDATION_DETAIL},
+    )
+    assert queued is not None
+    assert excinfo.value.errors == queued.errors
+    # ...and the human-readable line, too: both surfaces summarise the array
+    # through one function, so a body that names two fields reads the same on
+    # `run()` and on the queued surface rather than collapsing to a bare join of
+    # the messages on one of them.
+    assert excinfo.value.detail == queued.detail
+    assert excinfo.value.detail == (
+        "body.steps: ensure this value is less than or equal to 8; "
+        "body.model: unknown model variant"
+    )
 
 
 # --- the key survives the failure ----------------------------------------
@@ -285,6 +695,7 @@ class _RaisingLow:
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
+        **_: Any,
     ) -> dict[str, Any]:
         self.keys.append(idempotency_key)
         raise self._exc
@@ -298,6 +709,7 @@ class _AsyncRaisingLow(_RaisingLow):
         *,
         idempotency_key: str | None = None,
         timeout: Any = None,
+        **_: Any,
     ) -> dict[str, Any]:
         self.keys.append(idempotency_key)
         raise self._exc
@@ -594,3 +1006,235 @@ def test_an_undecodable_success_body_is_a_stamped_sdk_error(server) -> None:
     assert excinfo.value.idempotency_key is not None
     assert excinfo.value.http_status == 200
     assert excinfo.value.code == "invalid_response"
+
+
+# --- run_detailed: what Router disclosed about HOW the run ran ---------------
+
+
+class _HeaderLow:
+    """A stub whose ``post_model_run`` answers one canned (body, headers) pair."""
+
+    def __init__(self, headers: dict[str, str]) -> None:
+        self._headers = headers
+        self.result: dict[str, Any] = {"images": [{"url": "http://example.invalid/x.png"}]}
+
+    def post_model_run(
+        self, model: str, arguments: Mapping[str, Any], **_: Any
+    ) -> tuple[dict[str, Any], Mapping[str, str]]:
+        return self.result, self._headers
+
+
+def _detailed(headers: dict[str, str]) -> Any:
+    low = _HeaderLow(headers)
+    return Models(cast(Any, low)).run_detailed(MODEL, ARGS)
+
+
+def test_run_detailed_surfaces_the_provider_that_actually_served_the_call() -> None:
+    """The body cannot answer this, which is the whole reason the header exists.
+
+    An alt-provider response is translated back to the model's own native
+    contract, so a fal-served run and a natively-served one produce the SAME
+    document. ``X-Comfy-Router-Fallback-Provider`` is the only disclosure that
+    they differed, so dropping it -- as returning the bare body did -- left a
+    caller no way to tell which leg ran.
+    """
+    assert _detailed({"X-Comfy-Router-Fallback-Provider": "fal"}).serving_provider == "fal"
+    # Absent means "the provider asked for served it", the common case — NOT
+    # "unknown", so it must not be reported as a missing value.
+    assert _detailed({}).serving_provider is None
+
+
+def test_run_detailed_parses_dropped_params_as_json_not_as_a_comma_split() -> None:
+    """The spec's own example entry contains a comma, so a comma split is wrong.
+
+    The header is described in prose as "a JSON array of strings" while its
+    declared schema (``type: array``) means OpenAPI's simple comma-delimited
+    form. The example settles it: one entry reading ``moderation (fal applies
+    its own, non-configurable safety filtering)`` has a comma INSIDE it, and a
+    comma split would tear that single entry into two meaningless fragments.
+    """
+    entry = "moderation (fal applies its own, non-configurable safety filtering)"
+    got = _detailed({"X-Comfy-Router-Dropped-Params": json.dumps([entry])})
+    assert got.dropped_params == (entry,)
+    assert _detailed({}).dropped_params is None
+    # A value that is not JSON at all is kept whole rather than guessed at: one
+    # intact entry a human can read beats two confident fragments.
+    assert _detailed({"X-Comfy-Router-Dropped-Params": "not json"}).dropped_params == ("not json",)
+
+
+def test_run_detailed_reports_a_replay_from_the_headers_presence() -> None:
+    # The header is absent on a fresh run rather than sent as `false`, so this
+    # branches on presence — reading it as a boolean would make "absent" and
+    # "false" indistinguishable from a bug that stopped sending it.
+    assert _detailed({"Idempotent-Replayed": "true"}).replayed is True
+    assert _detailed({}).replayed is False
+    # The contract spells the header bare. The `X-Comfy-` prefixed spelling the
+    # lift used to read is not a second name for it — it is not sent at all, so
+    # it must not be honoured as an alias either. Accepting it would keep the
+    # old bug alive under a test that looked like it covered the fix.
+    assert _detailed({"X-Comfy-Idempotent-Replayed": "true"}).replayed is False
+
+
+def test_run_detailed_reports_a_replay_off_a_real_replayed_response(server) -> None:
+    """The header name is the whole of this field, so pin it over the wire.
+
+    The unit test above hand-feeds a dict and would pass against whatever
+    spelling the lift happened to read — which is exactly how the lift came to
+    read `X-Comfy-Idempotent-Replayed`, a name the vendored contract does not
+    use, leaving `replayed` permanently `False` against a real deployment. Here
+    the stub answers a re-sent key the way the contract says Router does, so
+    the name has to match something the SDK did not choose.
+    """
+    with Comfy(retry=NO_RETRY) as client:
+        key = "replay-name-pin"
+        server.state.model_run_replay_store[key] = server.state.model_run_result
+        got = client.models.run_detailed(MODEL, ARGS, idempotency_key=key)
+    assert got.replayed is True
+
+
+def test_a_replayed_run_can_report_its_credits_too(server) -> None:
+    # A replay is the canonical reported-zero: it is answered from the record
+    # and not billed again. `credits_used` and `replayed` are only ever both
+    # meaningful on this one response, so pin the combination rather than
+    # assuming the two lifts compose.
+    server.state.model_run_response_headers = {"X-Comfy-Credits-Used": "0"}
+    with Comfy(retry=NO_RETRY) as client:
+        key = "replay-with-credits"
+        server.state.model_run_replay_store[key] = server.state.model_run_result
+        got = client.models.run_detailed(MODEL, ARGS, idempotency_key=key)
+    assert got.replayed is True
+    # Reported zero, not absent — the distinction the field exists to keep.
+    assert got.credits_used == "0"
+    assert got.credits_used is not None
+
+
+def test_run_returns_the_bare_body_so_the_default_surface_is_unchanged() -> None:
+    low = _HeaderLow({"X-Comfy-Router-Fallback-Provider": "fal"})
+    assert Models(cast(Any, low)).run(MODEL, ARGS) == low.result
+
+
+@pytest.mark.parametrize("cls", [Models, AsyncModels])
+def test_both_clients_expose_run_detailed(cls: type) -> None:
+    # The suffix rule is about sync-vs-async naming, not about a second
+    # operation — but both namespaces must still spell the same operations.
+    assert hasattr(cls, "run_detailed")
+
+
+def test_run_detailed_surfaces_the_credits_router_reported_for_the_run() -> None:
+    """The body never states a price, so the header is the only disclosure.
+
+    Router stamps ``X-Comfy-Credits-Used`` on a run it priced. Dropping it --
+    as this closed shape did -- left a caller no way to reach it at all: the
+    dataclass is frozen and slotted, so they could not even attach the value
+    themselves from a response they had.
+    """
+    assert _detailed({"X-Comfy-Credits-Used": "0.42"}).credits_used == "0.42"
+
+
+def test_run_detailed_reports_an_unstamped_run_as_not_reported() -> None:
+    # Absent is "not reported", never "free". A large share of real runs carry
+    # no header even where the cost is known server side, so `None` here says
+    # nothing at all about what the call cost — and must not be normalised to a
+    # zero, which would report an unknown cost as a known one.
+    assert _detailed({}).credits_used is None
+
+
+def test_run_detailed_keeps_a_reported_zero_distinguishable_from_an_absent_one() -> None:
+    """``0`` is a real reported cost and must not collapse into "not reported".
+
+    A run Router priced at zero -- a replay, a model that costs nothing -- is a
+    *known* cost, and reporting it as unknown is the failure this pins. The
+    string representation is what keeps the two apart cheaply: ``"0"`` is a
+    non-empty string, so even the sloppy ``if result.credits_used:`` test
+    happens to hold. That is luck, not a contract -- it stops holding the
+    moment a caller parses to ``Decimal("0")`` for their own arithmetic, which
+    is exactly what the docstring tells them to do -- so the rule the SDK
+    documents is presence, and this asserts presence.
+    """
+    reported_zero = _detailed({"X-Comfy-Credits-Used": "0"}).credits_used
+    not_reported = _detailed({}).credits_used
+    assert reported_zero == "0"
+    assert reported_zero is not None
+    assert not_reported is None
+    # The two must be distinguishable by the documented test, not merely unequal.
+    assert (reported_zero is not None) != (not_reported is not None)
+
+
+def test_run_detailed_carries_the_credits_header_off_a_real_response(server) -> None:
+    """The unit stubs hand back a plain dict; a real run hands back httpx.Headers.
+
+    Worth its own pass over the wire: the lift reads one exact header name off
+    whatever ``post_model_run`` returned, and a stub dict would answer the same
+    way whether or not the name survives a real HTTP round trip.
+    """
+    server.state.model_run_response_headers = {"X-Comfy-Credits-Used": "1.25"}
+    with Comfy(retry=NO_RETRY) as client:
+        assert client.models.run_detailed(MODEL, ARGS).credits_used == "1.25"
+
+
+async def test_async_run_detailed_carries_the_credits_header_too(server) -> None:
+    # Both namespaces build their result through the same `_run_result`, but
+    # the async client reaches it down its own transport — so the parity is
+    # asserted rather than assumed.
+    server.state.model_run_response_headers = {"X-Comfy-Credits-Used": "1.25"}
+    async with AsyncComfy(retry=NO_RETRY) as client:
+        got = await client.models.run_detailed(MODEL, ARGS)
+    assert got.credits_used == "1.25"
+
+
+def test_credits_used_is_optional_so_the_public_shape_stays_constructible() -> None:
+    """`RouterRunResult` is public and re-exported, so this had to stay additive.
+
+    A field with no default turns into a required constructor argument, and
+    every out-of-tree fake, fixture or adapter that builds the result from the
+    five fields it had before would start raising `TypeError` — a breaking
+    change filed under "Added".
+    """
+    built = RouterRunResult(
+        output={"ok": True},
+        serving_provider=None,
+        dropped_params=None,
+        replayed=False,
+        request_id=None,
+    )
+    assert built.credits_used is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",  # header sent empty
+        "   ",  # whitespace only
+        "1.25, 1.25",  # repeated header, joined by httpx.Headers.get
+        "NaN",  # Decimal accepts it silently, then poisons every comparison
+        "Infinity",
+        "-Infinity",
+        "not a number",
+    ],
+)
+def test_run_detailed_reports_an_unusable_credits_value_as_not_reported(raw: str) -> None:
+    """A value that cannot be parsed must not pass the presence test.
+
+    The field documents a two-step contract — branch on presence, then parse to
+    `Decimal` — and each of these clears step one only to raise
+    `InvalidOperation` (or, for the non-finite pair, to parse and then wreck
+    the arithmetic) in step two. "Reported" is made to mean "reportable".
+    """
+    assert _detailed({"X-Comfy-Credits-Used": raw}).credits_used is None
+
+
+def test_run_detailed_hands_a_usable_credits_value_over_untouched() -> None:
+    # Normalising the unusable cases must not reformat the usable ones: the
+    # digits the server sent are the point, so nothing is re-rendered through
+    # Decimal on the way out.
+    for raw in ("0", "0.00", "0.42", "1.25", "12"):
+        assert _detailed({"X-Comfy-Credits-Used": raw}).credits_used == raw
+    # Surrounding whitespace is trimmed rather than treated as unusable.
+    assert _detailed({"X-Comfy-Credits-Used": " 1.25 "}).credits_used == "1.25"
+
+
+def test_an_ordinary_unstamped_run_over_the_wire_reports_no_credits(server) -> None:
+    # The server stamps nothing, which is the common case today. Nothing in the
+    # lift may invent a value for it.
+    with Comfy(retry=NO_RETRY) as client:
+        assert client.models.run_detailed(MODEL, ARGS).credits_used is None

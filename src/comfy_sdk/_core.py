@@ -105,3 +105,30 @@ _UI_KEYS = ("nodes", "links", "last_node_id")
 
 def looks_like_ui_format(graph: dict[str, Any]) -> bool:
     return isinstance(graph, dict) and all(k in graph for k in _UI_KEYS)
+
+
+def validate_idempotency_key(key: str) -> str:
+    """``key`` unchanged, or ``ValueError`` for one the contract cannot carry.
+
+    The vendored router contract pins ``Idempotency-Key`` to 1-255 characters,
+    and the value rides an HTTP header, so a control character (CR/LF above
+    all) or a non-ASCII byte never produces a keyed request — it produces a
+    transport-layer error after the round trip, or worse, a smuggled header.
+    Refusing locally, before any bytes move, mirrors what ``parse_model_id``
+    does for path segments and closes the emptiness trap specifically: the
+    call sites mint a fresh key for ``None``, and without this check an
+    explicit ``""`` fell into that same branch — so a caller who meant "collect
+    under my key" but passed an empty one silently dispatched a SECOND billed
+    generation instead.
+    """
+    if not key:
+        raise ValueError("idempotency_key must not be empty; pass None to have one minted")
+    if len(key) > 255:
+        raise ValueError(f"idempotency_key is {len(key)} characters; the contract caps it at 255")
+    if not key.isascii() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in key):
+        raise ValueError(
+            "idempotency_key must be printable ASCII: it is sent as an HTTP "
+            "header, and a control or non-ASCII character fails at the "
+            "transport instead of being keyed"
+        )
+    return key
