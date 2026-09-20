@@ -69,13 +69,76 @@ _UNSET = object()
 # blocking iter_lines() forever. (Pass timeout=None to opt out of the timeout.)
 _SSE_IDLE_TIMEOUT = httpx.Timeout(10.0, read=45.0)
 
+#: Comfy Router's own server-side deadline for a model run, mirrored here as the
+#: documented default so the client timeout below can be *derived* to sit safely
+#: ABOVE it. Router aborts a run at this bound and writes a ``504
+#: deadline_exceeded`` carrying ``X-Comfy-Request-Id`` and ``Retry-After``; those
+#: are exactly what a caller needs to reason about the still-running,
+#: already-billed generation. On the Router side this is ``DefaultDeadline`` in
+#: ``routerdeadline/routerdeadline.go`` (10 minutes) and is configurable per
+#: deployment via ``COMFY_ROUTER_DEADLINE`` — a value the *client* cannot read
+#: (it lives in Router's environment, not the caller's), so this is the default
+#: to keep in step by hand: **if you raise Router's deadline, raise this too.**
+ROUTER_DEADLINE = 600.0
+
+#: Headroom kept between Router's deadline and the client read timeout below.
+#: One minute is enough to receive the ``504`` and its headers after Router hits
+#: its bound, without waiting so long past a genuinely dead connection that a
+#: hung run ties up a caller's thread needlessly.
+_MODEL_RUN_TIMEOUT_HEADROOM = 60.0
+
+#: Write bound for a model run — pushing the *request* up, which is NOT a
+#: generation wait and must not be sized as one. It is the one bound that a
+#: single positional ``httpx.Timeout`` argument gets plainly wrong: nothing
+#: about sending a request body should be allowed eleven minutes. It is still
+#: generous next to ``connect`` because a run's arguments can carry an inline
+#: base64 image of several megabytes, which httpx hands to the transport as one
+#: write and a slow uplink legitimately needs longer than a handshake to push.
+_MODEL_RUN_WRITE_TIMEOUT = 120.0
+
+#: Pool-acquisition bound for a model run: how long to wait for a free
+#: connection before ``PoolTimeout``. Deliberately generation-scale, and stated
+#: here rather than inherited from a positional argument so that it is a
+#: DECISION and not an accident.
+#:
+#: The tempting reading is that pool acquisition is mere local queueing and so
+#: belongs with ``connect`` at a few seconds. On this route it is not. httpx's
+#: default ``max_connections`` is 100, :class:`~comfy_sdk.client.Comfy` exposes
+#: no ``limits=`` to raise it, and every connection in that pool is held for the
+#: length of a generation — so the 101st concurrent run is queued behind a
+#: *generation*, not behind a handshake, and any bound shorter than one turns a
+#: legitimate fan-out into errors rather than into a queue that drains. The
+#: cost of keeping it long is the pathological case: if the pool never frees, a
+#: caller waits this long for the ``PoolTimeout``, and because
+#: ``comfy_sdk.retry`` classes that as never-delivered and therefore *fast*, its
+#: one-minute ``max_elapsed`` is spent by then and it surfaces without a retry.
+#: That is the accepted trade: a slow failure in the pathological case, rather
+#: than a fast failure in the ordinary one. Raising ``max_connections`` is the
+#: real lever for a caller who needs the fan-out not to queue at all.
+_MODEL_RUN_POOL_TIMEOUT = ROUTER_DEADLINE + _MODEL_RUN_TIMEOUT_HEADROOM
+
 #: Default timeout for a model run. A run is *awaited server-side*: the server
 #: holds the connection until the generation is complete, polling the upstream
 #: provider itself when that provider is submit/poll. So the client has to be
 #: willing to wait minutes, not the tens of seconds a normal API call gets —
 #: the client's own default (30s) would abort a perfectly healthy generation.
-#: ``connect`` stays short: an unreachable host is not a slow generation.
-MODEL_RUN_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
+#: The read timeout is derived to sit ``_MODEL_RUN_TIMEOUT_HEADROOM`` seconds
+#: ABOVE :data:`ROUTER_DEADLINE` rather than equal to it: at equality the client
+#: can abort at the same instant Router is writing its ``504 deadline_exceeded``,
+#: so the caller gets a bare client-side timeout with no request id, no
+#: ``Retry-After`` and no error body — precisely the outcome the deadline exists
+#: to report cleanly. ``read`` and ``pool`` are both sized that way (see
+#: :data:`_MODEL_RUN_POOL_TIMEOUT`); all four bounds are named explicitly
+#: because a single positional argument would set ``write`` to the generation
+#: wait too, and it is not one: it bounds pushing the request body up, never
+#: waiting for an answer. ``connect`` stays short: an unreachable host is not a
+#: slow generation.
+MODEL_RUN_TIMEOUT = httpx.Timeout(
+    read=ROUTER_DEADLINE + _MODEL_RUN_TIMEOUT_HEADROOM,
+    connect=10.0,
+    write=_MODEL_RUN_WRITE_TIMEOUT,
+    pool=_MODEL_RUN_POOL_TIMEOUT,
+)
 
 #: Base URL of Comfy Router — the surface ``post_model_run`` targets, and the
 #: ``servers[0].url`` of ``spec/router-openapi.yaml``. It is a *different host*

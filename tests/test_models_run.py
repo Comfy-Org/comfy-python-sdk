@@ -1063,10 +1063,16 @@ def test_run_detailed_parses_dropped_params_as_json_not_as_a_comma_split() -> No
 
 
 def test_run_detailed_reports_a_replay_from_the_headers_presence() -> None:
+    # The header name is `Idempotent-Replayed` -- NO `X-Comfy-` prefix -- exactly
+    # as `spec/router-openapi.yaml` declares it (the `RouterIdempotentReplayedHeader`
+    # component, referenced on every replayable response). This asserts against
+    # the CONTRACT name rather than a literal copied from the implementation: an
+    # `X-Comfy-` prefix here would silently agree with a prefixed bug in the code
+    # and report `replayed=False` on every genuine replay.
+    assert _detailed({"Idempotent-Replayed": "true"}).replayed is True
     # The header is absent on a fresh run rather than sent as `false`, so this
     # branches on presence — reading it as a boolean would make "absent" and
     # "false" indistinguishable from a bug that stopped sending it.
-    assert _detailed({"Idempotent-Replayed": "true"}).replayed is True
     assert _detailed({}).replayed is False
     # The contract spells the header bare. The `X-Comfy-` prefixed spelling the
     # lift used to read is not a second name for it — it is not sent at all, so
@@ -1106,6 +1112,50 @@ def test_a_replayed_run_can_report_its_credits_too(server) -> None:
     # Reported zero, not absent — the distinction the field exists to keep.
     assert got.credits_used == "0"
     assert got.credits_used is not None
+
+
+def test_run_detailed_reports_a_replay_end_to_end_against_the_server(server) -> None:
+    # End to end through the real transport, so the header name is proven against
+    # what a Router-shaped deployment actually sends -- the fake server replies
+    # with `Idempotent-Replayed: true` (conftest), the name `router-openapi.yaml`
+    # declares. A stub can only echo whatever literal a test writes, so it agrees
+    # with an `X-Comfy-`-prefixed lookup bug just as the code once did; this path
+    # reads the real wire header via httpx (case-insensitively) and fails if the
+    # SDK looks for any other name.
+    server.state.model_run_error = (504, "deadline_exceeded")
+    server.state.model_run_replays_lost_result = True
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.models.run(MODEL, ARGS)
+        detailed = client.models.run_detailed(
+            MODEL, ARGS, idempotency_key=excinfo.value.idempotency_key
+        )
+    assert detailed.replayed is True
+    assert detailed.output == server.state.model_run_result
+    # One generation, served twice from the record: the replay was not billed again.
+    assert server.state.model_run_generations == 1
+
+
+def test_run_detailed_reads_the_headers_case_insensitively() -> None:
+    """HTTP header names are case-insensitive, so the lookups must be too.
+
+    ``_run_result`` is annotated ``Mapping[str, str]`` and every name it reads
+    is mixed-case, so on a plain mapping a case-sensitive ``get`` would miss all
+    four -- and miss them SILENTLY, reporting ``replayed=False`` and
+    ``request_id=None`` exactly as a wrong header name does. ``dict(resp.headers)``
+    is the realistic way a caller produces one: httpx lowercases on the way out.
+    """
+    lowercased = {
+        "idempotent-replayed": "true",
+        "x-comfy-request-id": "req_abc",
+        "x-comfy-router-fallback-provider": "fal",
+        "x-comfy-router-dropped-params": '["seed"]',
+    }
+    detailed = _detailed(lowercased)
+    assert detailed.replayed is True
+    assert detailed.request_id == "req_abc"
+    assert detailed.serving_provider == "fal"
+    assert detailed.dropped_params == ("seed",)
 
 
 def test_run_returns_the_bare_body_so_the_default_surface_is_unchanged() -> None:
