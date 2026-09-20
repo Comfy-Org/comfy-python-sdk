@@ -17,6 +17,9 @@ the fuller account of each version, including verification notes.
   id and a live handle, so the generation stays collectable.
 - `SubscribeTimeout` — a `TimeoutError` subclass raised by the `models.subscribe` timeouts that
   still raise, carrying `.request_id`, `.model`, `.cancelled` and `.cancel_error`.
+- `IN_QUEUE` / `IN_PROGRESS` — the two live values of the contract's closed `RouterQueueStatus`
+  enum, exported alongside `COMPLETED` so a caller comparing `QueueUpdate.status` uses the
+  contract's own spelling.
 
 ### Changed
 
@@ -32,9 +35,18 @@ the fuller account of each version, including verification notes.
   process.
 - **A 2xx on the cleanup cancel is no longer taken as proof the run stopped.** The cancel's own
   answer is read: terminal with a bucket is a cancellation, terminal without one is a run that
-  finished and is collected, and a live status (a `202`/`CANCELING`, or a request that won the race
-  into flight) is a detach. Only a body-less accepted cancel still reports a cancellation
-  unconfirmed, which is the shape that carries nothing to read.
+  finished and is collected, and a live status is a detach. Only a body-less accepted cancel still
+  reports a cancellation unconfirmed, which is the shape that carries nothing to read.
+- **The cancel route's `202 CANCELLATION_REQUESTED` is read per the contract: accepted, then
+  confirmed by one status read.** It says the ask was taken and nothing more, so the request's own
+  state decides the ending — `COMPLETED` carrying the `cancelled` bucket is a cancellation
+  (`SubscribeTimeout` with `.cancelled` `True`, rather than the `Cancelled` router exception a run
+  that failed on its own raises); `IN_PROGRESS` or an unrecognised live status is a
+  `DetachedRequest`; and a row still `IN_QUEUE` — which the route's write order forbids — reports
+  that the cancel never applied, as `SubscribeTimeout` with `.cancelled` `False` and a
+  `.cancel_error` coded `cancel_not_applied`. A `DetachedRequest` can no longer be built carrying
+  `IN_QUEUE` at all: that status means the request was never dispatched and cannot be charged,
+  which is the opposite of what a detach claims.
 - **Only a `409` that names no bucket is read as the in-flight refusal.** A typed `CancelRefused`
   is recognised by its class; a `409` carrying a documented bucket (`invalid_input`,
   `concurrency_limit_exceeded`) is not the state refusal and surfaces on

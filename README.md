@@ -536,7 +536,7 @@ The handle carries four operations:
 |---|---|
 | `handle.status()` | one authoritative poll, returned as a `QueueUpdate` (`status`, `queue_position`, `error_type`, `retry_after`, `raw`) |
 | `handle.get(timeout=None)` | poll to completion, then return the provider's own payload — the same value `run` would have returned |
-| `handle.cancel()` | ask the server to cancel. A request, not a guarantee: the queue honours one only while the request is still waiting to be dispatched, and a run it has already started is served, billed, and its cancel *refused* — which reaches you as an exception rather than as an update |
+| `handle.cancel()` | ask the server to cancel. A request, not a guarantee: the route takes a request in either live state and answers `202 CANCELLATION_REQUESTED`, which says the ask landed and not that the run stopped — read `handle.status()` afterwards. Only an already-terminal request is *refused*, which reaches you as an exception rather than as an update |
 | `handle.iter_events(timeout=None)` | the poll loop with its updates exposed — yields the first observation, every change of status or queue position, and the completion |
 
 Polling is **poll-authoritative**: there is no stream to reconcile against on
@@ -581,10 +581,11 @@ outlive the caller's patience.
 #### A `timeout` detaches; it does not reliably cancel
 
 `timeout=` is a **client-side** bound with no server-side meaning. When it runs
-out, `subscribe` makes a best-effort `cancel()` — and **the queue honours a
-cancel only while the request is still waiting to be dispatched.** A run it has
-already started is served to the end and **billed in full**, whatever the
-caller does. So a timeout on an in-flight run is a *detach*, not a
+out, `subscribe` makes a best-effort `cancel()` — and **accepting a cancel is
+not the same as stopping the run.** The cancel route takes a request in either
+live state, but a generation already on the wire at a partner may complete
+anyway, and one that completes is **billed** whether or not anyone collected
+it. So a timeout on a run the cancel did not stop is a *detach*, not a
 cancellation: you stop waiting, the generation carries on, it completes, and
 **you pay for it**.
 
@@ -599,9 +600,10 @@ from comfy_sdk import DetachedRequest, SubscribeTimeout
 try:
     outcome = client.models.subscribe("fal-ai/flux-pro", {"prompt": "a cat"}, timeout=300)
 except SubscribeTimeout as exc:
-    # The request was still queued, the cancel was accepted, nothing ran and
-    # nothing is billed. `exc.cancelled` is False if the cancel itself failed,
-    # in which case the run may still be going — `exc.request_id` reaches it.
+    # The cancel landed and the request's row says it was withdrawn.
+    # `exc.cancelled` is False if the cancel itself failed or never applied, in
+    # which case the run may still be going — `exc.request_id` reaches it, and
+    # `exc.cancel_error` says what went wrong.
     raise
 
 if isinstance(outcome, DetachedRequest):
@@ -616,16 +618,29 @@ The three ways the timeout can end, told apart by type and never by a message:
 
 | | |
 |---|---|
-| **cancelled** | the request was still queued and the cancel really stopped it. Nothing ran, nothing is billed. Raises `SubscribeTimeout` (a `TimeoutError`) with `.cancelled` `True` |
-| **detached** | the run was already in flight, so the cancel did not stop it. It continues, completes and **is billed**. Returns a `DetachedRequest` |
-| **completed during teardown** | the run finished while the timeout was being torn down. The result exists and is paid for, so it is collected and returned like any other result |
+| **cancelled** | the cancel landed and the request's row came back `COMPLETED` carrying the `cancelled` bucket. Raises `SubscribeTimeout` (a `TimeoutError`) with `.cancelled` `True`. A request cancelled while still `IN_QUEUE` was never dispatched and cannot be charged; one cancelled after it was admitted **may still be charged**, and this ending is not a claim that it was not |
+| **detached** | the cancel did not stop the run: the confirming poll found it still `IN_PROGRESS` (or reporting some live status this SDK cannot place). It continues, completes and **is billed**. Returns a `DetachedRequest` |
+| **completed during teardown** | the run finished on its own while the timeout was being torn down. The result exists and is paid for, so it is collected and returned like any other result |
 
-Which one you get is read off the cancel's **answer**, not off the bare fact
-that it returned a 2xx: a cancel the route accepts while reporting a live
-status (a `202`/`CANCELING`, or a request that won the race into flight) is a
-**detach**, because the run did not stop. Only a body-less accepted cancel —
-the shape that carries nothing to read — is reported as a cancellation
-unconfirmed.
+Which one you get is read off the cancel's **answer and then off the request's
+own state**, never off the bare fact that a 2xx came back. The route's own
+answer is `202 CANCELLATION_REQUESTED`, which says the ask was accepted and
+nothing more — so it is **confirmed by one status read**:
+
+* the row is `COMPLETED` carrying `cancelled` → `SubscribeTimeout` with
+  `.cancelled` `True`;
+* the row is still `IN_QUEUE` → the cancel never applied (the route writes the
+  row terminal *before* it answers, so this is a server out of its own
+  documented order). `SubscribeTimeout` with `.cancelled` `False` and a
+  `.cancel_error` coded `cancel_not_applied`. Not a detach: an `IN_QUEUE`
+  request cannot have been charged, which is the opposite of what a detach
+  says;
+* the row is `IN_PROGRESS`, or an unrecognised live status → a
+  `DetachedRequest`.
+
+A body-less accepted cancel — the legacy `204`, the shape that carries nothing
+to read — is still reported as a cancellation unconfirmed, and a 2xx echoing a
+live queue state is still a detach.
 
 A cancel that fails for some *other* reason — a transport failure, a rejected
 credential, a `500`, or a `409` naming a bucket the contract documents as
