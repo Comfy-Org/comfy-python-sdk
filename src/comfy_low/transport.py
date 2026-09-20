@@ -127,10 +127,12 @@ _MODEL_RUN_POOL_TIMEOUT = ROUTER_DEADLINE + _MODEL_RUN_TIMEOUT_HEADROOM
 #: can abort at the same instant Router is writing its ``504 deadline_exceeded``,
 #: so the caller gets a bare client-side timeout with no request id, no
 #: ``Retry-After`` and no error body — precisely the outcome the deadline exists
-#: to report cleanly. Only ``read`` is sized that way: all four bounds are named
-#: explicitly because a single positional argument would set ``write`` and
-#: ``pool`` to the generation wait as well, and neither of those is one.
-#: ``connect`` stays short: an unreachable host is not a slow generation.
+#: to report cleanly. ``read`` and ``pool`` are both sized that way (see
+#: :data:`_MODEL_RUN_POOL_TIMEOUT`); all four bounds are named explicitly
+#: because a single positional argument would set ``write`` to the generation
+#: wait too, and it is not one: it bounds pushing the request body up, never
+#: waiting for an answer. ``connect`` stays short: an unreachable host is not a
+#: slow generation.
 MODEL_RUN_TIMEOUT = httpx.Timeout(
     read=ROUTER_DEADLINE + _MODEL_RUN_TIMEOUT_HEADROOM,
     connect=10.0,

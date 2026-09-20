@@ -964,12 +964,14 @@ def test_every_bound_of_the_run_timeout_is_chosen_rather_than_inherited() -> Non
     """Each of the four is a decision, because a positional argument sets three at once.
 
     ``httpx.Timeout(<value>, connect=...)`` applies ``<value>`` to ``read``,
-    ``write`` AND ``pool``. Two of those three should not follow a generation:
+    ``write`` AND ``pool``. Only one of those three should not follow a
+    generation:
 
     * ``write`` bounds pushing the request body up, never waiting for an answer,
       so it must be well under the generation wait however large a base64 image
       the arguments carry;
-    * ``pool`` genuinely IS generation-scale here and is asserted so on purpose.
+    * ``pool`` genuinely IS generation-scale here, same as ``read``, and is
+      asserted so on purpose.
       Every connection in httpx's default 100 is held for a whole generation and
       ``Comfy`` exposes no ``limits=``, so the 101st concurrent run is queued
       behind a generation. Shortening this to ``connect``-scale would convert a
