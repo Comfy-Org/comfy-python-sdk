@@ -50,6 +50,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, cast
 
 import httpx
@@ -210,16 +211,19 @@ class RouterRunResult:
 
     :meth:`Models.run` returns the partner model's native output on its own,
     which is the right default: that document is the thing a caller asked for,
-    and wrapping every run in an envelope to carry two usually-absent headers
-    would tax every caller for the few that need them. This is the opt-in shape
-    for the callers that do -- :meth:`Models.run_detailed`.
+    and wrapping every run in an envelope to carry a handful of usually-absent
+    headers would tax every caller for the few that need them. This is the
+    opt-in shape for the callers that do -- :meth:`Models.run_detailed`.
 
     What it adds is not decoration. On an alt-provider run
     (``model_provider=...``) the response body is translated back to this
     model's native contract, so the body alone looks IDENTICAL whether the call
-    was served by the model's own provider or by an alternate. The two headers
-    below are the only disclosure of the difference, which makes them the only
-    way a caller -- or a test -- can prove which leg actually ran.
+    was served by the model's own provider or by an alternate.
+    :attr:`serving_provider` and :attr:`dropped_params` are the only disclosure
+    of the difference, which makes them the only way a caller -- or a test --
+    can prove which leg actually ran. :attr:`credits_used` is the same story
+    about cost: the body never states what the run was priced at, so the header
+    is the only place it is disclosed at all.
     """
 
     output: dict[str, Any] | BinaryResult
@@ -251,14 +255,58 @@ class RouterRunResult:
     """
 
     replayed: bool
-    """``X-Comfy-Idempotent-Replayed``: served from the key's record, not run again.
+    """``Idempotent-Replayed``: served from the key's record, not run again.
 
     A replay is not billed a second time. The header is absent on a fresh run
     rather than sent as ``false``, so this is derived from its presence.
+
+    The name carries no ``X-Comfy-`` prefix. The vendored contract spells it
+    bare -- on this route's ``200`` and on the ``400``/``409``/``422`` that can
+    also be replayed -- and reading the prefixed spelling made this field
+    permanently ``False`` against a real deployment, reporting a replayed,
+    unbilled response as a fresh generation.
     """
 
     request_id: str | None
     """``X-Comfy-Request-Id`` -- the id to quote in a support request."""
+
+    credits_used: str | None = None
+    """``X-Comfy-Credits-Used``: what Router reported this run cost.
+
+    Three things about it, each of which a caller gets wrong by assuming the
+    obvious:
+
+    * **It is a price, not a settled ledger entry.** It is what Router priced
+      this call at as it answered, not a balance, not a running total, and not
+      a charge you can prove was applied. Reconcile against billing rather than
+      treating this as the record.
+    * **Absent means "not reported", never "free".** Router does not stamp
+      every run it knows the cost of, so ``None`` says nothing about whether
+      the call cost anything -- only that this response did not say. A caller
+      that renders a missing value as zero is inventing a number.
+    * **``0`` is a real reported cost, so branch on presence.** ``if
+      result.credits_used is not None``, never on the value being non-zero: a
+      run priced at nothing is a *known* cost, and folding it into the absent
+      case above reports a known cost as unknown. The string form happens to
+      survive a sloppy ``if result.credits_used`` -- ``"0"`` is a non-empty
+      string -- but that is luck and it ends the moment you parse, because
+      ``Decimal("0")`` is falsy.
+
+    Carried as the wire string rather than parsed. The value is a decimal
+    formatted to at most 2dp, and binary ``float`` is the wrong type for a
+    number a caller reconciles money against -- so the digits the server sent
+    are handed over intact and the caller picks the numeric type (``Decimal``)
+    its own reconciliation needs.
+
+    Handed over intact, but only when there is something to hand over: a value
+    that is not a finite decimal is reported as ``None`` rather than passed
+    through. That is what makes the presence test above mean what it says --
+    see :func:`_credits_used`.
+
+    The field defaults to ``None``, so this stayed an additive change: code
+    that already constructed a :class:`RouterRunResult` by hand -- a fake, a
+    fixture, an adapter -- still does.
+    """
 
 
 def _dropped_params(raw: str | None) -> tuple[str, ...] | None:
@@ -289,14 +337,51 @@ def _dropped_params(raw: str | None) -> tuple[str, ...] | None:
     return (raw,)
 
 
+def _credits_used(raw: str | None) -> str | None:
+    """Normalise the ``X-Comfy-Credits-Used`` header value, or ``None``.
+
+    :attr:`RouterRunResult.credits_used` documents a two-step contract --
+    branch on presence, then parse to ``Decimal`` -- and a value that survives
+    step one only to raise ``InvalidOperation`` in step two breaks it. Three
+    values do exactly that, and none needs a misbehaving server:
+
+    * an empty or whitespace-only header, which arrives as ``""``;
+    * a repeated header, which ``httpx.Headers.get`` joins with ``", "`` --
+      so a doubled stamp reads ``"1.25, 1.25"``;
+    * ``NaN`` / ``Infinity``, which ``Decimal`` accepts *silently* and which
+      then poison every later comparison and ``quantize``.
+
+    So "reported" is made to mean "reportable": anything that is not a finite
+    decimal is reported as not reported. Dropping a malformed value rather than
+    keeping it whole is the opposite of what :func:`_dropped_params` does with
+    its own bad input, and deliberately: there, one intact entry is still
+    readable by a human, whereas here the documented use of the value is
+    arithmetic that a non-number cannot survive.
+
+    A value that does parse is returned as the server sent it, not
+    re-formatted -- the digits are the point.
+    """
+    if raw is None:
+        return None
+    candidate = raw.strip()
+    if not candidate:
+        return None
+    try:
+        parsed = Decimal(candidate)
+    except InvalidOperation:
+        return None
+    return candidate if parsed.is_finite() else None
+
+
 def _run_result(body: dict[str, Any] | BinaryResult, headers: Mapping[str, str]) -> RouterRunResult:
     """Build a :class:`RouterRunResult` from one run's body and response headers."""
     return RouterRunResult(
         output=body,
         serving_provider=headers.get("X-Comfy-Router-Fallback-Provider"),
         dropped_params=_dropped_params(headers.get("X-Comfy-Router-Dropped-Params")),
-        replayed=headers.get("X-Comfy-Idempotent-Replayed") is not None,
+        replayed=headers.get("Idempotent-Replayed") is not None,
         request_id=headers.get("X-Comfy-Request-Id"),
+        credits_used=_credits_used(headers.get("X-Comfy-Credits-Used")),
     )
 
 

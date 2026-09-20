@@ -38,6 +38,7 @@ import yaml
 
 from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE
 from comfy_sdk import COMFY_ROUTER_BASE_URL
+from comfy_sdk.models import _run_result
 from comfy_sdk.router_exceptions import (
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
@@ -320,3 +321,85 @@ def test_the_200_promises_the_headers_a_binary_result_is_built_from() -> None:
     assert "X-Comfy-Request-Id" in headers
     assert "X-Content-Type-Options" in headers
     assert "Idempotent-Replayed" in headers
+
+
+# --- run_detailed's header lifts, pinned against the contract -----------------
+#
+# `RouterRunResult` is built entirely out of response header names. A name is
+# not type-checked, not exercised by a stub that was handed the SDK's own
+# spelling, and wrong in a way that looks exactly like the header being absent
+# -- which the field documents as a legitimate, common case. So a misspelling
+# is silent in every other test in the suite, and it has already happened once:
+# the lift read `X-Comfy-Idempotent-Replayed`, a name the contract does not
+# use, leaving `replayed` permanently `False` against a real deployment.
+#
+# These tests close that gap from both ends: the name must be declared by the
+# spec, AND the lift must actually be reading that declared name.
+
+#: field on :class:`RouterRunResult` -> the 200 response header it is lifted
+#: from, for the lifts whose names the vendored contract declares.
+_CONTRACT_HEADER_LIFTS = {
+    "serving_provider": "X-Comfy-Router-Fallback-Provider",
+    "dropped_params": "X-Comfy-Router-Dropped-Params",
+    "replayed": "Idempotent-Replayed",
+    "request_id": "X-Comfy-Request-Id",
+}
+
+
+def _declared_run_response_headers() -> set[str]:
+    """The header names the spec declares on ``runRouterModel``'s ``200``."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    for _path, item in (doc.get("paths") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        post = item.get("post")
+        if isinstance(post, dict) and post.get("operationId") == "runRouterModel":
+            return set((post["responses"]["200"].get("headers") or {}).keys())
+    raise AssertionError("the vendored spec declares no runRouterModel operation")
+
+
+@pytest.mark.parametrize(("field", "header"), sorted(_CONTRACT_HEADER_LIFTS.items()))
+def test_every_lifted_header_is_declared_by_the_contract(field: str, header: str) -> None:
+    declared = _declared_run_response_headers()
+    assert header in declared, (
+        f"RouterRunResult.{field} is lifted from {header!r}, which the vendored spec does "
+        f"not declare on runRouterModel's 200. Declared: {sorted(declared)}. Either a sync "
+        f"renamed the header or the SDK is reading a name Router never sends."
+    )
+
+
+@pytest.mark.parametrize(("field", "header"), sorted(_CONTRACT_HEADER_LIFTS.items()))
+def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> None:
+    """Declaring the right name is half of it; the lift must also read it.
+
+    Asserted through ``_run_result`` rather than by re-reading the source, so
+    this fails if the constant above and the code drift apart -- the constant
+    is a restatement otherwise, and a restatement would pass the sync it exists
+    to fail.
+    """
+    absent = getattr(_run_result({}, {}), field)
+    present = getattr(_run_result({}, {header: "x"}), field)
+    assert present != absent, (
+        f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
+        f"the header and without it, so the lift is reading some other name."
+    )
+
+
+def test_credits_used_header_is_declared_by_the_contract() -> None:
+    """``credits_used`` is pinned to its declared name here, not above.
+
+    It shares ``test_every_lifted_header_is_declared_by_the_contract``'s
+    declared-ness check, but not ``test_the_lift_actually_reads_the_declared_name``:
+    that test proves a lift reads a header by checking presence changes the
+    field's value, and does so with the literal ``"x"`` -- which
+    :func:`_credits_used` rejects as not a finite decimal, so it would come
+    back ``None`` whether or not the header were sent. `tests/test_models_run.py`
+    already pins the reads-the-declared-name half of this contract with values
+    that actually parse.
+    """
+    declared = _declared_run_response_headers()
+    assert "X-Comfy-Credits-Used" in declared, (
+        "RouterRunResult.credits_used is lifted from 'X-Comfy-Credits-Used', which the "
+        f"vendored spec does not declare on runRouterModel's 200. Declared: {sorted(declared)}. "
+        "Either a sync renamed the header or the SDK is reading a name Router never sends."
+    )

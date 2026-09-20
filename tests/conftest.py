@@ -171,6 +171,14 @@ class ServerState:
     # success. `None` sends no header, which is the response an intermediary
     # that never reached the router gives.
     model_run_request_id: str | None = None
+    # Extra response headers stamped on a SUCCESSFUL model run, for the
+    # disclosure headers the body cannot carry (X-Comfy-Credits-Used,
+    # X-Comfy-Router-Fallback-Provider, ...). Empty by default, because Router
+    # sends none of them on an ordinary run and "absent" is a case the SDK has
+    # to get right in its own name. Applied to a replayed 200 as well as a
+    # fresh one -- a replay carries `Idempotent-Replayed` on top of these
+    # rather than instead of them.
+    model_run_response_headers: dict[str, str] = field(default_factory=dict)
     # Answer a repeated model-run key with the v2 jobs rule (422
     # idempotency_key_reuse) instead of the router contract's replay-or-409.
     # Default False: the run route's vendored contract answers a consumed,
@@ -854,10 +862,18 @@ def _make_handler(state: ServerState):
             # again — which is the whole point of asking under the same key.
             if key and key in state.model_run_replay_store:
                 recorded_payload, recorded_body, recorded_type = state.model_run_replay_store[key]
+                # `model_run_response_headers` is merged in here as well as on
+                # the fresh-run path below, because a replay is the canonical
+                # reported-zero and the only response where `credits_used` and
+                # `replayed` are both meaningful at once. Stamped first, so the
+                # replay marker itself cannot be overwritten by a test's dict.
                 self._serve_run_result(
                     200,
                     recorded_payload,
-                    headers={"Idempotent-Replayed": "true"},
+                    headers={
+                        **state.model_run_response_headers,
+                        "Idempotent-Replayed": "true",
+                    },
                     binary=(recorded_body, recorded_type),
                 )
                 return
@@ -976,7 +992,11 @@ def _make_handler(state: ServerState):
                     state.model_run_undecodable_content_type,
                 )
                 return
-            self._serve_run_result(state.model_run_status, state.model_run_result)
+            self._serve_run_result(
+                state.model_run_status,
+                state.model_run_result,
+                headers=state.model_run_response_headers or None,
+            )
 
         def _serve_run_result(
             self,

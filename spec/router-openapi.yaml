@@ -112,6 +112,8 @@ paths:
               $ref: '#/components/headers/RouterFallbackProviderHeader'
             X-Comfy-Router-Dropped-Params:
               $ref: '#/components/headers/RouterDroppedParamsHeader'
+            X-Comfy-Credits-Used:
+              $ref: '#/components/headers/RouterCreditsUsedHeader'
             Idempotent-Replayed:
               $ref: '#/components/headers/RouterIdempotentReplayedHeader'
             X-Committed-Spend-Limit:
@@ -131,6 +133,8 @@ paths:
         '400':
           $ref: '#/components/responses/RouterRunRequestError'
         '401':
+          $ref: '#/components/responses/RouterRequestError'
+        '402':
           $ref: '#/components/responses/RouterRequestError'
         '403':
           $ref: '#/components/responses/RouterRequestError'
@@ -415,7 +419,7 @@ components:
       - error_type
     RouterErrorType:
       type: string
-      description: 'Coarse, machine-readable bucket for a Router failure, mirrored on the `X-Comfy-Error-Type` response header so a caller can branch without parsing the body. The set is closed at fifteen values: the six request-level buckets `invalid_input`, `content_policy_violation`, `provider_error`, `provider_timeout`, `insufficient_credits` and `model_not_found`, plus the transport-level `unauthorized`, `forbidden`, `concurrency_limit_exceeded`, `client_disconnected`, `internal_error`, `deadline_exceeded`, `not_enabled`, `service_unavailable` and `rate_limited`.'
+      description: 'Coarse, machine-readable bucket for a Router failure, mirrored on the `X-Comfy-Error-Type` response header so a caller can branch without parsing the body. The set is closed at eighteen values: the six request-level buckets `invalid_input`, `content_policy_violation`, `provider_error`, `provider_timeout`, `insufficient_credits` and `model_not_found`, plus the transport-level `unauthorized`, `forbidden`, `concurrency_limit_exceeded`, `client_disconnected`, `internal_error`, `deadline_exceeded`, `not_enabled`, `service_unavailable`, `rate_limited`, `cancelled`, `queue_timeout` and `request_not_found`. Closed describes the set as documented today, not a bound that holds forever: the set is expected to grow, which is why this is deliberately a plain string and not an `enum`, so a client must treat an unrecognised value as `internal_error` rather than switch exhaustively over the list above and break on the next addition.'
       example: invalid_input
       x-comfy-error-types:
       - value: invalid_input
@@ -914,15 +918,18 @@ components:
         format: int64
         minimum: 0
         example: 400
-    RouterDroppedParamsHeader:
-      description: Present, as a JSON array of strings, only when `model_provider` translated this call's body (`strict_mode=false`, the default) and that translation could not express one or more native fields exactly on the alternate provider's own schema - each entry names the field and why. Absent when no translation ran (no `model_provider`, or `strict_mode=true`), when translation ran but dropped nothing, and on an error response. Present on a fallback retry too, naming what its own translation (into the provider that actually served the call) dropped, never the primary attempt's.
+    RouterCreditsUsedHeader:
+      description: 'What this run cost, in Comfy credits, priced from the same rate card the charge itself is billed against - so a caller needs no price table of its own, and on a run that reached the provider through more than one billed call it is their sum rather than the last one. It reports a price, not a settled ledger entry. On a model Comfy bills while your request is still open, the value is published only once the usage event was accepted by billing; on a model that submits and then polls, it is the price the asynchronous worker will bill, recorded before that charge settles - so a run whose billing later fails can still have carried this header. Treat it as what you will be charged, not as proof you were, and reconcile against the usage and billing API rather than against this header alone. Absent whenever no cost was reported: a request billed against your own provider key, a partner whose response does not carry every dimension its price is computed from, a usage event that matched no billable metric, or a charge that did not reach billing - so a missing header means "not reported" and must not be read as "free", and a report that sums absent headers as zero will not reconcile. A run that was rated and genuinely cost nothing reads `0`, which is a reported cost rather than a missing one, so branch on whether the header is present rather than on whether its value is non-zero. Coverage is partial today and widening, so do not assume the header is present for every model. On a response that also carries `Idempotent-Replayed: true` this restates what the original run cost, and that run is charged once however many times you retry the key - so do not add the header up across retries of one `Idempotency-Key`. Absent on an error response: it is written only on the path that returns a result, which a refused call never reaches.'
       required: false
       schema:
-        type: array
-        items:
-          type: string
-        example:
-        - moderation (fal applies its own, non-configurable safety filtering)
+        type: string
+        example: '12.5'
+    RouterDroppedParamsHeader:
+      description: One JSON-encoded string holding an array of strings - decode it with a JSON parser rather than splitting it on commas, because it is a single string on the wire, not a comma-separated OpenAPI array, and each entry is a sentence carrying commas of its own - present whenever a translation produced this call's request body and could not express one or more native fields exactly on the provider that served it, naming each dropped field and why, whether the caller asked for that translation with `model_provider` (`strict_mode=false`, the default) or an automatic `fallback_provider` retry ran it. Absent when no translation ran, when translation ran but dropped nothing, and on an error response. On a fallback retry it names what that retry's own translation (into the provider that actually served the call) dropped, never the primary attempt's.
+      required: false
+      schema:
+        type: string
+        example: '["moderation (fal applies its own, non-configurable safety filtering)"]'
     RouterErrorTypeHeader:
       description: Coarse, machine-readable bucket for the failure, set by Router on every error response. It carries the same value as `RouterErrorResponse.error_type`, and on the `422` it is the only machine-readable bucket, because that body is the FastAPI `detail[]` shape and has no `error_type` field of its own. A client can therefore branch on this header alone, before deciding which of the two Router error bodies it received.
       required: true
