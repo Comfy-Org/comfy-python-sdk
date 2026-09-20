@@ -433,8 +433,12 @@ Three things follow from that, and they are the whole contract of this method:
 `run` returns when the generation is **complete**. There is no submit step and
 nothing to poll: where the platform has to submit-and-poll an upstream
 provider, that happens server side inside this one call. The value you get back
-is the provider's own payload — decoded JSON, handed over as-is, with no
-wrapper class between you and the fields the provider documented.
+is the provider's own payload, handed over as-is. For a model that answers
+JSON — most of them — that is a `dict` with no wrapper class between you and
+what the provider produced. For a model whose partner answers a generation
+directly as bytes, it is a `BinaryResult` carrying those bytes unchanged
+alongside the `content_type` and `request_id` that came with them; see "Two
+result shapes" below.
 
 The awaitable form is the **async client**, not a differently-named method:
 
@@ -445,6 +449,62 @@ async with AsyncComfy(api_key="comfyui-...") as client:
 
 There is no `run_async()`, and there will not be one — one operation, one name,
 and `await` is what makes it asynchronous.
+
+### Two result shapes — JSON, or the model's own bytes
+
+Router forwards the partner's output *under the partner's own media type*, so
+`run` returns one of two things, decided by the response's `Content-Type`:
+
+| The model answers with | You get back | Read it as |
+|---|---|---|
+| a JSON document (`application/json`, or a `+json` type) | `dict` | `result["images"][0]["url"]` |
+| raw bytes under its own media type (`audio/mpeg`, ...) | `BinaryResult` | `result.content`, `result.content_type`, `result.request_id` |
+
+Almost every model in the catalog is the first row, and that shape is unchanged.
+The second row is for a model whose partner answers a generation *directly as a
+file* — the ElevenLabs audio models are the first of these. The bytes come back
+exactly as they arrived: not base64-encoded, not wrapped in a dict, not decoded
+or transcoded. Write them to a file and you have the file the partner produced:
+
+```python
+from pathlib import Path
+
+from comfy_sdk import BinaryResult, Comfy
+
+client = Comfy(api_key="comfyui-...")
+result = client.models.run(
+    "elevenlabs/eleven_v3",
+    {"inputs": [{"text": "Hello from Comfy Router.", "voice_id": "..."}]},
+)
+
+assert isinstance(result, BinaryResult)
+print(result.content_type)          # 'audio/mpeg'
+print(result.request_id)            # the server's X-Comfy-Request-Id, or None
+Path("hello.mp3").write_bytes(result.content)
+```
+
+`BinaryResult` is importable from `comfy_sdk` for exactly this `isinstance`
+check. Which shape a given model returns is in its own contract — `GET
+/v2/models/{provider}/{model}/openapi.json`, whose `200` is `application/json`
+for a JSON model and `*/*` with `format: binary` for a bytes one.
+
+Note `content_type` keeps the header's **parameters**, because for some media
+types the parameters are part of what the bytes are — ElevenLabs' `pcm_*` output
+formats come back as `audio/L16; rate=16000`, and the sample rate is not
+decoration. It is bounded and stripped of unprintable characters first, the way
+every other server-supplied string this SDK hands you is; no real media type
+contains either, so what you get is what was sent. And a `200` whose
+`Content-Type` *claims* JSON but whose body will not parse is still an error
+(`ComfyError`, `code="invalid_response"`), not bytes: there the response
+promised a document and did not deliver one.
+
+A non-JSON `200` reaches you even when it is an intermediary's error page or an
+empty body — this route's `200` means a generation ran and was billed, so the
+SDK will not destroy one it merely finds suspicious. Two checks tell you:
+`result.request_id is None` means no Router answer was seen at all (Router's
+contract marks that header required on every answer it sends, so an HTML
+interstitial from a proxy in front of it has none), and `not result.content`
+means nothing was delivered. Check them before writing `content` to disk.
 
 ### Image to image — upload an asset first
 
@@ -535,7 +595,7 @@ The handle carries four operations:
 | | |
 |---|---|
 | `handle.status()` | one authoritative poll, returned as a `QueueUpdate` (`status`, `queue_position`, `error_type`, `retry_after`, `raw`) |
-| `handle.get(timeout=None)` | poll to completion, then return the provider's own payload — the same value `run` would have returned |
+| `handle.get(timeout=None)` | poll to completion, then return the provider's own payload — the same value `run` would have returned, including the `BinaryResult` branch from "Two result shapes" above |
 | `handle.cancel()` | ask the server to cancel. A request, not a guarantee: a request that already completed stays completed |
 | `handle.iter_events(timeout=None)` | the poll loop with its updates exposed — yields the first observation, every change of status or queue position, and the completion |
 

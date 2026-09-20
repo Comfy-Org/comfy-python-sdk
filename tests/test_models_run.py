@@ -1087,7 +1087,7 @@ def test_run_detailed_reports_a_replay_off_a_real_replayed_response(server) -> N
     """
     with Comfy(retry=NO_RETRY) as client:
         key = "replay-name-pin"
-        server.state.model_run_replay_store[key] = server.state.model_run_result
+        server.state.model_run_replay_store[key] = (server.state.model_run_result, None, None)
         got = client.models.run_detailed(MODEL, ARGS, idempotency_key=key)
     assert got.replayed is True
 
@@ -1100,7 +1100,7 @@ def test_a_replayed_run_can_report_its_credits_too(server) -> None:
     server.state.model_run_response_headers = {"X-Comfy-Credits-Used": "0"}
     with Comfy(retry=NO_RETRY) as client:
         key = "replay-with-credits"
-        server.state.model_run_replay_store[key] = server.state.model_run_result
+        server.state.model_run_replay_store[key] = (server.state.model_run_result, None, None)
         got = client.models.run_detailed(MODEL, ARGS, idempotency_key=key)
     assert got.replayed is True
     # Reported zero, not absent — the distinction the field exists to keep.

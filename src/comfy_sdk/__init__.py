@@ -70,6 +70,7 @@ from .exceptions import (
 )
 from .jobs import AsyncJob, Job, JobWorkflow
 from .model_requests import COMPLETED, AsyncRequestHandle, QueueUpdate, RequestHandle
+from .models import BinaryResult
 from .outputs import AsyncOutput, DownloadUrl, Output
 from .retry import DEFAULT_RETRY, NO_RETRY, RetryPolicy
 from .workflows import Workflow, WorkflowFactory
@@ -113,6 +114,7 @@ __all__ = [
     "Output",
     "AsyncOutput",
     "DownloadUrl",
+    "BinaryResult",
     # events
     "Event",
     "Progress",
