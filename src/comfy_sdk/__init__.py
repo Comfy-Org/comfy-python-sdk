@@ -69,7 +69,17 @@ from .exceptions import (
     WorkflowFormatUi,
 )
 from .jobs import AsyncJob, Job, JobWorkflow
-from .model_requests import COMPLETED, AsyncRequestHandle, QueueUpdate, RequestHandle
+from .model_requests import (
+    COMPLETED,
+    IN_PROGRESS,
+    IN_QUEUE,
+    AsyncDetachedRequest,
+    AsyncRequestHandle,
+    DetachedRequest,
+    QueueUpdate,
+    RequestHandle,
+    SubscribeTimeout,
+)
 from .outputs import AsyncOutput, DownloadUrl, Output
 from .retry import DEFAULT_RETRY, NO_RETRY, RetryPolicy
 from .workflows import Workflow, WorkflowFactory
@@ -110,6 +120,11 @@ __all__ = [
     "AsyncRequestHandle",
     "QueueUpdate",
     "COMPLETED",
+    "IN_QUEUE",
+    "IN_PROGRESS",
+    "DetachedRequest",
+    "AsyncDetachedRequest",
+    "SubscribeTimeout",
     "Output",
     "AsyncOutput",
     "DownloadUrl",

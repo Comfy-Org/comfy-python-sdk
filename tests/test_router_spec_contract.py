@@ -294,11 +294,13 @@ _CONTRACT_HEADER_LIFTS = {
     "dropped_params": "X-Comfy-Router-Dropped-Params",
     "replayed": "Idempotent-Replayed",
     "request_id": "X-Comfy-Request-Id",
+    "credits_used": "X-Comfy-Credits-Used",
 }
 
 #: Lifted by the SDK but NOT declared on the contract's 200 -- see the tripwire
-#: test at the bottom of this file.
-_UNDECLARED_HEADER_LIFTS = {"credits_used": "X-Comfy-Credits-Used"}
+#: test at the bottom of this file. Empty today: `credits_used` moved up to
+#: `_CONTRACT_HEADER_LIFTS` once `X-Comfy-Credits-Used` was declared.
+_UNDECLARED_HEADER_LIFTS: dict[str, str] = {}
 
 
 def _declared_run_response_headers() -> set[str]:
@@ -323,6 +325,14 @@ def test_every_lifted_header_is_declared_by_the_contract(field: str, header: str
     )
 
 
+#: Probe value per field for the "reads the declared name" test below. Most
+#: lifts pass the raw header through (or key off mere presence), so an
+#: arbitrary non-empty string proves the read; `credits_used` normalises
+#: anything that is not a finite decimal to `None`, so it needs a value that
+#: survives its own validation to be distinguishable from absent.
+_LIFT_PROBE_VALUES = {"credits_used": "12.5"}
+
+
 @pytest.mark.parametrize(("field", "header"), sorted(_CONTRACT_HEADER_LIFTS.items()))
 def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> None:
     """Declaring the right name is half of it; the lift must also read it.
@@ -332,8 +342,9 @@ def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> N
     is a restatement otherwise, and a restatement would pass the sync it exists
     to fail.
     """
+    probe = _LIFT_PROBE_VALUES.get(field, "x")
     absent = getattr(_run_result({}, {}), field)
-    present = getattr(_run_result({}, {header: "x"}), field)
+    present = getattr(_run_result({}, {header: probe}), field)
     assert present != absent, (
         f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
         f"the header and without it, so the lift is reading some other name."
@@ -346,12 +357,11 @@ def test_an_undeclared_lift_stays_undeclared_until_someone_reconciles_it(
 ) -> None:
     """Tripwire, and deliberately asserting the *absence*.
 
-    ``credits_used`` is lifted from a header the vendored contract does not
-    declare anywhere -- the 200's only cost headers are the
-    ``X-Committed-Spend-*`` trio, which is a different quantity (USD cents of
-    in-flight commitment, not the price of this run). Nothing in the suite can
-    catch a wrong name here, because every test configures its stub to emit the
-    exact literal the lift reads.
+    A field lifted from a header the vendored contract does not declare
+    anywhere is untestable by name: nothing in the suite can catch a wrong
+    name here, because every test configures its stub to emit the exact
+    literal the lift reads (this is how ``credits_used`` lived here until a
+    spec sync declared ``X-Comfy-Credits-Used`` and it moved up).
 
     That gap is tracked, not accepted. This test fails the moment a spec sync
     declares the header, which is the signal to move the entry up into

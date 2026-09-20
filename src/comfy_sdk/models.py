@@ -67,12 +67,15 @@ from .exceptions import IdempotencyKeyReuse, _stamp, to_sdk_error, translating
 from .model_requests import (
     _CANCEL_FAILURES,
     _CANCEL_TIMEOUT,
+    AsyncDetachedRequest,
     AsyncRequestHandle,
+    DetachedRequest,
     QueueUpdate,
     RequestHandle,
     _completed,
     _remaining,
     _request_id_of,
+    _subscribe_timed_out,
 )
 from .retry import DEFAULT_RETRY, Retrier, RetryPolicy, may_have_claimed_key
 from .router_exceptions import RouterError
@@ -757,7 +760,7 @@ class Models(_ModelsBase):
         on_queue_update: Callable[[QueueUpdate], Any] | None = None,
         timeout: float | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | DetachedRequest:
         """Queue a request, follow it to completion, and return its result.
 
         :meth:`submit` plus polling plus
@@ -778,13 +781,56 @@ class Models(_ModelsBase):
         running, then every poll, retry and pause, and the result fetch — with
         no server-side meaning: the queue's own timeouts are the server's.
         When it runs out this makes a best-effort
-        :meth:`~comfy_sdk.model_requests.RequestHandle.cancel` — so a caller
-        that has stopped waiting is not also still paying for a generation
-        nobody will collect — and then raises ``TimeoutError``. Best-effort is
-        literal: a cancel that itself fails is swallowed, because the timeout
-        is the failure worth reporting and a masked one would send the caller
-        looking in the wrong place. Use :meth:`submit` instead when the request
-        should outlive the caller's patience.
+        :meth:`~comfy_sdk.model_requests.RequestHandle.cancel`, and **what that
+        cancel is answered — and then what the request's own state says —
+        decides how the call ends.** The route takes a cancel in either live
+        state and answers ``202 CANCELLATION_REQUESTED``, which says the ask
+        landed and nothing more; a generation already on the wire may complete
+        anyway, and one that completes is **billed** whatever the caller does.
+        So one confirming status read settles it, and there are three endings,
+        told apart by type and never by a message:
+
+        * **Cancelled** — the request's row came back ``COMPLETED`` carrying
+          the ``cancelled`` bucket. Raises
+          :class:`~comfy_sdk.model_requests.SubscribeTimeout` (a
+          ``TimeoutError``) with ``cancelled=True``. A request cancelled while
+          still ``IN_QUEUE`` was never dispatched and cannot be charged; one
+          cancelled after admission may still be, and this ending does not
+          claim otherwise.
+        * **Detached** — the confirming poll found the run still going
+          (``IN_PROGRESS``, or a live status this SDK cannot place). Nothing
+          has gone wrong: the generation continues, completes and is billed,
+          and it stays collectable. **Returns** a
+          :class:`~comfy_sdk.model_requests.DetachedRequest` carrying the
+          ``request_id``, the model id and a live handle, rather than raising.
+        * **Completed during teardown** — the run had just finished on its
+          own. The result exists and has been paid for, so it is collected and
+          returned like any other result.
+
+        A cancel that fails for any *other* reason — a transport failure, a
+        rejected credential, a ``500`` — is not benign and is not swallowed:
+        the ``SubscribeTimeout`` is raised with ``cancelled=False`` and the
+        cancel's own failure on ``.cancel_error`` and ``__cause__``, because a
+        cancel that never landed means the run may still be going. The same
+        goes for a cancel the route ACCEPTED whose row is nevertheless still
+        ``IN_QUEUE`` — an ordering the route's own write order forbids: the
+        ``cancel_error`` is coded ``cancel_not_applied``, because an
+        ``IN_QUEUE`` request cannot have been charged and a detach would claim
+        it was.
+
+        **The teardown itself is not inside the bound.** ``timeout`` bounds
+        the *wait*; deciding how it ended costs up to three further round
+        trips beyond it, each bounded at ``_CANCEL_TIMEOUT`` (10s): the
+        cleanup cancel, the status read that confirms what it did, and — on
+        the completed-during-teardown ending only — the result fetch. So a
+        ``subscribe(timeout=N)`` that ends in a detach can return up to ~30s
+        after ``N`` in the worst case. Overrunning is the deliberate trade:
+        the alternative is telling a caller their run was cancelled without
+        having checked, or discarding a generation they have already paid for.
+
+        Use :meth:`submit` instead when the request is *meant* to outlive the
+        caller's patience — a detach is the timeout making the best of a run it
+        can no longer stop, not a substitute for queueing one deliberately.
 
         A completion carrying an ``error_type`` — which is how the server
         reports a failure *and* a cancellation — raises the typed router
@@ -812,15 +858,35 @@ class Models(_ModelsBase):
                     update = next(updates)
                 except StopIteration:
                     break
-                except TimeoutError:
+                except TimeoutError as timed_out:
                     try:
-                        handle._cancel_best_effort()
-                    except _CANCEL_FAILURES:
-                        # Best-effort is literal: the timeout is the failure
-                        # worth reporting, and a masked one sends the caller
-                        # looking in the wrong place.
-                        pass
-                    raise
+                        teardown = handle._after_subscribe_timeout()
+                    except _CANCEL_FAILURES as cancel_error:
+                        # Still not masked — the timeout is the failure worth
+                        # reporting, and a masked one sends the caller looking
+                        # in the wrong place — but no longer silent either: the
+                        # cancel's failure rides out on the timeout it could
+                        # not clean up after.
+                        raise _subscribe_timed_out(
+                            handle, timed_out, cancelled=False, cancel_error=cancel_error
+                        ) from cancel_error
+                    if teardown is None:
+                        raise _subscribe_timed_out(handle, timed_out, cancelled=True) from timed_out
+                    if isinstance(teardown, QueueUpdate):
+                        # It completed while the teardown was running. The
+                        # generation is finished and billed; a bounded fetch of
+                        # its result is a far better answer than discarding it.
+                        #
+                        # The callback is owed this observation like any other.
+                        # It is the terminal one, and on the single timeout
+                        # ending that returns a result it is the only place the
+                        # caller's own state machine can learn the run ended —
+                        # which the docstring promises it ("every change of
+                        # status ... and the completion").
+                        if on_queue_update is not None:
+                            on_queue_update(teardown)
+                        return handle._collect_or_detach(teardown, budget=_CANCEL_TIMEOUT)
+                    return teardown
                 completion = update
                 if on_queue_update is not None:
                     on_queue_update(update)
@@ -1009,12 +1075,16 @@ class AsyncModels(_ModelsBase):
         on_queue_update: Callable[[QueueUpdate], Any] | None = None,
         timeout: float | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | AsyncDetachedRequest:
         """Awaitable :meth:`Models.subscribe` — same arguments, same result.
 
         ``on_queue_update`` may be a plain callable or a coroutine function;
         an awaitable it returns is awaited before the next poll, so an async
-        callback does not need wrapping. See :meth:`Models.subscribe`.
+        callback does not need wrapping. The timeout's three endings are
+        :meth:`Models.subscribe`'s, unchanged, with
+        :class:`~comfy_sdk.model_requests.AsyncDetachedRequest` in place of
+        :class:`~comfy_sdk.model_requests.DetachedRequest` so the handle it
+        carries is the awaitable one. See :meth:`Models.subscribe`.
         """
         deadline = None if timeout is None else _now() + timeout
         handle = await self.submit(model, arguments, idempotency_key=idempotency_key)
@@ -1036,12 +1106,30 @@ class AsyncModels(_ModelsBase):
                         update = await anext(updates)
                     except StopAsyncIteration:
                         break
-                    except TimeoutError:
+                    except TimeoutError as timed_out:
+                        # The three endings of `Models.subscribe`'s timeout,
+                        # decided identically — see it for why each one is what
+                        # it is.
                         try:
-                            await handle._cancel_best_effort()
-                        except _CANCEL_FAILURES:
-                            pass
-                        raise
+                            teardown = await handle._after_subscribe_timeout()
+                        except _CANCEL_FAILURES as cancel_error:
+                            raise _subscribe_timed_out(
+                                handle, timed_out, cancelled=False, cancel_error=cancel_error
+                            ) from cancel_error
+                        if teardown is None:
+                            raise _subscribe_timed_out(
+                                handle, timed_out, cancelled=True
+                            ) from timed_out
+                        if isinstance(teardown, QueueUpdate):
+                            # Delivered to the callback first, for the reason
+                            # `Models.subscribe` gives — and awaited here, as
+                            # the loop below awaits it.
+                            if on_queue_update is not None:
+                                outcome = on_queue_update(teardown)
+                                if isinstance(outcome, Awaitable):
+                                    await outcome
+                            return await handle._collect_or_detach(teardown, budget=_CANCEL_TIMEOUT)
+                        return teardown
                     completion = update
                     if on_queue_update is not None:
                         outcome = on_queue_update(update)
@@ -1052,8 +1140,15 @@ class AsyncModels(_ModelsBase):
             # queued or running. `subscribe` has exposed neither the handle nor
             # its key, so the caller has no way back to a generation that would
             # otherwise keep running — and keep billing — after they stopped
-            # waiting for it. One shielded, bounded best-effort cancel, exactly
-            # as on the timeout path, then the cancellation proceeds.
+            # waiting for it. One shielded, bounded best-effort cancel, then
+            # the cancellation proceeds.
+            #
+            # Unlike the timeout above, this one still swallows every cancel
+            # failure alike, refusal included. There is nowhere to put a detach
+            # report: the caller is not receiving a value from this call, and
+            # replacing their `CancelledError` with something else would break
+            # the cancellation they asked for. Reaching the run again from here
+            # needs the handle, which means `submit` rather than `subscribe`.
             with contextlib.suppress(*_CANCEL_FAILURES, TimeoutError, asyncio.TimeoutError):
                 await asyncio.shield(
                     asyncio.wait_for(handle._cancel_best_effort(), _CANCEL_TIMEOUT + 1.0)

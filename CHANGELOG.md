@@ -12,6 +12,14 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `DetachedRequest` / `AsyncDetachedRequest` — what `models.subscribe` now returns when its
+  `timeout` expires on a run the queue has already dispatched. Carries the `request_id`, the model
+  id and a live handle, so the generation stays collectable.
+- `SubscribeTimeout` — a `TimeoutError` subclass raised by the `models.subscribe` timeouts that
+  still raise, carrying `.request_id`, `.model`, `.cancelled` and `.cancel_error`.
+- `IN_QUEUE` / `IN_PROGRESS` — the two live values of the contract's closed `RouterQueueStatus`
+  enum, exported alongside `COMPLETED` so a caller comparing `QueueUpdate.status` uses the
+  contract's own spelling.
 - `RouterRunResult.credits_used` — what Comfy Router reported a run cost, lifted from the
   `X-Comfy-Credits-Used` response header onto what `models.run_detailed()` returns. It is a
   price rather than a settled ledger entry, absent means "not reported" and never "free", and
@@ -21,6 +29,68 @@ the fuller account of each version, including verification notes.
   with `", "`), `NaN`/`Infinity` — reports as `None` rather than passing through to break the
   `Decimal()` parse the field documents. The field defaults to `None`, so this stays additive
   for anything that constructs a `RouterRunResult` by hand.
+
+### Changed
+
+- **`models.subscribe(timeout=N)` now returns a `DetachedRequest` instead of raising** when its
+  cleanup cancel did not stop the run — the queue refused it because the request was already in
+  flight, or took it and answered with a live status. Such a run is served and **billed** whatever
+  the caller does, so the timeout is a detach rather than a cancellation and the request stays
+  collectable by `request_id`. Its return type is now `dict[str, Any] | DetachedRequest` — check
+  the type before using the result.
+- A `subscribe` timeout that *did* cancel the request raises `SubscribeTimeout` rather than a bare
+  `TimeoutError`. It subclasses `TimeoutError`, so `except TimeoutError` is unaffected.
+  `SubscribeTimeout` pickles and copies with its fields intact, so the ids survive reaching another
+  process.
+- **A 2xx on the cleanup cancel is no longer taken as proof the run stopped.** The cancel's own
+  answer is read: terminal with a bucket is a cancellation, terminal without one is a run that
+  finished and is collected, and a live status is a detach. Only a body-less accepted cancel still
+  reports a cancellation unconfirmed, which is the shape that carries nothing to read.
+- **The cancel route's `202 CANCELLATION_REQUESTED` is read per the contract: accepted, then
+  confirmed by one status read.** It says the ask was taken and nothing more, so the request's own
+  state decides the ending — `COMPLETED` carrying the `cancelled` bucket is a cancellation
+  (`SubscribeTimeout` with `.cancelled` `True`, rather than the `Cancelled` router exception a run
+  that failed on its own raises); `IN_PROGRESS` or an unrecognised live status is a
+  `DetachedRequest`; and a row still `IN_QUEUE` — which the route's write order forbids — reports
+  that the cancel never applied, as `SubscribeTimeout` with `.cancelled` `False` and a
+  `.cancel_error` coded `cancel_not_applied`. A `DetachedRequest` can no longer be built carrying
+  `IN_QUEUE` at all: that status means the request was never dispatched and cannot be charged,
+  which is the opposite of what a detach claims.
+- **Only a `409` that names no bucket is read as the in-flight refusal.** A typed `CancelRefused`
+  is recognised by its class; a `409` carrying a documented bucket (`invalid_input`,
+  `concurrency_limit_exceeded`) is not the state refusal and surfaces on
+  `SubscribeTimeout.cancel_error` instead of being reported as a detach.
+- A result fetch that fails during the timeout teardown degrades to a `DetachedRequest` rather than
+  escaping as a raw transport error, so a caller's `except TimeoutError` still sees the ids for a
+  generation that has finished and been billed. A completion carrying its own `error_type` still
+  raises the typed error — that is the run's outcome, not a failure to read it.
+- `on_queue_update` is now called with the completion found during the timeout teardown, which is
+  the terminal observation the docstring promises it.
+- `subscribe`'s teardown can overrun `timeout` by up to ~30s in the worst case (three bounded round
+  trips: the cancel, the confirming poll, the result fetch). Documented on the method.
+- **A cleanup cancel that fails for any other reason is no longer swallowed.** A transport
+  failure, a `401` or a `500` on the cancel now reaches the caller on
+  `SubscribeTimeout.cancel_error` and `__cause__`, with `.cancelled` `False`, instead of looking
+  exactly like a successful cancellation.
+- **Because those three buckets are now one class each, they descend from `RouterError` on the
+  workflow surface too**: a `POST /jobs` call that fails `401`/`403`/`402` raises a `RouterError`
+  subclass. `except Unauthorized` / `except Forbidden` / `except InsufficientCredits` (from either
+  module) and `except ComfyError` are unchanged; only `except RouterError` sees more than its name
+  suggests.
+- **Breaking, for code that *constructs* those three classes.** `Unauthorized`, `Forbidden` and
+  `InsufficientCredits` are now `RouterError` subclasses, so they take `RouterError`'s
+  constructor: the human-readable string is the positional `detail`, and the bucket is
+  `error_type=`. There is no `message=` or `code=` keyword any more, so a hand-built
+  `Unauthorized(message="...", code="unauthorized")` — in a test double, a re-raise, or a
+  subclass — now raises `TypeError` and becomes `Unauthorized("...")`. Only construction is
+  affected: `raise`, `except` and every attribute a caller reads inside the handler (`.message`,
+  `.code`, `.http_status`, `.details`, `.request_id`, `.retry_after`) are unchanged.
+- `RouterError` is exported from the package root, alongside `CancelRefused` and
+  `AlreadyCompleted`. The eighteen per-bucket classes still live in
+  `comfy_sdk.router_exceptions`.
+- `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
+  body's `error_type`), or `None` when it named none — which is also how the SDK tells which
+  surface answered.
 
 ### Fixed
 
@@ -56,28 +126,6 @@ the fuller account of each version, including verification notes.
   control characters, ANSI escapes and bidi overrides reduced, whitespace collapsed, and a 256-character
   cap — so a hostile or merely careless `msg` can no longer scribble on a terminal or flood a log line.
   Only the summary string changes; `.errors` still carries the raw typed entries.
-
-### Changed
-
-- **Because those three buckets are now one class each, they descend from `RouterError` on the
-  workflow surface too**: a `POST /jobs` call that fails `401`/`403`/`402` raises a `RouterError`
-  subclass. `except Unauthorized` / `except Forbidden` / `except InsufficientCredits` (from either
-  module) and `except ComfyError` are unchanged; only `except RouterError` sees more than its name
-  suggests.
-- **Breaking, for code that *constructs* those three classes.** `Unauthorized`, `Forbidden` and
-  `InsufficientCredits` are now `RouterError` subclasses, so they take `RouterError`'s
-  constructor: the human-readable string is the positional `detail`, and the bucket is
-  `error_type=`. There is no `message=` or `code=` keyword any more, so a hand-built
-  `Unauthorized(message="...", code="unauthorized")` — in a test double, a re-raise, or a
-  subclass — now raises `TypeError` and becomes `Unauthorized("...")`. Only construction is
-  affected: `raise`, `except` and every attribute a caller reads inside the handler (`.message`,
-  `.code`, `.http_status`, `.details`, `.request_id`, `.retry_after`) are unchanged.
-- `RouterError` is exported from the package root, alongside `CancelRefused` and
-  `AlreadyCompleted`. The eighteen per-bucket classes still live in
-  `comfy_sdk.router_exceptions`.
-- `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
-  body's `error_type`), or `None` when it named none — which is also how the SDK tells which
-  surface answered.
 
 ## [0.3.0] - 2026-09-14
 
