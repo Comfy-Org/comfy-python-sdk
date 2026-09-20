@@ -294,11 +294,25 @@ _CONTRACT_HEADER_LIFTS = {
     "dropped_params": "X-Comfy-Router-Dropped-Params",
     "replayed": "Idempotent-Replayed",
     "request_id": "X-Comfy-Request-Id",
+    # Reconciled out of `_UNDECLARED_HEADER_LIFTS` when the vendored spec sync
+    # declared the name on `runRouterModel`'s 200, which is exactly what the
+    # tripwire at the bottom of this file exists to prompt.
+    "credits_used": "X-Comfy-Credits-Used",
 }
 
 #: Lifted by the SDK but NOT declared on the contract's 200 -- see the tripwire
-#: test at the bottom of this file.
-_UNDECLARED_HEADER_LIFTS = {"credits_used": "X-Comfy-Credits-Used"}
+#: test at the bottom of this file. Empty today: every lift is pinned above.
+_UNDECLARED_HEADER_LIFTS: dict[str, str] = {}
+
+#: field -> a header value that must survive the lift's own normalisation.
+#: `test_the_lift_actually_reads_the_declared_name` proves a lift reads its
+#: declared name by showing the field changes when the header is present, so
+#: the probe has to be a value the field will actually keep. The default `"x"`
+#: works for the lifts that pass their header through (or merely test it for
+#: presence), but `credits_used` drops anything that is not a finite decimal --
+#: `_credits_used("x")` is `None`, the same as absent -- so probing it with
+#: `"x"` would read as "the lift ignored the header" when the lift is fine.
+_HEADER_PROBE_VALUES = {"credits_used": "1.25"}
 
 
 def _declared_run_response_headers() -> set[str]:
@@ -332,11 +346,14 @@ def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> N
     is a restatement otherwise, and a restatement would pass the sync it exists
     to fail.
     """
+    probe = _HEADER_PROBE_VALUES.get(field, "x")
     absent = getattr(_run_result({}, {}), field)
-    present = getattr(_run_result({}, {header: "x"}), field)
+    present = getattr(_run_result({}, {header: probe}), field)
     assert present != absent, (
         f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
-        f"the header and without it, so the lift is reading some other name."
+        f"the header and without it, so the lift is reading some other name. (Probed with "
+        f"{probe!r}; if the lift normalises its input, _HEADER_PROBE_VALUES may need an entry "
+        f"that survives it.)"
     )
 
 
@@ -346,18 +363,24 @@ def test_an_undeclared_lift_stays_undeclared_until_someone_reconciles_it(
 ) -> None:
     """Tripwire, and deliberately asserting the *absence*.
 
-    ``credits_used`` is lifted from a header the vendored contract does not
-    declare anywhere -- the 200's only cost headers are the
-    ``X-Committed-Spend-*`` trio, which is a different quantity (USD cents of
-    in-flight commitment, not the price of this run). Nothing in the suite can
-    catch a wrong name here, because every test configures its stub to emit the
-    exact literal the lift reads.
+    ``_UNDECLARED_HEADER_LIFTS`` is empty today, so this parametrises to
+    nothing and skips; it is kept for the next lift added ahead of its
+    contract. Such a lift reads a header name nothing in the suite can check,
+    because every test configures its stub to emit the exact literal the lift
+    reads -- so a wrong name passes everywhere and is only caught against a
+    real deployment, which is how ``replayed`` stayed ``False`` in production.
 
     That gap is tracked, not accepted. This test fails the moment a spec sync
     declares the header, which is the signal to move the entry up into
     ``_CONTRACT_HEADER_LIFTS`` and get it pinned like the rest. It also fails
     if the header is declared under a *different* name for the same quantity,
     because the reconciliation is the same either way.
+
+    ``credits_used`` was the last entry to make that trip: it was lifted from
+    ``X-Comfy-Credits-Used`` before the contract named it -- the 200's only
+    cost headers were the ``X-Committed-Spend-*`` trio, a different quantity
+    (USD cents of in-flight commitment, not the price of this run) -- and the
+    sync that declared it tripped this test, which is what moved it up.
     """
     declared = _declared_run_response_headers()
     assert header not in declared, (
