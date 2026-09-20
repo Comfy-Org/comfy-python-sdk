@@ -714,6 +714,36 @@ def test_a_huge_detail_array_stops_accumulating_at_the_excerpt_budget() -> None:
     assert len(err.message) == _BODY_EXCERPT_LIMIT
 
 
+def test_an_unprintable_entry_does_not_spend_the_budget_it_cannot_fill() -> None:
+    from comfy_low.errors import summarise_detail
+
+    # The budget stops accumulation once there is enough to FILL the 256-char
+    # cap, so only text that survives the reduction may be charged to it. A
+    # control-only `msg` survives `_clean` -- `str.strip()` does not treat NUL
+    # as whitespace -- but sanitises away to nothing, so charging its raw length
+    # let one such entry exhaust the budget on its own, break the loop, and then
+    # contribute no output at all. Every readable entry behind it was lost and
+    # the caller got a bare `HTTP 422` -- the exact failure `summarise_detail`
+    # was written to end, reachable by anything that can set a response body.
+    entries = [{"msg": "\x00" * 2048}, {"loc": ["body", "seed"], "msg": "field required"}]
+    assert summarise_detail(entries) == "body.seed: field required"
+
+    err = error_from_envelope(422, {"detail": entries}, error_type="invalid_input")
+    assert err.message == "body.seed: field required"
+    # The raw entries are unaffected either way -- they are data, not display.
+    assert len(err.validation_errors) == 2
+
+    # The same for a run of them, and for the interleaved case: an entry that
+    # reduces to nothing is skipped, never merely truncated into the output.
+    # Control characters and a bidi override only -- an ANSI sequence would be
+    # a poor probe here, since only its ESC is unprintable and the `[31m` that
+    # follows is ordinary text that should and does survive.
+    noise = {"msg": "\x00\x01\u202e\x7f" * 512}
+    assert summarise_detail([noise] * 20 + [{"msg": "real"}]) == "real"
+    assert summarise_detail([{"msg": "a"}, noise, {"msg": "b"}]) == "a; b"
+    assert summarise_detail([noise] * 50) is None
+
+
 def test_a_shared_bucket_without_an_array_still_maps_by_code() -> None:
     # The array is not what types a shared bucket: a bare `unauthorized` with no
     # `detail[]` still maps by code to the one class both surfaces export.

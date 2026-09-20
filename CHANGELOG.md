@@ -56,6 +56,11 @@ the fuller account of each version, including verification notes.
   control characters, ANSI escapes and bidi overrides reduced, whitespace collapsed, and a 256-character
   cap — so a hostile or merely careless `msg` can no longer scribble on a terminal or flood a log line.
   Only the summary string changes; `.errors` still carries the raw typed entries.
+  An entry that is nothing but control characters no longer costs the summary its
+  readable entries: it reduces to nothing, so it is skipped rather than charged against
+  the length budget, where before a single such entry could exhaust the budget on its own
+  and leave the caller with a bare `HTTP 422` while the fields that actually failed sat
+  unread in the same body.
 - **The string `detail` and `error.message` forms are sanitised too.** A Router request-level
   `detail` string, and a v2 envelope's `error.message`, reached `str(exc)` exactly as sent — so a
   server, a proxy or a provider in front of either surface could put ANSI escape sequences, a bidi

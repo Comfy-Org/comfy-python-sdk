@@ -346,13 +346,21 @@ def summarise_detail(entries: Any) -> str | None:
     """
     if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
         return None
-    # Stop accumulating once there is provably enough to fill the capped result,
-    # rather than rendering a server-controlled array in full and slicing 256
-    # characters off the end. `clean_body_excerpt` already reads only its first
-    # `_BODY_EXCERPT_LIMIT * _BODY_EXCERPT_WINDOW` characters, so anything past
-    # that budget cannot reach the output — collecting it would only make the
-    # cost of describing a body scale with the body, which is the property
-    # `_BODY_EXCERPT_WINDOW` exists to bound.
+    # Stop accumulating once there is provably enough SANITISED text to fill the
+    # capped result, rather than rendering a server-controlled array in full and
+    # slicing 256 characters off the end: anything past this budget cannot reach
+    # the output, so collecting it would only grow the peak memory a failure
+    # costs to describe.
+    #
+    # The budget bounds what is KEPT, not what is looked at. An array whose
+    # every entry sanitises away is walked to the end, so the work here is
+    # proportional to the body — which is the same order as the `json.loads`
+    # that produced `entries` and the `validation_errors` tuple built over the
+    # same array in `error_from_envelope`, and each entry costs at most the
+    # `_BODY_EXCERPT_LIMIT * _BODY_EXCERPT_WINDOW` head `clean_body_excerpt`
+    # reads. Bounding the walk instead would mean charging unreadable entries
+    # for the budget, which is precisely the bug the per-part reduction below
+    # exists to fix.
     budget = _BODY_EXCERPT_LIMIT * _BODY_EXCERPT_WINDOW
     parts: list[str] = []
     size = 0
@@ -367,8 +375,24 @@ def summarise_detail(entries: Any) -> str | None:
             part = location or message or ""
         else:
             continue
-        parts.append(part)
-        size += len(part) + 2  # the "; " this part will join on
+        # Reduce each part BEFORE it is measured or kept, rather than only
+        # reducing the joined line at the end. The budget exists to stop
+        # accumulating once there is provably enough to fill the capped result,
+        # and only text that survives the reduction can fill it: counting a
+        # part's RAW length let a single server-controlled entry of 2,048
+        # control characters — which `_clean` passes through, because `.strip()`
+        # does not treat NUL as whitespace — exhaust the budget on its own,
+        # break the loop, and then sanitise away to nothing. The readable entry
+        # behind it never got a chance to be added, and `error_from_envelope`
+        # fell through to a bare `HTTP <status>` with the per-field reasons
+        # dropped on the floor — the exact failure this function was written to
+        # end. A part that sanitises to nothing is skipped for the same reason:
+        # it contributes nothing to the output, so it must cost nothing.
+        cleaned = clean_body_excerpt(part)
+        if not cleaned:
+            continue
+        parts.append(cleaned)
+        size += len(cleaned) + 2  # the "; " this part will join on
         if size >= budget:
             break
     return clean_body_excerpt("; ".join(parts))
