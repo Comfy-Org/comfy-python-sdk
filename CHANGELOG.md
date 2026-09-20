@@ -113,6 +113,15 @@ the fuller account of each version, including verification notes.
   required on every one Router sends), and `not content` means nothing was
   delivered.
 
+  The queued surface gets the identical branch: `RequestHandle.get()` /
+  `AsyncRequestHandle.get()` and `models.subscribe()` now return
+  `dict[str, Any] | BinaryResult` too, because the result route they collect
+  from (`GET .../requests/{request_id}`) declares the same `application/json` /
+  `*/*` pair `models.run()` does. Before this it still went through the
+  JSON-only decoder, so a binary generation submitted through `submit()` raised
+  `invalid_response` on collection even though the identical model run directly
+  through `run()` already worked.
+
 ### Changed
 - **Because those three buckets are now one class each, they descend from `RouterError` on the
   workflow surface too**: a `POST /jobs` call that fails `401`/`403`/`402` raises a `RouterError`

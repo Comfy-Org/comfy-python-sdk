@@ -446,16 +446,8 @@ class Models(_ModelsBase):
         awaitable form of this method is :meth:`AsyncModels.run` on
         ``AsyncComfy``.
 
-        The return value is the provider's own payload, handed back as-is. For
-        a model that answers JSON that is a ``dict``, with no wrapper class
-        standing between the caller and what the provider produced; for one
-        whose partner answers a generation directly as bytes it is a
-        :class:`~comfy_sdk.BinaryResult` holding those bytes unchanged, which
-        is a carrier for the response's ``content_type`` and ``request_id``
-        rather than a model of the payload. The branch is the response's
-        ``Content-Type``, exactly as this route's published ``200`` says a
-        client must take it.
-        It comes in **two shapes**, decided by the response's ``Content-Type``,
+        The return value is the provider's own payload, handed back as-is. It
+        comes in **two shapes**, decided by the response's ``Content-Type``,
         because Router forwards the partner's output under the partner's own
         media type:
 
@@ -799,14 +791,16 @@ class Models(_ModelsBase):
         on_queue_update: Callable[[QueueUpdate], Any] | None = None,
         timeout: float | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | BinaryResult:
         """Queue a request, follow it to completion, and return its result.
 
         :meth:`submit` plus polling plus
         :meth:`~comfy_sdk.model_requests.RequestHandle.get`, in one call — the
         ergonomic form for a caller who does want to wait but also wants to
         show progress while waiting. The return value is the provider's own
-        payload, identical to what :meth:`run` would have returned.
+        payload, identical to what :meth:`run` would have returned — a ``dict``
+        for JSON output, a :class:`BinaryResult` for a model whose partner
+        answers a generation directly as bytes.
 
         ``on_queue_update`` is called with a
         :class:`~comfy_sdk.model_requests.QueueUpdate` each time the queue
@@ -1051,7 +1045,7 @@ class AsyncModels(_ModelsBase):
         on_queue_update: Callable[[QueueUpdate], Any] | None = None,
         timeout: float | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | BinaryResult:
         """Awaitable :meth:`Models.subscribe` — same arguments, same result.
 
         ``on_queue_update`` may be a plain callable or a coroutine function;

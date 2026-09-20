@@ -143,14 +143,15 @@ _CONTENT_TYPE_LIMIT = 128
 class BinaryResult:
     """A completed model run whose native output is bytes rather than JSON.
 
-    What ``post_model_run`` — and so ``comfy_sdk.models.run`` — returns instead
-    of a ``dict`` when Comfy Router answers a run under a media type that is not
-    JSON. Router forwards the partner model's output *unchanged*, and for a
+    What ``post_model_run`` and ``get_model_request_result`` — and so
+    ``comfy_sdk.models.run`` and the queued surface's own result fetch — return
+    instead of a ``dict`` when Comfy Router answers under a media type that is
+    not JSON. Router forwards the partner model's output *unchanged*, and for a
     model whose partner answers a generation directly as bytes (the ElevenLabs
     audio models are the first in the catalog) that output is raw audio under
-    the partner's own ``Content-Type``. The run route's ``200`` declares both
-    branches — ``application/json`` and a ``*/*`` ``format: binary`` one — and
-    the spec tells clients to branch on the response ``Content-Type``.
+    the partner's own ``Content-Type``. Both routes' ``200`` declare the same
+    two branches — ``application/json`` and a ``*/*`` ``format: binary`` one —
+    and the spec tells clients to branch on the response ``Content-Type``.
 
     The bytes are handed over exactly as they arrived: not base64-encoded, not
     wrapped in a dict, not decoded or transcoded. The point of the surface is
@@ -610,14 +611,16 @@ class _Prepared:
     ) -> dict[str, Any] | BinaryResult:
         """:meth:`parse_or_raise` for an operation whose success may not be JSON.
 
-        Used by ``post_model_run`` and nothing else. Comfy Router forwards the
-        partner model's native output **under the partner's own media type**:
-        the run route's ``200`` declares an ``application/json`` branch *and* a
-        ``*/*`` ``format: binary`` branch, and the spec says in as many words
-        that a client MUST branch on the response ``Content-Type`` rather than
-        assume a JSON document. So this is the one place that does, and every
-        other operation keeps :meth:`parse_or_raise` — including its reading of
-        an undecodable success as an interstitial, which stays correct for a
+        Used by ``post_model_run`` and ``get_model_request_result`` — the
+        awaited and the queued routes for collecting a model run's result —
+        and nothing else. Comfy Router forwards the partner model's native
+        output **under the partner's own media type** on both: each route's
+        ``200`` declares an ``application/json`` branch *and* a ``*/*``
+        ``format: binary`` branch, and the spec says in as many words that a
+        client MUST branch on the response ``Content-Type`` rather than assume
+        a JSON document. So this is the one place that does, and every other
+        operation keeps :meth:`parse_or_raise` — including its reading of an
+        undecodable success as an interstitial, which stays correct for a
         route whose only declared success media type is JSON.
 
         The branch is on the declared type, not on whether the bytes happen to
@@ -1289,18 +1292,23 @@ class ComfyLow:
 
     def get_model_request_result(
         self, model: str, request_id: str, *, timeout: Any = _UNSET
-    ) -> tuple[dict[str, Any], httpx.Headers]:
+    ) -> tuple[dict[str, Any] | BinaryResult, httpx.Headers]:
         """GET the finished result of one submitted request.
 
         The body is the provider's own payload, exactly as
         :meth:`post_model_run` returns it — this route is where a queued
-        request's result is collected, not a differently-shaped one.
+        request's result is collected, not a differently-shaped one. That
+        includes the same ``dict`` / :class:`BinaryResult` branch: this route's
+        published ``200`` declares the identical ``application/json`` and
+        ``*/*`` ``format: binary`` pair, so a model whose partner answers a
+        generation directly as bytes is not a JSON document here either. See
+        :meth:`_Prepared.parse_run_result`.
         """
         url = self._p.router_base_url + model_request_path(
             model, request_id, _MODEL_REQUEST_PATH_TEMPLATE
         )
         resp = self.raw_request("GET", url, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200,)), resp.headers
+        return self._p.parse_run_result(resp, (200,)), resp.headers
 
     def put_model_request_cancel(
         self, model: str, request_id: str, *, timeout: Any = _UNSET
@@ -1670,13 +1678,13 @@ class AsyncComfyLow:
 
     async def get_model_request_result(
         self, model: str, request_id: str, *, timeout: Any = _UNSET
-    ) -> tuple[dict[str, Any], httpx.Headers]:
+    ) -> tuple[dict[str, Any] | BinaryResult, httpx.Headers]:
         """Async :meth:`ComfyLow.get_model_request_result`."""
         url = self._p.router_base_url + model_request_path(
             model, request_id, _MODEL_REQUEST_PATH_TEMPLATE
         )
         resp = await self.raw_request("GET", url, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200,)), resp.headers
+        return self._p.parse_run_result(resp, (200,)), resp.headers
 
     async def put_model_request_cancel(
         self, model: str, request_id: str, *, timeout: Any = _UNSET

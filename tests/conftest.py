@@ -256,6 +256,13 @@ class ServerState:
             "seed": 7,
         }
     )
+    # Answer a completed result with these raw bytes under
+    # `queue_result_binary_content_type` instead of `queue_result` as JSON —
+    # the queued sibling of `model_run_binary_body`. `None` serves JSON.
+    queue_result_binary_body: bytes | None = None
+    # Content-Type for `queue_result_binary_body`. `None` sends no Content-Type
+    # header at all, which is the header-stripping-intermediary case.
+    queue_result_binary_content_type: str | None = "audio/mpeg"
     # Status code for the cancel response; 204 exercises the empty-body path.
     queue_cancel_status: int = 200
     # Cancels that answer a transient failure (status, code) before one is
@@ -789,6 +796,11 @@ def _make_handler(state: ServerState):
         def _serve_queue_result(self, request_id: str) -> None:
             state.queue_result_count += 1
             state.queue_paths.append(self.path)
+            if state.queue_result_binary_body is not None:
+                self._raw(
+                    200, state.queue_result_binary_body, state.queue_result_binary_content_type
+                )
+                return
             if state.queue_result_raw is not None:
                 self._json(200, state.queue_result_raw)
                 return

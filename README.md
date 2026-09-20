@@ -595,7 +595,7 @@ The handle carries four operations:
 | | |
 |---|---|
 | `handle.status()` | one authoritative poll, returned as a `QueueUpdate` (`status`, `queue_position`, `error_type`, `retry_after`, `raw`) |
-| `handle.get(timeout=None)` | poll to completion, then return the provider's own payload — the same value `run` would have returned |
+| `handle.get(timeout=None)` | poll to completion, then return the provider's own payload — the same value `run` would have returned, including the `BinaryResult` branch from "Two result shapes" above |
 | `handle.cancel()` | ask the server to cancel. A request, not a guarantee: a request that already completed stays completed |
 | `handle.iter_events(timeout=None)` | the poll loop with its updates exposed — yields the first observation, every change of status or queue position, and the completion |
 
