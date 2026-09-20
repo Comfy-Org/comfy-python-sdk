@@ -294,11 +294,18 @@ _CONTRACT_HEADER_LIFTS = {
     "dropped_params": "X-Comfy-Router-Dropped-Params",
     "replayed": "Idempotent-Replayed",
     "request_id": "X-Comfy-Request-Id",
+    "credits_used": "X-Comfy-Credits-Used",
 }
 
 #: Lifted by the SDK but NOT declared on the contract's 200 -- see the tripwire
 #: test at the bottom of this file.
-_UNDECLARED_HEADER_LIFTS = {"credits_used": "X-Comfy-Credits-Used"}
+_UNDECLARED_HEADER_LIFTS: dict[str, str] = {}
+
+#: Stub header value each field's lift accepts, for the round-trip test below.
+#: ``"x"`` works for every field except ``credits_used``, whose lift parses the
+#: value as a ``Decimal`` and normalises anything else to ``None`` -- so "x"
+#: would round-trip to ``None`` both present and absent, and prove nothing.
+_CONTRACT_HEADER_LIFT_STUB_VALUES: dict[str, str] = {"credits_used": "1.25"}
 
 
 def _declared_run_response_headers() -> set[str]:
@@ -332,8 +339,9 @@ def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> N
     is a restatement otherwise, and a restatement would pass the sync it exists
     to fail.
     """
+    stub = _CONTRACT_HEADER_LIFT_STUB_VALUES.get(field, "x")
     absent = getattr(_run_result({}, {}), field)
-    present = getattr(_run_result({}, {header: "x"}), field)
+    present = getattr(_run_result({}, {header: stub}), field)
     assert present != absent, (
         f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
         f"the header and without it, so the lift is reading some other name."
@@ -346,11 +354,10 @@ def test_an_undeclared_lift_stays_undeclared_until_someone_reconciles_it(
 ) -> None:
     """Tripwire, and deliberately asserting the *absence*.
 
-    ``credits_used`` is lifted from a header the vendored contract does not
-    declare anywhere -- the 200's only cost headers are the
-    ``X-Committed-Spend-*`` trio, which is a different quantity (USD cents of
-    in-flight commitment, not the price of this run). Nothing in the suite can
-    catch a wrong name here, because every test configures its stub to emit the
+    Empty for now -- every lift the SDK makes is declared by the vendored
+    contract. An entry belongs here only while it is lifted from a header the
+    contract does not declare anywhere. Nothing in the suite can catch a wrong
+    name in that state, because every test configures its stub to emit the
     exact literal the lift reads.
 
     That gap is tracked, not accepted. This test fails the moment a spec sync
