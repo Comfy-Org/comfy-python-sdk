@@ -12,6 +12,7 @@ from __future__ import annotations
 import httpx
 
 import comfy_sdk
+from comfy_low.transport import ComfyLow
 from comfy_sdk import AsyncComfy, Comfy
 from comfy_sdk.models import AsyncModels, Models
 
@@ -68,6 +69,53 @@ async def test_a_timeout_change_on_the_async_client_is_visible_through_models(se
         assert client.models.timeout.read == 30.0
         client._low._client.timeout = httpx.Timeout(1.25)
         assert client.models.timeout.read == 1.25
+
+
+# --- the pool the namespace shares --------------------------------------
+#
+# `models.run` holds its pooled connection for the whole generation, so the
+# pool's ceiling is what caps a fan-out of concurrent runs. These reach into
+# httpx/httpcore internals (`_transport._pool._max_connections`) because httpx
+# exposes no public getter for the limits a client was built with; the
+# alternative is asserting nothing about whether `limits=` arrived at all.
+
+
+def test_limits_sizes_the_pool_the_client_builds(server) -> None:
+    with Comfy(limits=httpx.Limits(max_connections=250)) as client:
+        assert client._low._client._transport._pool._max_connections == 250
+
+
+async def test_limits_sizes_the_pool_the_async_client_builds(server) -> None:
+    async with AsyncComfy(limits=httpx.Limits(max_connections=250)) as client:
+        assert client._low._client._transport._pool._max_connections == 250
+
+
+def test_no_limits_leaves_httpxs_own_default_pool(server) -> None:
+    # `limits=None` is dropped rather than forwarded — httpx types the
+    # parameter as a `Limits` and does not accept `None` — so the default path
+    # has to land on httpx's own DEFAULT_LIMITS, 100 connections.
+    with Comfy() as client:
+        assert client._low._client._transport._pool._max_connections == 100
+
+
+async def test_no_limits_leaves_the_async_client_httpxs_default_pool(server) -> None:
+    async with AsyncComfy() as client:
+        assert client._low._client._transport._pool._max_connections == 100
+
+
+def test_an_injected_client_keeps_its_own_pool(server) -> None:
+    # Injecting `client=` hands pool ownership to the caller, so `limits` is
+    # ignored there exactly as `timeout` already is: the pool stays the
+    # injected client's default 100, not the 5 asked for here.
+    with httpx.Client() as injected:
+        low = ComfyLow(
+            server.base_url,
+            "ck_test",
+            client=injected,
+            limits=httpx.Limits(max_connections=5),
+        )
+        assert low._client is injected
+        assert low._client._transport._pool._max_connections == 100
 
 
 def test_models_sends_the_host_clients_credentials(server) -> None:

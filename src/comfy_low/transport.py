@@ -621,12 +621,26 @@ class ComfyLow:
         *,
         client: httpx.Client | None = None,
         timeout: float | None = 30.0,
+        limits: httpx.Limits | None = None,
         client_info: str | None = None,
         router_base_url: str = ROUTER_BASE_URL,
     ) -> None:
+        """``limits`` sizes the connection pool of the client built here.
+
+        ``None`` means httpx's own default (100 connections, 20 kept alive) —
+        it is not forwarded, because ``httpx.Client`` types ``limits`` as a
+        ``Limits`` and does not accept ``None`` for it.
+
+        Passing ``client=`` hands pool ownership to the caller, so ``limits``
+        is ignored on that path exactly as ``timeout`` already is: the injected
+        client was built with its own.
+        """
         self._p = _Prepared(base_url, api_key, client_info, router_base_url)
         self._own_client = client is None
-        self._client = client or httpx.Client(timeout=timeout, follow_redirects=True)
+        kwargs: dict[str, Any] = {"timeout": timeout, "follow_redirects": True}
+        if limits is not None:
+            kwargs["limits"] = limits
+        self._client = client or httpx.Client(**kwargs)
 
     # -- configuration ----------------------------------------------------
     # Read-only views of the settings this transport was built with, so a layer
@@ -1109,12 +1123,22 @@ class AsyncComfyLow:
         *,
         client: httpx.AsyncClient | None = None,
         timeout: float | None = 30.0,
+        limits: httpx.Limits | None = None,
         client_info: str | None = None,
         router_base_url: str = ROUTER_BASE_URL,
     ) -> None:
+        """``limits`` sizes the pool of the client built here — see :class:`ComfyLow`.
+
+        Same two rules: ``None`` means httpx's own default rather than being
+        forwarded, and an injected ``client=`` owns its pool, so ``limits`` is
+        ignored there.
+        """
         self._p = _Prepared(base_url, api_key, client_info, router_base_url)
         self._own_client = client is None
-        self._client = client or httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        kwargs: dict[str, Any] = {"timeout": timeout, "follow_redirects": True}
+        if limits is not None:
+            kwargs["limits"] = limits
+        self._client = client or httpx.AsyncClient(**kwargs)
 
     # -- configuration (mirrors :class:`ComfyLow`) -------------------------
     @property

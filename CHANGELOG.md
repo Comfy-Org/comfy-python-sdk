@@ -12,6 +12,12 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `Comfy(limits=...)` / `AsyncComfy(limits=...)` — an `httpx.Limits` sizing the connection pool
+  the client's namespaces share. The default is unchanged (httpx's own, 100 connections). Raise
+  `max_connections` when fanning out more than 100 concurrent `models.run` calls: each holds its
+  pooled connection for the whole generation, so past 100 the next call waits on a generation and
+  can end in `httpx.PoolTimeout`. `ComfyLow`/`AsyncComfyLow` take the same keyword; an injected
+  `client=` owns its own pool and ignores it, as it already does `timeout`.
 - `RouterRunResult.credits_used` — what Comfy Router reported a run cost, lifted from the
   `X-Comfy-Credits-Used` response header onto what `models.run_detailed()` returns. It is a
   price rather than a settled ledger entry, absent means "not reported" and never "free", and
