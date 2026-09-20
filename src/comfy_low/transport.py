@@ -132,6 +132,12 @@ _MAX_REQUEST_ID_LENGTH = 256
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
+#: Longest ``Content-Type`` kept on a :class:`BinaryResult`. Generous next to
+#: any real media type and its parameters (``audio/L16; rate=16000; channels=1``
+#: is 34 characters), short enough that a partner-controlled header cannot
+#: flood the log line or REPL echo that prints it.
+_CONTENT_TYPE_LIMIT = 128
+
 
 @dataclass(frozen=True)
 class BinaryResult:
@@ -157,14 +163,24 @@ class BinaryResult:
 
     #: The response body verbatim — the partner's own file bytes.
     content: bytes
-    #: The response's ``Content-Type`` **verbatim**, parameters included
+    #: The response's ``Content-Type`` as sent, parameters included
     #: (``audio/mpeg``, ``audio/L16; rate=16000``, ...), because for some
     #: partner media types the parameters are part of what the bytes are.
-    #: Empty string when the response carried no ``Content-Type`` at all.
+    #: Bounded and stripped of unprintable characters, which no real media type
+    #: has. Empty string when the response carried no ``Content-Type`` at all.
     content_type: str
     #: The server-minted ``X-Comfy-Request-Id`` for the call, or ``None`` when
     #: the response named none. The id to quote in a support request — the same
     #: one a failure of this call would have carried on ``exc.request_id``.
+    #:
+    #: ``None`` is also the one signal that distinguishes a partner's native
+    #: output from an intermediary's error page. Router's contract marks this
+    #: header ``required`` on every answer it sends, so a 200 that omits it did
+    #: not come from Router — it is the ``text/html`` interstitial or the
+    #: ``no healthy upstream`` text a proxy served in its place. The SDK hands
+    #: those back rather than raising (see :meth:`_Prepared.parse_run_result`),
+    #: so a caller who would rather not write one to disk should check this
+    #: before trusting ``content``.
     request_id: str | None
 
     def __repr__(self) -> str:
@@ -185,10 +201,19 @@ def media_type(content_type: str | None) -> str:
     ``""`` for ``None`` or for a header that names no type at all, which is the
     "the response said nothing" case callers branch on separately from "the
     response said something that is not JSON".
+
+    A comma ends the type as surely as a semicolon does. ``httpx.Headers.get``
+    joins a header sent *twice* with ``", "`` — the same joining
+    :func:`comfy_low.errors.clean_request_id` already has to allow for — and
+    intermediaries do duplicate ``Content-Type``, so a perfectly ordinary JSON
+    answer can arrive as ``"application/json, application/json"``. Splitting on
+    the semicolon alone would read that as a type of its own, decide it is not
+    JSON, and hand a decodable result back as opaque bytes.
     """
     if not content_type:
         return ""
-    return content_type.split(";", 1)[0].strip().lower()
+    head = content_type.split(";", 1)[0]
+    return head.split(",", 1)[0].strip().lower()
 
 
 def is_json_media_type(media: str) -> bool:
@@ -601,12 +626,37 @@ class _Prepared:
         but will not parse is still the truncated/interstitial failure the
         caller needs raised rather than handed back as opaque bytes.
 
+        **A non-JSON 2xx is handed back even when it looks like an error page,
+        and even when it is empty.** A ``text/html`` interstitial and a
+        zero-length ``audio/mpeg`` body both reach the caller as a
+        :class:`BinaryResult` rather than raising. That is deliberate and it is
+        the asymmetry that decides it: this route's 200 means a generation ran
+        and was billed, so raising on a body the SDK merely finds suspicious
+        destroys something the caller paid for and cannot get back, while
+        returning an inspectable object costs them a check. The check is cheap
+        and it is exact — ``request_id is None`` means no Router answer was
+        seen at all (the header is ``required`` on every one it sends), and
+        ``not content`` means nothing was delivered. Gating the branch on
+        either instead would make this SDK discard a real generation whenever
+        an intermediary stripped a header or a partner served an empty file,
+        which is the failure the whole surface exists to stop.
+
         A success carrying no ``Content-Type`` at all is the one case with
         nothing to branch on. An empty body stays ``{}`` (what every other
-        operation does with one) and a body that parses as JSON stays a dict;
-        only a non-empty body that does not parse becomes a
-        :class:`BinaryResult`, with ``content_type=""`` to say the response
-        never named one.
+        operation does with one) and a body that parses as a JSON **object**
+        stays a dict; anything else non-empty becomes a :class:`BinaryResult`,
+        with ``content_type=""`` to say the response never named one.
+
+        "Object", not merely "valid JSON", because this branch is a *probe* of
+        arbitrary bytes rather than a decode of a document the response
+        promised. ``null``, ``[...]`` and a bare number are all valid JSON and
+        none of them is the run result this method is declared to return, so
+        accepting one would hand back a ``None``/``list``/``int`` from a
+        ``dict | BinaryResult`` signature and break the caller who narrowed with
+        ``isinstance(result, BinaryResult)``. It would also re-open the very
+        failure this method exists to fix: a short binary body that happens to
+        be all ASCII digits parses as an ``int``, and the generation's bytes are
+        gone. Only a dict is a result; everything else is bytes.
         """
         if resp.status_code in ok:
             media = media_type(resp.headers.get("Content-Type"))
@@ -617,19 +667,38 @@ class _Prepared:
             if not resp.content:
                 return {}
             try:
-                return cast("dict[str, Any]", resp.json())
-            except ValueError:
+                probed = resp.json()
+            except (ValueError, RecursionError):
+                # `RecursionError` beside `ValueError` because this probes bytes
+                # that were never claimed to be JSON: a long run of `[` is
+                # syntactically valid and nests until the decoder blows the
+                # stack, which is not a `ValueError` and would escape as a raw
+                # exception instead of falling through to the bytes.
                 return self._binary_result(resp)
+            if isinstance(probed, dict):
+                return cast("dict[str, Any]", probed)
+            return self._binary_result(resp)
         self._raise_for_response(resp)
 
     def _binary_result(self, resp: httpx.Response) -> BinaryResult:
-        # The header verbatim rather than the bare media type: the partner's
+        # The whole header rather than the bare media type: the partner's
         # parameters are part of what the bytes are (`audio/L16; rate=16000`
         # says nothing without its `rate`), and the whole point of the surface
         # is that the native output comes back unchanged.
+        #
+        # Filtered the way every other server-supplied string this SDK surfaces
+        # is — `request_id` through `clean_request_id`, body text through
+        # `clean_body_excerpt` — because the README tells callers to print this
+        # one, and a partner-controlled header is unbounded and can carry the
+        # C1/ESC bytes that repaint the terminal reading it. For every media
+        # type this route actually serves the filter is a no-op, so the value
+        # stays verbatim exactly where "verbatim" means anything.
         return BinaryResult(
             content=resp.content,
-            content_type=resp.headers.get("Content-Type", ""),
+            content_type=clean_body_excerpt(
+                resp.headers.get("Content-Type"), limit=_CONTENT_TYPE_LIMIT
+            )
+            or "",
             request_id=_request_id(resp),
         )
 
@@ -1115,7 +1184,9 @@ class ComfyLow:
 
         ``arguments`` is sent as the body verbatim (the partner model's native
         JSON input) and the response body is returned verbatim (its native
-        output), with no model class layered over either. This is not an
+        output), with no model class layered over either — a non-JSON output
+        reaches the caller as the :class:`BinaryResult` carrier described
+        below, which holds the bytes rather than modelling them. This is not an
         ``operationId`` of ``spec/openapi.yaml``; it is ``runRouterModel`` of
         ``spec/router-openapi.yaml``, hand-bound — see
         :data:`_MODEL_RUN_PATH_TEMPLATE`.

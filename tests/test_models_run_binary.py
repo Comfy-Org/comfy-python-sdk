@@ -134,10 +134,29 @@ def test_the_content_type_reaches_the_caller_unchanged(server, content_type: str
 def test_a_json_content_type_with_a_charset_is_still_the_dict_branch(server) -> None:
     # `application/json; charset=utf-8` is JSON. Branching on the raw header
     # rather than its media type would have sent it down the binary path.
-    server.state.model_run_binary_body = None
+    #
+    # Served through the binary knobs rather than by leaving them unset: the
+    # stub's JSON path sends a bare `application/json`, so a test that left
+    # them alone would never put a parameter on the wire and would pass just as
+    # happily if `media_type` stopped stripping one.
+    server.state.model_run_binary_body = b'{"images": [], "seed": 7}'
+    server.state.model_run_binary_content_type = "application/json; charset=utf-8"
     with Comfy(retry=NO_RETRY) as client:
         result = client.models.run(MODEL, ARGS)
-    assert result == server.state.model_run_result
+    assert result == {"images": [], "seed": 7}
+
+
+def test_a_content_type_sent_twice_is_still_the_dict_branch(server) -> None:
+    # An intermediary that duplicates `Content-Type` reaches httpx as one
+    # header joined with ", ". Splitting on the semicolon alone read that as a
+    # media type of its own, found it was not JSON, and handed a perfectly
+    # decodable result back as opaque bytes -- a silent regression for callers
+    # who never left the JSON branch.
+    server.state.model_run_binary_body = b'{"images": [], "seed": 7}'
+    server.state.model_run_binary_content_type = "application/json, application/json"
+    with Comfy(retry=NO_RETRY) as client:
+        result = client.models.run(MODEL, ARGS)
+    assert result == {"images": [], "seed": 7}
 
 
 def test_a_json_suffix_media_type_is_the_dict_branch(server) -> None:
@@ -226,6 +245,74 @@ def test_no_content_type_and_an_empty_body_is_still_an_empty_dict(server) -> Non
         assert client.models.run(MODEL, ARGS) == {}
 
 
+@pytest.mark.parametrize(
+    ("body", "description"),
+    [
+        (b"null", "a JSON null"),
+        (b"[1, 2, 3]", "a JSON array"),
+        # The one that re-opens the bug this surface exists to fix: a short
+        # binary body of all-ASCII digits is valid JSON, and accepting the
+        # number would drop the generation's bytes on the floor.
+        (b"1234", "a bare JSON number"),
+        (b'"a string"', "a bare JSON string"),
+        (b"[" * 5000, "a nesting depth the decoder cannot walk"),
+    ],
+)
+def test_no_content_type_and_a_non_object_body_is_bytes(server, body, description) -> None:
+    # The headerless branch *probes* arbitrary bytes rather than decoding a
+    # document the response promised, so only a JSON object counts as a result.
+    # Returning the `None`/`list`/`int` would hand back something outside the
+    # declared `dict | BinaryResult` union, and a caller who narrowed with
+    # `isinstance(result, BinaryResult)` would meet a bare `TypeError` on the
+    # subscript that follows. The deep-nesting case also pins that the probe
+    # stays total: `json` raises `RecursionError` there, not `ValueError`.
+    server.state.model_run_binary_body = body
+    server.state.model_run_binary_content_type = None
+    with Comfy(retry=NO_RETRY) as client:
+        result = client.models.run(MODEL, ARGS)
+    assert isinstance(result, BinaryResult), description
+    assert result.content == body
+    assert result.content_type == ""
+
+
+def test_a_binary_200_with_an_empty_body_is_an_empty_binary_result(server) -> None:
+    # Pinned rather than raised, and deliberately. A declared `audio/mpeg` 200
+    # means a generation ran and was billed, so refusing to return it destroys
+    # something the caller paid for; handing back an inspectable object costs
+    # them `if not result.content`. The check is what the docstring points at,
+    # so it has to actually hold.
+    server.state.model_run_binary_body = b""
+    server.state.model_run_binary_content_type = "audio/mpeg"
+    with Comfy(retry=NO_RETRY) as client:
+        result = client.models.run(MODEL, ARGS)
+    assert isinstance(result, BinaryResult)
+    assert result.content == b""
+    assert result.content_type == "audio/mpeg"
+
+
+def test_a_content_type_carrying_control_bytes_is_filtered(server) -> None:
+    # The README tells callers to print `content_type`, and this header is
+    # partner-controlled -- so it is reduced the way every other server-supplied
+    # string this SDK surfaces is, rather than put on a terminal verbatim. The
+    # media type itself survives; only what no real one contains is stripped.
+    server.state.model_run_binary_body = AUDIO
+    server.state.model_run_binary_content_type = "audio/mpeg\x1b[31m; rate=16000"
+    with Comfy(retry=NO_RETRY) as client:
+        result = client.models.run(MODEL, ARGS)
+    assert isinstance(result, BinaryResult)
+    assert "\x1b" not in result.content_type
+    assert result.content_type.startswith("audio/mpeg")
+
+
+def test_a_long_content_type_is_bounded(server) -> None:
+    server.state.model_run_binary_body = AUDIO
+    server.state.model_run_binary_content_type = "audio/mpeg; note=" + "x" * 4000
+    with Comfy(retry=NO_RETRY) as client:
+        result = client.models.run(MODEL, ARGS)
+    assert isinstance(result, BinaryResult)
+    assert len(result.content_type) <= 128
+
+
 # --- the key still rides out, and a replay is a result ---------------------
 
 
@@ -265,6 +352,13 @@ def test_a_replayed_binary_200_is_returned_like_a_first_run(server) -> None:
         assert key is not None
 
         server.state.model_run_error = None
+        # Moved out from under the stub before the resend: the replay must
+        # answer from the record it stored against this key, not from whatever
+        # the knobs say now. Without that the assertion below would hold even
+        # with the per-key record wrong or empty -- on the one path where
+        # serving the wrong record means billing the caller twice.
+        server.state.model_run_binary_body = b"bytes from a different generation"
+        server.state.model_run_binary_content_type = "audio/wav"
         replayed = client.models.run(MODEL, ARGS, idempotency_key=key)
 
     assert isinstance(replayed, BinaryResult)
@@ -364,6 +458,11 @@ def test_binary_result_is_exported_from_both_layers() -> None:
         ("  Application/JSON ;charset=UTF-8", "application/json"),
         ("audio/mpeg", "audio/mpeg"),
         ("audio/L16; rate=16000", "audio/l16"),
+        # `httpx.Headers.get` joins a header sent twice with ", ", so a comma
+        # ends the type as surely as a semicolon does.
+        ("application/json, application/json", "application/json"),
+        ("application/json;charset=utf-8, application/json", "application/json"),
+        ("audio/mpeg, audio/mpeg", "audio/mpeg"),
         ("", ""),
         (None, ""),
     ],

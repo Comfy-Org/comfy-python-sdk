@@ -50,17 +50,26 @@ the fuller account of each version, including verification notes.
   decoded or transcoded — so `Path("out.mp3").write_bytes(result.content)` is
   the whole of it. `content_type` is the header including its parameters,
   because for some partner media types the parameters are part of what the
-  bytes are (`audio/L16; rate=16000`). The return annotation is therefore
-  `dict[str, Any] | BinaryResult`; a caller that only uses JSON models sees no
-  behaviour change, but a type checker will now ask them to narrow.
+  bytes are (`audio/L16; rate=16000`); it is bounded and stripped of
+  unprintable characters first, which no real media type contains, the way
+  every other server-supplied string this SDK surfaces already is. The return
+  annotation is therefore `dict[str, Any] | BinaryResult`; a caller that only
+  uses JSON models sees no behaviour change, but a type checker will now ask
+  them to narrow. `run_detailed` is the same story one level out:
+  `RouterRunResult.output` carries whichever of the two shapes the run
+  answered with.
 
   Two boundaries worth knowing: a 2xx whose `Content-Type` claims JSON and
   whose body will not parse still raises `invalid_response` (there the response
   promised a document and did not deliver one), while a 2xx that names *no*
-  `Content-Type` is a `BinaryResult` with `content_type=""` only when its
-  non-empty body does not parse as JSON. The binary path runs inside the same
-  translation as the JSON one, so a failure still carries `.idempotency_key`
-  and an `Idempotent-Replayed` binary 200 comes back like a first run.
+  `Content-Type` is a `BinaryResult` unless its body is empty (`{}`, as on
+  every other operation) or parses as a JSON **object**. Object, not merely
+  valid JSON: that branch probes bytes nothing declared, so `null`, `[...]` and
+  a bare number are bytes — accepting one would return a value outside the
+  declared union, and a short binary body of all-ASCII digits parses as a
+  number. The binary path runs inside the same translation as the JSON one, so
+  a failure still carries `.idempotency_key` and an `Idempotent-Replayed`
+  binary 200 comes back like a first run.
 
   The one deliberate behaviour change beyond the fix: a non-JSON 2xx used to be
   read as "a proxy interstitial served as 200" and raised. On this route that
@@ -69,7 +78,12 @@ the fuller account of each version, including verification notes.
   partner's — so a `text/html` 200 now reaches the caller as bytes they can
   inspect, rather than discarding a generation they were billed for. Every
   other operation keeps the old reading, because JSON is the only success media
-  type their routes declare.
+  type their routes declare. The same asymmetry decides the empty case: a
+  declared-binary 200 with a zero-length body is a `BinaryResult` holding no
+  bytes rather than an exception. Two checks tell an answer from an artefact —
+  `request_id is None` means no Router answer was seen at all (the header is
+  required on every one Router sends), and `not content` means nothing was
+  delivered.
 
 ### Changed
 - **Because those three buckets are now one class each, they descend from `RouterError` on the

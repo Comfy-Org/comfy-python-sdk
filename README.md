@@ -433,8 +433,12 @@ Three things follow from that, and they are the whole contract of this method:
 `run` returns when the generation is **complete**. There is no submit step and
 nothing to poll: where the platform has to submit-and-poll an upstream
 provider, that happens server side inside this one call. The value you get back
-is the provider's own payload, handed over as-is, with no wrapper class between
-you and what the provider produced.
+is the provider's own payload, handed over as-is. For a model that answers
+JSON — most of them — that is a `dict` with no wrapper class between you and
+what the provider produced. For a model whose partner answers a generation
+directly as bytes, it is a `BinaryResult` carrying those bytes unchanged
+alongside the `content_type` and `request_id` that came with them; see "Two
+result shapes" below.
 
 The awaitable form is the **async client**, not a differently-named method:
 
@@ -484,12 +488,23 @@ check. Which shape a given model returns is in its own contract — `GET
 /v2/models/{provider}/{model}/openapi.json`, whose `200` is `application/json`
 for a JSON model and `*/*` with `format: binary` for a bytes one.
 
-Note `content_type` is the header **verbatim**, parameters included, because for
-some media types the parameters are part of what the bytes are — ElevenLabs'
-`pcm_*` output formats come back as `audio/L16; rate=16000`, and the sample rate
-is not decoration. And a `200` whose `Content-Type` *claims* JSON but whose body
-will not parse is still an error (`ComfyError`, `code="invalid_response"`), not
-bytes: there the response promised a document and did not deliver one.
+Note `content_type` keeps the header's **parameters**, because for some media
+types the parameters are part of what the bytes are — ElevenLabs' `pcm_*` output
+formats come back as `audio/L16; rate=16000`, and the sample rate is not
+decoration. It is bounded and stripped of unprintable characters first, the way
+every other server-supplied string this SDK hands you is; no real media type
+contains either, so what you get is what was sent. And a `200` whose
+`Content-Type` *claims* JSON but whose body will not parse is still an error
+(`ComfyError`, `code="invalid_response"`), not bytes: there the response
+promised a document and did not deliver one.
+
+A non-JSON `200` reaches you even when it is an intermediary's error page or an
+empty body — this route's `200` means a generation ran and was billed, so the
+SDK will not destroy one it merely finds suspicious. Two checks tell you:
+`result.request_id is None` means no Router answer was seen at all (Router's
+contract marks that header required on every answer it sends, so an HTML
+interstitial from a proxy in front of it has none), and `not result.content`
+means nothing was delivered. Check them before writing `content` to disk.
 
 ### Image to image — upload an asset first
 

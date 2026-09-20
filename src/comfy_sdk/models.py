@@ -289,9 +289,7 @@ def _dropped_params(raw: str | None) -> tuple[str, ...] | None:
     return (raw,)
 
 
-def _run_result(
-    body: dict[str, Any] | BinaryResult, headers: Mapping[str, str]
-) -> RouterRunResult:
+def _run_result(body: dict[str, Any] | BinaryResult, headers: Mapping[str, str]) -> RouterRunResult:
     """Build a :class:`RouterRunResult` from one run's body and response headers."""
     return RouterRunResult(
         output=body,
@@ -363,8 +361,15 @@ class Models(_ModelsBase):
         awaitable form of this method is :meth:`AsyncModels.run` on
         ``AsyncComfy``.
 
-        The return value is the provider's own payload, handed back as-is — no
-        wrapper class stands between the caller and what the provider produced.
+        The return value is the provider's own payload, handed back as-is. For
+        a model that answers JSON that is a ``dict``, with no wrapper class
+        standing between the caller and what the provider produced; for one
+        whose partner answers a generation directly as bytes it is a
+        :class:`~comfy_sdk.BinaryResult` holding those bytes unchanged, which
+        is a carrier for the response's ``content_type`` and ``request_id``
+        rather than a model of the payload. The branch is the response's
+        ``Content-Type``, exactly as this route's published ``200`` says a
+        client must take it.
         It comes in **two shapes**, decided by the response's ``Content-Type``,
         because Router forwards the partner's output under the partner's own
         media type:

@@ -235,9 +235,17 @@ def _declared_run_route() -> tuple[str, str, list[str]]:
     # exactly two -- JSON to a dict, anything else to a BinaryResult -- so a
     # sync that drops or adds one changes what `post_model_run` must return.
     responses = paths[declared[0]]["post"].get("responses")
-    if not isinstance(responses, dict) or not isinstance(responses.get("200"), dict):
+    # `"200"` *or* `200`: the vendored spec quotes its status codes, but PyYAML
+    # reads an unquoted `200:` as the integer, and a sync from a generator that
+    # does not quote them would otherwise fail this gate with "declares no 200
+    # response" -- a message about the wrong thing entirely. `_declared_router_
+    # error_types` is defensive about its own shape for the same reason.
+    ok = responses.get("200") if isinstance(responses, dict) else None
+    if not isinstance(ok, dict) and isinstance(responses, dict):
+        ok = responses.get(200)
+    if not isinstance(ok, dict):
         raise ValueError(f"{ROUTER_SPEC.name}'s runRouterModel declares no 200 response")
-    content = responses["200"].get("content")
+    content = ok.get("content")
     if not isinstance(content, dict) or not content:
         raise ValueError(f"{ROUTER_SPEC.name}'s runRouterModel 200 declares no content")
     return declared[0], host, sorted(content)

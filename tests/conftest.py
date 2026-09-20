@@ -323,7 +323,16 @@ class ServerState:
     # Idempotency-Key -> the result recorded for it under
     # `model_run_replays_lost_result`, served verbatim to a later request
     # presenting the same key.
-    model_run_replay_store: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #
+    # The whole answer is recorded, not just the JSON payload: `(payload,
+    # binary_body, binary_content_type)` as they stood when the generation
+    # completed. A replay has to serve *that record* rather than re-read the
+    # knobs, or a test asserting the recorded result came back would pass even
+    # with the per-key record wrong or empty -- on the one path where serving
+    # the wrong record means double-billing.
+    model_run_replay_store: dict[str, tuple[dict[str, Any], bytes | None, str | None]] = field(
+        default_factory=dict
+    )
     # How many times the model actually *ran*, as distinct from how many
     # requests arrived (`model_run_count`). A replay serves a recorded result
     # and does not increment this, which is what lets a test tell a real replay
@@ -844,10 +853,12 @@ def _make_handler(state: ServerState):
             # rather than rejecting the resend, and the model does not run
             # again — which is the whole point of asking under the same key.
             if key and key in state.model_run_replay_store:
+                recorded_payload, recorded_body, recorded_type = state.model_run_replay_store[key]
                 self._serve_run_result(
                     200,
-                    state.model_run_replay_store[key],
+                    recorded_payload,
                     headers={"Idempotent-Replayed": "true"},
+                    binary=(recorded_body, recorded_type),
                 )
                 return
 
@@ -908,7 +919,11 @@ def _make_handler(state: ServerState):
                     # The generation completed; only the answer was lost. Bill
                     # it once and record it, so the same key collects it.
                     state.model_run_generations += 1
-                    state.model_run_replay_store[key] = state.model_run_result
+                    state.model_run_replay_store[key] = (
+                        state.model_run_result,
+                        state.model_run_binary_body,
+                        state.model_run_binary_content_type,
+                    )
                 headers: dict[str, str] = {}
                 if state.model_run_retry_after is not None:
                     headers["Retry-After"] = state.model_run_retry_after
@@ -964,7 +979,11 @@ def _make_handler(state: ServerState):
             self._serve_run_result(state.model_run_status, state.model_run_result)
 
         def _serve_run_result(
-            self, status: int, payload: dict, headers: dict | None = None
+            self,
+            status: int,
+            payload: dict,
+            headers: dict | None = None,
+            binary: tuple[bytes | None, str | None] | None = None,
         ) -> None:
             """A successful run's body — the partner's JSON, or its own bytes.
 
@@ -972,18 +991,23 @@ def _make_handler(state: ServerState):
             answers in whichever shape the run itself would have: the route's
             ``Idempotent-Replayed`` 200 carries the recorded result, and a
             recorded result that was audio is still audio.
+
+            ``binary`` is that record's own ``(body, content_type)``, passed by
+            the replay branch so the replay serves what was stored against the
+            key instead of whatever the knobs say *now*. A fresh run passes
+            none and reads the knobs, which for it are the same thing.
             """
+            body, content_type = (
+                binary
+                if binary is not None
+                else (state.model_run_binary_body, state.model_run_binary_content_type)
+            )
             if state.model_run_request_id is not None:
                 # Router stamps the id on every answer, not only on failures;
                 # `BinaryResult.request_id` is read off a *success*.
                 headers = {**(headers or {}), "X-Comfy-Request-Id": state.model_run_request_id}
-            if state.model_run_binary_body is not None:
-                self._raw(
-                    status,
-                    state.model_run_binary_body,
-                    state.model_run_binary_content_type,
-                    headers=headers,
-                )
+            if body is not None:
+                self._raw(status, body, content_type, headers=headers)
                 return
             self._json(status, payload, headers=headers)
 
