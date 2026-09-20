@@ -47,6 +47,15 @@ the fuller account of each version, including verification notes.
 - `models.run` now populates `RouterError.errors` from a Router 422's per-field `detail[]` and
   uses the entries' messages as `detail`, instead of `HTTP 422`; `comfy_low.ApiError.validation_errors`
   carries the raw entries.
+- **A Router `detail[]` summary now names its fields, and is sanitised.** Both the awaited
+  (`models.run`) and the queued (`submit`) paths build the human-readable string with one shared
+  function, so a single server response reads the same way whichever surface raised it. Each entry
+  renders as `<loc>: <msg>`, so two `field required` errors now read `body.seed: field required;
+  body.steps: field required` rather than collapsing to an unrecoverable `field required; field
+  required`. The joined line gets the same treatment every other body-derived string already gets:
+  control characters, ANSI escapes and bidi overrides reduced, whitespace collapsed, and a 256-character
+  cap — so a hostile or merely careless `msg` can no longer scribble on a terminal or flood a log line.
+  Only the summary string changes; `.errors` still carries the raw typed entries.
 
 ### Changed
 
