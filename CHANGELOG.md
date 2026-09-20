@@ -12,6 +12,19 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- **`Job` and `AsyncJob` expose the rest of the job they already hold.**
+  `created_at`, `started_at`, `completed_at`, `expires_at`, `progress`,
+  `queue_position`, `metrics` and `urls` join `id` / `status` / `outputs` /
+  `error`; previously the only way to read one was the private model attribute.
+  The timestamps are timezone-aware `datetime`s, so `job.completed_at -
+  job.started_at` is the run's duration, and the nullable ones (`started_at`,
+  `completed_at`, `progress`, `queue_position`, `metrics`) are `None` rather
+  than absent. Like the existing properties, these are views onto the state on
+  the handle — nothing re-fetches.
+- `Progress` gained `current_node_class`, the one field of the contract's
+  progress schema the event decoder was dropping. It is appended to the
+  dataclass rather than placed beside `current_node`, so the existing
+  positional order is unchanged.
 - `RouterRunResult.credits_used` — what Comfy Router reported a run cost, lifted from the
   `X-Comfy-Credits-Used` response header onto what `models.run_detailed()` returns. It is a
   price rather than a settled ledger entry, absent means "not reported" and never "free", and

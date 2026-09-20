@@ -92,6 +92,19 @@ class ServerState:
     )
     job_workflow_format: str = "api"
     job_workflow_not_found: bool = False
+    # The nullable lifecycle fields of a served job. The defaults are the
+    # shape a queued job has on the wire (nothing started, nothing finished,
+    # no snapshot); a test that needs the populated shape sets them, so both
+    # halves come from a real response rather than a hand-built model.
+    # `job_metrics` is the one that defaults to populated, since a server
+    # reports queue timings from the start.
+    job_started_at: str | None = None
+    job_completed_at: str | None = None
+    job_progress: dict[str, Any] | None = None
+    job_queue_position: int | None = 0
+    job_metrics: dict[str, int | None] | None = field(
+        default_factory=lambda: {"queue_ms": 9000, "execution_ms": None}
+    )
 
     # --- POST /v2/models/{provider}/{model} (the awaited model run) ---
     # The provider's native payload the run resolves to. Deliberately not a
@@ -359,19 +372,21 @@ def _asset_json(asset_id: str, hash_: str, created_new: bool, size: int) -> dict
     }
 
 
-def _job_json(job_id: str, status: str, outputs: list[dict] | None = None) -> dict:
+def _job_json(
+    state: ServerState, job_id: str, status: str, outputs: list[dict] | None = None
+) -> dict:
     return {
         "id": job_id,
         "status": status,
         "created_at": "2026-07-10T18:20:00Z",
-        "started_at": None,
-        "completed_at": None,
+        "started_at": state.job_started_at,
+        "completed_at": state.job_completed_at,
         "expires_at": "2026-07-11T18:20:00Z",
-        "queue_position": 0,
-        "progress": None,
+        "queue_position": state.job_queue_position,
+        "progress": state.job_progress,
         "outputs": outputs or [],
         "error": None,
-        "metrics": {"queue_ms": 9000, "execution_ms": None},
+        "metrics": state.job_metrics,
         "urls": {
             "self": f"/api/v2/jobs/{job_id}",
             "events": f"/api/v2/jobs/{job_id}/events",
@@ -568,7 +583,7 @@ def _make_handler(state: ServerState):
             else:
                 status = "running"
                 outputs = []
-            self._json(200, _job_json(job_id, status, outputs))
+            self._json(200, _job_json(state, job_id, status, outputs))
 
         def _serve_job_workflow(self, job_id: str) -> None:
             if state.job_workflow_not_found:
@@ -662,7 +677,7 @@ def _make_handler(state: ServerState):
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
-                self._json(200, _job_json(m.group(1), "canceling"))
+                self._json(200, _job_json(state, m.group(1), "canceling"))
                 return
             self._read_body()
             self._err(404, "not_found")
@@ -1008,7 +1023,7 @@ def _make_handler(state: ServerState):
             job_id = f"job_{state.submit_count:02d}"
             if key:
                 state.idempotency[key] = job_id
-            self._json(201, _job_json(job_id, "queued"))
+            self._json(201, _job_json(state, job_id, "queued"))
 
     return Handler
 

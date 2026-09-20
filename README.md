@@ -304,6 +304,37 @@ live UI feedback, and `wait()`/`result()`/`run()` for the definitive answer.
 output handles regardless of which node produced them (`job.get_outputs(node_id)`
 filters to one node, as in the quickstart above).
 
+### What else a job handle carries
+
+| | |
+|---|---|
+| `job.created_at` | when the server accepted the job |
+| `job.started_at` | when execution began — `None` while queued |
+| `job.completed_at` | when it reached a terminal state — `None` before then |
+| `job.expires_at` | retention deadline: when the job and its outputs stop being readable |
+| `job.progress` | the latest `Progress` snapshot, or `None` |
+| `job.queue_position` | place in the queue, or `None` |
+| `job.metrics` | server timings in ms (`queue_ms`, `execution_ms`), or `None` |
+| `job.urls` | the follow-up links — `self` / `events` / `cancel` |
+
+The timestamps are timezone-aware `datetime`s, so a duration is a
+subtraction:
+
+```python
+job = client.run(wf)
+print(job.completed_at - job.started_at)    # how long the run took
+```
+
+Every one of these is a view onto the state the handle already holds — the
+same as `status` and `outputs`, and for the same reason: nothing here
+re-fetches, so `refresh()` (or `wait()` / `result()`, which call it) is what
+moves them. `AsyncJob` exposes all of them identically, and none of them is
+awaitable — there is nothing to await in a read of local state.
+
+`job.progress` is whatever snapshot came back on the last poll, and not every
+surface fills that in — `None` there means "nothing on this handle", not "no
+progress". For live progress, use `job.events()`.
+
 ## Getting a job's workflow back
 
 The SDK only holds the workflow it submitted for as long as the originating
