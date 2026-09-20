@@ -81,11 +81,13 @@ That, not a guess about the network, is what sorts the failures:
    on a run is the important member: the generation-sized client timeout expired
    with no answer, which is precisely when the server is most likely still
    generating). Nothing on the wire says the key survives this, so a same-key
-   retry may be a ``422`` that replaces the real error — and a *fresh*-key retry
+   retry may be refused ``422`` — and a *fresh*-key retry
    is the second billed generation this module exists to prevent. Not retried by
    default. :attr:`RetryPolicy.retry_possibly_in_flight` opts in, and it is
    correct exactly when a deployment replays a repeated key instead of rejecting
-   it.
+   it. That refusal no longer costs the caller the diagnosis: ``models.run``
+   raises the failure that caused the retry and chains the ``422`` onto it as
+   ``__cause__``, so the real error is what surfaces.
 5. **Everything else** — every other 4xx is the server's considered answer
    about *this* request, and asking again spends money to be refused again.
    Never retried.
@@ -273,8 +275,9 @@ def is_unknown_outcome_status(status: int) -> bool:
     ``invalid_input``. That is why
     this class sits behind :attr:`RetryPolicy.retry_possibly_in_flight` rather
     than being retried by default: unless the deployment replays a claimed key,
-    the same-key retry cannot succeed and *replaces* the genuine 5xx with a
-    confusing key-reuse error.
+    the same-key retry cannot succeed at all. What it costs is one wasted
+    request rather than the diagnosis — ``models.run`` raises the genuine 5xx
+    and chains the key-reuse refusal onto it as ``__cause__``.
 
     A ``502``/``504`` from an intermediary belongs here for the same reason:
     the proxy's response completed, which says nothing about whether the origin
@@ -288,6 +291,40 @@ def is_unknown_outcome_status(status: int) -> bool:
     is that asking again with the same key is how you find it out.
     """
     return 500 <= status <= 599
+
+
+def may_have_claimed_key(exc: BaseException) -> bool:
+    """Whether ``exc`` could have left the ``Idempotency-Key`` claimed server-side.
+
+    The question :meth:`RetryPolicy.should_retry` does not ask: *that* one is
+    "could another attempt survive this", and several failures answer yes to it
+    precisely because the key is provably still spendable. This one separates
+    those two groups, because only a failure that could have claimed the key can
+    explain a later ``idempotency_key_reuse`` refusal as an artefact of the
+    retry loop rather than as a genuine answer about the caller's key.
+
+    False for the never-delivered transport failures (:data:`_NEVER_DELIVERED` —
+    the request never reached a server that could claim anything) and for a
+    ``429``, which the contract rejects *without starting work* and whose key is
+    explicitly released. True for a collectable answer (the server says it is
+    holding a generation under this very key) and for every other 5xx, whose
+    outcome the server could not characterise and whose key it therefore keeps.
+
+    When this is false and the resend still comes back refused, the refusal is
+    real: the key was consumed by something other than this loop — a
+    caller-supplied key already spent elsewhere — and it is the error worth
+    raising, not the transport blip that preceded it.
+    """
+    status = getattr(exc, "http_status", None)
+    if isinstance(status, int):
+        if status == _TOO_MANY_REQUESTS:
+            return False
+        if is_collectable(exc):
+            return True
+        return is_unknown_outcome_status(status)
+    if isinstance(exc, _NEVER_DELIVERED):
+        return False
+    return isinstance(exc, _POSSIBLY_IN_FLIGHT)
 
 
 def retry_after_of(exc: BaseException) -> float | None:
@@ -421,7 +458,9 @@ class RetryPolicy:
     #: caution: a key whose recorded answer cannot be replayed is answered
     #: ``409`` ``invalid_input`` on the router surface (use a NEW key), and the
     #: v2 jobs contract makes ``Idempotency-Key`` single-use outright — so a
-    #: same-key retry here can surface a key refusal that hides the real error.
+    #: same-key retry here buys a key refusal rather than an answer. It no
+    #: longer hides the real error: ``models.run`` raises the failure that
+    #: caused the retry, with the refusal chained on as ``__cause__``.
     #: Turn it on for a deployment that replays a repeated
     #: key instead of rejecting it — and raise ``max_elapsed`` when you do, since
     #: one full-length client timeout on a run spends the whole default budget on
@@ -665,5 +704,6 @@ __all__ = [
     "error_bucket_of",
     "is_collectable",
     "is_unknown_outcome_status",
+    "may_have_claimed_key",
     "retry_after_of",
 ]
