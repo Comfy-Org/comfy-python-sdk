@@ -294,11 +294,12 @@ _CONTRACT_HEADER_LIFTS = {
     "dropped_params": "X-Comfy-Router-Dropped-Params",
     "replayed": "Idempotent-Replayed",
     "request_id": "X-Comfy-Request-Id",
+    "credits_used": "X-Comfy-Credits-Used",
 }
 
 #: Lifted by the SDK but NOT declared on the contract's 200 -- see the tripwire
 #: test at the bottom of this file.
-_UNDECLARED_HEADER_LIFTS = {"credits_used": "X-Comfy-Credits-Used"}
+_UNDECLARED_HEADER_LIFTS: dict[str, str] = {}
 
 
 def _declared_run_response_headers() -> set[str]:
@@ -331,9 +332,15 @@ def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> N
     this fails if the constant above and the code drift apart -- the constant
     is a restatement otherwise, and a restatement would pass the sync it exists
     to fail.
+
+    The probe value is ``"1"`` rather than an arbitrary string like ``"x"``
+    because ``credits_used`` validates its header as a finite decimal and
+    silently drops anything else back to ``None`` (see ``_credits_used``) --
+    a non-numeric probe would make this test indistinguishable from the lift
+    being ignored.
     """
     absent = getattr(_run_result({}, {}), field)
-    present = getattr(_run_result({}, {header: "x"}), field)
+    present = getattr(_run_result({}, {header: "1"}), field)
     assert present != absent, (
         f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
         f"the header and without it, so the lift is reading some other name."
@@ -346,18 +353,17 @@ def test_an_undeclared_lift_stays_undeclared_until_someone_reconciles_it(
 ) -> None:
     """Tripwire, and deliberately asserting the *absence*.
 
-    ``credits_used`` is lifted from a header the vendored contract does not
-    declare anywhere -- the 200's only cost headers are the
-    ``X-Committed-Spend-*`` trio, which is a different quantity (USD cents of
-    in-flight commitment, not the price of this run). Nothing in the suite can
-    catch a wrong name here, because every test configures its stub to emit the
-    exact literal the lift reads.
+    An entry here is a header the SDK lifts that the vendored contract does not
+    (yet) declare anywhere. Nothing in the suite can catch a wrong name for such
+    a lift, because every test configures its stub to emit the exact literal the
+    lift reads.
 
     That gap is tracked, not accepted. This test fails the moment a spec sync
     declares the header, which is the signal to move the entry up into
     ``_CONTRACT_HEADER_LIFTS`` and get it pinned like the rest. It also fails
     if the header is declared under a *different* name for the same quantity,
-    because the reconciliation is the same either way.
+    because the reconciliation is the same either way. (``credits_used`` was
+    the first tenant of this dict and has since been reconciled and pinned.)
     """
     declared = _declared_run_response_headers()
     assert header not in declared, (

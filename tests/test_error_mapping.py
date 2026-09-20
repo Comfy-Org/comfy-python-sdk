@@ -13,12 +13,14 @@ import pytest
 import comfy_low.transport as low_transport
 from comfy_low.errors import (
     ApiError,
+    AssetInUse,
     HashMismatch,
     QueueFull,
     Unauthorized,
     clean_body_excerpt,
     error_from_envelope,
 )
+from comfy_sdk.exceptions import AssetInUse as SdkAssetInUse
 from comfy_sdk.exceptions import ComfyError, NotFound, to_sdk_error
 from comfy_sdk.exceptions import HashMismatch as SdkHashMismatch
 from comfy_sdk.exceptions import Unauthorized as SdkUnauthorized
@@ -547,6 +549,51 @@ def test_an_undecodable_success_body_keeps_what_was_served_instead() -> None:
     assert str(err) == (
         "Could not decode the 200 response body as JSON: <html>proxy: gateway timeout</html>"
     )
+
+
+# --- the two documented 409s are different failures -------------------------
+#
+# `spec/openapi.yaml` gives `POST /api/v2/assets` a `hash_mismatch` 409 and
+# `DELETE /api/v2/assets/{id}` an `asset_in_use` one. Both are enveloped, so the
+# `code` is what tells them apart -- and until each has a class of its own a
+# caller who wants to handle only the delete conflict has to string-compare
+# `.code`, which is the protocol detail the typed surface exists to hide.
+
+
+def test_an_enveloped_delete_conflict_is_typed_at_the_protocol_layer() -> None:
+    err = error_from_envelope(
+        409,
+        {"error": {"code": "asset_in_use", "message": "still referenced by a job"}},
+    )
+    assert isinstance(err, AssetInUse)
+    assert err.code == "asset_in_use"
+    assert err.message == "still referenced by a job"
+    # Not the upload conflict: the two 409s are siblings, not subclasses.
+    assert not isinstance(err, HashMismatch)
+
+
+def test_an_enveloped_delete_conflict_is_typed_at_the_sdk_layer() -> None:
+    err = to_sdk_error(
+        error_from_envelope(
+            409,
+            {"error": {"code": "asset_in_use", "message": "still referenced by a job"}},
+        )
+    )
+    assert isinstance(err, SdkAssetInUse)
+    assert err.code == "asset_in_use"
+    assert err.http_status == 409
+    # The point of the class: `except AssetInUse` replaces `if exc.code == ...`,
+    # and a caller who only wants the delete conflict does not also catch the
+    # upload one.
+    assert not isinstance(err, SdkHashMismatch)
+
+
+def test_the_upload_conflict_is_unchanged_by_the_new_delete_class() -> None:
+    err = to_sdk_error(
+        error_from_envelope(409, {"error": {"code": "hash_mismatch", "message": "bad bytes"}})
+    )
+    assert isinstance(err, SdkHashMismatch)
+    assert not isinstance(err, SdkAssetInUse)
 
 
 # --- the per-field summary is sanitised, bounded, and one string per body ---

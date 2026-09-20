@@ -181,6 +181,24 @@ def _exported(module) -> dict[str, object]:
     return {name: getattr(module, name) for name in sorted(names)}
 
 
+def test_every_mapped_code_names_a_documented_class() -> None:
+    # `_exported` above unions `__all__` with `dir()` on purpose, so it stays
+    # green when a class is left out of `__all__`. That omission is its own
+    # defect: the class is still importable, but `import *` skips it and doc
+    # tooling reads it as private, so the typed error the mapping promises is
+    # not actually part of the documented surface. Pinned per mapped code
+    # because `_BY_CODE` is the list of classes the SDK commits to raising.
+    undocumented = sorted(
+        cls.__name__
+        for cls in sdk_exceptions._BY_CODE.values()
+        if cls.__name__ not in sdk_exceptions.__all__
+    )
+    assert undocumented == [], (
+        "these classes are raised by `to_sdk_error` but missing from "
+        f"`comfy_sdk.exceptions.__all__`: {undocumented}"
+    )
+
+
 def test_no_name_means_two_different_things_across_the_two_modules() -> None:
     ours = _exported(sdk_exceptions)
     theirs = _exported(router)

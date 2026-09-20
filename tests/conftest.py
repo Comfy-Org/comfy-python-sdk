@@ -39,6 +39,8 @@ class ServerState:
     server_hash: str = "blake3:" + "ab" * 32
     # If set, POST /assets rejects with 409 hash_mismatch.
     reject_hash_mismatch: bool = False
+    # If set, DELETE /assets/{id} rejects with 409 asset_in_use.
+    reject_delete_in_use: bool = False
     # Bytes served by GET /assets/{id}/content.
     content_bytes: bytes = b"\x89PNG-stub-output-bytes-0123456789"
     # Require an Authorization header (Cloud/serverless).
@@ -470,6 +472,9 @@ def _make_handler(state: ServerState):
             m = re.match(r"/api/v2/assets/([^/]+)$", self.path)
             if m:
                 state.delete_count += 1
+                if state.reject_delete_in_use:
+                    self._err(409, "asset_in_use", "the platform still depends on this asset")
+                    return
                 state.deleted_assets.add(m.group(1))
                 self.send_response(204)
                 self.end_headers()
