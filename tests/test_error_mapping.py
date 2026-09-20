@@ -195,7 +195,8 @@ def test_a_router_validation_body_is_read_rather_than_coerced_into_the_message()
         error_type="internal_error",
     )
     assert err.code == "internal_error"
-    assert err.message == "too large"
+    # `<loc>: <msg>`, the same rendering the queued surface uses.
+    assert err.message == "body.steps: too large"
     # The intent the old status-derived message protected, unchanged: whatever
     # reaches `str(exc)` is prose, never a repr of the array.
     assert "[" not in err.message
@@ -204,17 +205,31 @@ def test_a_router_validation_body_is_read_rather_than_coerced_into_the_message()
     )
 
 
-def test_a_validation_body_whose_entries_state_no_message_still_degrades() -> None:
-    # The entries decoded, so they are carried; none of them named a reason, so
-    # there is nothing to say but the status. Both halves matter: a caller that
-    # branches on `.errors` still gets them, and the message never becomes an
-    # empty string.
+def test_a_validation_body_whose_entries_name_nothing_still_degrades() -> None:
+    # The entries decoded, so they are carried; none of them named a field OR a
+    # reason, so there is nothing to say but the status. Both halves matter: a
+    # caller that branches on `.errors` still gets them, and the message never
+    # becomes an empty string. (An entry that names a field but no message is a
+    # separate case -- it surfaces the field, see the loc-only test below.)
+    err = error_from_envelope(
+        422,
+        {"detail": [{"type": "missing"}, {"msg": "   "}]},
+        error_type="invalid_input",
+    )
+    assert err.message == "HTTP 422"
+    assert err.validation_errors == ({"type": "missing"}, {"msg": "   "})
+
+
+def test_a_validation_entry_with_a_loc_but_no_msg_names_the_field() -> None:
+    # A field named with no reason still beats the bare status: the loc alone
+    # tells the caller which field the server rejected. A blank `msg` reads as
+    # absent, exactly as `_clean` treats every other whitespace-only wire string.
     err = error_from_envelope(
         422,
         {"detail": [{"loc": ["body", "steps"]}, {"msg": "   "}]},
         error_type="invalid_input",
     )
-    assert err.message == "HTTP 422"
+    assert err.message == "body.steps"
     assert err.validation_errors == ({"loc": ["body", "steps"]}, {"msg": "   "})
 
 
@@ -355,7 +370,7 @@ def test_a_validation_array_that_states_a_message_drops_the_excerpt_too() -> Non
         error_type="invalid_input",
         body_excerpt=raw,
     )
-    assert str(err) == "too large"
+    assert str(err) == "body.steps: too large"
     assert err.body_excerpt is None
 
 
@@ -532,3 +547,175 @@ def test_an_undecodable_success_body_keeps_what_was_served_instead() -> None:
     assert str(err) == (
         "Could not decode the 200 response body as JSON: <html>proxy: gateway timeout</html>"
     )
+
+
+# --- the per-field summary is sanitised, bounded, and one string per body ---
+#
+# The `detail[]` summary reaches `str(exc)`, a traceback and a log line, and its
+# `msg` is server-, proxy- or provider-controlled text. It gets the same
+# treatment every other body-derived string gets (`clean_body_excerpt`), and the
+# awaited `models.run` path and the queued surface render it through one
+# summariser so a caller's branch cannot work on one and silently not the other.
+
+
+def test_summarise_detail_names_each_field_rather_than_collapsing() -> None:
+    # Two `field required` entries must not collapse to the unrecoverable
+    # `field required; field required`: the loc is what tells them apart.
+    from comfy_low.errors import summarise_detail
+
+    summary = summarise_detail(
+        [
+            {"loc": ["body", "a"], "msg": "field required"},
+            {"loc": ["body", "b"], "msg": "field required"},
+        ]
+    )
+    assert summary == "body.a: field required; body.b: field required"
+    # An integer index renders like the queued surface's `.location`.
+    assert summarise_detail([{"loc": ["body", "images", 0], "msg": "bad"}]) == "body.images.0: bad"
+    # Nothing to summarise -> None, so the caller falls back to the status.
+    assert summarise_detail([]) is None
+    assert summarise_detail([1, "x"]) is None
+    assert summarise_detail("not a sequence of entries") is None
+
+
+def test_a_validation_summary_is_sanitised_before_it_reaches_str() -> None:
+    # A newline, a C0 NUL and an ANSI escape in a provider `msg` must not reach
+    # the terminal reading the error verbatim -- the escape's ESC byte is the
+    # dangerous part and is reduced to a space, whitespace collapses to one line.
+    err = error_from_envelope(
+        422,
+        {"detail": [{"loc": ["body", "steps"], "msg": "line one\nline\x1b[2Jtwo\x00three"}]},
+        error_type="invalid_input",
+    )
+    assert "\n" not in err.message
+    assert "\x1b" not in err.message
+    assert "\x00" not in err.message
+    assert err.message == "body.steps: line one line [2Jtwo three"
+
+
+def test_a_validation_summary_is_capped_at_the_excerpt_limit() -> None:
+    # Many long entries could otherwise make the message arbitrarily large; the
+    # same 256-char cap the excerpt gets applies to the summary.
+    from comfy_low.errors import _BODY_EXCERPT_LIMIT
+
+    err = error_from_envelope(
+        422,
+        {"detail": [{"msg": "x" * 5000} for _ in range(10)]},
+        error_type="invalid_input",
+    )
+    assert len(err.message) == _BODY_EXCERPT_LIMIT
+
+
+def test_a_detail_array_of_non_mappings_never_leaks_a_list_repr() -> None:
+    # When the array yields no summary -- every member a non-mapping -- the
+    # message falls through to `_clean(raw_detail)` with the LIST. `_clean`'s
+    # isinstance guard is load-bearing there: without it the caller's message
+    # would be a Python list repr. It degrades to the status instead.
+    err = error_from_envelope(422, {"detail": [1, "x", 2]}, error_type="invalid_input")
+    assert err.message == "HTTP 422"
+    assert "[" not in err.message
+    assert err.validation_errors == ()
+
+
+# --- a `detail[]` array identifies the Router surface even under the
+#     status-derived guess a stripped header falls to, or a code this version
+#     does not know: the typed entries must not be dropped by the non-Router
+#     branch.
+
+
+def test_a_validation_array_under_a_shared_bucket_keeps_its_entries() -> None:
+    import comfy_sdk.router_exceptions as rx
+
+    low = error_from_envelope(
+        401,
+        {"detail": [{"loc": ["body", "key"], "msg": "field required"}]},
+        error_type="unauthorized",
+    )
+    err = to_sdk_error(low)
+    # `unauthorized` is one of the three buckets both surfaces spell alike. They
+    # are a single class now (#157), re-exported from both modules, so there is
+    # no longer a collision to resolve -- `except RouterError` and
+    # `except comfy_sdk.Unauthorized` both catch this. What this test pins is the
+    # part that is still this change's: the array's typed entries survive the
+    # mapping instead of being dropped on the non-Router branch.
+    assert isinstance(err, rx.Unauthorized)
+    assert isinstance(err, rx.RouterError)
+    assert rx.Unauthorized is SdkUnauthorized
+    assert [e.msg for e in err.errors] == ["field required"]
+    assert err.errors[0].location == "body.key"
+
+
+def test_a_stripped_422_header_validation_array_keeps_its_v2_class() -> None:
+    import comfy_sdk.router_exceptions as rx
+    from comfy_sdk.exceptions import InvalidWorkflow
+
+    # No `error_type`: the 422 falls to the status-derived `invalid_workflow`
+    # guess. The `detail[]` array must NOT retype it into the Router hierarchy
+    # -- the array is a body shape any proxy or gateway can send, and the module
+    # rule is that only a response carrying a BUCKET gets retyped. Rerouting on
+    # the array would silently stop `except InvalidWorkflow` from firing.
+    low = error_from_envelope(422, {"detail": [{"loc": ["body", "steps"], "msg": "too large"}]})
+    assert low.code == "invalid_workflow"
+    err = to_sdk_error(low)
+    assert isinstance(err, InvalidWorkflow)
+    assert not isinstance(err, rx.RouterError)
+    # The per-field reasons still reach the caller: `summarise_detail` made them
+    # the message one layer down, which is what this change fixed.
+    assert "body.steps: too large" in str(err)
+
+
+def test_a_v2_envelope_with_an_array_keeps_its_class_details_and_summary() -> None:
+    import comfy_sdk.router_exceptions as rx
+    from comfy_sdk.exceptions import InvalidWorkflow
+
+    # An `error.message` AND a `detail[]` array, under a v2 envelope code. The
+    # class stays the one integrators catch, and `details` -- the per-node
+    # diagnostics `InvalidWorkflow` documents -- is still forwarded.
+    low = error_from_envelope(
+        422,
+        {
+            "error": {
+                "code": "invalid_workflow",
+                "message": "the graph is invalid",
+                "details": {"node_errors": {"3": "bad"}},
+            },
+            "detail": [{"loc": ["body", "steps"], "msg": "too large"}],
+        },
+    )
+    err = to_sdk_error(low)
+    assert isinstance(err, InvalidWorkflow)
+    assert not isinstance(err, rx.RouterError)
+    assert err.details == {"node_errors": {"3": "bad"}}
+    # The envelope's own message still wins as the human-readable string.
+    assert "the graph is invalid" in str(err)
+
+
+def test_a_loc_member_that_is_not_a_scalar_never_leaks_a_repr() -> None:
+    # `str(part)` on a nested member would render `['a', 'b']: bad` into the
+    # user-visible message -- the same list-repr leak `_clean`'s isinstance
+    # guard exists to stop, and `clean_body_excerpt` does not strip brackets.
+    err = error_from_envelope(
+        422,
+        {"detail": [{"loc": ["body", ["a", "b"], 0], "msg": "bad"}]},
+        error_type="invalid_input",
+    )
+    assert "[" not in err.message
+    assert err.message == "body.0: bad"
+
+
+def test_a_huge_detail_array_stops_accumulating_at_the_excerpt_budget() -> None:
+    from comfy_low.errors import _BODY_EXCERPT_LIMIT
+
+    # The cap must not be reached by rendering the whole server-controlled array
+    # and slicing the tail off: describing a body costs the same whether it is
+    # small or huge.
+    entries = [{"msg": "x" * 100} for _ in range(10_000)]
+    err = error_from_envelope(422, {"detail": entries}, error_type="invalid_input")
+    assert len(err.message) == _BODY_EXCERPT_LIMIT
+
+
+def test_a_shared_bucket_without_an_array_still_maps_by_code() -> None:
+    # The array is not what types a shared bucket: a bare `unauthorized` with no
+    # `detail[]` still maps by code to the one class both surfaces export.
+    err = to_sdk_error(ApiError("no", code="unauthorized", http_status=401))
+    assert isinstance(err, SdkUnauthorized)

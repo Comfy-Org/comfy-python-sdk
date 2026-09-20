@@ -10,11 +10,74 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Added
+
+- `RouterRunResult.credits_used` — what Comfy Router reported a run cost, lifted from the
+  `X-Comfy-Credits-Used` response header onto what `models.run_detailed()` returns. It is a
+  price rather than a settled ledger entry, absent means "not reported" and never "free", and
+  `0` is a real reported cost — so branch on `credits_used is not None`, not on truthiness.
+  Carried as the wire string; binary `float` is the wrong type to reconcile money against.
+  A value that is not a finite decimal — an empty header, a repeated one (`httpx` joins those
+  with `", "`), `NaN`/`Infinity` — reports as `None` rather than passing through to break the
+  `Decimal()` parse the field documents. The field defaults to `None`, so this stays additive
+  for anything that constructs a `RouterRunResult` by hand.
+
 ### Fixed
 
+- **`RouterRunResult.replayed` was always `False` against a real deployment.** It was lifted
+  from `X-Comfy-Idempotent-Replayed`; the header Comfy Router actually sends — and the only
+  spelling `spec/router-openapi.yaml` declares, on the `200` as on the `400`/`409`/`422` — is
+  `Idempotent-Replayed`, with no `X-Comfy-` prefix. A replayed, unbilled response was reported
+  as a fresh generation. The prefixed spelling is *not* honoured as an alias, because Router
+  does not send it. `tests/test_router_spec_contract.py` now pins every header `run_detailed`
+  lifts against the name the vendored contract declares, and pins that the lift reads it.
+- **`except RouterError` now catches every Comfy Router refusal.** `insufficient_credits`,
+  `unauthorized` and `forbidden` raised a class that was *not* a `RouterError`, so the obvious
+  catch-all around a `client.models.*` call caught nothing for them. Those three buckets are now
+  one class each, exported from both `comfy_sdk.exceptions` and `comfy_sdk.router_exceptions` —
+  `comfy_sdk.exceptions.InsufficientCredits is comfy_sdk.router_exceptions.InsufficientCredits`,
+  so either import catches what the other does. A Router bucket this version does not know now
+  raises `RouterError` rather than a bare `ComfyError`.
+- A cancel the server refuses raises a named exception instead of an untyped `409`:
+  `AlreadyCompleted` (the `{"status": "ALREADY_COMPLETED"}` answer to cancelling finished work),
+  under the `CancelRefused` base. Nothing has to match on the response body text any more.
+  Only the refusal shapes this version recognises are typed, and `ALREADY_COMPLETED` is the whole
+  of that list today: a refusal that names no bucket and no code stays an untyped `ComfyError`,
+  because nothing in such a response identifies it as a refusal at all.
 - `models.run` now populates `RouterError.errors` from a Router 422's per-field `detail[]` and
   uses the entries' messages as `detail`, instead of `HTTP 422`; `comfy_low.ApiError.validation_errors`
   carries the raw entries.
+- **A Router `detail[]` summary now names its fields, and is sanitised.** Both the awaited
+  (`models.run`) and the queued (`submit`) paths build the human-readable string with one shared
+  function, so a single server response reads the same way whichever surface raised it. Each entry
+  renders as `<loc>: <msg>`, so two `field required` errors now read `body.seed: field required;
+  body.steps: field required` rather than collapsing to an unrecoverable `field required; field
+  required`. The joined line gets the same treatment every other body-derived string already gets:
+  control characters, ANSI escapes and bidi overrides reduced, whitespace collapsed, and a 256-character
+  cap — so a hostile or merely careless `msg` can no longer scribble on a terminal or flood a log line.
+  Only the summary string changes; `.errors` still carries the raw typed entries.
+
+### Changed
+
+- **Because those three buckets are now one class each, they descend from `RouterError` on the
+  workflow surface too**: a `POST /jobs` call that fails `401`/`403`/`402` raises a `RouterError`
+  subclass. `except Unauthorized` / `except Forbidden` / `except InsufficientCredits` (from either
+  module) and `except ComfyError` are unchanged; only `except RouterError` sees more than its name
+  suggests.
+- **Breaking, for code that *constructs* those three classes.** `Unauthorized`, `Forbidden` and
+  `InsufficientCredits` are now `RouterError` subclasses, so they take `RouterError`'s
+  constructor: the human-readable string is the positional `detail`, and the bucket is
+  `error_type=`. There is no `message=` or `code=` keyword any more, so a hand-built
+  `Unauthorized(message="...", code="unauthorized")` — in a test double, a re-raise, or a
+  subclass — now raises `TypeError` and becomes `Unauthorized("...")`. Only construction is
+  affected: `raise`, `except` and every attribute a caller reads inside the handler (`.message`,
+  `.code`, `.http_status`, `.details`, `.request_id`, `.retry_after`) are unchanged.
+- `RouterError` is exported from the package root, alongside `CancelRefused` and
+  `AlreadyCompleted`. The eighteen per-bucket classes still live in
+  `comfy_sdk.router_exceptions`.
+- `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
+  body's `error_type`), or `None` when it named none — which is also how the SDK tells which
+  surface answered.
 
 ## [0.3.0] - 2026-09-14
 

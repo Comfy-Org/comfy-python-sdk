@@ -825,7 +825,9 @@ asset, job, event, and output helpers translate protocol errors, so catches of
   when a failure that could actually have claimed the key preceded the refusal —
   after a never-delivered `ConnectError` or a released `429`, a `422` is a
   genuine refusal of a key spent elsewhere and is raised as itself.
-- `InsufficientCredits` — the account can't afford the job.
+- `InsufficientCredits` — the account can't afford the job. Shared with the
+  Router surface (see [Catching Comfy Router errors](#catching-comfy-router-errors)),
+  as `Unauthorized` and `Forbidden` are.
 - `QueueFull` — backpressure; carries `.retry_after` seconds. `client.submit`
   retries 429 responses with `Retry-After` for a bounded budget (including
   deployment warm-up), then raises the translated error if backpressure remains.
@@ -851,6 +853,65 @@ except JobFailed as e:
 except Unauthorized:
     print("check your api_key")
 ```
+
+### Catching Comfy Router errors
+
+`client.models.*` talks to Comfy Router, whose closed error set has its own one
+class per bucket in **`comfy_sdk.router_exceptions`**. Every one of them
+descends from `RouterError`, so the broad catch is one clause:
+
+```python
+from comfy_sdk import RouterError                       # the base — also on the root
+from comfy_sdk.router_exceptions import NotEnabled      # the per-bucket names
+
+try:
+    result = client.models.run("fal-ai/flux-pro", {"prompt": "a cat"})
+except NotEnabled:
+    print("Router is not switched on for this key yet")  # terminal — do not retry
+except RouterError as exc:
+    print(exc.error_type, exc.request_id)                # every other bucket
+```
+
+`RouterError` covers every refusal Router itself answered with, including a
+bucket newer than your installed version — Router names the bucket on every
+error it sends, and that is what types the exception. A response that never
+reached Router carries no bucket to read (an intermediary's HTML `404`, a bare
+`503 no healthy upstream`), so it arrives as a plain `ComfyError` with the
+status on `.http_status`; keep an `except ComfyError` outside the clause above
+if you need to handle those in the same place.
+
+`RouterError` is exported from the package root because it is the handler most
+callers write first. The eighteen per-bucket classes stay in
+`comfy_sdk.router_exceptions` — `InvalidInput`, `ContentPolicyViolation`,
+`ProviderError`, `ProviderTimeout`, `InsufficientCredits`, `ModelNotFound`,
+`Unauthorized`, `Forbidden`, `ConcurrencyLimitExceeded`, `ClientDisconnected`,
+`InternalError`, `DeadlineExceeded`, `NotEnabled`, `ServiceUnavailable`,
+`RateLimited`, `Cancelled`, `QueueTimeout`, `RequestNotFound` — one import path
+for the whole set rather than half of it here and half of it there. A bucket added to Router after your installed version
+arrives as `RouterError` itself, with the raw value readable on `.error_type`.
+
+Three of those names — `Unauthorized`, `Forbidden`, `InsufficientCredits` —
+are also exported by `comfy_sdk` and `comfy_sdk.exceptions`. **They are the same
+class**, re-exported, not a second one wearing the same name, so
+`except InsufficientCredits` catches the refusal whichever import you wrote. The
+consequence worth knowing is the other direction: because one class cannot
+descend from `RouterError` on one surface and not on the other, a *workflow*
+call that fails `401`/`403`/`402` raises a `RouterError` subclass too, so
+`except RouterError` is slightly wider than its name for exactly those three.
+
+A `cancel()` the server declines raises `AlreadyCompleted` when the request had
+already finished — there was nothing left to stop, and the result is still
+collectable with `handle.get()`. It descends from `CancelRefused`, the base to
+catch when all you want to know is "the cancel did not take"; both are
+`RouterError`s and both are on the package root.
+
+`AlreadyCompleted` is the only refusal shape this version recognises, so
+`except CancelRefused` fires for exactly it today. A refusal this SDK has not
+been taught is a `409` that names no bucket and no code at all — nothing
+identifies it as a refusal — so it stays an untyped `ComfyError` rather than
+being guessed at. Catch `ComfyError` if you need the residue too, and treat the
+next `handle.status()` as authoritative either way: cancelling is a request,
+not a guarantee.
 
 ## Architecture — two layers
 

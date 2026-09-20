@@ -40,7 +40,7 @@ import yaml
 
 from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE
 from comfy_sdk import COMFY_ROUTER_BASE_URL
-from comfy_sdk.models import _RUN_RESULT_HEADERS
+from comfy_sdk.models import _RUN_RESULT_HEADERS, _run_result
 from comfy_sdk.router_exceptions import (
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
@@ -332,3 +332,44 @@ def test_the_replayed_header_carries_no_x_comfy_prefix() -> None:
 
     assert _HEADER_REPLAYED == "Idempotent-Replayed"
     assert not _HEADER_REPLAYED.lower().startswith("x-comfy-")
+
+
+#: Fields :func:`_run_result` lifts from ``_RUN_RESULT_HEADERS``, in the same
+#: order -- ``_HEADER_FALLBACK_PROVIDER``, ``_HEADER_DROPPED_PARAMS``,
+#: ``_HEADER_REPLAYED``, ``_HEADER_REQUEST_ID``, ``_HEADER_CREDITS_USED`` --
+#: paired with a value each lift actually accepts, for the sensitivity check
+#: below. ``credits_used`` needs a real decimal: ``_credits_used`` drops
+#: anything that does not parse, so the generic ``"x"`` the other four accept
+#: would silently come back ``None`` on both sides and the check would pass
+#: vacuously.
+_RUN_RESULT_FIELDS_AND_VALUES = (
+    ("serving_provider", "x"),
+    ("dropped_params", "x"),
+    ("replayed", "x"),
+    ("request_id", "x"),
+    ("credits_used", "1.25"),
+)
+
+
+@pytest.mark.parametrize(
+    ("header", "field", "value"),
+    [
+        (header, field, value)
+        for header, (field, value) in zip(
+            _RUN_RESULT_HEADERS, _RUN_RESULT_FIELDS_AND_VALUES, strict=True
+        )
+    ],
+)
+def test_the_lift_actually_reads_the_declared_name(header: str, field: str, value: str) -> None:
+    """Declaring the right name is half of it; the lift must also read it.
+
+    Asserted through ``_run_result`` rather than by re-reading the source, so
+    this fails if a future edit moves a lift onto some other header name while
+    leaving ``_RUN_RESULT_HEADERS`` (and so the two tests above) untouched.
+    """
+    absent = getattr(_run_result({}, {}), field)
+    present = getattr(_run_result({}, {header: value}), field)
+    assert present != absent, (
+        f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
+        f"the header and without it, so the lift is reading some other name."
+    )

@@ -154,6 +154,14 @@ class ServerState:
     # Sent as X-Comfy-Request-Id alongside a failed run. `None` sends no header,
     # which is the response an intermediary that never reached the router gives.
     model_run_request_id: str | None = None
+    # Extra response headers stamped on a SUCCESSFUL model run, for the
+    # disclosure headers the body cannot carry (X-Comfy-Credits-Used,
+    # X-Comfy-Router-Fallback-Provider, ...). Empty by default, because Router
+    # sends none of them on an ordinary run and "absent" is a case the SDK has
+    # to get right in its own name. Applied to a replayed 200 as well as a
+    # fresh one -- a replay carries `Idempotent-Replayed` on top of these
+    # rather than instead of them.
+    model_run_response_headers: dict[str, str] = field(default_factory=dict)
     # Answer a repeated model-run key with the v2 jobs rule (422
     # idempotency_key_reuse) instead of the router contract's replay-or-409.
     # Default False: the run route's vendored contract answers a consumed,
@@ -244,6 +252,13 @@ class ServerState:
     queue_result_raw: Any = None
     # The status read answers a body naming no `status` at all.
     queue_status_omits_status: bool = False
+    # When set, a cancel is REFUSED with this (status, body) instead of being
+    # accepted -- the shape the route declines in, which is neither of the two
+    # the error reader already knows: no `X-Comfy-Error-Type` header, no
+    # `error_type` in the body, and no v2 `{error: {code}}` envelope either.
+    # Just a status and a queue `status` value. The default models a cancel
+    # that arrived after the work finished.
+    queue_cancel_refusal: tuple[int, dict[str, Any]] | None = None
     # The bucket a cancelled request's completion carries.
     queue_cancel_error_type: str = "client_disconnected"
     # Set by a cancel; makes every later status poll report the cancellation.
@@ -760,6 +775,10 @@ def _make_handler(state: ServerState):
                 status, code = state.queue_cancel_transient_error
                 self._router_err(status, code, retry_after=state.queue_cancel_transient_retry_after)
                 return
+            if state.queue_cancel_refusal is not None:
+                status, refusal = state.queue_cancel_refusal
+                self._json(status, refusal)
+                return
             state.queue_canceled = True
             if state.queue_cancel_status == 204:
                 self.send_response(204)
@@ -803,10 +822,18 @@ def _make_handler(state: ServerState):
             # rather than rejecting the resend, and the model does not run
             # again — which is the whole point of asking under the same key.
             if key and key in state.model_run_replay_store:
+                # `model_run_response_headers` is merged in here as well as on
+                # the fresh-run path below, because a replay is the canonical
+                # reported-zero and the only response where `credits_used` and
+                # `replayed` are both meaningful at once. Stamped first, so the
+                # replay marker itself cannot be overwritten by a test's dict.
                 self._json(
                     200,
                     state.model_run_replay_store[key],
-                    headers={"Idempotent-Replayed": "true"},
+                    headers={
+                        **state.model_run_response_headers,
+                        "Idempotent-Replayed": "true",
+                    },
                 )
                 return
 
@@ -920,7 +947,11 @@ def _make_handler(state: ServerState):
                     "text/html",
                 )
                 return
-            self._json(state.model_run_status, state.model_run_result)
+            self._json(
+                state.model_run_status,
+                state.model_run_result,
+                headers=state.model_run_response_headers or None,
+            )
 
         def _post_jobs(self) -> None:
             state.submit_count += 1

@@ -54,22 +54,37 @@ catchable exception carrying its raw ``error_type`` -- treat one like
 exactly when something has already gone wrong.
 
 Three of these names -- ``Unauthorized``, ``Forbidden``, ``InsufficientCredits``
--- already exist in :mod:`comfy_sdk.exceptions` for the workflow surface, where
-they mean the same thing about a different API. They are deliberately *not*
-merged and this module is deliberately *not* re-exported from the package root:
-one name cannot be two classes, and silently making ``comfy_sdk.Unauthorized``
-mean the router one would change what an existing ``except`` clause catches.
-Import the router ones from this module, or catch
-:class:`~comfy_sdk.exceptions.ComfyError` to cover both surfaces at once.
+-- also exist in :mod:`comfy_sdk.exceptions`, which is where the workflow
+surface's error codes are mapped. **They are the same class object, defined
+here and re-exported there**, so ``comfy_sdk.exceptions.Unauthorized is
+comfy_sdk.router_exceptions.Unauthorized`` and either import catches whatever
+the other one does. ``tests/test_exception_modules.py`` asserts that of every
+name the two modules share.
 
-That holds for the buckets whose names collide with *nothing* too --
-:class:`NotEnabled`, :class:`ServiceUnavailable`, :class:`RateLimited`,
-:class:`DeadlineExceeded`. Lifting the non-colliding subset to the package root
-would make ``comfy_sdk.NotEnabled`` importable while ``comfy_sdk.InvalidInput``
-stayed a name that does not exist, and a caller cannot be expected to remember
-which half of one hierarchy lives where. One import path for the whole set is
-the property worth keeping; ``from comfy_sdk.router_exceptions import
-NotEnabled`` is it.
+They used to be two classes with one name, and that was a dead handler rather
+than a naming nit: the class ``to_sdk_error`` actually raised for a router
+``402`` was the ``exceptions`` one, which did **not** descend from
+:class:`RouterError` -- so ``except RouterError`` around a call that refused
+for insufficient credits, a rejected key or a model the caller is not entitled
+to compiled, type-checked, and caught nothing. Merging them is what makes the
+broad catch honest. The consequence to know is the other direction: a *workflow*
+call that fails ``401``/``403``/``402`` now raises a :class:`RouterError`
+subclass too, because one class cannot be a ``RouterError`` on one surface and
+not on the other. ``except Unauthorized`` (from either module) is unchanged;
+``except RouterError`` is wider than the name suggests for exactly those three
+buckets.
+
+This module is still deliberately *not* star-re-exported from the package root:
+lifting :class:`NotEnabled` there while ``comfy_sdk.InvalidInput`` stayed a name
+that does not exist would leave a caller guessing which half of one hierarchy
+lives where. One import path for the whole set is the property worth keeping,
+and ``from comfy_sdk.router_exceptions import NotEnabled`` is it.
+:class:`RouterError` itself *is* lifted to the root, because it is the one name
+a caller writing a broad handler reaches for first -- and so are
+:class:`CancelRefused` and :class:`AlreadyCompleted`, which a caller handles at
+the ``cancel()`` call site rather than through this module. Those three are the
+whole of the package root's share; everything else is ``from
+comfy_sdk.router_exceptions import ...``.
 
 The coarse bucket is not the whole story. A per-field model-validation failure
 carries a ``detail`` *array* whose entries keep the specific, provider-level
@@ -85,9 +100,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from comfy_low.errors import clean_request_id
+from comfy_low.errors import _location, clean_request_id, summarise_detail
 
-from .exceptions import ComfyError
+from ._errors import ComfyError
 
 #: Response header carrying the coarse failure bucket. Set on every router error
 #: response, and on a per-field validation failure it is the only place the
@@ -166,8 +181,13 @@ class ValidationErrorDetail:
 
     @property
     def location(self) -> str:
-        """``loc`` as a dotted path -- ``body.images.0`` -- for display."""
-        return ".".join(str(part) for part in self.loc)
+        """``loc`` as a dotted path -- ``body.images.0`` -- for display.
+
+        The one renderer :func:`comfy_low.errors.summarise_detail` uses, shared
+        rather than restated so this property and the summary built from the
+        same array can never disagree about what a field is called.
+        """
+        return _location(self.loc)
 
 
 class RouterError(ComfyError):
@@ -187,12 +207,13 @@ class RouterError(ComfyError):
         *,
         error_type: str | None = None,
         http_status: int | None = None,
+        details: dict[str, Any] | None = None,
         request_id: str | None = None,
         retry_after: int | None = None,
         errors: Sequence[ValidationErrorDetail] = (),
     ) -> None:
         resolved = error_type if error_type is not None else self.error_type
-        super().__init__(detail, code=resolved or None, http_status=http_status)
+        super().__init__(detail, code=resolved or None, http_status=http_status, details=details)
         if error_type is not None:
             self.error_type = error_type
         #: Human-readable description of the failure, safe to show a user. Not
@@ -501,6 +522,73 @@ class RequestNotFound(RouterError):
     _spec_meaning_digest: str = "385112b3cdcf"
 
 
+# -- cancel refusals ---------------------------------------------------------
+#
+# Deliberately OUTSIDE the closed set below, and carrying no
+# `_spec_meaning_digest`: the contract's `x-comfy-error-types` does not name
+# them, because this is not a bucket the run route reports. It is what the
+# CANCEL route answers with when it declines -- a `409` whose body states a
+# `status` and names no bucket at all. The classes exist anyway, for the reason
+# the typed hierarchy exists at all: without them the only way to tell a cancel
+# that arrived too late from any other `409` is to substring-match the response
+# body, and a second refusal shape would mean a second substring match.
+#
+# They are `RouterError` subclasses because they come off a Router route, so
+# `except RouterError` around a cancel catches them like every other refusal.
+
+
+class CancelRefused(RouterError):
+    """The server declined to cancel a submitted request.
+
+    The base for the cancel route's refusals, so a caller who only wants "the
+    cancel did not take" writes one ``except`` clause and does not have to
+    enumerate the reasons.
+
+    Nothing raises this class itself, and that is not an oversight to be fixed
+    by a fallback: unlike an unknown *bucket*, which :class:`RouterError`
+    catches because the response still named a bucket, a refusal shape this SDK
+    does not recognise carries nothing that identifies it as a refusal at all --
+    it is a ``409`` naming no bucket and no code, indistinguishable from any
+    other. Such a response stays an untyped ``ComfyError``, which is the honest
+    answer; typing it would be guessing. Teaching the SDK a new refusal is one
+    entry in :data:`comfy_low.errors._CODE_BY_CANCEL_STATUS` plus one subclass
+    here.
+
+    A refusal is not necessarily a problem: cancelling is a request, not a
+    guarantee, and the authoritative state is whatever
+    :meth:`comfy_sdk.model_requests.RequestHandle.status` says next.
+    """
+
+    error_type = "cancel_refused"
+
+
+class AlreadyCompleted(CancelRefused):
+    """The request had already finished when the cancel reached the server.
+
+    The ``409`` answer to cancelling a request whose work is done -- body
+    ``{"status": "ALREADY_COMPLETED"}``. Terminal and benign: there was
+    nothing left to stop, the result is still collectable with
+    :meth:`comfy_sdk.model_requests.RequestHandle.get`, and re-sending the
+    cancel will be refused the same way.
+
+    ``error_type`` is ``already_completed`` -- the snake_case of the body's
+    ``status``, not a value read off ``X-Comfy-Error-Type``, which this
+    response does not send.
+    """
+
+    error_type = "already_completed"
+
+
+#: Cancel-refusal classes, keyed by the ``error_type`` :mod:`comfy_low.errors`
+#: derives for them. Not folded into :data:`_BY_ERROR_TYPE`, which is the
+#: contract's closed set and is asserted against the vendored spec.
+CANCEL_REFUSALS: tuple[type[CancelRefused], ...] = (AlreadyCompleted,)
+
+_BY_CANCEL_REFUSAL: dict[str, type[CancelRefused]] = {
+    cls.error_type: cls for cls in CANCEL_REFUSALS
+}
+
+
 #: Every class in the closed set, in the order the error set declares it: the
 #: request-level buckets, then the transport-level ones. The order is the
 #: vendored spec's ``x-comfy-error-types`` order, and
@@ -626,6 +714,9 @@ def error_from_response(
             errors = tuple(
                 _detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping)
             )
+            # The same summariser the awaited `models.run` path uses, so one wire
+            # body produces one `.detail` whichever surface built the exception.
+            detail = summarise_detail(raw_detail)
         if error_type is None:
             error_type = _clean(body.get("error_type"))
 
@@ -633,7 +724,7 @@ def error_from_response(
         error_type = _ERROR_TYPE_BY_STATUS.get(http_status)
 
     if detail is None:
-        detail = _summarise(errors) or f"HTTP {http_status}"
+        detail = f"HTTP {http_status}"
 
     return exception_for(error_type)(
         detail,
@@ -685,9 +776,12 @@ def error_from_completion(
         detail = raw_detail or None
     elif isinstance(raw_detail, Sequence) and not isinstance(raw_detail, (str, bytes)):
         errors = tuple(_detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping))
+        # One summariser across both surfaces (see `error_from_response`), so the
+        # queued path's `.detail` matches the awaited one for the same body.
+        detail = summarise_detail(raw_detail)
 
     if detail is None:
-        detail = _summarise(errors) or f"the request completed with error_type {error_type!r}"
+        detail = f"the request completed with error_type {error_type!r}"
 
     return exception_for(error_type)(
         detail,
@@ -747,7 +841,17 @@ def _detail_from(entry: Mapping[str, Any]) -> ValidationErrorDetail:
     raw_loc = entry.get("loc")
     loc: tuple[str | int, ...] = ()
     if isinstance(raw_loc, Sequence) and not isinstance(raw_loc, (str, bytes)):
-        loc = tuple(part if isinstance(part, (str, int)) else str(part) for part in raw_loc)
+        # A member that is not a path segment is DROPPED, not stringified. The
+        # field is typed as a path -- a field name or an array index -- and
+        # `str(part)` on a server-controlled nested value put a Python repr in
+        # there instead (`('body', "['a', 'b']")`), which then reached the user
+        # through `.location`. `bool` is excluded despite being an `int`: `True`
+        # is neither a field name nor an index.
+        loc = tuple(
+            part
+            for part in raw_loc
+            if isinstance(part, str) or (isinstance(part, int) and not isinstance(part, bool))
+        )
 
     msg, reason, ctx = entry.get("msg"), entry.get("type"), entry.get("ctx")
     return ValidationErrorDetail(
@@ -759,30 +863,18 @@ def _detail_from(entry: Mapping[str, Any]) -> ValidationErrorDetail:
     )
 
 
-def _summarise(errors: Sequence[ValidationErrorDetail]) -> str:
-    """A one-line message for a per-field failure.
-
-    This is *in addition to* ``.errors``, never instead of it -- the entries stay
-    readable as data, and a caller branching on a field reads them rather than
-    parsing this back apart.
-    """
-    parts: list[str] = []
-    for entry in errors:
-        if entry.location and entry.msg:
-            parts.append(f"{entry.location}: {entry.msg}")
-        elif entry.location or entry.msg:
-            parts.append(entry.location or entry.msg)
-    return "; ".join(parts)
-
-
 __all__ = [
+    "CANCEL_REFUSALS",
     "ERROR_TYPE_HEADER",
     "REQUEST_ID_HEADER",
     "RETRY_AFTER_HEADER",
     "ROUTER_ERROR_TYPES",
     "ROUTER_EXCEPTIONS",
+    "AlreadyCompleted",
+    "CancelRefused",
     "Cancelled",
     "ClientDisconnected",
+    "ComfyError",
     "ConcurrencyLimitExceeded",
     "ContentPolicyViolation",
     "DeadlineExceeded",
