@@ -38,6 +38,7 @@ import yaml
 
 from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE
 from comfy_sdk import COMFY_ROUTER_BASE_URL
+from comfy_sdk.models import _run_result
 from comfy_sdk.router_exceptions import (
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
@@ -271,3 +272,95 @@ def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None
     assert _MODEL_RUN_PATH_TEMPLATE.count("{") == 2
     assert "{provider}" in _MODEL_RUN_PATH_TEMPLATE
     assert "{model}" in _MODEL_RUN_PATH_TEMPLATE
+
+
+# --- run_detailed's header lifts, pinned against the contract -----------------
+#
+# `RouterRunResult` is built entirely out of response header names. A name is
+# not type-checked, not exercised by a stub that was handed the SDK's own
+# spelling, and wrong in a way that looks exactly like the header being absent
+# -- which the field documents as a legitimate, common case. So a misspelling
+# is silent in every other test in the suite, and it has already happened once:
+# the lift read `X-Comfy-Idempotent-Replayed`, a name the contract does not
+# use, leaving `replayed` permanently `False` against a real deployment.
+#
+# These tests close that gap from both ends: the name must be declared by the
+# spec, AND the lift must actually be reading that declared name.
+
+#: field on :class:`RouterRunResult` -> the 200 response header it is lifted
+#: from, for the lifts whose names the vendored contract declares.
+_CONTRACT_HEADER_LIFTS = {
+    "serving_provider": "X-Comfy-Router-Fallback-Provider",
+    "dropped_params": "X-Comfy-Router-Dropped-Params",
+    "replayed": "Idempotent-Replayed",
+    "request_id": "X-Comfy-Request-Id",
+}
+
+#: Lifted by the SDK but NOT declared on the contract's 200 -- see the tripwire
+#: test at the bottom of this file.
+_UNDECLARED_HEADER_LIFTS = {"credits_used": "X-Comfy-Credits-Used"}
+
+
+def _declared_run_response_headers() -> set[str]:
+    """The header names the spec declares on ``runRouterModel``'s ``200``."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    for _path, item in (doc.get("paths") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        post = item.get("post")
+        if isinstance(post, dict) and post.get("operationId") == "runRouterModel":
+            return set((post["responses"]["200"].get("headers") or {}).keys())
+    raise AssertionError("the vendored spec declares no runRouterModel operation")
+
+
+@pytest.mark.parametrize(("field", "header"), sorted(_CONTRACT_HEADER_LIFTS.items()))
+def test_every_lifted_header_is_declared_by_the_contract(field: str, header: str) -> None:
+    declared = _declared_run_response_headers()
+    assert header in declared, (
+        f"RouterRunResult.{field} is lifted from {header!r}, which the vendored spec does "
+        f"not declare on runRouterModel's 200. Declared: {sorted(declared)}. Either a sync "
+        f"renamed the header or the SDK is reading a name Router never sends."
+    )
+
+
+@pytest.mark.parametrize(("field", "header"), sorted(_CONTRACT_HEADER_LIFTS.items()))
+def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> None:
+    """Declaring the right name is half of it; the lift must also read it.
+
+    Asserted through ``_run_result`` rather than by re-reading the source, so
+    this fails if the constant above and the code drift apart -- the constant
+    is a restatement otherwise, and a restatement would pass the sync it exists
+    to fail.
+    """
+    absent = getattr(_run_result({}, {}), field)
+    present = getattr(_run_result({}, {header: "x"}), field)
+    assert present != absent, (
+        f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
+        f"the header and without it, so the lift is reading some other name."
+    )
+
+
+@pytest.mark.parametrize(("field", "header"), sorted(_UNDECLARED_HEADER_LIFTS.items()))
+def test_an_undeclared_lift_stays_undeclared_until_someone_reconciles_it(
+    field: str, header: str
+) -> None:
+    """Tripwire, and deliberately asserting the *absence*.
+
+    ``credits_used`` is lifted from a header the vendored contract does not
+    declare anywhere -- the 200's only cost headers are the
+    ``X-Committed-Spend-*`` trio, which is a different quantity (USD cents of
+    in-flight commitment, not the price of this run). Nothing in the suite can
+    catch a wrong name here, because every test configures its stub to emit the
+    exact literal the lift reads.
+
+    That gap is tracked, not accepted. This test fails the moment a spec sync
+    declares the header, which is the signal to move the entry up into
+    ``_CONTRACT_HEADER_LIFTS`` and get it pinned like the rest. It also fails
+    if the header is declared under a *different* name for the same quantity,
+    because the reconciliation is the same either way.
+    """
+    declared = _declared_run_response_headers()
+    assert header not in declared, (
+        f"the vendored spec now declares {header!r}: move {field!r} from "
+        f"_UNDECLARED_HEADER_LIFTS into _CONTRACT_HEADER_LIFTS so it is pinned."
+    )
