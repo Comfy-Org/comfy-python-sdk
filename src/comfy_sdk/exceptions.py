@@ -238,7 +238,19 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
     # and none of the remaining classes takes the argument. A validation body
     # that reaches this branch — a `detail[]` under a v2 `error.code`, or under
     # the status-derived guess when no bucket was sent at all — still gets the
-    # entries' messages, since those became `exc.message` one layer down.
+    # entries' summary, since `summarise_detail` made it `exc.message` one layer
+    # down. The same holds for the `queue_full` early return above.
+    #
+    # The array is deliberately NOT used to reroute these into the Router
+    # hierarchy. `detail[]` is a body shape any server, proxy or gateway can
+    # send (a FastAPI `RequestValidationError` is exactly it), so keying the
+    # class off it would let an intermediary in front of the v2 jobs surface
+    # decide which `except` a caller runs. Provenance is the header, and
+    # `_class_for` already reads it: `error_type` is set only for a response
+    # that identified itself as Router's, and for those this branch is
+    # unreachable — every Router bucket resolves to a `RouterError` subclass,
+    # including the three both surfaces spell alike, so the entries are
+    # forwarded above.
     return cls(
         str(exc),
         code=exc.code,
