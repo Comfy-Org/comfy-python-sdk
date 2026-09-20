@@ -100,7 +100,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from comfy_low.errors import clean_request_id
+from comfy_low.errors import _location, clean_request_id, summarise_detail
 
 from ._errors import ComfyError
 
@@ -181,8 +181,13 @@ class ValidationErrorDetail:
 
     @property
     def location(self) -> str:
-        """``loc`` as a dotted path -- ``body.images.0`` -- for display."""
-        return ".".join(str(part) for part in self.loc)
+        """``loc`` as a dotted path -- ``body.images.0`` -- for display.
+
+        The one renderer :func:`comfy_low.errors.summarise_detail` uses, shared
+        rather than restated so this property and the summary built from the
+        same array can never disagree about what a field is called.
+        """
+        return _location(self.loc)
 
 
 class RouterError(ComfyError):
@@ -709,6 +714,9 @@ def error_from_response(
             errors = tuple(
                 _detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping)
             )
+            # The same summariser the awaited `models.run` path uses, so one wire
+            # body produces one `.detail` whichever surface built the exception.
+            detail = summarise_detail(raw_detail)
         if error_type is None:
             error_type = _clean(body.get("error_type"))
 
@@ -716,7 +724,7 @@ def error_from_response(
         error_type = _ERROR_TYPE_BY_STATUS.get(http_status)
 
     if detail is None:
-        detail = _summarise(errors) or f"HTTP {http_status}"
+        detail = f"HTTP {http_status}"
 
     return exception_for(error_type)(
         detail,
@@ -768,9 +776,12 @@ def error_from_completion(
         detail = raw_detail or None
     elif isinstance(raw_detail, Sequence) and not isinstance(raw_detail, (str, bytes)):
         errors = tuple(_detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping))
+        # One summariser across both surfaces (see `error_from_response`), so the
+        # queued path's `.detail` matches the awaited one for the same body.
+        detail = summarise_detail(raw_detail)
 
     if detail is None:
-        detail = _summarise(errors) or f"the request completed with error_type {error_type!r}"
+        detail = f"the request completed with error_type {error_type!r}"
 
     return exception_for(error_type)(
         detail,
@@ -830,7 +841,17 @@ def _detail_from(entry: Mapping[str, Any]) -> ValidationErrorDetail:
     raw_loc = entry.get("loc")
     loc: tuple[str | int, ...] = ()
     if isinstance(raw_loc, Sequence) and not isinstance(raw_loc, (str, bytes)):
-        loc = tuple(part if isinstance(part, (str, int)) else str(part) for part in raw_loc)
+        # A member that is not a path segment is DROPPED, not stringified. The
+        # field is typed as a path -- a field name or an array index -- and
+        # `str(part)` on a server-controlled nested value put a Python repr in
+        # there instead (`('body', "['a', 'b']")`), which then reached the user
+        # through `.location`. `bool` is excluded despite being an `int`: `True`
+        # is neither a field name nor an index.
+        loc = tuple(
+            part
+            for part in raw_loc
+            if isinstance(part, str) or (isinstance(part, int) and not isinstance(part, bool))
+        )
 
     msg, reason, ctx = entry.get("msg"), entry.get("type"), entry.get("ctx")
     return ValidationErrorDetail(
@@ -840,22 +861,6 @@ def _detail_from(entry: Mapping[str, Any]) -> ValidationErrorDetail:
         ctx=ctx if isinstance(ctx, Mapping) else None,
         input=entry.get("input"),
     )
-
-
-def _summarise(errors: Sequence[ValidationErrorDetail]) -> str:
-    """A one-line message for a per-field failure.
-
-    This is *in addition to* ``.errors``, never instead of it -- the entries stay
-    readable as data, and a caller branching on a field reads them rather than
-    parsing this back apart.
-    """
-    parts: list[str] = []
-    for entry in errors:
-        if entry.location and entry.msg:
-            parts.append(f"{entry.location}: {entry.msg}")
-        elif entry.location or entry.msg:
-            parts.append(entry.location or entry.msg)
-    return "; ".join(parts)
 
 
 __all__ = [

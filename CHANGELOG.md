@@ -20,6 +20,15 @@ the fuller account of each version, including verification notes.
 - `IN_QUEUE` / `IN_PROGRESS` — the two live values of the contract's closed `RouterQueueStatus`
   enum, exported alongside `COMPLETED` so a caller comparing `QueueUpdate.status` uses the
   contract's own spelling.
+- `RouterRunResult.credits_used` — what Comfy Router reported a run cost, lifted from the
+  `X-Comfy-Credits-Used` response header onto what `models.run_detailed()` returns. It is a
+  price rather than a settled ledger entry, absent means "not reported" and never "free", and
+  `0` is a real reported cost — so branch on `credits_used is not None`, not on truthiness.
+  Carried as the wire string; binary `float` is the wrong type to reconcile money against.
+  A value that is not a finite decimal — an empty header, a repeated one (`httpx` joins those
+  with `", "`), `NaN`/`Infinity` — reports as `None` rather than passing through to break the
+  `Decimal()` parse the field documents. The field defaults to `None`, so this stays additive
+  for anything that constructs a `RouterRunResult` by hand.
 
 ### Changed
 
@@ -85,6 +94,13 @@ the fuller account of each version, including verification notes.
 
 ### Fixed
 
+- **`RouterRunResult.replayed` was always `False` against a real deployment.** It was lifted
+  from `X-Comfy-Idempotent-Replayed`; the header Comfy Router actually sends — and the only
+  spelling `spec/router-openapi.yaml` declares, on the `200` as on the `400`/`409`/`422` — is
+  `Idempotent-Replayed`, with no `X-Comfy-` prefix. A replayed, unbilled response was reported
+  as a fresh generation. The prefixed spelling is *not* honoured as an alias, because Router
+  does not send it. `tests/test_router_spec_contract.py` now pins every header `run_detailed`
+  lifts against the name the vendored contract declares, and pins that the lift reads it.
 - **`except RouterError` now catches every Comfy Router refusal.** `insufficient_credits`,
   `unauthorized` and `forbidden` raised a class that was *not* a `RouterError`, so the obvious
   catch-all around a `client.models.*` call caught nothing for them. Those three buckets are now
@@ -101,6 +117,15 @@ the fuller account of each version, including verification notes.
 - `models.run` now populates `RouterError.errors` from a Router 422's per-field `detail[]` and
   uses the entries' messages as `detail`, instead of `HTTP 422`; `comfy_low.ApiError.validation_errors`
   carries the raw entries.
+- **A Router `detail[]` summary now names its fields, and is sanitised.** Both the awaited
+  (`models.run`) and the queued (`submit`) paths build the human-readable string with one shared
+  function, so a single server response reads the same way whichever surface raised it. Each entry
+  renders as `<loc>: <msg>`, so two `field required` errors now read `body.seed: field required;
+  body.steps: field required` rather than collapsing to an unrecoverable `field required; field
+  required`. The joined line gets the same treatment every other body-derived string already gets:
+  control characters, ANSI escapes and bidi overrides reduced, whitespace collapsed, and a 256-character
+  cap — so a hostile or merely careless `msg` can no longer scribble on a terminal or flood a log line.
+  Only the summary string changes; `.errors` still carries the raw typed entries.
 
 ## [0.3.0] - 2026-09-14
 
