@@ -34,6 +34,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 
@@ -298,17 +299,37 @@ def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None
 #: normalisers disagree about what is even a value: ``_credits_used`` reports
 #: anything that is not a finite decimal as ``None``, so a generic ``"x"``
 #: makes a correct lift look like it read some other name entirely. Each entry
-#: is a value the contract itself would send.
+#: is the spec's own ``example`` for that header, rendered as the string it
+#: arrives as on the wire (``Idempotent-Replayed`` declares the YAML boolean
+#: ``true``), so "a value the contract itself would send" is literal rather
+#: than aspirational. ``X-Comfy-Router-Fallback-Provider`` is the one header
+#: declaring no example, so its probe is just a provider the spec names
+#: elsewhere. The examples are copied, not asserted against: pinning a probe to
+#: the spec byte-for-byte would churn this table on an example-only sync while
+#: catching nothing, since these tests only ever compare present against
+#: absent.
+#:
+#: Copying the example verbatim is why ``dropped_params`` carries a
+#: comma-bearing entry rather than a tidied-up one -- that comma is the
+#: property its parser exists to preserve (asserted on the parsed value in
+#: ``test_models_run.py``, not here).
 _CONTRACT_HEADER_LIFTS = {
     "serving_provider": ("X-Comfy-Router-Fallback-Provider", "fal"),
-    "dropped_params": ("X-Comfy-Router-Dropped-Params", '["moderation"]'),
+    "dropped_params": (
+        "X-Comfy-Router-Dropped-Params",
+        '["moderation (fal applies its own, non-configurable safety filtering)"]',
+    ),
     "replayed": ("Idempotent-Replayed", "true"),
-    "request_id": ("X-Comfy-Request-Id", "req_01HZY"),
+    "request_id": ("X-Comfy-Request-Id", "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21"),
     "credits_used": ("X-Comfy-Credits-Used", "12.5"),
 }
 
 #: :class:`RouterRunResult` fields that are NOT lifted from a response header,
 #: and so are exempt from the completeness test at the bottom of this file.
+#:
+#: Being listed here exempts a field from BOTH pins above, so the exemption is
+#: itself checked -- see
+#: ``test_an_exempt_field_is_really_unmoved_by_the_headers_it_skips``.
 _NON_HEADER_FIELDS = {"output"}
 
 
@@ -348,9 +369,17 @@ def test_the_lift_actually_reads_the_declared_name(field: str, header: str, prob
     this fails if the constant above and the code drift apart -- the constant
     is a restatement otherwise, and a restatement would pass the sync it exists
     to fail.
+
+    The probe is an ``httpx.Headers`` and not a plain dict because that is what
+    production hands ``_run_result`` -- ``Models.run_detailed`` passes the
+    transport's own response headers straight through. A dict's ``.get`` is
+    case-sensitive; ``httpx.Headers`` is not. Probing with a dict would make a
+    spec sync that only re-cased a declared name fail here even though the SDK
+    still reads it correctly, and the only way to get green again would be a
+    no-op edit to the source spelling.
     """
-    absent = getattr(_run_result({}, {}), field)
-    present = getattr(_run_result({}, {header: probe}), field)
+    absent = getattr(_run_result({}, httpx.Headers()), field)
+    present = getattr(_run_result({}, httpx.Headers({header: probe})), field)
     assert present != absent, (
         f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
         f"the header and without it, so the lift is reading some other name."
@@ -375,6 +404,12 @@ def test_every_header_derived_field_is_pinned_against_the_contract() -> None:
     as deliberately not a lift. Adding a field forces one of those two, which
     is the decision the tripwire used to defer.
     """
+    overlap = set(_CONTRACT_HEADER_LIFTS) & _NON_HEADER_FIELDS
+    assert not overlap, (
+        f"{sorted(overlap)} are classified as BOTH lifted from a header and not a lift. "
+        f"The union below would accept that contradiction silently, and the field would be "
+        f"skipped by the exemption test while still being pinned as a lift. Pick one."
+    )
     declared = {f.name for f in fields(RouterRunResult)}
     accounted = set(_CONTRACT_HEADER_LIFTS) | _NON_HEADER_FIELDS
     assert declared == accounted, (
@@ -383,3 +418,43 @@ def test_every_header_derived_field_is_pinned_against_the_contract() -> None:
         f"Add each new field to _CONTRACT_HEADER_LIFTS (with the header it is lifted from) "
         f"or to _NON_HEADER_FIELDS."
     )
+
+
+def test_an_exempt_field_is_really_unmoved_by_the_headers_it_skips() -> None:
+    """``_NON_HEADER_FIELDS`` has to earn the exemption, not just assert it.
+
+    Listing a field there exempts it from BOTH pins above, so on its own it is
+    an unverified escape hatch that partly reopens the gap this block exists to
+    close -- and it is the *convenient* hatch, because a field lifted from a
+    header the vendored spec has not declared yet fails
+    ``test_every_lifted_header_is_declared_by_the_contract`` if it is filed
+    honestly in ``_CONTRACT_HEADER_LIFTS``. That is not a hypothetical shape:
+    it is exactly the state ``credits_used`` was in, and the one-way spec sync
+    makes it recurring.
+
+    So the claim is tested: hand ``_run_result`` every header that could move a
+    field -- the ones this file pins, plus every other name the contract
+    declares on the ``200`` -- and an exempt field must read the same as it
+    does against no headers at all. A lift misfiled as an exemption moves, and
+    fails here instead of passing silently.
+
+    The one shape this still cannot see is a field lifted from a header that is
+    neither pinned here nor declared by the spec, since nothing in the repo
+    then knows the name to send. Closing that needs the source read, which the
+    rest of this block deliberately refuses to do.
+    """
+    probes = {header: probe for header, probe in _CONTRACT_HEADER_LIFTS.values()}
+    # Declared-but-unpinned names (the X-Committed-Spend-* trio, nosniff) have
+    # no field and so no normaliser to satisfy; any non-empty value will do,
+    # and one that moves a field is the finding.
+    probes |= {name: "probe" for name in _declared_run_response_headers() - probes.keys()}
+
+    bare = _run_result({}, httpx.Headers())
+    loaded = _run_result({}, httpx.Headers(probes))
+    for field in sorted(_NON_HEADER_FIELDS):
+        assert getattr(loaded, field) == getattr(bare, field), (
+            f"RouterRunResult.{field} is listed in _NON_HEADER_FIELDS as not header-derived, "
+            f"but it changed from {getattr(bare, field)!r} to {getattr(loaded, field)!r} when "
+            f"the contract's 200 headers were supplied. It IS a lift: move it into "
+            f"_CONTRACT_HEADER_LIFTS with the header it reads, so both pins apply to it."
+        )
