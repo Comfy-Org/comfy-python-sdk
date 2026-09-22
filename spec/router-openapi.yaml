@@ -219,6 +219,8 @@ paths:
       parameters:
       - $ref: '#/components/parameters/RouterProvider'
       - $ref: '#/components/parameters/RouterModel'
+      - $ref: '#/components/parameters/ModelProvider'
+      - $ref: '#/components/parameters/StrictMode'
       - $ref: '#/components/parameters/RouterIdempotencyKey'
       requestBody:
         required: true
