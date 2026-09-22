@@ -219,6 +219,8 @@ paths:
       parameters:
       - $ref: '#/components/parameters/RouterProvider'
       - $ref: '#/components/parameters/RouterModel'
+      - $ref: '#/components/parameters/ModelProvider'
+      - $ref: '#/components/parameters/StrictMode'
       - $ref: '#/components/parameters/RouterIdempotencyKey'
       requestBody:
         required: true
@@ -835,7 +837,7 @@ components:
       name: model_provider
       in: query
       required: false
-      description: 'Selects an alternate provider for this model, instead of its current default. Omitted, or `default`, is byte-for-byte today''s behavior. A value naming a real provider that does not serve this model is refused `404` with `error_type: model_not_found` - the same bucket an unknown model ID itself uses; an unrecognized value (not a real, registered provider at all) is refused `400` with `error_type: invalid_input`. Router''s error_type set is closed (see the Router error contract note above); it carries neither a `provider_not_available` nor a `validation_error` bucket.'
+      description: 'Selects an alternate provider for this model, instead of its current default. Omitted, `default`, `comfy`, or `comfyui` are all byte-for-byte today''s behavior - Comfy Router is never itself a serving backend, so these name no override rather than a fifth provider. A value naming a real provider that does not serve this model is refused `404` with `error_type: model_not_found` - the same bucket an unknown model ID itself uses; an unrecognized value (not a real, registered provider at all) is refused `400` with `error_type: invalid_input`. Router''s error_type set is closed (see the Router error contract note above); it carries neither a `provider_not_available` nor a `validation_error` bucket.'
       schema:
         type: string
     RouterCatalogCursor:
