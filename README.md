@@ -446,6 +446,29 @@ async with AsyncComfy(api_key="comfyui-...") as client:
 There is no `run_async()`, and there will not be one — one operation, one name,
 and `await` is what makes it asynchronous.
 
+### Choosing a provider — `model_provider`
+
+A model can be served by more than one provider. By default a run goes to the
+model's default provider; pass `model_provider` to route it through an alternate
+one instead (`"fal"`, `"wavespeed"`, `"runware"`, `"higgsfield"`, ...):
+
+```python
+result = client.models.run(
+    "bfl/flux-2-pro",
+    {"prompt": "a cat", "steps": 4},
+    model_provider="fal",
+)
+```
+
+Under the default `strict_mode` (`False`) the `arguments` you pass stay this
+model's own native input and Router translates them to the alternate provider's
+schema on the way in and the response back on the way out; `strict_mode=True`
+sends and returns that provider's own raw shape unchanged, so `arguments` must
+already be that provider's schema. `fallback_provider` is on by default — pass
+`False` to opt out, so a failure is refused rather than retried against the
+model's other registered provider. All three are sent only when set, so a call
+that names none of them is byte-for-byte unchanged.
+
 ### Image to image — upload an asset first
 
 An image-to-image model takes an image *as input*, and Router forwards the
