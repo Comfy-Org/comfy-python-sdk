@@ -350,6 +350,15 @@ def _declared_run_response_headers() -> set[str]:
     sorted((field, header) for field, (header, _probe) in _CONTRACT_HEADER_LIFTS.items()),
 )
 def test_every_lifted_header_is_declared_by_the_contract(field: str, header: str) -> None:
+    """The other half of the pin below: Router must actually send this name.
+
+    Reading the declared name is worth nothing if the name is not in the
+    contract at all, which is the failure ``credits_used`` shipped with -- a
+    lift nothing could check, because every other test in the suite configures
+    its stub to emit the exact literal the lift reads. Asserted against the
+    vendored spec, so a sync that renames or drops a header fails here rather
+    than silently turning the field into a permanent default in production.
+    """
     declared = _declared_run_response_headers()
     assert header in declared, (
         f"RouterRunResult.{field} is lifted from {header!r}, which the vendored spec does "
