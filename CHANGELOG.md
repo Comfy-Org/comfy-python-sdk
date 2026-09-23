@@ -12,6 +12,11 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `QueueBacklogFull` in `comfy_sdk.router_exceptions` — the `queue_backlog_full` bucket
+  (`429`) Comfy Router answers a queued submit with when the caller already has too many
+  requests waiting. It previously arrived as the bare `RouterError` base. It shares `429` with
+  `ConcurrencyLimitExceeded` and `RateLimited` but is its own condition: nothing was enqueued,
+  and it clears as the caller's own queued requests finish.
 - `RouterRunResult.credits_used` — what Comfy Router reported a run cost, lifted from the
   `X-Comfy-Credits-Used` response header onto what `models.run_detailed()` returns. It is a
   price rather than a settled ledger entry, absent means "not reported" and never "free", and
