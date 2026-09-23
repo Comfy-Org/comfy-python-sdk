@@ -294,11 +294,14 @@ _CONTRACT_HEADER_LIFTS = {
     "dropped_params": "X-Comfy-Router-Dropped-Params",
     "replayed": "Idempotent-Replayed",
     "request_id": "X-Comfy-Request-Id",
+    "credits_used": "X-Comfy-Credits-Used",
 }
 
 #: Lifted by the SDK but NOT declared on the contract's 200 -- see the tripwire
-#: test at the bottom of this file.
-_UNDECLARED_HEADER_LIFTS = {"credits_used": "X-Comfy-Credits-Used"}
+#: test at the bottom of this file. Empty today: every lift the SDK reads is now
+#: declared by the vendored contract and pinned in ``_CONTRACT_HEADER_LIFTS``.
+#: A future sync that adds a lift ahead of its spec declaration goes here.
+_UNDECLARED_HEADER_LIFTS: dict[str, str] = {}
 
 
 def _declared_run_response_headers() -> set[str]:
@@ -332,8 +335,14 @@ def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> N
     is a restatement otherwise, and a restatement would pass the sync it exists
     to fail.
     """
+    # `"1"` rather than a placeholder like `"x"`: the sentinel has to be
+    # distinguishing for every lift, and `credits_used` drops any value that is
+    # not a finite decimal (see `_credits_used`), so a non-numeric sentinel
+    # would read back as `None` for it -- absent both ways, failing this test
+    # for a lift that is in fact wired correctly. `"1"` survives that normalise
+    # and is still != the default for the string, tuple, and bool lifts.
     absent = getattr(_run_result({}, {}), field)
-    present = getattr(_run_result({}, {header: "x"}), field)
+    present = getattr(_run_result({}, {header: "1"}), field)
     assert present != absent, (
         f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
         f"the header and without it, so the lift is reading some other name."
