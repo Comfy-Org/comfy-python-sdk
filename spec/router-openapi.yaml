@@ -219,6 +219,8 @@ paths:
       parameters:
       - $ref: '#/components/parameters/RouterProvider'
       - $ref: '#/components/parameters/RouterModel'
+      - $ref: '#/components/parameters/ModelProvider'
+      - $ref: '#/components/parameters/StrictMode'
       - $ref: '#/components/parameters/RouterIdempotencyKey'
       requestBody:
         required: true
@@ -414,6 +416,9 @@ components:
           description: Human-readable description of the failure, safe to surface to an end user. Not machine-parsed - branch on `error_type` instead.
         error_type:
           $ref: '#/components/schemas/RouterErrorType'
+        upstream_detail:
+          type: string
+          description: A bounded, sanitized reason the model provider gave for rejecting the request, present only when `error_type` is `invalid_input` and `X-Comfy-Upstream-Status` is a provider `4xx` - i.e. the provider refused the request as malformed and said why. Absent on every other failure, including provider `5xx`, transport failures, content-policy refusals and any refusal Router raised about itself. It mirrors the `X-Comfy-Upstream-Detail` header.
       required:
       - detail
       - error_type
@@ -817,6 +822,8 @@ components:
           $ref: '#/components/headers/RouterRequestIdHeader'
         X-Comfy-Upstream-Status:
           $ref: '#/components/headers/RouterUpstreamStatusHeader'
+        X-Comfy-Upstream-Detail:
+          $ref: '#/components/headers/RouterUpstreamDetailHeader'
         Idempotent-Replayed:
           $ref: '#/components/headers/RouterIdempotentReplayedHeader'
       content:
@@ -835,7 +842,7 @@ components:
       name: model_provider
       in: query
       required: false
-      description: 'Selects an alternate provider for this model, instead of its current default. Omitted, or `default`, is byte-for-byte today''s behavior. A value naming a real provider that does not serve this model is refused `404` with `error_type: model_not_found` - the same bucket an unknown model ID itself uses; an unrecognized value (not a real, registered provider at all) is refused `400` with `error_type: invalid_input`. Router''s error_type set is closed (see the Router error contract note above); it carries neither a `provider_not_available` nor a `validation_error` bucket.'
+      description: 'Selects an alternate provider for this model, instead of its current default. Omitted, `default`, `comfy`, or `comfyui` are all byte-for-byte today''s behavior - Comfy Router is never itself a serving backend, so these name no override rather than a fifth provider. A value naming a real provider that does not serve this model is refused `404` with `error_type: model_not_found` - the same bucket an unknown model ID itself uses; an unrecognized value (not a real, registered provider at all) is refused `400` with `error_type: invalid_input`. Router''s error_type set is closed (see the Router error contract note above); it carries neither a `provider_not_available` nor a `validation_error` bucket.'
       schema:
         type: string
     RouterCatalogCursor:
@@ -987,6 +994,12 @@ components:
       schema:
         type: string
         example: '"6b8c1f2e0a9d4c3b5e7f8a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f"'
+    RouterUpstreamDetailHeader:
+      description: A bounded, sanitized reason the model provider gave for rejecting the request. Present only when `error_type` is `invalid_input` and `X-Comfy-Upstream-Status` is a provider `4xx`; absent otherwise - so branch on its presence. Mirrors `RouterErrorResponse.upstream_detail`.
+      required: false
+      schema:
+        type: string
+        example: expected the height to be at least 300px, but received a 445x283px image instead
     RouterUpstreamStatusHeader:
       description: 'The model provider''s own HTTP status for this call. Present only when the failure came from the provider, and absent whenever Comfy Router refused the call itself - so branch on its presence: present means the request left Comfy, reached the provider, and the provider''s answer is what produced this response''s `error_type`.'
       required: false
