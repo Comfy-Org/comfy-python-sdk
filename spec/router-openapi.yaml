@@ -95,7 +95,7 @@ paths:
       - $ref: '#/components/parameters/FallbackProvider'
       requestBody:
         required: true
-        description: The partner model's native JSON input. Without `model_provider`, or with `strict_mode=true`, forwarded to the provider unchanged - under `strict_mode=true` the body must already be the alternate provider's own real schema, not this model's native one (see `strict_mode`). With `model_provider` selecting an alternate provider and `strict_mode=false` (the default), the body is translated into that provider's real schema before it is sent - any native field that cannot be expressed exactly is dropped and disclosed via the response's `X-Comfy-Router-Dropped-Params` header, never silently.
+        description: 'The partner model''s native JSON input. Without `model_provider` the request runs native dispatch on the model''s default provider and this body is the model''s own native schema, forwarded unchanged (`strict_mode` is meaningless there and changes nothing). With `model_provider` selecting an alternate provider and `strict_mode=false` (the default), the body is translated into that provider''s real schema before it is sent - any native field that cannot be expressed exactly is dropped and disclosed via the response''s `X-Comfy-Router-Dropped-Params` header, never silently. With `model_provider` selecting an alternate provider and `strict_mode=true` no translation runs: the body must already be that alternate provider''s own real schema, not this model''s native one (see `strict_mode`), and is forwarded unchanged. The body''s own fields also select which operation Router runs on a model that supports more than one: for an editable image model, including an input image switches it from text-to-image to the image-to-image (edit) operation; for a Seedance video model, a first-frame image selects image-to-video and a reference image or clip selects reference-to-video. Each conditioned operation is metered on its own rate, not the base text-to-image or text-to-video rate.'
         content:
           application/json:
             schema:
@@ -219,10 +219,12 @@ paths:
       parameters:
       - $ref: '#/components/parameters/RouterProvider'
       - $ref: '#/components/parameters/RouterModel'
+      - $ref: '#/components/parameters/ModelProvider'
+      - $ref: '#/components/parameters/StrictMode'
       - $ref: '#/components/parameters/RouterIdempotencyKey'
       requestBody:
         required: true
-        description: The partner model's native JSON input, identical to the body the synchronous route accepts for this model. Validated against the model's own input schema before the run is admitted, so a body the model would reject is a `422` here rather than a queued request that fails minutes later.
+        description: 'The partner model''s native JSON input, identical to the body the synchronous route accepts for this model, and it selects the operation and is metered the same way: the body''s own fields choose which operation Router runs on a model that supports more than one (an input image switches an editable image model to image-to-image; a Seedance first-frame image selects image-to-video and a reference image or clip selects reference-to-video), and each conditioned operation is metered on its own rate, not the base text-to-image or text-to-video rate. The same provider-selection contract applies at dispatch: without `model_provider`, or with `model_provider` and `strict_mode=false` (the default), the body is the model''s native document and is validated against the model''s own input schema before the run is admitted, so a body the model would reject is a `422` here rather than a queued request that fails minutes later - a non-strict alternate-provider body is additionally translated into that provider''s real schema at dispatch. With `strict_mode=true` the body must already be the alternate provider''s own schema and is forwarded unchanged: native-schema validation is skipped, exactly as on the synchronous route (see `model_provider` and `strict_mode`).'
         content:
           application/json:
             schema:
@@ -414,6 +416,9 @@ components:
           description: Human-readable description of the failure, safe to surface to an end user. Not machine-parsed - branch on `error_type` instead.
         error_type:
           $ref: '#/components/schemas/RouterErrorType'
+        upstream_detail:
+          type: string
+          description: A bounded, sanitized reason the model provider gave for rejecting the request, present only when `error_type` is `invalid_input` and `X-Comfy-Upstream-Status` is a provider `4xx` - i.e. the provider refused the request as malformed and said why. Absent on every other failure, including provider `5xx`, transport failures, content-policy refusals and any refusal Router raised about itself. It mirrors the `X-Comfy-Upstream-Detail` header.
       required:
       - detail
       - error_type
@@ -817,6 +822,8 @@ components:
           $ref: '#/components/headers/RouterRequestIdHeader'
         X-Comfy-Upstream-Status:
           $ref: '#/components/headers/RouterUpstreamStatusHeader'
+        X-Comfy-Upstream-Detail:
+          $ref: '#/components/headers/RouterUpstreamDetailHeader'
         Idempotent-Replayed:
           $ref: '#/components/headers/RouterIdempotentReplayedHeader'
       content:
@@ -828,14 +835,14 @@ components:
       name: fallback_provider
       in: query
       required: false
-      description: 'Controls whether Router retries this call against the model''s other registered provider when the first attempt fails for a reason attributable to Router''s own side or to the specific provider tried - never for a reason attributable to the request itself (an unretried failure is refused exactly as it always was). Omitted, or any value other than `false`, turns fallback on (the default) and Router uses the one alternate the model has today. `false` turns fallback off: a failure is refused, never retried. A successful fallback response carries the `X-Comfy-Router-Fallback-Provider` header, naming the provider that served it; a fallback attempt that itself also fails does not carry the header, and no case retries a generation that may already have been submitted to a provider.'
+      description: 'Controls whether Router retries this call against the model''s other registered provider when the first attempt fails for a reason attributable to Router''s own side or to the specific provider tried - never for a reason attributable to the request itself (an unretried failure is refused exactly as it always was). Omitted, or any value other than `false`, turns fallback on (the default) and Router uses the one alternate the model has today. `false` turns fallback off: a failure is refused, never retried. Fallback also turns itself off, regardless of this parameter, when the request carries a caller-supplied provider credential, when the body is `multipart/form-data`, or when `strict_mode=true` - each binds the call to one specific provider and cannot be faithfully replayed against another. A successful fallback response carries the `X-Comfy-Router-Fallback-Provider` header, naming the provider that served it; a fallback attempt that itself also fails does not carry the header, and no case retries a generation that may already have been submitted to a provider.'
       schema:
         type: string
     ModelProvider:
       name: model_provider
       in: query
       required: false
-      description: 'Selects an alternate provider for this model, instead of its current default. Omitted, or `default`, is byte-for-byte today''s behavior. A value naming a real provider that does not serve this model is refused `404` with `error_type: model_not_found` - the same bucket an unknown model ID itself uses; an unrecognized value (not a real, registered provider at all) is refused `400` with `error_type: invalid_input`. Router''s error_type set is closed (see the Router error contract note above); it carries neither a `provider_not_available` nor a `validation_error` bucket.'
+      description: 'Selects an alternate provider to serve this model, instead of its current default. Omitting it runs native dispatch on the model''s own default provider; `default`, `comfy`, and `comfyui` are aliases for that same native behavior and name no override, because Comfy Router is never itself a serving backend. The alternate providers Router can retarget a model onto are `fal`, `wavespeed`, `runware`, and `higgsfield`; which of them a given model supports is reported by `GET /v2/models/{provider}/{model}`. A value naming a real provider that does not serve this model is refused `404` with `error_type: model_not_found` - the same bucket an unknown model ID itself uses; a value that is not a registered provider at all is refused `400` with `error_type: invalid_input`. When an alternate provider is selected, the native request body is translated into that provider''s real schema unless `strict_mode=true`; see `strict_mode` and `fallback_provider`. Router defines no `provider_not_available` or `validation_error` `error_type`: these conditions fold onto the buckets named above (`invalid_input` and `model_not_found`). The `error_type` set can still grow, so treat any value you do not recognize as `internal_error` rather than switching exhaustively.'
       schema:
         type: string
     RouterCatalogCursor:
@@ -889,7 +896,7 @@ components:
       name: strict_mode
       in: query
       required: false
-      description: 'Only meaningful together with `model_provider`. `false` (the default): the request body must be this model''s own native contract, translated to the alternate provider''s real schema - any native field that cannot be expressed exactly is dropped and disclosed via the response''s `X-Comfy-Router-Dropped-Params` header, never silently. `true`: the body must already be the alternate provider''s own real schema, passed through unmodified in both directions - no translation, so the header is never sent.'
+      description: 'Only meaningful together with `model_provider`. `false` (the default): the request body must be this model''s own native contract, translated to the alternate provider''s real schema - any native field that cannot be expressed exactly is dropped and disclosed via the response''s `X-Comfy-Router-Dropped-Params` header, never silently. `true`: the body must already be the alternate provider''s own real schema, passed through unmodified in both directions - no translation, so `X-Comfy-Router-Dropped-Params` is never sent, and provider fallback is disabled for the call because a body shaped for one provider cannot be replayed against another (see `fallback_provider`).'
       schema:
         type: boolean
         default: false
@@ -987,6 +994,12 @@ components:
       schema:
         type: string
         example: '"6b8c1f2e0a9d4c3b5e7f8a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f"'
+    RouterUpstreamDetailHeader:
+      description: A bounded, sanitized reason the model provider gave for rejecting the request. Present only when `error_type` is `invalid_input` and `X-Comfy-Upstream-Status` is a provider `4xx`; absent otherwise - so branch on its presence. Mirrors `RouterErrorResponse.upstream_detail`.
+      required: false
+      schema:
+        type: string
+        example: expected the height to be at least 300px, but received a 445x283px image instead
     RouterUpstreamStatusHeader:
       description: 'The model provider''s own HTTP status for this call. Present only when the failure came from the provider, and absent whenever Comfy Router refused the call itself - so branch on its presence: present means the request left Comfy, reached the provider, and the provider''s answer is what produced this response''s `error_type`.'
       required: false
