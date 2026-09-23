@@ -522,6 +522,22 @@ class RequestNotFound(RouterError):
     _spec_meaning_digest: str = "385112b3cdcf"
 
 
+class QueueBacklogFull(RouterError):
+    """The caller already has too many queued requests waiting, so this submit
+    was refused.
+
+    It shares ``429`` with :class:`ConcurrencyLimitExceeded` and
+    :class:`RateLimited` and is neither: the queue accepts a submit at the
+    concurrency limit and parks it, and this is the separate bound on how many a
+    caller may leave waiting so that parking cannot mean enqueuing without end.
+    Nothing was enqueued. It clears as the caller's own queued requests finish,
+    so retry once some of them complete.
+    """
+
+    error_type = "queue_backlog_full"
+    _spec_meaning_digest: str = "50745ff63044"
+
+
 # -- cancel refusals ---------------------------------------------------------
 #
 # Deliberately OUTSIDE the closed set below, and carrying no
@@ -613,6 +629,7 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     Cancelled,
     QueueTimeout,
     RequestNotFound,
+    QueueBacklogFull,
 )
 
 _BY_ERROR_TYPE: dict[str, type[RouterError]] = {cls.error_type: cls for cls in ROUTER_EXCEPTIONS}
@@ -886,6 +903,7 @@ __all__ = [
     "NotEnabled",
     "ProviderError",
     "ProviderTimeout",
+    "QueueBacklogFull",
     "QueueTimeout",
     "RateLimited",
     "RequestNotFound",
