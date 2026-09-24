@@ -150,6 +150,7 @@ the effort — several past releases were verified that way.
   the signing phrase on their PR. Only the PR author needs to sign.
 - **Review.** `.github/CODEOWNERS` requires an approving review from
   `@Comfy-Org/comfy-cloud-team` or `@Comfy-Org/core-engine-team` on every PR.
+  Certain Public API changes require approval from a more narrow user group.
 - **Update `CHANGELOG.md`.** Add a bullet under `## [Unreleased]` describing the
   user-visible change. Purely internal changes (CI, refactors with no API
   effect) do not need an entry.
