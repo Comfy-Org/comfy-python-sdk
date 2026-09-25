@@ -40,6 +40,29 @@ def clean_request_id(raw: Any) -> str | None:
     return match.group(0) if match else None
 
 
+#: What a ``refusal_subject`` may look like: one short snake-case-ish token.
+#: Every documented value (``input``, ``output_image``, ...) fits, and so does
+#: any subject the Router adds later in the same style.
+_REFUSAL_SUBJECT_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def clean_refusal_subject(raw: Any) -> str | None:
+    """``raw`` as a bounded, printable refusal subject, or ``None``.
+
+    Shared for the reason :func:`clean_request_id` is: the header is read by
+    both error surfaces and lands on a displayed attribute on each. Unlike the
+    id this is a *full* match, not a prefix one -- a duplicated header that
+    httpx joined into ``"input_image, output_text"`` names two subjects, and
+    keeping the first would state one of them as the answer, so it reads as
+    undisclosed instead. An unknown-but-well-formed value still passes; this
+    bounds the shape, it does not narrow to the documented list.
+    """
+    if not isinstance(raw, str):
+        return None
+    candidate = raw.strip()
+    return candidate if _REFUSAL_SUBJECT_RE.fullmatch(candidate) else None
+
+
 #: Longest body excerpt kept on an exception. Long enough for the one-line
 #: reason an intermediary states (``no healthy upstream``, ``upstream connect
 #: error or disconnect/reset before headers``), short enough that an HTML error
@@ -500,7 +523,7 @@ def error_from_envelope(
         (body or {}).get("error_type") if isinstance(body, dict) else None
     )
     # Header first, then body -- the same order the bucket is read in.
-    subject = _clean(refusal_subject) or _clean(
+    subject = clean_refusal_subject(refusal_subject) or clean_refusal_subject(
         (body or {}).get("refusal_subject") if isinstance(body, dict) else None
     )
     if code is None:

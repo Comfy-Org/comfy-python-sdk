@@ -100,7 +100,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from comfy_low.errors import _location, clean_request_id, summarise_detail
+from comfy_low.errors import (
+    _location,
+    clean_refusal_subject,
+    clean_request_id,
+    summarise_detail,
+)
 
 from ._errors import ComfyError
 
@@ -127,7 +132,8 @@ REQUEST_ID_HEADER = "X-Comfy-Request-Id"
 RETRY_AFTER_HEADER = "Retry-After"
 
 #: Response header naming *which* input or output a
-#: :class:`ContentPolicyViolation` refused -- one of :data:`REFUSAL_SUBJECTS`.
+#: :class:`ContentPolicyViolation` refused -- typically one of
+#: :data:`REFUSAL_SUBJECTS`, though never narrowed to it.
 #: The body repeats it as ``refusal_subject``; the header is read first, the
 #: same precedence :data:`ERROR_TYPE_HEADER` gets over the body's
 #: ``error_type``.
@@ -267,7 +273,9 @@ class RouterError(ComfyError):
         #: whenever the response did not say. It is the raw wire value, never
         #: narrowed to :data:`REFUSAL_SUBJECTS`: a subject the Router adds after
         #: this SDK version was built reaches the caller as sent, the same
-        #: policy ``error_type`` follows. Named ``refusalSubject`` in the
+        #: policy ``error_type`` follows. It is bounded to one short printable
+        #: token, though, so a hostile or duplicated header reads as ``None``
+        #: rather than landing in a log line verbatim. Named ``refusalSubject`` in the
         #: TypeScript SDK, per the cross-SDK naming rule.
         self.refusal_subject = refusal_subject
 
@@ -743,7 +751,7 @@ def error_from_response(
     request_id = clean_request_id(lowered.get(REQUEST_ID_HEADER.lower()))
     error_type = _clean(lowered.get(ERROR_TYPE_HEADER.lower()))
     retry_after = _retry_after(lowered.get(RETRY_AFTER_HEADER.lower()))
-    refusal_subject = _clean(lowered.get(REFUSAL_SUBJECT_HEADER.lower()))
+    refusal_subject = clean_refusal_subject(lowered.get(REFUSAL_SUBJECT_HEADER.lower()))
 
     detail: str | None = None
     errors: tuple[ValidationErrorDetail, ...] = ()
@@ -761,7 +769,7 @@ def error_from_response(
         if error_type is None:
             error_type = _clean(body.get("error_type"))
         if refusal_subject is None:
-            refusal_subject = _clean(body.get("refusal_subject"))
+            refusal_subject = clean_refusal_subject(body.get("refusal_subject"))
 
     if error_type is None:
         error_type = _ERROR_TYPE_BY_STATUS.get(http_status)
@@ -837,9 +845,10 @@ def error_from_completion(
         request_id=clean_request_id(request_id),
         retry_after=retry_after,
         errors=errors,
-        # A completion has no headers of its own, so the body is the only
-        # place the subject can ride.
-        refusal_subject=_clean(payload.get("refusal_subject")),
+        # Body only: the poll and result responses do carry headers, but only
+        # the completion body is handed down to here, so a subject disclosed
+        # solely on `X-Comfy-Refusal-Subject` reads as `None` on this path.
+        refusal_subject=clean_refusal_subject(payload.get("refusal_subject")),
     )
 
 
