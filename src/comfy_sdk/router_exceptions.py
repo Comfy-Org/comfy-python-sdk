@@ -126,6 +126,31 @@ REQUEST_ID_HEADER = "X-Comfy-Request-Id"
 #: silent no-op.
 RETRY_AFTER_HEADER = "Retry-After"
 
+#: Response header naming *which* input or output a
+#: :class:`ContentPolicyViolation` refused -- one of :data:`REFUSAL_SUBJECTS`.
+#: The body repeats it as ``refusal_subject``; the header is read first, the
+#: same precedence :data:`ERROR_TYPE_HEADER` gets over the body's
+#: ``error_type``.
+REFUSAL_SUBJECT_HEADER = "X-Comfy-Refusal-Subject"
+
+#: The ``refusal_subject`` values the Router documents, coarse (``input``,
+#: ``output``) first and then per modality. Informational, not a filter:
+#: :attr:`RouterError.refusal_subject` carries whatever the server sent,
+#: including a value this SDK version does not list, for the same
+#: forward-compatibility reason an unknown ``error_type`` still raises.
+REFUSAL_SUBJECTS: tuple[str, ...] = (
+    "input",
+    "output",
+    "input_text",
+    "input_image",
+    "input_video",
+    "input_audio",
+    "output_text",
+    "output_image",
+    "output_video",
+    "output_audio",
+)
+
 
 def _meaning_digest(meaning: str) -> str:
     """First 12 hex of sha256 of the whitespace-normalized spec prose.
@@ -211,6 +236,7 @@ class RouterError(ComfyError):
         request_id: str | None = None,
         retry_after: int | None = None,
         errors: Sequence[ValidationErrorDetail] = (),
+        refusal_subject: str | None = None,
     ) -> None:
         resolved = error_type if error_type is not None else self.error_type
         super().__init__(detail, code=resolved or None, http_status=http_status, details=details)
@@ -235,6 +261,15 @@ class RouterError(ComfyError):
         #: carries is read off the header, so the entries have to survive
         #: whichever bucket that turns out to be.
         self.errors: tuple[ValidationErrorDetail, ...] = tuple(errors)
+        #: Which input or output the refusal was about, from
+        #: ``X-Comfy-Refusal-Subject`` or else the body's ``refusal_subject`` --
+        #: in practice set only on :class:`ContentPolicyViolation`, and ``None``
+        #: whenever the response did not say. It is the raw wire value, never
+        #: narrowed to :data:`REFUSAL_SUBJECTS`: a subject the Router adds after
+        #: this SDK version was built reaches the caller as sent, the same
+        #: policy ``error_type`` follows. Named ``refusalSubject`` in the
+        #: TypeScript SDK, per the cross-SDK naming rule.
+        self.refusal_subject = refusal_subject
 
 
 # Each class below carries two lines of contract under its docstring:
@@ -271,6 +306,9 @@ class ContentPolicyViolation(RouterError):
     Deterministic: the same input will be refused again, so this is never a
     retry candidate. It is deliberately not a :class:`ProviderError` -- the two
     differ in whether a retry can ever succeed.
+
+    :attr:`~RouterError.refusal_subject` names which input or output tripped
+    the policy, when the Router disclosed it.
     """
 
     error_type = "content_policy_violation"
@@ -690,6 +728,8 @@ def error_from_response(
     HTML error page from an intermediary, an empty 502). The bucket is read from
     ``X-Comfy-Error-Type`` first and from the body's ``error_type`` second,
     because the per-field validation body carries no ``error_type`` of its own.
+    ``refusal_subject`` follows the same order: ``X-Comfy-Refusal-Subject``,
+    then the body's ``refusal_subject``.
 
     This never raises. A malformed or unrecognised body degrades to the most
     specific exception the response still supports -- worst case a bare
@@ -703,6 +743,7 @@ def error_from_response(
     request_id = clean_request_id(lowered.get(REQUEST_ID_HEADER.lower()))
     error_type = _clean(lowered.get(ERROR_TYPE_HEADER.lower()))
     retry_after = _retry_after(lowered.get(RETRY_AFTER_HEADER.lower()))
+    refusal_subject = _clean(lowered.get(REFUSAL_SUBJECT_HEADER.lower()))
 
     detail: str | None = None
     errors: tuple[ValidationErrorDetail, ...] = ()
@@ -719,6 +760,8 @@ def error_from_response(
             detail = summarise_detail(raw_detail)
         if error_type is None:
             error_type = _clean(body.get("error_type"))
+        if refusal_subject is None:
+            refusal_subject = _clean(body.get("refusal_subject"))
 
     if error_type is None:
         error_type = _ERROR_TYPE_BY_STATUS.get(http_status)
@@ -733,6 +776,7 @@ def error_from_response(
         request_id=request_id,
         retry_after=retry_after,
         errors=errors,
+        refusal_subject=refusal_subject,
     )
 
 
@@ -793,6 +837,9 @@ def error_from_completion(
         request_id=clean_request_id(request_id),
         retry_after=retry_after,
         errors=errors,
+        # A completion has no headers of its own, so the body is the only
+        # place the subject can ride.
+        refusal_subject=_clean(payload.get("refusal_subject")),
     )
 
 
@@ -866,6 +913,8 @@ def _detail_from(entry: Mapping[str, Any]) -> ValidationErrorDetail:
 __all__ = [
     "CANCEL_REFUSALS",
     "ERROR_TYPE_HEADER",
+    "REFUSAL_SUBJECTS",
+    "REFUSAL_SUBJECT_HEADER",
     "REQUEST_ID_HEADER",
     "RETRY_AFTER_HEADER",
     "ROUTER_ERROR_TYPES",

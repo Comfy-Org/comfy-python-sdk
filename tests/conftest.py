@@ -174,6 +174,11 @@ class ServerState:
     # fronted by Router, so this is the shape a real deployment's 504 arrives
     # in, and the bucket-keyed collect rule has to read it.
     model_run_router_error_shape: bool = False
+    # Extra response headers and extra top-level body fields on a failed run in
+    # Router's shape (`model_run_router_error_shape`) -- the refusal-subject
+    # disclosure rides here (`X-Comfy-Refusal-Subject` / `refusal_subject`).
+    model_run_error_headers: dict[str, str] = field(default_factory=dict)
+    model_run_error_body_extra: dict[str, Any] = field(default_factory=dict)
     # Answer the model run with Router's *per-field* validation failure: a
     # `422` whose body is `{"detail": [...]}` -- this list, verbatim -- with the
     # coarse bucket on `X-Comfy-Error-Type` and no `error_type` in the body,
@@ -907,8 +912,11 @@ def _make_handler(state: ServerState):
                     # retry rules have to survive this shape too, and nothing
                     # exercised it while the stub only ever spoke the envelope.
                     headers["X-Comfy-Error-Type"] = code
+                    headers.update(state.model_run_error_headers)
                     self._json(
-                        status, {"detail": message, "error_type": code}, headers=headers or None
+                        status,
+                        {"detail": message, "error_type": code, **state.model_run_error_body_extra},
+                        headers=headers or None,
                     )
                     return
                 self._json(
