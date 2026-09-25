@@ -109,6 +109,7 @@ class ApiError(Exception):
         body_excerpt: str | None = None,
         error_type: str | None = None,
         validation_errors: Sequence[Mapping[str, Any]] = (),
+        refusal_subject: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -158,6 +159,14 @@ class ApiError(Exception):
         #: so ``code`` is *set from* the bucket whenever there is one. A
         #: response carrying both would be a shape neither contract defines.
         self.error_type = error_type
+        #: Which input or output a Router ``content_policy_violation`` refused
+        #: -- ``X-Comfy-Refusal-Subject``, or the body's top-level
+        #: ``refusal_subject`` -- or ``None`` when the response named none. The
+        #: raw wire value, carried up for ``comfy_sdk.exceptions.to_sdk_error``
+        #: to put on ``RouterError.refusal_subject``; like
+        #: :attr:`validation_errors`, this attribute is the carrier, not the
+        #: surface.
+        self.refusal_subject = refusal_subject
         #: Server-minted id for the call, read off ``X-Comfy-Request-Id``.
         #: ``None`` when the response carried no such header. Surfaced the same
         #: way ``retry_after`` is — a response header kept on the exception,
@@ -407,6 +416,7 @@ def error_from_envelope(
     request_id: str | None = None,
     error_type: str | None = None,
     body_excerpt: str | None = None,
+    refusal_subject: str | None = None,
 ) -> ApiError:
     """Build the typed exception for an error response.
 
@@ -489,6 +499,10 @@ def error_from_envelope(
     bucket = _clean(error_type) or _clean(
         (body or {}).get("error_type") if isinstance(body, dict) else None
     )
+    # Header first, then body -- the same order the bucket is read in.
+    subject = _clean(refusal_subject) or _clean(
+        (body or {}).get("refusal_subject") if isinstance(body, dict) else None
+    )
     if code is None:
         code = bucket
     if code is None:
@@ -547,6 +561,7 @@ def error_from_envelope(
         body_excerpt=body_excerpt,
         error_type=bucket,
         validation_errors=validation_errors,
+        refusal_subject=subject,
     )
 
 
