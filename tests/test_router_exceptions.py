@@ -647,6 +647,41 @@ def test_an_unknown_refusal_subject_passes_through_unnarrowed() -> None:
     assert from_body.refusal_subject == "input_3d_mesh"
 
 
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "input_image, output_text",  # httpx's join of a duplicated header
+        "input\x1b[31m",
+        "input\nX-Injected: 1",
+        "input_\u202eegami",
+        "x" * 65,
+    ],
+    ids=["duplicated", "ansi", "newline", "bidi", "overlong"],
+)
+def test_a_malformed_refusal_subject_reads_as_undisclosed(hostile: str) -> None:
+    # Server-controlled text headed for a displayed attribute: bounded to one
+    # printable token, and dropped rather than truncated when it is not one.
+    from_header = error_from_response(
+        400,
+        {ERROR_TYPE_HEADER: "content_policy_violation", REFUSAL_SUBJECT_HEADER: hostile},
+        REFUSED_BODY,
+    )
+    from_body = error_from_response(400, {}, {**REFUSED_BODY, "refusal_subject": hostile})
+    from_completion = error_from_completion({**REFUSED_BODY, "refusal_subject": hostile})
+    assert from_header.refusal_subject is None
+    assert from_body.refusal_subject is None
+    assert from_completion is not None and from_completion.refusal_subject is None
+
+
+def test_a_malformed_refusal_subject_header_falls_back_to_the_body() -> None:
+    exc = error_from_response(
+        400,
+        {REFUSAL_SUBJECT_HEADER: "input_image, output_text"},
+        {**REFUSED_BODY, "refusal_subject": "input_image"},
+    )
+    assert exc.refusal_subject == "input_image"
+
+
 def test_the_422_validation_shape_never_carries_a_refusal_subject() -> None:
     exc = error_from_response(422, {ERROR_TYPE_HEADER: "invalid_input"}, VALIDATION_BODY)
     assert type(exc) is InvalidInput
@@ -689,8 +724,9 @@ def _refuse(server: Any, *, header: str | None, body: str | None) -> None:
         ("input_image", "output_image", "input_image"),
         (None, "output_text", "output_text"),
         (None, None, None),
+        ("input\x1b[31m", None, None),
     ],
-    ids=["header-wins", "body-only", "absent"],
+    ids=["header-wins", "body-only", "absent", "hostile-header"],
 )
 def test_models_run_carries_the_refusal_subject(server, header, body, expected) -> None:
     from comfy_sdk import Comfy

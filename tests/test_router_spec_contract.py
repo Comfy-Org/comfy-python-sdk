@@ -364,3 +364,23 @@ def test_an_undeclared_lift_stays_undeclared_until_someone_reconciles_it(
         f"the vendored spec now declares {header!r}: move {field!r} from "
         f"_UNDECLARED_HEADER_LIFTS into _CONTRACT_HEADER_LIFTS so it is pinned."
     )
+
+
+def test_the_refusal_subject_stays_undeclared_until_someone_reconciles_it() -> None:
+    """Tripwire for ``RouterError.refusal_subject`` / ``REFUSAL_SUBJECTS``.
+
+    The SDK reads ``X-Comfy-Refusal-Subject`` and the body's
+    ``refusal_subject``, and lists the documented values in
+    ``REFUSAL_SUBJECTS``, but the vendored contract names none of them -- so
+    nothing pins that list the way ``ROUTER_ERROR_TYPES`` is pinned. This fails
+    the moment a spec sync mentions either name, which is the signal to
+    reconcile the header name, the body field and the value list against what
+    the contract then says, and replace this with a real pin.
+    """
+    text = ROUTER_SPEC.read_text(encoding="utf-8")
+    for name in ("X-Comfy-Refusal-Subject", "refusal_subject"):
+        assert name not in text, (
+            f"the vendored Router spec now mentions {name!r}: reconcile "
+            f"comfy_sdk.router_exceptions.REFUSAL_SUBJECT_HEADER / REFUSAL_SUBJECTS against "
+            f"it and pin them here."
+        )
