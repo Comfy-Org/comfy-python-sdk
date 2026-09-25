@@ -541,6 +541,9 @@ class _Prepared:
             # object and still not an envelope. For such a response the text is
             # the only statement of the cause it made.
             body_excerpt=_body_excerpt(resp),
+            # Which input or output a content-policy refusal was about; the
+            # body may repeat it, and `error_from_envelope` falls back to that.
+            refusal_subject=resp.headers.get("X-Comfy-Refusal-Subject"),
         )
 
 

@@ -21,6 +21,12 @@ the fuller account of each version, including verification notes.
   with `", "`), `NaN`/`Infinity` — reports as `None` rather than passing through to break the
   `Decimal()` parse the field documents. The field defaults to `None`, so this stays additive
   for anything that constructs a `RouterRunResult` by hand.
+- `RouterError.refusal_subject` — which input or output a `ContentPolicyViolation` refused
+  (`input_image`, `output_text`, ...), read from the `X-Comfy-Refusal-Subject` response header
+  and falling back to the body's `refusal_subject`. It is the raw wire value, never narrowed:
+  `comfy_sdk.router_exceptions.REFUSAL_SUBJECTS` lists the ten documented values, and one this
+  version does not list still passes through. `None` when the Router did not say. Populated on
+  `models.run`, on `error_from_response`, and on a refused queued completion.
 
 ### Fixed
 
