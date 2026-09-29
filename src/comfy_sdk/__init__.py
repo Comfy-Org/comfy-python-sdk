@@ -82,6 +82,7 @@ try:
 except PackageNotFoundError:  # running from a source tree, not installed
     __version__ = "0+unknown"
 
+from .model_catalog import AsyncModelList, CatalogModel, ModelList, ModelPage, SchemaResult
 from .models import RouterRunResult
 
 __all__ = [
@@ -95,6 +96,12 @@ __all__ = [
     "AsyncComfy",
     # model runs
     "RouterRunResult",
+    # model discovery
+    "CatalogModel",
+    "ModelList",
+    "AsyncModelList",
+    "ModelPage",
+    "SchemaResult",
     # assets / workflows / jobs / outputs
     "Asset",
     "AsyncAsset",

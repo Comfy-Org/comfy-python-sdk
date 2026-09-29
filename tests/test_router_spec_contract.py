@@ -12,7 +12,9 @@ restated here:
   ``post.operationId`` is ``runRouterModel``, and the ``servers[0].url`` it is
   addressed against -- compared against
   :data:`comfy_low.transport._MODEL_RUN_PATH_TEMPLATE` and
-  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL`.
+  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL` -- and, the same way, the two
+  discovery routes ``models.list()`` / ``models.schema()`` read, by their
+  ``get.operationId`` (``listRouterModels``, ``getRouterModelInputSchema``).
 
 Neither is generated, so a Router spec sync is the moment they can drift. The
 failures guarded against are a sync landing a new bucket that then reaches
@@ -36,7 +38,12 @@ from typing import Any
 import pytest
 import yaml
 
-from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE
+from comfy_low.transport import (
+    _MODEL_CATALOG_PATH,
+    _MODEL_RUN_PATH_TEMPLATE,
+    _MODEL_SCHEMA_PATH_TEMPLATE,
+    model_catalog_path,
+)
 from comfy_sdk import COMFY_ROUTER_BASE_URL
 from comfy_sdk.models import _run_result
 from comfy_sdk.router_exceptions import (
@@ -263,6 +270,51 @@ def test_run_path_matches_vendored_spec() -> None:
         f"the vendored spec's servers[0].url is {declared_host!r} and the SDK defaults to "
         f"{COMFY_ROUTER_BASE_URL!r} -- update comfy_low.transport.ROUTER_BASE_URL"
     )
+
+
+def _declared_get_paths(operation_id: str) -> list[str]:
+    """Every path whose ``get.operationId`` is ``operation_id``, in spec order."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    return [
+        path
+        for path, item in (doc.get("paths") or {}).items()
+        if isinstance(item, dict)
+        and isinstance(item.get("get"), dict)
+        and item["get"].get("operationId") == operation_id
+    ]
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "bound", "constant"),
+    [
+        ("listRouterModels", _MODEL_CATALOG_PATH, "_MODEL_CATALOG_PATH"),
+        ("getRouterModelInputSchema", _MODEL_SCHEMA_PATH_TEMPLATE, "_MODEL_SCHEMA_PATH_TEMPLATE"),
+    ],
+)
+def test_the_discovery_routes_match_the_vendored_spec(
+    operation_id: str, bound: str, constant: str
+) -> None:
+    # `models.list()` / `models.schema()` are hand-bound exactly as the run
+    # route is, so a sync that moves either route has to fail here rather than
+    # ship an SDK that GETs a path the server no longer serves.
+    declared = _declared_get_paths(operation_id)
+    assert declared == [bound], (
+        f"the vendored spec declares {operation_id} at {declared} and the SDK reads "
+        f"{bound!r} -- update comfy_low.transport.{constant}"
+    )
+
+
+def test_the_catalog_query_parameters_are_the_ones_the_spec_declares() -> None:
+    # `model_catalog_path` sends `cursor` and `limit` by name; a sync renaming
+    # either would otherwise be silently ignored by the server.
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    params = doc["paths"][_MODEL_CATALOG_PATH]["get"]["parameters"]
+    shared = doc["components"]["parameters"]
+    names = {
+        shared[p["$ref"].rsplit("/", 1)[-1]]["name"] if "$ref" in p else p["name"] for p in params
+    }
+    assert names == {"cursor", "limit"}
+    assert model_catalog_path("c", 5) == f"{_MODEL_CATALOG_PATH}?cursor=c&limit=5"
 
 
 def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None:
