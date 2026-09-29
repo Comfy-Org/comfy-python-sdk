@@ -381,6 +381,49 @@ def model_schema_path(model: str) -> str:
     )
 
 
+def model_schema_headers(etag: str | None) -> dict[str, str] | None:
+    """``If-None-Match`` for a conditional schema read, or ``None`` for a plain one.
+
+    Raises ``ValueError`` before any request for an empty or non-ASCII tag: an
+    empty header makes the read effectively unconditional, so a ``304`` to it
+    could not honestly mean "your copy is current", and a non-ASCII value would
+    fail inside httpx's header encoding as an untyped ``UnicodeEncodeError``.
+    """
+    if etag is None:
+        return None
+    if not isinstance(etag, str):
+        raise TypeError(f"etag must be a str, got {type(etag).__name__}")
+    if not etag or not etag.isascii():
+        raise ValueError(f"etag must be a non-empty ASCII string; got {etag!r}")
+    return {"If-None-Match": etag}
+
+
+def model_schema_answer(
+    p: _Prepared, resp: httpx.Response, etag: str | None
+) -> dict[str, Any] | None:
+    """The schema document, or ``None`` for a ``304`` to a conditional read.
+
+    ``None`` is reserved for the ``304`` so the SDK can read it as "unchanged":
+    a ``200`` whose body decodes to anything but a JSON object (``null``, a list,
+    a scalar) is raised as ``invalid_response`` rather than passed through.
+    """
+    # Only an answer to a conditional read: a 304 to a request that sent no tag
+    # cannot mean "your copy is current", so it falls through and is raised
+    # like any other unexpected status.
+    if resp.status_code == 304 and etag is not None:
+        return None
+    body: Any = p.parse_or_raise(resp, (200,))
+    if not isinstance(body, dict):
+        raise ApiError(
+            f"The {resp.status_code} schema response is not a JSON object",
+            code="invalid_response",
+            http_status=resp.status_code,
+            request_id=_request_id(resp),
+            body_excerpt=_body_excerpt(resp),
+        )
+    return body
+
+
 def _build_user_agent(client_info: str | None) -> str:
     """SDK identity sent on every request. This is request metadata (not
     telemetry — no phone-home), so adoption is measurable server-side from
@@ -1042,8 +1085,9 @@ class ComfyLow:
         schema could not carry every field. Returning the body alone discarded
         both, so a caller could not tell an alt-provider run from a native one.
 
-        Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
-        any request when ``model`` is not a ``{provider}/{model}`` id.
+        Raises ``TypeError``/``ValueError`` before any request when ``model``
+        is not a ``{provider}/{model}`` id (:func:`parse_model_id`) or ``etag``
+        is not a non-empty ASCII string (:func:`model_schema_headers`).
         """
         path, body, headers = model_run_request(
             model,
@@ -1096,8 +1140,9 @@ class ComfyLow:
         schema could not carry every field. Returning the body alone discarded
         both, so a caller could not tell an alt-provider run from a native one.
 
-        Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
-        any request when ``model`` is not a ``{provider}/{model}`` id.
+        Raises ``TypeError``/``ValueError`` before any request when ``model``
+        is not a ``{provider}/{model}`` id (:func:`parse_model_id`) or ``etag``
+        is not a non-empty ASCII string (:func:`model_schema_headers`).
         """
         path, body, headers = model_submit_request(model, arguments, idempotency_key)
         url = self._p.router_base_url + path
@@ -1181,18 +1226,14 @@ class ComfyLow:
         document is unchanged — is a success, returned as a ``None`` body
         rather than raised: it is the answer the caller asked for.
 
-        Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
-        any request when ``model`` is not a ``{provider}/{model}`` id.
+        Raises ``TypeError``/``ValueError`` before any request when ``model``
+        is not a ``{provider}/{model}`` id (:func:`parse_model_id`) or ``etag``
+        is not a non-empty ASCII string (:func:`model_schema_headers`).
         """
         url = self._p.router_base_url + model_schema_path(model)
-        headers = {"If-None-Match": etag} if etag is not None else None
+        headers = model_schema_headers(etag)
         resp = self.raw_request("GET", url, headers=headers, timeout=timeout)
-        # Only an answer to a conditional read: a 304 to a request that sent
-        # no tag cannot mean "your copy is current", so it falls through and is
-        # raised like any other unexpected status.
-        if resp.status_code == 304 and etag is not None:
-            return None, resp.headers
-        return self._p.parse_or_raise(resp, (200,)), resp.headers
+        return model_schema_answer(self._p, resp, etag), resp.headers
 
 
 class AsyncComfyLow:
@@ -1586,14 +1627,9 @@ class AsyncComfyLow:
     ) -> tuple[dict[str, Any] | None, httpx.Headers]:
         """Async :meth:`ComfyLow.get_model_schema` — a ``304`` is a ``None`` body."""
         url = self._p.router_base_url + model_schema_path(model)
-        headers = {"If-None-Match": etag} if etag is not None else None
+        headers = model_schema_headers(etag)
         resp = await self.raw_request("GET", url, headers=headers, timeout=timeout)
-        # Only an answer to a conditional read: a 304 to a request that sent
-        # no tag cannot mean "your copy is current", so it falls through and is
-        # raised like any other unexpected status.
-        if resp.status_code == 304 and etag is not None:
-            return None, resp.headers
-        return self._p.parse_or_raise(resp, (200,)), resp.headers
+        return model_schema_answer(self._p, resp, etag), resp.headers
 
 
 def _looks_like_path(s: str) -> bool:

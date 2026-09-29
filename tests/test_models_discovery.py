@@ -376,3 +376,123 @@ def test_a_304_to_an_unconditional_read_is_not_reported_as_unchanged(server) -> 
         client._low.raw_request = as_304  # type: ignore[method-assign]
         with pytest.raises(ComfyError):
             client.models.schema(MODEL)
+
+
+# --- malformed answers are invalid_response, never an untyped error --------
+
+
+@pytest.mark.parametrize("body", [[], "page", None])
+def test_a_non_object_catalog_page_is_invalid_response(server, body: Any) -> None:
+    server.state.catalog_pages[None] = body
+    with Comfy() as client, pytest.raises(ComfyError) as info:
+        client.models.list().page()
+    assert info.value.code == "invalid_response"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        # No slash: parses as no run id at all.
+        {"id": "flux-2-pro", "provider": "bfl", "model": "flux-2-pro"},
+        # A runnable id that names a different provider than the entry claims.
+        {"id": "acme/flux-2-pro", "provider": "bfl", "model": "flux-2-pro"},
+        {"id": "bfl/flux-2-dev", "provider": "bfl", "model": "flux-2-pro"},
+    ],
+)
+def test_an_entry_whose_id_does_not_address_its_provider_and_model_is_invalid_response(
+    server, entry: dict[str, Any]
+) -> None:
+    server.state.catalog_pages[None]["data"] = [entry]
+    with Comfy() as client, pytest.raises(ComfyError) as info:
+        list(client.models.list())
+    assert info.value.code == "invalid_response"
+
+
+def test_the_last_page_never_hands_back_a_cursor(server) -> None:
+    # `c-3` is the last page and carries a stale cursor; paging by hand must
+    # not be told to follow it.
+    _three_pages(server)
+    with Comfy() as client:
+        page = client.models.list(cursor="c-3").page()
+    assert page.has_more is False
+    assert page.next_cursor is None
+
+
+def test_catalog_entries_are_hashable(server) -> None:
+    _three_pages(server)
+    with Comfy() as client:
+        models = set(client.models.list())
+    assert {m.id for m in models} == set(EXPECTED_IDS)
+
+
+@pytest.mark.parametrize("document", [None, [], "doc"])
+def test_a_non_object_schema_200_is_invalid_response_not_unchanged(server, document: Any) -> None:
+    # `None` is how a 304 reaches the SDK, so a 200 carrying JSON `null` must
+    # not be read as "your copy is current".
+    server.state.schema_document = document
+    with Comfy(retry=NO_RETRY) as client, pytest.raises(ComfyError) as info:
+        client.models.schema(MODEL)
+    assert info.value.code == "invalid_response"
+
+
+def test_a_304_without_an_etag_keeps_the_tag_that_was_sent(server) -> None:
+    with Comfy() as client:
+        real = client._low.raw_request
+
+        def stripped(*args: Any, **kwargs: Any) -> httpx.Response:
+            real(*args, **kwargs)
+            return httpx.Response(304)
+
+        client._low.raw_request = stripped  # type: ignore[method-assign]
+        result = client.models.schema(MODEL, etag='"schema-v1"')
+    assert result.unchanged is True
+    assert result.etag == '"schema-v1"'
+
+
+@pytest.mark.parametrize("bad", ["", '"café"'])
+def test_schema_rejects_an_empty_or_non_ascii_etag_before_any_request(server, bad: str) -> None:
+    with Comfy() as client, pytest.raises(ValueError):
+        client.models.schema(MODEL, etag=bad)
+    assert server.state.schema_paths == []
+
+
+async def test_async_schema_rejects_an_empty_etag_before_any_request(server) -> None:
+    async with AsyncComfy() as client:
+        with pytest.raises(ValueError):
+            await client.models.schema(MODEL, etag="")
+    assert server.state.schema_paths == []
+
+
+def test_discovery_retries_a_read_timeout_under_the_default_policy(server, monkeypatch) -> None:
+    # A discovery read carries no key and bills nothing, so the possibly-in-
+    # flight class a run needs an opt-in for is retried here by default.
+    import comfy_sdk.model_catalog as catalog
+
+    monkeypatch.setattr(catalog.time, "sleep", lambda _s: None)
+    with Comfy() as client:
+        real = client._low.raw_request
+        calls: list[int] = []
+
+        def flaky(*args: Any, **kwargs: Any) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                raise httpx.ReadTimeout("slow")
+            return real(*args, **kwargs)
+
+        client._low.raw_request = flaky  # type: ignore[method-assign]
+        assert client.models.schema(MODEL).document == server.state.schema_document
+    assert len(calls) == 2
+
+
+def test_no_retry_still_means_one_discovery_attempt(server) -> None:
+    with Comfy(retry=NO_RETRY) as client:
+        calls: list[int] = []
+
+        def flaky(*args: Any, **kwargs: Any) -> httpx.Response:
+            calls.append(1)
+            raise httpx.ReadTimeout("slow")
+
+        client._low.raw_request = flaky  # type: ignore[method-assign]
+        with pytest.raises(httpx.ReadTimeout):
+            client.models.schema(MODEL)
+    assert len(calls) == 1

@@ -28,13 +28,13 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, TypeVar, cast
 
 import httpx
 
 from comfy_low.errors import ApiError, clean_request_id
-from comfy_low.transport import DISCOVERY_TIMEOUT, AsyncComfyLow, ComfyLow
+from comfy_low.transport import DISCOVERY_TIMEOUT, AsyncComfyLow, ComfyLow, parse_model_id
 
 from .exceptions import ComfyError, translating
 from .retry import Retrier, RetryPolicy
@@ -71,6 +71,12 @@ class CatalogModel:
     ``charges_on_policy_rejection``) rather than as a class, so a field the
     server adds reaches the caller without an SDK release.
     """
+
+    def __hash__(self) -> int:
+        # The generated hash would cover `billing`, a dict, and raise; the id
+        # triple is enough to be consistent with the generated `__eq__`, and
+        # lets `set(client.models.list())` work.
+        return hash((self.id, self.provider, self.model))
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,25 +133,39 @@ def _entry(raw: Any, request_id: str | None) -> CatalogModel:
     """One catalog entry, or ``invalid_response`` if it cannot address a run.
 
     ``id``/``provider``/``model`` are required and checked, because they are
-    what a caller hands back to ``models.run``; ``billing`` is read leniently,
+    what a caller hands back to ``models.run``: ``id`` must parse exactly as
+    ``models.run`` would parse it, and ``provider``/``model`` must be its two
+    segments, so a caller that allowlists on ``entry.provider`` and then runs
+    ``entry.id`` runs the provider it checked. ``billing`` is read leniently,
     because nothing downstream is addressed by it.
     """
     if not isinstance(raw, dict):
         raise _invalid("catalog entry is not a JSON object", request_id)
-    fields = (raw.get("id"), raw.get("provider"), raw.get("model"))
-    if not all(isinstance(value, str) and value for value in fields):
+    model_id, provider, model = raw.get("id"), raw.get("provider"), raw.get("model")
+    if not all(isinstance(value, str) and value for value in (model_id, provider, model)):
         raise _invalid("catalog entry is missing id, provider or model", request_id)
+    try:
+        segments = parse_model_id(cast(str, model_id))
+    except ValueError:
+        raise _invalid("catalog entry id is not a runnable model id", request_id) from None
+    if segments != (provider, model):
+        raise _invalid("catalog entry id does not match its provider and model", request_id)
     billing = raw.get("billing")
     return CatalogModel(
-        id=cast(str, fields[0]),
-        provider=cast(str, fields[1]),
-        model=cast(str, fields[2]),
+        id=cast(str, model_id),
+        provider=cast(str, provider),
+        model=cast(str, model),
         billing=dict(billing) if isinstance(billing, dict) else {},
     )
 
 
-def _page(body: dict[str, Any], headers: Mapping[str, str]) -> ModelPage:
+def _page(body: Any, headers: Mapping[str, str]) -> ModelPage:
     request_id = clean_request_id(headers.get(REQUEST_ID_HEADER))
+    # The transport returns the decoded body unchecked, so a 200 carrying a
+    # top-level list, string or `null` has to be refused here, inside the same
+    # `invalid_response` as every other malformed page.
+    if not isinstance(body, Mapping):
+        raise _invalid("catalog page is not a JSON object", request_id)
     data = body.get("data")
     has_more = body.get("has_more")
     limit = body.get("limit")
@@ -155,7 +175,11 @@ def _page(body: dict[str, Any], headers: Mapping[str, str]) -> ModelPage:
     return ModelPage(
         data=tuple(_entry(item, request_id) for item in data),
         has_more=has_more,
-        next_cursor=next_cursor if isinstance(next_cursor, str) and next_cursor else None,
+        # Only a page that has more names a next one: a stale cursor on the
+        # last page would send a caller paging by hand round again.
+        next_cursor=(
+            next_cursor if has_more and isinstance(next_cursor, str) and next_cursor else None
+        ),
         # `limit` is required by the contract, but a page that omits it is
         # still a usable page; its own length is the honest stand-in.
         limit=limit if isinstance(limit, int) and not isinstance(limit, bool) else len(data),
@@ -181,18 +205,41 @@ def _next_cursor(page: ModelPage, seen: set[str]) -> str | None:
     return cursor
 
 
-def _schema_result(body: dict[str, Any] | None, headers: Mapping[str, str]) -> SchemaResult:
+def _schema_result(
+    body: dict[str, Any] | None, headers: Mapping[str, str], sent: str | None
+) -> SchemaResult:
+    # The transport returns `None` for a 304 to a conditional read and nothing
+    # else — a non-object 200 is already `invalid_response` there.
+    unchanged = body is None
+    etag = headers.get("ETag")
+    if unchanged and etag is None:
+        # A 304 just confirmed the tag that was sent; an intermediary that
+        # strips `ETag` off it must not make the caller drop that tag and read
+        # unconditionally from then on.
+        etag = sent
     return SchemaResult(
-        unchanged=body is None,
+        unchanged=unchanged,
         document=body,
-        etag=headers.get("ETag"),
+        etag=etag,
         request_id=clean_request_id(headers.get(REQUEST_ID_HEADER)),
     )
 
 
+def _read_policy(policy: RetryPolicy) -> RetryPolicy:
+    """``policy`` for a discovery read, which is a plain ``GET``.
+
+    :attr:`~comfy_sdk.retry.RetryPolicy.retry_possibly_in_flight` is off by
+    default because a run's resend may bill a second generation or be refused
+    for its reused key. Neither applies to a read that carries no key and bills
+    nothing, so a ``503`` or a read timeout here is retried whenever the policy
+    retries at all; its budgets and backoff are still the caller's.
+    """
+    return replace(policy, retry_possibly_in_flight=True)
+
+
 def _call(policy: RetryPolicy, send: Callable[[], _T]) -> _T:
     """Run one discovery read under the client's retry policy, translated."""
-    retrier = Retrier(policy, now=_now)
+    retrier = Retrier(_read_policy(policy), now=_now)
     with translating():
         while True:
             try:
@@ -206,7 +253,7 @@ def _call(policy: RetryPolicy, send: Callable[[], _T]) -> _T:
 
 async def _acall(policy: RetryPolicy, send: Callable[[], Awaitable[_T]]) -> _T:
     """Awaitable :func:`_call`."""
-    retrier = Retrier(policy, now=_now)
+    retrier = Retrier(_read_policy(policy), now=_now)
     with translating():
         while True:
             try:
@@ -318,7 +365,7 @@ def get_schema(
 ) -> SchemaResult:
     """One ``openapi.json`` read, sync — see :meth:`comfy_sdk.models.Models.schema`."""
     body, headers = _call(retry, lambda: low.get_model_schema(model, etag=etag, timeout=timeout))
-    return _schema_result(body, headers)
+    return _schema_result(body, headers, etag)
 
 
 async def aget_schema(
@@ -328,7 +375,7 @@ async def aget_schema(
     body, headers = await _acall(
         retry, lambda: low.get_model_schema(model, etag=etag, timeout=timeout)
     )
-    return _schema_result(body, headers)
+    return _schema_result(body, headers, etag)
 
 
 __all__ = [
