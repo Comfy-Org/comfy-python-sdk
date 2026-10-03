@@ -70,6 +70,7 @@ from .exceptions import (
 )
 from .jobs import AsyncJob, Job, JobWorkflow
 from .model_requests import COMPLETED, AsyncRequestHandle, QueueUpdate, RequestHandle
+from .models import BinaryResult
 from .outputs import AsyncOutput, DownloadUrl, Output
 from .retry import DEFAULT_RETRY, NO_RETRY, RetryPolicy
 from .workflows import Workflow, WorkflowFactory
@@ -82,6 +83,7 @@ try:
 except PackageNotFoundError:  # running from a source tree, not installed
     __version__ = "0+unknown"
 
+from .model_catalog import AsyncModelList, CatalogModel, ModelList, ModelPage, SchemaResult
 from .models import RouterRunResult
 
 __all__ = [
@@ -95,6 +97,12 @@ __all__ = [
     "AsyncComfy",
     # model runs
     "RouterRunResult",
+    # model discovery
+    "CatalogModel",
+    "ModelList",
+    "AsyncModelList",
+    "ModelPage",
+    "SchemaResult",
     # assets / workflows / jobs / outputs
     "Asset",
     "AsyncAsset",
@@ -113,6 +121,7 @@ __all__ = [
     "Output",
     "AsyncOutput",
     "DownloadUrl",
+    "BinaryResult",
     # events
     "Event",
     "Progress",

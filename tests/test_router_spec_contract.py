@@ -12,7 +12,9 @@ restated here:
   ``post.operationId`` is ``runRouterModel``, and the ``servers[0].url`` it is
   addressed against -- compared against
   :data:`comfy_low.transport._MODEL_RUN_PATH_TEMPLATE` and
-  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL`.
+  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL` -- and, the same way, the two
+  discovery routes ``models.list()`` / ``models.schema()`` read, by their
+  ``get.operationId`` (``listRouterModels``, ``getRouterModelInputSchema``).
 
 Neither is generated, so a Router spec sync is the moment they can drift. The
 failures guarded against are a sync landing a new bucket that then reaches
@@ -38,7 +40,12 @@ import httpx
 import pytest
 import yaml
 
-from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE
+from comfy_low.transport import (
+    _MODEL_CATALOG_PATH,
+    _MODEL_RUN_PATH_TEMPLATE,
+    _MODEL_SCHEMA_PATH_TEMPLATE,
+    model_catalog_path,
+)
 from comfy_sdk import COMFY_ROUTER_BASE_URL
 from comfy_sdk.models import RouterRunResult, _run_result
 from comfy_sdk.router_exceptions import (
@@ -267,6 +274,51 @@ def test_run_path_matches_vendored_spec() -> None:
     )
 
 
+def _declared_get_paths(operation_id: str) -> list[str]:
+    """Every path whose ``get.operationId`` is ``operation_id``, in spec order."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    return [
+        path
+        for path, item in (doc.get("paths") or {}).items()
+        if isinstance(item, dict)
+        and isinstance(item.get("get"), dict)
+        and item["get"].get("operationId") == operation_id
+    ]
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "bound", "constant"),
+    [
+        ("listRouterModels", _MODEL_CATALOG_PATH, "_MODEL_CATALOG_PATH"),
+        ("getRouterModelInputSchema", _MODEL_SCHEMA_PATH_TEMPLATE, "_MODEL_SCHEMA_PATH_TEMPLATE"),
+    ],
+)
+def test_the_discovery_routes_match_the_vendored_spec(
+    operation_id: str, bound: str, constant: str
+) -> None:
+    # `models.list()` / `models.schema()` are hand-bound exactly as the run
+    # route is, so a sync that moves either route has to fail here rather than
+    # ship an SDK that GETs a path the server no longer serves.
+    declared = _declared_get_paths(operation_id)
+    assert declared == [bound], (
+        f"the vendored spec declares {operation_id} at {declared} and the SDK reads "
+        f"{bound!r} -- update comfy_low.transport.{constant}"
+    )
+
+
+def test_the_catalog_query_parameters_are_the_ones_the_spec_declares() -> None:
+    # `model_catalog_path` sends `cursor` and `limit` by name; a sync renaming
+    # either would otherwise be silently ignored by the server.
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    params = doc["paths"][_MODEL_CATALOG_PATH]["get"]["parameters"]
+    shared = doc["components"]["parameters"]
+    names = {
+        shared[p["$ref"].rsplit("/", 1)[-1]]["name"] if "$ref" in p else p["name"] for p in params
+    }
+    assert names == {"cursor", "limit"}
+    assert model_catalog_path("c", 5) == f"{_MODEL_CATALOG_PATH}?cursor=c&limit=5"
+
+
 def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None:
     # `model_run_request` fills `{provider}` and `{model}` by name; a sync that
     # renamed or added a template variable would silently KeyError at call time
@@ -274,6 +326,55 @@ def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None
     assert _MODEL_RUN_PATH_TEMPLATE.count("{") == 2
     assert "{provider}" in _MODEL_RUN_PATH_TEMPLATE
     assert "{model}" in _MODEL_RUN_PATH_TEMPLATE
+
+
+# --- the two media types the run route's 200 can answer under ------------
+
+
+def _run_200_content() -> dict[str, Any]:
+    """The ``content`` map of ``runRouterModel``'s ``200``, read out of the spec."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    item = (doc.get("paths") or {})[_MODEL_RUN_PATH_TEMPLATE]
+    content = item["post"]["responses"]["200"]["content"]
+    assert isinstance(content, dict) and content, "runRouterModel's 200 declares no content"
+    return content
+
+
+def test_the_run_200_declares_both_a_json_and_a_binary_branch() -> None:
+    """The contract behind ``post_model_run`` returning ``dict | BinaryResult``.
+
+    Read out of the spec rather than restated, for the same reason the route is:
+    the day a sync drops the ``*/*`` branch (or adds a third one), the SDK's
+    two-way branch is either dead code or newly incomplete, and nothing else in
+    the suite would notice — the binary tests drive a *stub*, which asserts the
+    SDK's behaviour rather than the server's contract.
+    """
+    content = _run_200_content()
+    assert set(content) == {"application/json", "*/*"}, (
+        f"the vendored spec's runRouterModel 200 declares {sorted(content)}; "
+        "comfy_low.transport._Prepared.parse_run_result branches on exactly two "
+        "cases (JSON -> dict, anything else -> BinaryResult)"
+    )
+
+
+def test_the_binary_branch_is_declared_as_raw_bytes() -> None:
+    # `format: binary` is what says the body is bytes rather than a base64
+    # string or a JSON document — i.e. that `BinaryResult.content` is the
+    # partner's file and needs no decoding on the way out.
+    schema = _run_200_content()["*/*"].get("schema") or {}
+    assert schema.get("type") == "string"
+    assert schema.get("format") == "binary"
+
+
+def test_the_200_promises_the_headers_a_binary_result_is_built_from() -> None:
+    # `BinaryResult.request_id` reads `X-Comfy-Request-Id` off a *success*, and
+    # the SDK takes the partner's `Content-Type` at its word — which is only
+    # safe because the route sends `X-Content-Type-Options: nosniff`.
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    headers = doc["paths"][_MODEL_RUN_PATH_TEMPLATE]["post"]["responses"]["200"]["headers"]
+    assert "X-Comfy-Request-Id" in headers
+    assert "X-Content-Type-Options" in headers
+    assert "Idempotent-Replayed" in headers
 
 
 # --- run_detailed's header lifts, pinned against the contract -----------------
