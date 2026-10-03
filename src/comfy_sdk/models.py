@@ -68,6 +68,14 @@ from comfy_low.transport import (
 
 from ._core import new_idempotency_key, validate_idempotency_key
 from .exceptions import IdempotencyKeyReuse, _stamp, to_sdk_error, translating
+from .model_catalog import (
+    DISCOVERY_TIMEOUT,
+    AsyncModelList,
+    ModelList,
+    SchemaResult,
+    aget_schema,
+    get_schema,
+)
 from .model_requests import (
     _CANCEL_FAILURES,
     _CANCEL_TIMEOUT,
@@ -883,6 +891,66 @@ class Models(_ModelsBase):
         parse_request_id(request_id)
         return RequestHandle(cast(ComfyLow, self._low), model, request_id, self._retry)
 
+    # -- discovery: what can run, and what it takes ------------------------
+    def list(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        timeout: float | httpx.Timeout | None = DISCOVERY_TIMEOUT,
+    ) -> ModelList:
+        """The Router model catalog — every model this client can :meth:`run`.
+
+        ``GET {router_base_url}/v2/models``, with the same host and credential
+        as :meth:`run`. Iterate the returned
+        :class:`~comfy_sdk.model_catalog.ModelList` to walk the whole catalog —
+        it follows ``next_cursor`` page by page while ``has_more`` is true — or
+        call its ``page()`` for exactly one page plus ``has_more``,
+        ``next_cursor``, the ``limit`` actually served, and ``request_id``.
+        Nothing is fetched until you do one or the other.
+
+        ``cursor`` starts from a page an earlier walk handed you (it is opaque
+        and only valid for that walk). ``limit`` is the page size, sent as
+        given: the server defaults to 20 and clamps anything above 100 down to
+        100 rather than rejecting it, and reports the size it served on the
+        page. Each is sent only when set.
+
+        ``timeout`` bounds each page request, defaulting to 30 seconds
+        (:data:`~comfy_low.transport.DISCOVERY_TIMEOUT`); pass seconds, an
+        ``httpx.Timeout``, or ``None`` to wait indefinitely. A failure raises
+        the same typed :class:`~comfy_sdk.router_exceptions.RouterError`
+        subclass :meth:`run` would, read off ``X-Comfy-Error-Type``.
+        """
+        return ModelList(
+            cast(ComfyLow, self._low), self._retry, cursor=cursor, limit=limit, timeout=timeout
+        )
+
+    def schema(
+        self,
+        model: str,
+        *,
+        etag: str | None = None,
+        timeout: float | httpx.Timeout | None = DISCOVERY_TIMEOUT,
+    ) -> SchemaResult:
+        """``model``'s input and output schemas, as a standalone OpenAPI document.
+
+        ``GET {router_base_url}/v2/models/{provider}/{model}/openapi.json``.
+        ``model`` is the same canonical ``{provider}/{model}`` id :meth:`run`
+        takes, validated the same way before any request.
+
+        Returns a :class:`~comfy_sdk.model_catalog.SchemaResult` carrying the
+        parsed ``document``, its ``etag`` and the ``request_id``. Pass a stored
+        ``etag`` to make the read conditional (``If-None-Match``): when the
+        document has not changed the server answers ``304`` with no body, and
+        this returns ``unchanged=True`` with ``document=None`` — not an
+        exception. The SDK keeps no cache; storing the tag is the caller's.
+
+        ``timeout`` defaults to 30 seconds, as on :meth:`list`. An unknown
+        model raises :class:`~comfy_sdk.router_exceptions.ModelNotFound`, and
+        every other failure the typed Router exception :meth:`run` would.
+        """
+        return get_schema(cast(ComfyLow, self._low), self._retry, model, etag=etag, timeout=timeout)
+
 
 class AsyncModels(_ModelsBase):
     """``client.models`` on :class:`~comfy_sdk.client.AsyncComfy` — mirrors :class:`Models`."""
@@ -1107,6 +1175,38 @@ class AsyncModels(_ModelsBase):
         parse_model_id(model)
         parse_request_id(request_id)
         return AsyncRequestHandle(cast(AsyncComfyLow, self._low), model, request_id, self._retry)
+
+    # -- discovery: what can run, and what it takes ------------------------
+    def list(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        timeout: float | httpx.Timeout | None = DISCOVERY_TIMEOUT,
+    ) -> AsyncModelList:
+        """The Router model catalog on ``AsyncComfy`` — see :meth:`Models.list`.
+
+        Not itself awaited: it returns an
+        :class:`~comfy_sdk.model_catalog.AsyncModelList` at once, which
+        ``async for`` walks page by page and whose ``page()`` is awaited for a
+        single page. That keeps ``async for m in client.models.list():`` the
+        one-liner it is in the sync client.
+        """
+        return AsyncModelList(
+            cast(AsyncComfyLow, self._low), self._retry, cursor=cursor, limit=limit, timeout=timeout
+        )
+
+    async def schema(
+        self,
+        model: str,
+        *,
+        etag: str | None = None,
+        timeout: float | httpx.Timeout | None = DISCOVERY_TIMEOUT,
+    ) -> SchemaResult:
+        """Awaitable :meth:`Models.schema` — same arguments, same result."""
+        return await aget_schema(
+            cast(AsyncComfyLow, self._low), self._retry, model, etag=etag, timeout=timeout
+        )
 
 
 __all__ = ["Models", "AsyncModels", "BinaryResult", "RouterRunResult"]

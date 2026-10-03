@@ -12,6 +12,18 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `models.list()` and `models.schema()`, so you can discover Comfy Router models from Python
+  as the TypeScript SDK already can. `list(cursor=, limit=, timeout=)` returns an iterable that
+  walks the catalog (`GET /v2/models`), following `next_cursor` while `has_more` is true, and
+  yields `CatalogModel` entries (`id`, `provider`, `model`, `billing`). `list(...).page()`
+  returns one `ModelPage` (`data`, `has_more`, `next_cursor`, `limit`, `request_id`).
+  `schema(model, etag=, timeout=)` reads `GET /v2/models/{provider}/{model}/openapi.json` into a
+  `SchemaResult`. With `etag=`, it sends `If-None-Match`, and a `304` returns `unchanged=True`
+  with `document=None` rather than raising. Both methods use the Router host and the client's
+  credential, raise the same typed Router exceptions as `models.run`, retry under the client's
+  policy (a keyless read also retries a `5xx` or read timeout whenever that policy retries at
+  all), and default to a 30-second timeout. `AsyncComfy` has the same methods
+  (`async for ... in client.models.list()`, `await client.models.schema(...)`).
 - `RouterRunResult.credits_used` — what Comfy Router reported a run cost, lifted from the
   `X-Comfy-Credits-Used` response header onto what `models.run_detailed()` returns. It is a
   price rather than a settled ledger entry, absent means "not reported" and never "free", and

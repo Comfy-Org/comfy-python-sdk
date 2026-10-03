@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
@@ -201,6 +201,49 @@ class ServerState:
     model_run_validation_detail: list[Any] | None = None
     # The bucket sent on `X-Comfy-Error-Type` alongside it.
     model_run_validation_error_type: str = "invalid_input"
+
+    # --- model discovery: GET /v2/models and .../openapi.json ---
+    # Catalog pages keyed by the `cursor` that fetches them (`None` is the first
+    # page). Each value is the whole response body, so a test states the
+    # paging facts (`has_more`, `next_cursor`, `limit`) it is about.
+    catalog_pages: dict[str | None, dict[str, Any]] = field(
+        default_factory=lambda: {
+            None: {
+                "data": [
+                    {
+                        "id": "bfl/flux-2-pro",
+                        "provider": "bfl",
+                        "model": "flux-2-pro",
+                        "billing": {"charges_on_policy_rejection": "unknown"},
+                    }
+                ],
+                "has_more": False,
+                "next_cursor": None,
+                "limit": 20,
+            }
+        }
+    )
+    # (status, code) answered instead of a catalog page.
+    catalog_error: tuple[int, str] | None = None
+    # Catalog requests answered 429 rate_limited (Retry-After: 1) before one is
+    # served — the transient path the client's retry policy rides out.
+    catalog_fail_times: int = 0
+    # Every catalog request's decoded query, in arrival order.
+    catalog_queries: list[dict[str, list[str]]] = field(default_factory=list)
+    # The document `.../openapi.json` serves, and the ETag it is served under.
+    schema_document: dict[str, Any] = field(
+        default_factory=lambda: {"openapi": "3.1.0", "info": {"title": "bfl/flux-2-pro"}}
+    )
+    schema_etag: str = '"schema-v1"'
+    # Models the schema route knows; any other id answers 404 model_not_found.
+    schema_models: set[str] = field(default_factory=lambda: {"bfl/flux-2-pro"})
+    # (status, code) answered instead of the document, for every model.
+    schema_error: tuple[int, str] | None = None
+    # Raw request path and If-None-Match of every schema request.
+    schema_paths: list[str] = field(default_factory=list)
+    schema_if_none_match: list[str | None] = field(default_factory=list)
+    # The `X-Comfy-Request-Id` both discovery routes stamp on their answers.
+    discovery_request_id: str = "req_discovery_01"
 
     # --- the queued model surface (submit / status / result / cancel) ---
     # POST .../requests answers this status with a body naming a request id.
@@ -557,6 +600,15 @@ def _make_handler(state: ServerState):
             if m:
                 self._serve_queue_result(m.group(3))
                 return
+            # Comfy Router's discovery routes — the catalog (query-string
+            # paged) and one model's schema document.
+            if urlsplit(self.path).path == "/v2/models":
+                self._serve_catalog()
+                return
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/openapi\.json$", self.path)
+            if m:
+                self._serve_schema(unquote(m.group(1)), unquote(m.group(2)))
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)/events$", self.path)
             if m:
                 self._serve_events(m.group(1))
@@ -844,6 +896,50 @@ def _make_handler(state: ServerState):
                     "error_type": state.queue_cancel_error_type,
                 },
             )
+
+        def _serve_catalog(self) -> None:
+            query = parse_qs(urlsplit(self.path).query)
+            state.catalog_queries.append(query)
+            if state.catalog_fail_times > 0:
+                state.catalog_fail_times -= 1
+                self._router_err(429, "rate_limited", retry_after="1")
+                return
+            if state.catalog_error:
+                status, code = state.catalog_error
+                self._router_err(status, code)
+                return
+            cursor = query.get("cursor", [None])[0]
+            if cursor not in state.catalog_pages:
+                self._router_err(400, "invalid_input", "unknown cursor")
+                return
+            self._json(
+                200,
+                state.catalog_pages[cursor],
+                headers={"X-Comfy-Request-Id": state.discovery_request_id},
+            )
+
+        def _serve_schema(self, provider: str, model: str) -> None:
+            state.schema_paths.append(self.path)
+            state.schema_if_none_match.append(self.headers.get("If-None-Match"))
+            if state.schema_error:
+                status, code = state.schema_error
+                self._router_err(status, code)
+                return
+            if f"{provider}/{model}" not in state.schema_models:
+                self._router_err(404, "model_not_found", "no such model")
+                return
+            headers = {
+                "X-Comfy-Request-Id": state.discovery_request_id,
+                "ETag": state.schema_etag,
+                "Cache-Control": "public, max-age=300",
+            }
+            if self.headers.get("If-None-Match") == state.schema_etag:
+                self.send_response(304)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                return
+            self._json(200, state.schema_document, headers=headers)
 
         def _router_err(
             self, status: int, code: str, message: str = "err", retry_after: str | None = None

@@ -38,6 +38,11 @@ them against. Their routes are confined to the ``_MODEL_REQUEST*`` constants
 for exactly the reason the run path was, and they are the one part of this
 change a spec sync is expected to correct.
 
+``get_model_catalog`` / ``get_model_schema`` bind the two discovery reads of
+the same contract (``listRouterModels``, ``getRouterModelInputSchema``), and
+follow the run path's rule: their routes live in :data:`_MODEL_CATALOG_PATH` /
+:data:`_MODEL_SCHEMA_PATH_TEMPLATE` alone, pinned against the vendored file.
+
 This layer contains no orchestration, retries, hashing, or reconnection — those
 live in ``comfy_sdk``.
 """
@@ -124,6 +129,21 @@ _MODEL_REQUESTS_PATH_TEMPLATE = _MODEL_RUN_PATH_TEMPLATE + "/requests"
 _MODEL_REQUEST_PATH_TEMPLATE = _MODEL_REQUESTS_PATH_TEMPLATE + "/{request_id}"
 _MODEL_REQUEST_STATUS_PATH_TEMPLATE = _MODEL_REQUEST_PATH_TEMPLATE + "/status"
 _MODEL_REQUEST_CANCEL_PATH_TEMPLATE = _MODEL_REQUEST_PATH_TEMPLATE + "/cancel"
+
+#: Routes for model *discovery* — the catalog (``operationId:
+#: listRouterModels``) and one model's input/output schema document
+#: (``operationId: getRouterModelInputSchema``), verbatim from
+#: ``spec/router-openapi.yaml``. Pinned against the vendored file by
+#: ``tests/test_router_spec_contract.py`` exactly as
+#: :data:`_MODEL_RUN_PATH_TEMPLATE` is, so a sync that moves either route fails.
+_MODEL_CATALOG_PATH = "/v2/models"
+_MODEL_SCHEMA_PATH_TEMPLATE = _MODEL_RUN_PATH_TEMPLATE + "/openapi.json"
+
+#: Default timeout for a discovery read. Both routes answer from a catalog the
+#: server already holds, so nothing here waits on a generation — the bound is
+#: the client's ordinary 30s, stated here so it does not silently follow a
+#: client configured with a much longer (or shorter) timeout for other calls.
+DISCOVERY_TIMEOUT = httpx.Timeout(30.0)
 
 #: Longest request id accepted into a path. The contract mints UUIDs (36
 #: characters); the bound exists so a server-controlled value that is NOT one
@@ -433,6 +453,80 @@ def model_request_path(model: str, request_id: str, template: str) -> str:
         model=quote(name, safe=""),
         request_id=quote(parse_request_id(request_id), safe=""),
     )
+
+
+def model_catalog_path(cursor: str | None = None, limit: int | None = None) -> str:
+    """Sans-IO path (with query) for one page of the Router model catalog.
+
+    Each parameter is sent only when given, so a bare call is the first page at
+    the server's default size. ``limit`` is passed through unchanged, including
+    a value above the declared maximum of 100: the route clamps rather than
+    rejects it and echoes the size it actually served, so refusing it here would
+    only disagree with the server.
+    """
+    params: list[tuple[str, str]] = []
+    if cursor is not None:
+        params.append(("cursor", cursor))
+    if limit is not None:
+        params.append(("limit", str(limit)))
+    query = urlencode(params)
+    return f"{_MODEL_CATALOG_PATH}?{query}" if query else _MODEL_CATALOG_PATH
+
+
+def model_schema_path(model: str) -> str:
+    """Sans-IO path for one model's input/output schema document.
+
+    Addressed by the same ``{provider}/{model}`` id, validated and
+    percent-encoded exactly as :func:`model_run_request` does it, so an id that
+    runs is an id whose schema can be read.
+    """
+    provider, name = parse_model_id(model)
+    return _MODEL_SCHEMA_PATH_TEMPLATE.format(
+        provider=quote(provider, safe=""), model=quote(name, safe="")
+    )
+
+
+def model_schema_headers(etag: str | None) -> dict[str, str] | None:
+    """``If-None-Match`` for a conditional schema read, or ``None`` for a plain one.
+
+    Raises ``ValueError`` before any request for an empty or non-ASCII tag: an
+    empty header makes the read effectively unconditional, so a ``304`` to it
+    could not honestly mean "your copy is current", and a non-ASCII value would
+    fail inside httpx's header encoding as an untyped ``UnicodeEncodeError``.
+    """
+    if etag is None:
+        return None
+    if not isinstance(etag, str):
+        raise TypeError(f"etag must be a str, got {type(etag).__name__}")
+    if not etag or not etag.isascii():
+        raise ValueError(f"etag must be a non-empty ASCII string; got {etag!r}")
+    return {"If-None-Match": etag}
+
+
+def model_schema_answer(
+    p: _Prepared, resp: httpx.Response, etag: str | None
+) -> dict[str, Any] | None:
+    """The schema document, or ``None`` for a ``304`` to a conditional read.
+
+    ``None`` is reserved for the ``304`` so the SDK can read it as "unchanged":
+    a ``200`` whose body decodes to anything but a JSON object (``null``, a list,
+    a scalar) is raised as ``invalid_response`` rather than passed through.
+    """
+    # Only an answer to a conditional read: a 304 to a request that sent no tag
+    # cannot mean "your copy is current", so it falls through and is raised
+    # like any other unexpected status.
+    if resp.status_code == 304 and etag is not None:
+        return None
+    body: Any = p.parse_or_raise(resp, (200,))
+    if not isinstance(body, dict):
+        raise ApiError(
+            f"The {resp.status_code} schema response is not a JSON object",
+            code="invalid_response",
+            http_status=resp.status_code,
+            request_id=_request_id(resp),
+            body_excerpt=_body_excerpt(resp),
+        )
+    return body
 
 
 def _build_user_agent(client_info: str | None) -> str:
@@ -1326,6 +1420,47 @@ class ComfyLow:
         resp = self.raw_request("PUT", url, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 202, 204)), resp.headers
 
+    # -- models: discovery ------------------------------------------------
+    def get_model_catalog(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        timeout: Any = DISCOVERY_TIMEOUT,
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """GET ``{router_base_url}/v2/models`` — one page of the model catalog.
+
+        ``listRouterModels`` of ``spec/router-openapi.yaml``, hand-bound — see
+        :data:`_MODEL_CATALOG_PATH`. Returns ``(body, headers)`` so the caller
+        can read ``X-Comfy-Request-Id`` off a success.
+        """
+        url = self._p.router_base_url + model_catalog_path(cursor, limit)
+        resp = self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    def get_model_schema(
+        self,
+        model: str,
+        *,
+        etag: str | None = None,
+        timeout: Any = DISCOVERY_TIMEOUT,
+    ) -> tuple[dict[str, Any] | None, httpx.Headers]:
+        """GET ``{router_base_url}/v2/models/{provider}/{model}/openapi.json``.
+
+        ``getRouterModelInputSchema`` of ``spec/router-openapi.yaml``. With
+        ``etag`` the request carries ``If-None-Match``, and a ``304`` — the
+        document is unchanged — is a success, returned as a ``None`` body
+        rather than raised: it is the answer the caller asked for.
+
+        Raises ``TypeError``/``ValueError`` before any request when ``model``
+        is not a ``{provider}/{model}`` id (:func:`parse_model_id`) or ``etag``
+        is not a non-empty ASCII string (:func:`model_schema_headers`).
+        """
+        url = self._p.router_base_url + model_schema_path(model)
+        headers = model_schema_headers(etag)
+        resp = self.raw_request("GET", url, headers=headers, timeout=timeout)
+        return model_schema_answer(self._p, resp, etag), resp.headers
+
 
 class AsyncComfyLow:
     """Asynchronous protocol bindings — mirrors :class:`ComfyLow`."""
@@ -1695,6 +1830,32 @@ class AsyncComfyLow:
         )
         resp = await self.raw_request("PUT", url, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 202, 204)), resp.headers
+
+    # -- models: discovery ------------------------------------------------
+    async def get_model_catalog(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        timeout: Any = DISCOVERY_TIMEOUT,
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """Async :meth:`ComfyLow.get_model_catalog`."""
+        url = self._p.router_base_url + model_catalog_path(cursor, limit)
+        resp = await self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    async def get_model_schema(
+        self,
+        model: str,
+        *,
+        etag: str | None = None,
+        timeout: Any = DISCOVERY_TIMEOUT,
+    ) -> tuple[dict[str, Any] | None, httpx.Headers]:
+        """Async :meth:`ComfyLow.get_model_schema` — a ``304`` is a ``None`` body."""
+        url = self._p.router_base_url + model_schema_path(model)
+        headers = model_schema_headers(etag)
+        resp = await self.raw_request("GET", url, headers=headers, timeout=timeout)
+        return model_schema_answer(self._p, resp, etag), resp.headers
 
 
 def _looks_like_path(s: str) -> bool:

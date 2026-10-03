@@ -403,7 +403,9 @@ two variables.
 `base_url` and `timeout` are a read-only view of that configuration; model
 operations are added to this namespace as they land. There are two ways to run
 a model on it — `run`, which waits, and `submit`, which queues — and they send
-the same request.
+the same request. Two more read-only calls tell you what to run before you run
+it: `list`, the model catalog, and `schema`, one model's input and output
+schemas.
 
 ### `models.run` — one call, one result
 
@@ -484,9 +486,10 @@ Path("hello.mp3").write_bytes(result.content)
 ```
 
 `BinaryResult` is importable from `comfy_sdk` for exactly this `isinstance`
-check. Which shape a given model returns is in its own contract — `GET
-/v2/models/{provider}/{model}/openapi.json`, whose `200` is `application/json`
-for a JSON model and `*/*` with `format: binary` for a bytes one.
+check. Which shape a given model returns is in its own contract —
+[`models.schema`](#modelsschema--what-a-model-takes-and-what-it-returns)
+fetches it — whose `200` is `application/json` for a JSON model and `*/*` with
+`format: binary` for a bytes one.
 
 Note `content_type` keeps the header's **parameters**, because for some media
 types the parameters are part of what the bytes are — ElevenLabs' `pcm_*` output
@@ -505,6 +508,76 @@ SDK will not destroy one it merely finds suspicious. Two checks tell you:
 contract marks that header required on every answer it sends, so an HTML
 interstitial from a proxy in front of it has none), and `not result.content`
 means nothing was delivered. Check them before writing `content` to disk.
+
+### `models.list` — what you can run
+
+```python
+from comfy_sdk import Comfy
+
+with Comfy(api_key="comfyui-...") as client:
+    for model in client.models.list():
+        print(model.id, model.billing)
+```
+
+That walks Router's model catalog — `GET https://api.comfy.org/v2/models` —
+page by page, following `next_cursor` while `has_more` is true, and yields one
+`CatalogModel` per entry: `id` (the `{provider}/{model}` id `models.run` takes),
+`provider`, `model`, and `billing` (per-model billing facts such as
+`charges_on_policy_rejection`, never prices). Nothing is fetched until you
+iterate, and each loop is a fresh walk.
+
+For one page and its paging facts instead, call `.page()`:
+
+```python
+page = client.models.list(limit=50).page()
+page.data          # tuple of CatalogModel
+page.has_more      # walk on this, not on a short page
+page.next_cursor   # pass back as list(cursor=...) for the next page
+page.limit         # the page size the server actually served
+page.request_id    # X-Comfy-Request-Id, for a support request
+```
+
+`limit` is sent as given. The server defaults to 20 and clamps anything above
+100 down to 100 rather than rejecting it, so read `page.limit` for the size you
+got. The cursor is opaque and only good for the walk that produced it. On
+`AsyncComfy` it is `async for model in client.models.list():` and
+`await client.models.list().page()`.
+
+### `models.schema` — what a model takes, and what it returns
+
+```python
+with Comfy(api_key="comfyui-...") as client:
+    result = client.models.schema("bfl/flux-2-pro")
+    document = result.document   # the model's own OpenAPI document
+    etag = result.etag           # keep it for the next call
+```
+
+That is `GET https://api.comfy.org/v2/models/bfl/flux-2-pro/openapi.json`: the
+model's input schema (the body `models.run` sends) and its output schema, as a
+standalone OpenAPI document. The id is validated exactly as `models.run`
+validates it, before any request.
+
+Pass a tag you stored earlier to make the read conditional. When the document
+has not changed, the server answers `304` with no body, and you get
+`unchanged=True` back rather than an exception:
+
+```python
+result = client.models.schema("bfl/flux-2-pro", etag=etag)
+if result.unchanged:
+    ...  # your cached document is still current; result.document is None
+else:
+    document, etag = result.document, result.etag
+```
+
+The SDK keeps no cache, so storing the tag and the document is up to you. An
+unknown model raises `ModelNotFound`, and `await client.models.schema(...)` is the
+async form.
+
+Both methods use the same host and credential as `models.run`, raise the same
+typed Router exceptions (see
+[Catching Comfy Router errors](#catching-comfy-router-errors)), and default to
+a 30-second timeout. Pass `timeout=` seconds, an `httpx.Timeout`, or `None` to
+wait indefinitely.
 
 ### Image to image — upload an asset first
 
@@ -558,8 +631,10 @@ result = client.models.run(
 )
 ```
 
-Which form a model takes is in its input schema — `GET
-/v2/models/{provider}/{model}/openapi.json`, or the model's page in the
+Which form a model takes is in its input schema —
+`client.models.schema("bfl/flux-2-pro").document` (see
+[`models.schema`](#modelsschema--what-a-model-takes-and-what-it-returns)), or
+the model's page in the
 [Router model catalog](https://docs.comfy.org/development/comfy-router/models).
 
 Because the server may legitimately hold the connection for minutes, `run` uses

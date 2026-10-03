@@ -106,6 +106,10 @@ _SYNC_ON_BOTH: dict[tuple[str, str], str] = {
     ("comfy_sdk.jobs.Job", "get_outputs"): (
         "reads outputs already on the handle — no re-fetch, so nothing to await"
     ),
+    ("comfy_sdk.models.Models", "list"): (
+        "builds a lazy AsyncModelList and fetches nothing; `async for` and its awaited "
+        "page() are the I/O, so `async for m in client.models.list()` needs no extra await"
+    ),
 }
 
 #: A name that encodes sync-vs-async instead of letting the client encode it.
