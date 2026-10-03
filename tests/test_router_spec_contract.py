@@ -391,12 +391,18 @@ def test_the_200_promises_the_headers_a_binary_result_is_built_from() -> None:
 # spec, the lift must actually be reading that declared name, AND every
 # header-derived field must be listed here to be checked at all.
 
-#: field on :class:`RouterRunResult` -> (the 200 response header it is lifted
-#: from, a header value that field's own normaliser accepts). Every
-#: header-derived field belongs here; the completeness test at the bottom of
-#: this file is what keeps that true as fields are added.
+#: 200 response header -> a header value its field's own normaliser accepts.
 #:
-#: The probe value is per-field rather than one shared literal because the
+#: Keyed by header, not by field, and kept apart from the lift classification
+#: below on purpose: the exemption test hands ``_run_result`` these values to
+#: prove a ``_NON_HEADER_FIELDS`` entry is not secretly a lift. If the probes
+#: lived only in ``_CONTRACT_HEADER_LIFTS``, misfiling a lift as an exemption
+#: would drop its valid probe along with its lift entry, the header would be
+#: sent as the generic fallback its parser rejects, and the field would read
+#: the same with and without it -- so the misfiling would pass the very test
+#: meant to catch it.
+#:
+#: The probe value is per-header rather than one shared literal because the
 #: normalisers disagree about what is even a value: ``_credits_used`` reports
 #: anything that is not a finite decimal as ``None``, so a generic ``"x"``
 #: makes a correct lift look like it read some other name entirely. Each entry
@@ -414,15 +420,29 @@ def test_the_200_promises_the_headers_a_binary_result_is_built_from() -> None:
 #: comma-bearing entry rather than a tidied-up one -- that comma is the
 #: property its parser exists to preserve (asserted on the parsed value in
 #: ``test_models_run.py``, not here).
-_CONTRACT_HEADER_LIFTS = {
-    "serving_provider": ("X-Comfy-Router-Fallback-Provider", "fal"),
-    "dropped_params": (
-        "X-Comfy-Router-Dropped-Params",
-        '["moderation (fal applies its own, non-configurable safety filtering)"]',
+_HEADER_PROBES = {
+    "X-Comfy-Router-Fallback-Provider": "fal",
+    "X-Comfy-Router-Dropped-Params": (
+        '["moderation (fal applies its own, non-configurable safety filtering)"]'
     ),
-    "replayed": ("Idempotent-Replayed", "true"),
-    "request_id": ("X-Comfy-Request-Id", "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21"),
-    "credits_used": ("X-Comfy-Credits-Used", "12.5"),
+    "Idempotent-Replayed": "true",
+    "X-Comfy-Request-Id": "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21",
+    "X-Comfy-Credits-Used": "12.5",
+}
+
+#: field on :class:`RouterRunResult` -> (the 200 response header it is lifted
+#: from, that header's probe from ``_HEADER_PROBES``). Every header-derived
+#: field belongs here; the completeness test at the bottom of this file is what
+#: keeps that true as fields are added.
+_CONTRACT_HEADER_LIFTS = {
+    field: (header, _HEADER_PROBES[header])
+    for field, header in {
+        "serving_provider": "X-Comfy-Router-Fallback-Provider",
+        "dropped_params": "X-Comfy-Router-Dropped-Params",
+        "replayed": "Idempotent-Replayed",
+        "request_id": "X-Comfy-Request-Id",
+        "credits_used": "X-Comfy-Credits-Used",
+    }.items()
 }
 
 #: :class:`RouterRunResult` fields that are NOT lifted from a response header,
@@ -553,7 +573,9 @@ def test_an_exempt_field_is_really_unmoved_by_the_headers_it_skips() -> None:
     then knows the name to send. Closing that needs the source read, which the
     rest of this block deliberately refuses to do.
     """
-    probes = {header: probe for header, probe in _CONTRACT_HEADER_LIFTS.values()}
+    # From ``_HEADER_PROBES``, not ``_CONTRACT_HEADER_LIFTS``: a misfiled lift
+    # has no lift entry, and must still be sent a value its parser accepts.
+    probes = dict(_HEADER_PROBES)
     # Declared-but-unpinned names (the X-Committed-Spend-* trio, nosniff) have
     # no field and so no normaliser to satisfy; any non-empty value will do,
     # and one that moves a field is the finding.
