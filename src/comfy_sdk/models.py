@@ -35,7 +35,10 @@ one operation is a published signature that cannot be withdrawn once released.
 to convention.
 
 Callers do not import anything for this: ``from comfy_sdk import Comfy`` stays
-the only entry point, and ``client.models`` is the whole surface.
+the only entry point, and ``client.models`` is the whole surface. The one name
+worth importing is :class:`~comfy_low.transport.BinaryResult`, re-exported here
+and from ``comfy_sdk``, for an ``isinstance`` check on a run whose model answers
+in bytes rather than JSON.
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ from comfy_low.errors import IdempotencyKeyReuse as ProtocolIdempotencyKeyReuse
 from comfy_low.transport import (
     MODEL_RUN_TIMEOUT,
     AsyncComfyLow,
+    BinaryResult,
     ComfyLow,
     parse_model_id,
     parse_request_id,
@@ -222,8 +226,15 @@ class RouterRunResult:
     is the only place it is disclosed at all.
     """
 
-    output: dict[str, Any]
-    """The partner model's native JSON output, exactly what :meth:`Models.run` returns."""
+    output: dict[str, Any] | BinaryResult
+    """The partner model's native output, exactly what :meth:`Models.run` returns.
+
+    A ``dict`` for a model whose partner answers JSON, and a
+    :class:`~comfy_sdk.BinaryResult` for one whose partner answers a generation
+    directly as bytes — the same two shapes, decided the same way, as
+    :meth:`Models.run`. ``run_detailed`` adds the Router disclosures beside the
+    output; it does not change what the output is.
+    """
 
     serving_provider: str | None
     """``X-Comfy-Router-Fallback-Provider``: the provider that ultimately served this call.
@@ -362,7 +373,7 @@ def _credits_used(raw: str | None) -> str | None:
     return candidate if parsed.is_finite() else None
 
 
-def _run_result(body: dict[str, Any], headers: Mapping[str, str]) -> RouterRunResult:
+def _run_result(body: dict[str, Any] | BinaryResult, headers: Mapping[str, str]) -> RouterRunResult:
     """Build a :class:`RouterRunResult` from one run's body and response headers."""
     return RouterRunResult(
         output=body,
@@ -395,7 +406,7 @@ class Models(_ModelsBase):
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> tuple[dict[str, Any], Mapping[str, str]]:
+    ) -> tuple[dict[str, Any] | BinaryResult, Mapping[str, str]]:
         """Run ``model`` with ``arguments`` and return the completed result.
 
         ``model`` is the canonical ``{provider}/{model}`` id — exactly the two
@@ -435,9 +446,27 @@ class Models(_ModelsBase):
         awaitable form of this method is :meth:`AsyncModels.run` on
         ``AsyncComfy``.
 
-        The return value is the provider's own payload, decoded from JSON and
-        handed back as-is — no wrapper class stands between the caller and the
-        fields the provider documented.
+        The return value is the provider's own payload, handed back as-is. It
+        comes in **two shapes**, decided by the response's ``Content-Type``,
+        because Router forwards the partner's output under the partner's own
+        media type:
+
+        * a ``dict`` — the provider's JSON document, decoded, with its own field
+          names untouched. This is what all but a couple of models in the
+          catalog return, and it is unchanged from previous releases.
+        * a :class:`~comfy_low.transport.BinaryResult` — for a model whose
+          partner answers a generation directly as bytes (the ElevenLabs audio
+          models are the first of these). ``result.content`` is the file bytes
+          exactly as they arrived, ``result.content_type`` the media type the
+          response named, ``result.request_id`` its ``X-Comfy-Request-Id``. The
+          bytes are not base64-encoded and not wrapped in a dict: write them to
+          a file and you have the file the partner produced.
+
+        Branch with ``isinstance(result, BinaryResult)`` when you call a model
+        that might do either; a model's own contract (``GET
+        /v2/models/{provider}/{model}/openapi.json``) says which it is, and a
+        ``200`` whose ``Content-Type`` claims JSON but whose body will not parse
+        is still an error rather than bytes.
 
         Because the server may legitimately hold the connection for minutes,
         ``timeout`` defaults to :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT`
@@ -628,11 +657,16 @@ class Models(_ModelsBase):
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | BinaryResult:
         """Run ``model`` with ``arguments`` and return the partner's native output.
 
         See :meth:`_run` for the full contract; this is that call, answering the
         result document alone.
+
+        The result is a ``dict`` for a model whose partner answers JSON and a
+        :class:`~comfy_sdk.BinaryResult` for one whose partner answers a
+        generation directly as bytes, branched on the response ``Content-Type``
+        exactly as the run route's published ``200`` says a client must.
 
         ``run`` answers the native output because that document is what a caller
         asked for; ``run_detailed`` answers a :class:`RouterRunResult`, which
@@ -757,14 +791,16 @@ class Models(_ModelsBase):
         on_queue_update: Callable[[QueueUpdate], Any] | None = None,
         timeout: float | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | BinaryResult:
         """Queue a request, follow it to completion, and return its result.
 
         :meth:`submit` plus polling plus
         :meth:`~comfy_sdk.model_requests.RequestHandle.get`, in one call — the
         ergonomic form for a caller who does want to wait but also wants to
         show progress while waiting. The return value is the provider's own
-        payload, identical to what :meth:`run` would have returned.
+        payload, identical to what :meth:`run` would have returned — a ``dict``
+        for JSON output, a :class:`BinaryResult` for a model whose partner
+        answers a generation directly as bytes.
 
         ``on_queue_update`` is called with a
         :class:`~comfy_sdk.model_requests.QueueUpdate` each time the queue
@@ -865,7 +901,7 @@ class AsyncModels(_ModelsBase):
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> tuple[dict[str, Any], Mapping[str, str]]:
+    ) -> tuple[dict[str, Any] | BinaryResult, Mapping[str, str]]:
         """Awaitable :meth:`Models.run` — same arguments, same result shape.
 
         This *is* the async form of ``run``: awaiting it on ``AsyncComfy`` is
@@ -930,8 +966,8 @@ class AsyncModels(_ModelsBase):
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> dict[str, Any]:
-        """Awaitable :meth:`Models.run` — same arguments, same result shape."""
+    ) -> dict[str, Any] | BinaryResult:
+        """Awaitable :meth:`Models.run` — same ``dict | BinaryResult`` result."""
         body, _ = await self._run(
             model,
             arguments,
@@ -1009,7 +1045,7 @@ class AsyncModels(_ModelsBase):
         on_queue_update: Callable[[QueueUpdate], Any] | None = None,
         timeout: float | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | BinaryResult:
         """Awaitable :meth:`Models.subscribe` — same arguments, same result.
 
         ``on_queue_update`` may be a plain callable or a coroutine function;
@@ -1071,3 +1107,6 @@ class AsyncModels(_ModelsBase):
         parse_model_id(model)
         parse_request_id(request_id)
         return AsyncRequestHandle(cast(AsyncComfyLow, self._low), model, request_id, self._retry)
+
+
+__all__ = ["Models", "AsyncModels", "BinaryResult", "RouterRunResult"]

@@ -56,9 +56,73 @@ the fuller account of each version, including verification notes.
   control characters, ANSI escapes and bidi overrides reduced, whitespace collapsed, and a 256-character
   cap — so a hostile or merely careless `msg` can no longer scribble on a terminal or flood a log line.
   Only the summary string changes; `.errors` still carries the raw typed entries.
+- `client.models.run()` no longer throws away a generation whose model answers
+  in bytes rather than JSON. Comfy Router forwards a partner model's output
+  under the partner's *own* media type, and for a model whose partner returns a
+  generation directly as a file — the ElevenLabs audio models are the first of
+  these in the catalog — that is raw `audio/mpeg`. The SDK called `.json()` on
+  every 2xx regardless, so such a run raised `ComfyError` with
+  `code="invalid_response"` (`UnicodeDecodeError: 'utf-8' codec can't decode
+  byte 0xff`, the MP3 frame sync) *after* the generation had run and been
+  billed. Those models were unusable from this SDK.
+
+### Added
+
+- `BinaryResult` — importable from `comfy_sdk` — the second shape
+  `models.run()` can return. `run` now branches on the response
+  `Content-Type`, exactly as the run route's published `200` says a client
+  must: `application/json` (or a `+json` suffix type) decodes to a `dict`
+  exactly as before, and anything else comes back as
+  `BinaryResult(content, content_type, request_id)`. The bytes are the
+  partner's file verbatim — not base64-encoded, not wrapped in a dict, not
+  decoded or transcoded — so `Path("out.mp3").write_bytes(result.content)` is
+  the whole of it. `content_type` is the header including its parameters,
+  because for some partner media types the parameters are part of what the
+  bytes are (`audio/L16; rate=16000`); it is bounded and stripped of
+  unprintable characters first, which no real media type contains, the way
+  every other server-supplied string this SDK surfaces already is. The return
+  annotation is therefore `dict[str, Any] | BinaryResult`; a caller that only
+  uses JSON models sees no behaviour change, but a type checker will now ask
+  them to narrow. `run_detailed` is the same story one level out:
+  `RouterRunResult.output` carries whichever of the two shapes the run
+  answered with.
+
+  Two boundaries worth knowing: a 2xx whose `Content-Type` claims JSON and
+  whose body will not parse still raises `invalid_response` (there the response
+  promised a document and did not deliver one), while a 2xx that names *no*
+  `Content-Type` is a `BinaryResult` unless its body is empty (`{}`, as on
+  every other operation) or parses as a JSON **object**. Object, not merely
+  valid JSON: that branch probes bytes nothing declared, so `null`, `[...]` and
+  a bare number are bytes — accepting one would return a value outside the
+  declared union, and a short binary body of all-ASCII digits parses as a
+  number. The binary path runs inside the same translation as the JSON one, so
+  a failure still carries `.idempotency_key` and an `Idempotent-Replayed`
+  binary 200 comes back like a first run.
+
+  The one deliberate behaviour change beyond the fix: a non-JSON 2xx used to be
+  read as "a proxy interstitial served as 200" and raised. On this route that
+  reading is no longer available — the SDK cannot tell an interstitial from a
+  partner's native text output, and the contract says the body is the
+  partner's — so a `text/html` 200 now reaches the caller as bytes they can
+  inspect, rather than discarding a generation they were billed for. Every
+  other operation keeps the old reading, because JSON is the only success media
+  type their routes declare. The same asymmetry decides the empty case: a
+  declared-binary 200 with a zero-length body is a `BinaryResult` holding no
+  bytes rather than an exception. Two checks tell an answer from an artefact —
+  `request_id is None` means no Router answer was seen at all (the header is
+  required on every one Router sends), and `not content` means nothing was
+  delivered.
+
+  The queued surface gets the identical branch: `RequestHandle.get()` /
+  `AsyncRequestHandle.get()` and `models.subscribe()` now return
+  `dict[str, Any] | BinaryResult` too, because the result route they collect
+  from (`GET .../requests/{request_id}`) declares the same `application/json` /
+  `*/*` pair `models.run()` does. Before this it still went through the
+  JSON-only decoder, so a binary generation submitted through `submit()` raised
+  `invalid_response` on collection even though the identical model run directly
+  through `run()` already worked.
 
 ### Changed
-
 - **Because those three buckets are now one class each, they descend from `RouterError` on the
   workflow surface too**: a `POST /jobs` call that fails `401`/`403`/`402` raises a `RouterError`
   subclass. `except Unauthorized` / `except Forbidden` / `except InsufficientCredits` (from either

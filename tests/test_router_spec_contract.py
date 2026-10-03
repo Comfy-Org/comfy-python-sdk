@@ -274,6 +274,55 @@ def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None
     assert "{model}" in _MODEL_RUN_PATH_TEMPLATE
 
 
+# --- the two media types the run route's 200 can answer under ------------
+
+
+def _run_200_content() -> dict[str, Any]:
+    """The ``content`` map of ``runRouterModel``'s ``200``, read out of the spec."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    item = (doc.get("paths") or {})[_MODEL_RUN_PATH_TEMPLATE]
+    content = item["post"]["responses"]["200"]["content"]
+    assert isinstance(content, dict) and content, "runRouterModel's 200 declares no content"
+    return content
+
+
+def test_the_run_200_declares_both_a_json_and_a_binary_branch() -> None:
+    """The contract behind ``post_model_run`` returning ``dict | BinaryResult``.
+
+    Read out of the spec rather than restated, for the same reason the route is:
+    the day a sync drops the ``*/*`` branch (or adds a third one), the SDK's
+    two-way branch is either dead code or newly incomplete, and nothing else in
+    the suite would notice — the binary tests drive a *stub*, which asserts the
+    SDK's behaviour rather than the server's contract.
+    """
+    content = _run_200_content()
+    assert set(content) == {"application/json", "*/*"}, (
+        f"the vendored spec's runRouterModel 200 declares {sorted(content)}; "
+        "comfy_low.transport._Prepared.parse_run_result branches on exactly two "
+        "cases (JSON -> dict, anything else -> BinaryResult)"
+    )
+
+
+def test_the_binary_branch_is_declared_as_raw_bytes() -> None:
+    # `format: binary` is what says the body is bytes rather than a base64
+    # string or a JSON document — i.e. that `BinaryResult.content` is the
+    # partner's file and needs no decoding on the way out.
+    schema = _run_200_content()["*/*"].get("schema") or {}
+    assert schema.get("type") == "string"
+    assert schema.get("format") == "binary"
+
+
+def test_the_200_promises_the_headers_a_binary_result_is_built_from() -> None:
+    # `BinaryResult.request_id` reads `X-Comfy-Request-Id` off a *success*, and
+    # the SDK takes the partner's `Content-Type` at its word — which is only
+    # safe because the route sends `X-Content-Type-Options: nosniff`.
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    headers = doc["paths"][_MODEL_RUN_PATH_TEMPLATE]["post"]["responses"]["200"]["headers"]
+    assert "X-Comfy-Request-Id" in headers
+    assert "X-Content-Type-Options" in headers
+    assert "Idempotent-Replayed" in headers
+
+
 # --- run_detailed's header lifts, pinned against the contract -----------------
 #
 # `RouterRunResult` is built entirely out of response header names. A name is
@@ -295,10 +344,6 @@ _CONTRACT_HEADER_LIFTS = {
     "replayed": "Idempotent-Replayed",
     "request_id": "X-Comfy-Request-Id",
 }
-
-#: Lifted by the SDK but NOT declared on the contract's 200 -- see the tripwire
-#: test at the bottom of this file.
-_UNDECLARED_HEADER_LIFTS = {"credits_used": "X-Comfy-Credits-Used"}
 
 
 def _declared_run_response_headers() -> set[str]:
@@ -340,27 +385,21 @@ def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> N
     )
 
 
-@pytest.mark.parametrize(("field", "header"), sorted(_UNDECLARED_HEADER_LIFTS.items()))
-def test_an_undeclared_lift_stays_undeclared_until_someone_reconciles_it(
-    field: str, header: str
-) -> None:
-    """Tripwire, and deliberately asserting the *absence*.
+def test_credits_used_header_is_declared_by_the_contract() -> None:
+    """``credits_used`` is pinned to its declared name here, not above.
 
-    ``credits_used`` is lifted from a header the vendored contract does not
-    declare anywhere -- the 200's only cost headers are the
-    ``X-Committed-Spend-*`` trio, which is a different quantity (USD cents of
-    in-flight commitment, not the price of this run). Nothing in the suite can
-    catch a wrong name here, because every test configures its stub to emit the
-    exact literal the lift reads.
-
-    That gap is tracked, not accepted. This test fails the moment a spec sync
-    declares the header, which is the signal to move the entry up into
-    ``_CONTRACT_HEADER_LIFTS`` and get it pinned like the rest. It also fails
-    if the header is declared under a *different* name for the same quantity,
-    because the reconciliation is the same either way.
+    It shares ``test_every_lifted_header_is_declared_by_the_contract``'s
+    declared-ness check, but not ``test_the_lift_actually_reads_the_declared_name``:
+    that test proves a lift reads a header by checking presence changes the
+    field's value, and does so with the literal ``"x"`` -- which
+    :func:`_credits_used` rejects as not a finite decimal, so it would come
+    back ``None`` whether or not the header were sent. `tests/test_models_run.py`
+    already pins the reads-the-declared-name half of this contract with values
+    that actually parse.
     """
     declared = _declared_run_response_headers()
-    assert header not in declared, (
-        f"the vendored spec now declares {header!r}: move {field!r} from "
-        f"_UNDECLARED_HEADER_LIFTS into _CONTRACT_HEADER_LIFTS so it is pinned."
+    assert "X-Comfy-Credits-Used" in declared, (
+        "RouterRunResult.credits_used is lifted from 'X-Comfy-Credits-Used', which the "
+        f"vendored spec does not declare on runRouterModel's 200. Declared: {sorted(declared)}. "
+        "Either a sync renamed the header or the SDK is reading a name Router never sends."
     )

@@ -122,6 +122,21 @@ class ServerState:
     # interstitial served under a 200, a response truncated mid-stream. The
     # generation ran and was billed; only the result is unreadable.
     model_run_undecodable_body: bool = False
+    # The Content-Type that undecodable body is served under. `application/json`
+    # by default, because that is the case that is still an ERROR: the response
+    # promised a JSON document and did not deliver one. Point it at `text/html`
+    # and the same body is instead a success carrying non-JSON bytes, which is
+    # what the run route's `*/*` branch says to do with it — the SDK cannot tell
+    # a proxy's interstitial from a partner's native text output, and on this
+    # route the contract says the body is the partner's.
+    model_run_undecodable_content_type: str = "application/json"
+    # Answer a successful run with these raw bytes under
+    # `model_run_binary_content_type` instead of `model_run_result` as JSON —
+    # the ElevenLabs-shaped direct-return binary 200. `None` serves JSON.
+    model_run_binary_body: bytes | None = None
+    # Content-Type for `model_run_binary_body`. `None` sends no Content-Type
+    # header at all, which is the header-stripping-intermediary case.
+    model_run_binary_content_type: str | None = "audio/mpeg"
     # Model the deployment `retry_possibly_in_flight` exists for: one that
     # *replays* a repeated Idempotency-Key rather than rejecting it, so a key
     # is released rather than claimed when a request fails 5xx. Default False
@@ -151,8 +166,10 @@ class ServerState:
     # 409). `None` sends no header at all, which is the same failure the policy
     # must *not* retry.
     model_run_retry_after: str | None = None
-    # Sent as X-Comfy-Request-Id alongside a failed run. `None` sends no header,
-    # which is the response an intermediary that never reached the router gives.
+    # Sent as X-Comfy-Request-Id on a model run's answer, success or failure —
+    # Router stamps it on both, and `BinaryResult.request_id` is read off a
+    # success. `None` sends no header, which is the response an intermediary
+    # that never reached the router gives.
     model_run_request_id: str | None = None
     # Extra response headers stamped on a SUCCESSFUL model run, for the
     # disclosure headers the body cannot carry (X-Comfy-Credits-Used,
@@ -239,6 +256,13 @@ class ServerState:
             "seed": 7,
         }
     )
+    # Answer a completed result with these raw bytes under
+    # `queue_result_binary_content_type` instead of `queue_result` as JSON —
+    # the queued sibling of `model_run_binary_body`. `None` serves JSON.
+    queue_result_binary_body: bytes | None = None
+    # Content-Type for `queue_result_binary_body`. `None` sends no Content-Type
+    # header at all, which is the header-stripping-intermediary case.
+    queue_result_binary_content_type: str | None = "audio/mpeg"
     # Status code for the cancel response; 204 exercises the empty-body path.
     queue_cancel_status: int = 200
     # Cancels that answer a transient failure (status, code) before one is
@@ -314,7 +338,16 @@ class ServerState:
     # Idempotency-Key -> the result recorded for it under
     # `model_run_replays_lost_result`, served verbatim to a later request
     # presenting the same key.
-    model_run_replay_store: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #
+    # The whole answer is recorded, not just the JSON payload: `(payload,
+    # binary_body, binary_content_type)` as they stood when the generation
+    # completed. A replay has to serve *that record* rather than re-read the
+    # knobs, or a test asserting the recorded result came back would pass even
+    # with the per-key record wrong or empty -- on the one path where serving
+    # the wrong record means double-billing.
+    model_run_replay_store: dict[str, tuple[dict[str, Any], bytes | None, str | None]] = field(
+        default_factory=dict
+    )
     # How many times the model actually *ran*, as distinct from how many
     # requests arrived (`model_run_count`). A replay serves a recorded result
     # and does not increment this, which is what lets a test tell a real replay
@@ -424,12 +457,25 @@ def _make_handler(state: ServerState):
             self.end_headers()
             self.wfile.write(body)
 
-        def _raw(self, status: int, body: bytes, content_type: str) -> None:
+        def _raw(
+            self,
+            status: int,
+            body: bytes,
+            content_type: str | None,
+            headers: dict | None = None,
+        ) -> None:
             """A response whose body is *not* JSON — the case a client that
-            calls ``.json()`` unguarded on a success status falls over on."""
+            calls ``.json()`` unguarded on a success status falls over on.
+
+            ``content_type=None`` sends **no** ``Content-Type`` header at all,
+            which is a real shape (an intermediary that strips it) and the one a
+            client branching on the header has nothing to branch on."""
             self.send_response(status)
-            self.send_header("Content-Type", content_type)
+            if content_type is not None:
+                self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -750,6 +796,11 @@ def _make_handler(state: ServerState):
         def _serve_queue_result(self, request_id: str) -> None:
             state.queue_result_count += 1
             state.queue_paths.append(self.path)
+            if state.queue_result_binary_body is not None:
+                self._raw(
+                    200, state.queue_result_binary_body, state.queue_result_binary_content_type
+                )
+                return
             if state.queue_result_raw is not None:
                 self._json(200, state.queue_result_raw)
                 return
@@ -822,18 +873,20 @@ def _make_handler(state: ServerState):
             # rather than rejecting the resend, and the model does not run
             # again — which is the whole point of asking under the same key.
             if key and key in state.model_run_replay_store:
+                recorded_payload, recorded_body, recorded_type = state.model_run_replay_store[key]
                 # `model_run_response_headers` is merged in here as well as on
                 # the fresh-run path below, because a replay is the canonical
                 # reported-zero and the only response where `credits_used` and
                 # `replayed` are both meaningful at once. Stamped first, so the
                 # replay marker itself cannot be overwritten by a test's dict.
-                self._json(
+                self._serve_run_result(
                     200,
-                    state.model_run_replay_store[key],
+                    recorded_payload,
                     headers={
                         **state.model_run_response_headers,
                         "Idempotent-Replayed": "true",
                     },
+                    binary=(recorded_body, recorded_type),
                 )
                 return
 
@@ -894,7 +947,11 @@ def _make_handler(state: ServerState):
                     # The generation completed; only the answer was lost. Bill
                     # it once and record it, so the same key collects it.
                     state.model_run_generations += 1
-                    state.model_run_replay_store[key] = state.model_run_result
+                    state.model_run_replay_store[key] = (
+                        state.model_run_result,
+                        state.model_run_binary_body,
+                        state.model_run_binary_content_type,
+                    )
                 headers: dict[str, str] = {}
                 if state.model_run_retry_after is not None:
                     headers["Retry-After"] = state.model_run_retry_after
@@ -944,14 +1001,47 @@ def _make_handler(state: ServerState):
                 self._raw(
                     state.model_run_status,
                     b"<html><body>502 from an intermediary</body></html>",
-                    "text/html",
+                    state.model_run_undecodable_content_type,
                 )
                 return
-            self._json(
+            self._serve_run_result(
                 state.model_run_status,
                 state.model_run_result,
                 headers=state.model_run_response_headers or None,
             )
+
+        def _serve_run_result(
+            self,
+            status: int,
+            payload: dict,
+            headers: dict | None = None,
+            binary: tuple[bytes | None, str | None] | None = None,
+        ) -> None:
+            """A successful run's body — the partner's JSON, or its own bytes.
+
+            Both shapes go through one helper so the *replay* of a claimed key
+            answers in whichever shape the run itself would have: the route's
+            ``Idempotent-Replayed`` 200 carries the recorded result, and a
+            recorded result that was audio is still audio.
+
+            ``binary`` is that record's own ``(body, content_type)``, passed by
+            the replay branch so the replay serves what was stored against the
+            key instead of whatever the knobs say *now*. A fresh run passes
+            none and reads the knobs, which for it are the same thing.
+            """
+            body, content_type = (
+                binary
+                if binary is not None
+                else (state.model_run_binary_body, state.model_run_binary_content_type)
+            )
+            if state.model_run_request_id is not None:
+                # Router stamps the id on every answer, not only on failures;
+                # `BinaryResult.request_id` is read off a *success*.
+                headers = {**(headers or {}), "X-Comfy-Request-Id": state.model_run_request_id}
+            if body is not None:
+                self._raw(status, body, content_type, headers=headers)
+                return
+            self._json(status, payload, headers=headers)
 
         def _post_jobs(self) -> None:
             state.submit_count += 1
