@@ -21,6 +21,13 @@ the fuller account of each version, including verification notes.
   with `", "`), `NaN`/`Infinity` — reports as `None` rather than passing through to break the
   `Decimal()` parse the field documents. The field defaults to `None`, so this stays additive
   for anything that constructs a `RouterRunResult` by hand.
+  The vendored Router spec now declares `X-Comfy-Credits-Used` on the run route's `200`, so
+  `tests/test_router_spec_contract.py` pins this lift against the contract like the other four.
+- `QueueBacklogFull` in `comfy_sdk.router_exceptions`, for the Router bucket `queue_backlog_full`:
+  a queued `submit` refused `429` because the caller already has too many requests waiting. It is
+  not `ConcurrencyLimitExceeded` — the queue parks a submit at the in-flight limit, and this is the
+  separate bound on how many may be left waiting. It clears as the caller's own queued requests
+  finish. Before this, the bucket arrived as a bare `RouterError`.
 
 ### Fixed
 
@@ -73,8 +80,12 @@ the fuller account of each version, including verification notes.
   affected: `raise`, `except` and every attribute a caller reads inside the handler (`.message`,
   `.code`, `.http_status`, `.details`, `.request_id`, `.retry_after`) are unchanged.
 - `RouterError` is exported from the package root, alongside `CancelRefused` and
-  `AlreadyCompleted`. The eighteen per-bucket classes still live in
+  `AlreadyCompleted`. The nineteen per-bucket classes still live in
   `comfy_sdk.router_exceptions`.
+- `NotEnabled`'s documented meaning widened with the synced Router spec: on a queued `submit` it
+  can also refuse a *model* whose partner answers a generation directly as bytes (it cannot yet be
+  queued; nothing is queued or charged; `models.run` serves it). It is still terminal, but on a
+  submit it no longer proves the caller is not switched on — read `.detail`.
 - `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
   body's `error_type`), or `None` when it named none — which is also how the SDK tells which
   surface answered.

@@ -604,7 +604,16 @@ async with AsyncComfy(api_key="comfyui-...") as client:
 This surface is **gated server side**. A caller the queue is not switched on
 for is answered `403 not_enabled`, which arrives as
 `comfy_sdk.router_exceptions.NotEnabled` — nothing about the request is wrong,
-and it is terminal: do not retry it.
+and it is terminal: do not retry it. The same `403 not_enabled` also refuses a
+*model* whose partner answers a generation directly as bytes: it cannot yet be
+queued, nothing is queued or charged, and `client.models.run` serves it instead —
+so read `.detail` before concluding the account is not switched on.
+
+A caller with too many queued requests already waiting is refused
+`429 queue_backlog_full`, raised as `comfy_sdk.router_exceptions.QueueBacklogFull`.
+It is not `ConcurrencyLimitExceeded` (the synchronous route's in-flight bound):
+the queue parks a submit at that limit, and this is the separate bound on how many
+may be left waiting. It clears as your own queued requests finish.
 
 ### Retrying a run without paying for it twice
 
@@ -879,12 +888,13 @@ status on `.http_status`; keep an `except ComfyError` outside the clause above
 if you need to handle those in the same place.
 
 `RouterError` is exported from the package root because it is the handler most
-callers write first. The eighteen per-bucket classes stay in
+callers write first. The nineteen per-bucket classes stay in
 `comfy_sdk.router_exceptions` — `InvalidInput`, `ContentPolicyViolation`,
 `ProviderError`, `ProviderTimeout`, `InsufficientCredits`, `ModelNotFound`,
 `Unauthorized`, `Forbidden`, `ConcurrencyLimitExceeded`, `ClientDisconnected`,
 `InternalError`, `DeadlineExceeded`, `NotEnabled`, `ServiceUnavailable`,
-`RateLimited`, `Cancelled`, `QueueTimeout`, `RequestNotFound` — one import path
+`RateLimited`, `Cancelled`, `QueueTimeout`, `RequestNotFound`,
+`QueueBacklogFull` — one import path
 for the whole set rather than half of it here and half of it there. A bucket added to Router after your installed version
 arrives as `RouterError` itself, with the raw value readable on `.error_type`.
 

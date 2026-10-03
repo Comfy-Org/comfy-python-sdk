@@ -294,11 +294,22 @@ _CONTRACT_HEADER_LIFTS = {
     "dropped_params": "X-Comfy-Router-Dropped-Params",
     "replayed": "Idempotent-Replayed",
     "request_id": "X-Comfy-Request-Id",
+    "credits_used": "X-Comfy-Credits-Used",
 }
 
+#: A value the lift will actually keep, for the lifts that validate what they
+#: read. ``credits_used`` reports a non-decimal as ``None`` -- the same as an
+#: absent header -- so probing it with an arbitrary string would make a correct
+#: lift look like one reading the wrong name. ``12.5`` is the spec's own
+#: example for the header. Anything not listed is probed with ``"x"``.
+_LIFT_PROBE_VALUES = {"X-Comfy-Credits-Used": "12.5"}
+
 #: Lifted by the SDK but NOT declared on the contract's 200 -- see the tripwire
-#: test at the bottom of this file.
-_UNDECLARED_HEADER_LIFTS = {"credits_used": "X-Comfy-Credits-Used"}
+#: test at the bottom of this file. Empty today: ``credits_used`` sat here until
+#: a spec sync declared ``X-Comfy-Credits-Used``, and was moved up into
+#: ``_CONTRACT_HEADER_LIFTS`` then. Kept, rather than deleted with its test, so
+#: the next lift the SDK reads ahead of the contract has somewhere to go.
+_UNDECLARED_HEADER_LIFTS: dict[str, str] = {}
 
 
 def _declared_run_response_headers() -> set[str]:
@@ -333,7 +344,7 @@ def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> N
     to fail.
     """
     absent = getattr(_run_result({}, {}), field)
-    present = getattr(_run_result({}, {header: "x"}), field)
+    present = getattr(_run_result({}, {header: _LIFT_PROBE_VALUES.get(header, "x")}), field)
     assert present != absent, (
         f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
         f"the header and without it, so the lift is reading some other name."
@@ -346,18 +357,17 @@ def test_an_undeclared_lift_stays_undeclared_until_someone_reconciles_it(
 ) -> None:
     """Tripwire, and deliberately asserting the *absence*.
 
-    ``credits_used`` is lifted from a header the vendored contract does not
-    declare anywhere -- the 200's only cost headers are the
-    ``X-Committed-Spend-*`` trio, which is a different quantity (USD cents of
-    in-flight commitment, not the price of this run). Nothing in the suite can
-    catch a wrong name here, because every test configures its stub to emit the
-    exact literal the lift reads.
+    For a lift the SDK reads from a header the vendored contract does not yet
+    declare. Nothing in the suite can catch a wrong name for such a lift,
+    because every test configures its stub to emit the exact literal the lift
+    reads -- so the gap is tracked, not accepted: this test fails the moment a
+    spec sync declares the header, which is the signal to move the entry up
+    into ``_CONTRACT_HEADER_LIFTS`` and get it pinned like the rest.
 
-    That gap is tracked, not accepted. This test fails the moment a spec sync
-    declares the header, which is the signal to move the entry up into
-    ``_CONTRACT_HEADER_LIFTS`` and get it pinned like the rest. It also fails
-    if the header is declared under a *different* name for the same quantity,
-    because the reconciliation is the same either way.
+    ``credits_used`` (``X-Comfy-Credits-Used``) went through exactly that: it
+    was lifted ahead of the contract, this test fired on the sync that declared
+    it, and it now lives in ``_CONTRACT_HEADER_LIFTS``. With nothing left
+    undeclared the parametrization is empty, which pytest reports as a skip.
     """
     declared = _declared_run_response_headers()
     assert header not in declared, (
