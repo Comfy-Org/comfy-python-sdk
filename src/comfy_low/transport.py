@@ -1308,9 +1308,8 @@ class ComfyLow:
         schema could not carry every field. Returning the body alone discarded
         both, so a caller could not tell an alt-provider run from a native one.
 
-        Raises ``TypeError``/``ValueError`` before any request when ``model``
-        is not a ``{provider}/{model}`` id (:func:`parse_model_id`) or ``etag``
-        is not a non-empty ASCII string (:func:`model_schema_headers`).
+        Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
+        any request when ``model`` is not a ``{provider}/{model}`` id.
         """
         path, body, headers = model_run_request(
             model,
@@ -1363,9 +1362,8 @@ class ComfyLow:
         schema could not carry every field. Returning the body alone discarded
         both, so a caller could not tell an alt-provider run from a native one.
 
-        Raises ``TypeError``/``ValueError`` before any request when ``model``
-        is not a ``{provider}/{model}`` id (:func:`parse_model_id`) or ``etag``
-        is not a non-empty ASCII string (:func:`model_schema_headers`).
+        Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
+        any request when ``model`` is not a ``{provider}/{model}`` id.
         """
         path, body, headers = model_submit_request(model, arguments, idempotency_key)
         url = self._p.router_base_url + path
