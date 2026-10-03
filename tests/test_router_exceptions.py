@@ -15,6 +15,8 @@ import pytest
 from comfy_sdk.exceptions import ComfyError
 from comfy_sdk.router_exceptions import (
     ERROR_TYPE_HEADER,
+    REFUSAL_SUBJECT_HEADER,
+    REFUSAL_SUBJECTS,
     REQUEST_ID_HEADER,
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
@@ -38,6 +40,7 @@ from comfy_sdk.router_exceptions import (
     ServiceUnavailable,
     Unauthorized,
     ValidationErrorDetail,
+    error_from_completion,
     error_from_response,
     exception_for,
 )
@@ -563,3 +566,185 @@ def test_the_location_rendering_is_shared_with_the_summariser() -> None:
     entry = {"loc": ["body", ["a", "b"], 0], "msg": "bad"}
     assert _detail_from(entry).location == "body.0"
     assert summarise_detail([entry]) == "body.0: bad"
+
+
+# -- refusal_subject: which input or output a content-policy refusal was about --
+
+REFUSED_BODY: dict[str, Any] = {"detail": "Refused.", "error_type": "content_policy_violation"}
+
+
+def test_the_documented_refusal_subjects_are_listed() -> None:
+    assert REFUSAL_SUBJECTS == (
+        "input",
+        "output",
+        "input_text",
+        "input_image",
+        "input_video",
+        "input_audio",
+        "output_text",
+        "output_image",
+        "output_video",
+        "output_audio",
+    )
+
+
+def test_the_refusal_subject_header_wins_over_the_body() -> None:
+    exc = error_from_response(
+        400,
+        {ERROR_TYPE_HEADER: "content_policy_violation", REFUSAL_SUBJECT_HEADER: "input_image"},
+        {**REFUSED_BODY, "refusal_subject": "output_image"},
+    )
+    assert type(exc) is ContentPolicyViolation
+    assert exc.refusal_subject == "input_image"
+
+
+def test_the_refusal_subject_header_is_matched_case_insensitively() -> None:
+    exc = error_from_response(
+        400,
+        {ERROR_TYPE_HEADER: "content_policy_violation", "x-comfy-refusal-subject": "input_text"},
+        REFUSED_BODY,
+    )
+    assert exc.refusal_subject == "input_text"
+
+
+def test_the_refusal_subject_is_read_off_the_body_when_the_header_is_absent() -> None:
+    exc = error_from_response(400, {}, {**REFUSED_BODY, "refusal_subject": "output_video"})
+    assert type(exc) is ContentPolicyViolation
+    assert exc.refusal_subject == "output_video"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_refusal_subject_header_falls_back_to_the_body(blank: str) -> None:
+    exc = error_from_response(
+        400, {REFUSAL_SUBJECT_HEADER: blank}, {**REFUSED_BODY, "refusal_subject": "input"}
+    )
+    assert exc.refusal_subject == "input"
+
+
+def test_an_absent_refusal_subject_is_none() -> None:
+    exc = error_from_response(400, {ERROR_TYPE_HEADER: "content_policy_violation"}, REFUSED_BODY)
+    assert type(exc) is ContentPolicyViolation
+    assert exc.refusal_subject is None
+
+
+@pytest.mark.parametrize("raw", [None, 3, ["input"], {"subject": "input"}])
+def test_a_non_string_body_refusal_subject_is_none(raw: Any) -> None:
+    exc = error_from_response(400, {}, {**REFUSED_BODY, "refusal_subject": raw})
+    assert exc.refusal_subject is None
+
+
+def test_an_unknown_refusal_subject_passes_through_unnarrowed() -> None:
+    # The raw wire value, like `error_type`: a subject added after this SDK
+    # version was built still reaches the caller.
+    assert "input_3d_mesh" not in REFUSAL_SUBJECTS
+    from_header = error_from_response(
+        400,
+        {ERROR_TYPE_HEADER: "content_policy_violation", REFUSAL_SUBJECT_HEADER: "input_3d_mesh"},
+        None,
+    )
+    from_body = error_from_response(400, {}, {**REFUSED_BODY, "refusal_subject": "input_3d_mesh"})
+    assert from_header.refusal_subject == "input_3d_mesh"
+    assert from_body.refusal_subject == "input_3d_mesh"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "input_image, output_text",  # httpx's join of a duplicated header
+        "input\x1b[31m",
+        "input\nX-Injected: 1",
+        "input_\u202eegami",
+        "x" * 65,
+    ],
+    ids=["duplicated", "ansi", "newline", "bidi", "overlong"],
+)
+def test_a_malformed_refusal_subject_reads_as_undisclosed(hostile: str) -> None:
+    # Server-controlled text headed for a displayed attribute: bounded to one
+    # printable token, and dropped rather than truncated when it is not one.
+    from_header = error_from_response(
+        400,
+        {ERROR_TYPE_HEADER: "content_policy_violation", REFUSAL_SUBJECT_HEADER: hostile},
+        REFUSED_BODY,
+    )
+    from_body = error_from_response(400, {}, {**REFUSED_BODY, "refusal_subject": hostile})
+    from_completion = error_from_completion({**REFUSED_BODY, "refusal_subject": hostile})
+    assert from_header.refusal_subject is None
+    assert from_body.refusal_subject is None
+    assert from_completion is not None and from_completion.refusal_subject is None
+
+
+def test_a_malformed_refusal_subject_header_falls_back_to_the_body() -> None:
+    exc = error_from_response(
+        400,
+        {REFUSAL_SUBJECT_HEADER: "input_image, output_text"},
+        {**REFUSED_BODY, "refusal_subject": "input_image"},
+    )
+    assert exc.refusal_subject == "input_image"
+
+
+def test_the_422_validation_shape_never_carries_a_refusal_subject() -> None:
+    exc = error_from_response(422, {ERROR_TYPE_HEADER: "invalid_input"}, VALIDATION_BODY)
+    assert type(exc) is InvalidInput
+    assert exc.refusal_subject is None
+
+
+def test_a_hand_built_router_error_defaults_the_refusal_subject_to_none() -> None:
+    assert ContentPolicyViolation("Refused.").refusal_subject is None
+    assert RouterError("x", refusal_subject="output").refusal_subject == "output"
+
+
+def test_a_refused_completion_carries_the_body_refusal_subject() -> None:
+    exc = error_from_completion({**REFUSED_BODY, "refusal_subject": "output_audio"})
+    assert isinstance(exc, ContentPolicyViolation)
+    assert exc.refusal_subject == "output_audio"
+    bare = error_from_completion(REFUSED_BODY)
+    assert bare is not None and bare.refusal_subject is None
+
+
+# The awaited `models.run` path does not go through `error_from_response`: it
+# crosses `comfy_low`'s `ApiError` and `to_sdk_error`, so the subject has to
+# survive that boundary too.
+
+MODEL = "fal-ai/flux-pro"
+ARGS = {"prompt": "a cat"}
+
+
+def _refuse(server: Any, *, header: str | None, body: str | None) -> None:
+    server.state.model_run_router_error_shape = True
+    server.state.model_run_error = (400, "content_policy_violation")
+    if header is not None:
+        server.state.model_run_error_headers = {REFUSAL_SUBJECT_HEADER: header}
+    if body is not None:
+        server.state.model_run_error_body_extra = {"refusal_subject": body}
+
+
+@pytest.mark.parametrize(
+    ("header", "body", "expected"),
+    [
+        ("input_image", "output_image", "input_image"),
+        (None, "output_text", "output_text"),
+        (None, None, None),
+        ("input\x1b[31m", None, None),
+    ],
+    ids=["header-wins", "body-only", "absent", "hostile-header"],
+)
+def test_models_run_carries_the_refusal_subject(server, header, body, expected) -> None:
+    from comfy_sdk import Comfy
+    from comfy_sdk.retry import NO_RETRY
+
+    _refuse(server, header=header, body=body)
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ContentPolicyViolation) as caught:
+            client.models.run(MODEL, ARGS)
+    assert caught.value.refusal_subject == expected
+
+
+async def test_the_async_models_run_carries_the_refusal_subject(server) -> None:
+    from comfy_sdk import AsyncComfy
+    from comfy_sdk.retry import NO_RETRY
+
+    _refuse(server, header="input_video", body=None)
+    async with AsyncComfy(retry=NO_RETRY) as client:
+        with pytest.raises(ContentPolicyViolation) as caught:
+            await client.models.run(MODEL, ARGS)
+    assert caught.value.refusal_subject == "input_video"
