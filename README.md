@@ -348,7 +348,9 @@ address with `COMFY_BASE_URL`. Elsewhere:
   `metadata` is a single string, so it refuses a label map on `submit()` with a
   `ComfyError` whose `code` is `"invalid_request"`. The SDK reads the proxy's
   string `metadata` as no labels (`{}`), so a filtered `list_jobs()` yields
-  nothing there, and an unfiltered one yields every job.
+  nothing there, and an unfiltered one yields every job, each with `metadata`
+  `{}`. Its list items carry `created_at` rather than `create_time`, so
+  `create_time` reads as `None` there (the raw value stays in `data`).
 
 Labels are fixed when the job is submitted. `job.metadata` is an empty dict for a
 job with none. A `metadata` that is not a map of strings reads as `{}`, and a
@@ -365,8 +367,11 @@ Each item is a `JobSummary` (`id`, `status`, `create_time`, `update_time`,
 way `submit()` retries.
 
 `list_jobs()` also checks the filters itself: an item whose labels do not include
-every pair you passed is skipped, even if the server sent it. So on a host that
-ignores the filters, a filtered `list_jobs()` yields only real matches.
+every pair you passed is skipped, even if the server sent it. Values are compared
+as the text the query sends, so `metadata={"run": 7}` matches the label `"7"`.
+So on a host that ignores the filters, a filtered `list_jobs()` yields only real
+matches; there, one step of the iteration can read several pages, or every page,
+before it yields or ends.
 
 The server sets the limits on labels and filters, and the SDK does not check
 them first. A map it refuses raises `ComfyError` with `code ==

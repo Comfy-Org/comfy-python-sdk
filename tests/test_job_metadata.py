@@ -173,6 +173,7 @@ _ODD_METADATA = [
     pytest.param({"n": None, "client": "acme"}, {"client": "acme"}, id="null-value"),
     pytest.param("batch-7", {}, id="string"),
     pytest.param(["batch-7"], {}, id="list"),
+    pytest.param({"__proto__": "x"}, {"__proto__": "x"}, id="proto-key"),
 ]
 
 
@@ -327,6 +328,16 @@ def test_a_filtered_list_skips_items_whose_labels_do_not_match(server) -> None:
         found = list(client.list_jobs(metadata={"client": "acme", "run": "nightly-42"}))
     assert [j.id for j in found] == ["job_06", "job_01"]
     assert len(server.state.job_list_queries) == 2
+
+
+def test_a_filtered_list_compares_values_as_the_text_the_query_sends(server) -> None:
+    # `metadata={"run": 7}` is sent as `run=7`, which the server matches against
+    # the label "7"; the client-side check must compare the same text.
+    server.state.job_list_pages = [[_item("job_02", {"run": "7"}), _item("job_01", {"run": "8"})]]
+    with Comfy() as client:
+        found = list(client.list_jobs(metadata={"run": 7}))  # type: ignore[dict-item]
+    assert [j.id for j in found] == ["job_02"]
+    assert server.state.job_list_queries[0]["metadata[run]"] == ["7"]
 
 
 async def test_async_filtered_list_skips_items_whose_labels_do_not_match(server) -> None:

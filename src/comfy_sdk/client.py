@@ -104,8 +104,12 @@ def _retry_delay(exc: ApiError, deadline: float) -> float | None:
 
 
 def _has_labels(summary: JobSummary, metadata: Mapping[str, str] | None) -> bool:
-    """Whether ``summary`` carries every ``metadata`` filter pair (always, with none)."""
-    return all(summary.metadata.get(k) == v for k, v in (metadata or {}).items())
+    """Whether ``summary`` carries every ``metadata`` filter pair (always, with none).
+
+    Each value is compared as the text the query string sends (``str(v)``), as
+    the server compares it, so ``{"run": 7}`` matches the label ``"7"``.
+    """
+    return all(summary.metadata.get(k) == str(v) for k, v in (metadata or {}).items())
 
 
 def _resolve_env_url(var: str, default: str) -> str:
@@ -418,7 +422,9 @@ class Comfy:
         The filters are also checked on each item, and an item that does not
         carry every pair is skipped. A host that ignores the filters (a
         self-hosted proxy, which keeps no labels) therefore yields nothing for a
-        filtered list rather than every job.
+        filtered list rather than every job. On such a host one step of the
+        iteration can read several pages, or every page, before it yields or
+        ends.
 
         Each page retries a 429 that carries ``Retry-After`` the way
         :meth:`submit` does, at the server's pace (at least one second) and
