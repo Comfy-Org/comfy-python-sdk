@@ -342,13 +342,14 @@ Labels are fixed when the job is submitted. `job.metadata` is an empty dict for 
 job with none. `list_jobs()` returns the newest jobs first and keeps only the
 ones whose labels include every key you pass, with exactly that value. It fetches
 page after page until there are no more; `limit=` sets the page size, not a cap
-on the total. Each item is a `JobSummary` (`id`, `status`, `metadata`, and
-`data`, the item as the server sent it); call `client.jobs.get(summary.id)` for
+on the total. Each item is a `JobSummary` (`id`, `status`, `create_time`,
+`update_time`, `deployment_id`, `metadata`, and `data`, the item as the server
+sent it); call `client.jobs.get(summary.id)` for
 the full job and its outputs. On `AsyncComfy`, iterate with
 `async for summary in client.list_jobs(...)`.
 
 The server sets the limits on labels and filters, and the SDK does not check
-them first. A map it refuses raises `ComfyError` with `code ==
+them first. A map it refuses raises `InvalidWorkflow` with `code ==
 "metadata_invalid"` and a message naming the key; a filter it refuses raises
 `ComfyError` with `code == "invalid_metadata_filter"`.
 

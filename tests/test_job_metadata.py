@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from comfy_sdk import AsyncComfy, Comfy, ComfyError, JobSummary
+from comfy_sdk import AsyncComfy, Comfy, ComfyError, InvalidWorkflow, JobSummary
 
 _GRAPH = {"3": {"class_type": "KSampler", "inputs": {}}}
 _LABELS = {"client": "acme", "run": "nightly-42"}
@@ -77,7 +77,7 @@ def test_a_refused_map_raises_the_servers_error_naming_the_key(server) -> None:
         'metadata key "bad key" has a character outside A-Z a-z 0-9 _ - .'
     )
     with Comfy() as client:
-        with pytest.raises(ComfyError) as excinfo:
+        with pytest.raises(InvalidWorkflow) as excinfo:
             client.submit(_wf(client), metadata={"bad key": "x"})
     assert excinfo.value.code == "metadata_invalid"
     assert excinfo.value.http_status == 422
@@ -90,7 +90,7 @@ async def test_async_refused_map_raises_the_servers_error_naming_the_key(server)
     server.state.job_error = (422, "metadata_invalid")
     server.state.job_error_message = 'metadata key "k16" is one pair too many (17 > 16)'
     async with AsyncComfy() as client:
-        with pytest.raises(ComfyError) as excinfo:
+        with pytest.raises(InvalidWorkflow) as excinfo:
             await client.submit(_wf(client), metadata={f"k{i}": "v" for i in range(17)})
     assert excinfo.value.code == "metadata_invalid"
     assert excinfo.value.http_status == 422
@@ -178,8 +178,21 @@ def test_list_jobs_items_keep_the_server_fields(server) -> None:
     assert isinstance(summary, JobSummary)
     assert summary.id == "job_01"
     assert summary.status == "completed"
+    assert summary.create_time == "2026-10-05T12:00:00Z"
+    assert summary.update_time == "2026-10-05T12:01:00Z"
+    assert summary.deployment_id == "dep_01"
     assert summary.metadata == {}
     assert summary.data == item
+
+
+def test_list_jobs_items_without_optional_fields_read_as_none(server) -> None:
+    server.state.job_list_pages = [[{"id": "job_01", "status": "pending"}]]
+    with Comfy() as client:
+        (summary,) = client.list_jobs()
+    assert summary.create_time is None
+    assert summary.update_time is None
+    assert summary.deployment_id is None
+    assert summary.metadata == {}
 
 
 def test_list_jobs_surfaces_a_refused_filter(server) -> None:

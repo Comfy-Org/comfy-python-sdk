@@ -65,6 +65,15 @@ class JobSummary:
 
     id: str
     status: str
+    create_time: str | None
+    """When the job was created, as the server's timestamp string."""
+
+    update_time: str | None
+    """When the job last changed, as the server's timestamp string."""
+
+    deployment_id: str | None
+    """The deployment that ran the job, or ``None`` when the item has none."""
+
     metadata: dict[str, str]
     """The job's labels, or an empty dict when it has none."""
 
@@ -81,6 +90,9 @@ class JobSummary:
         return cls(
             id=item["id"],
             status=item["status"],
+            create_time=item.get("create_time"),
+            update_time=item.get("update_time"),
+            deployment_id=item.get("deployment_id"),
             metadata=dict(item.get("metadata") or {}),
             data=item,
         )
