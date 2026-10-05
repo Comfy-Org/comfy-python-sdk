@@ -21,8 +21,13 @@ the fuller account of each version, including verification notes.
   `metadata`, `data`); on `AsyncComfy` it is an async iterator. The SDK leaves the label limits
   to the server: a refused map raises `ComfyError` with code `metadata_invalid`, and a
   refused filter raises `ComfyError` with code `invalid_metadata_filter` (`invalid_cursor` for a
-  cursor the server did not issue). Labels work on a deployment's
-  address; Comfy Cloud refuses them for now with `ComfyError` code `metadata_not_supported`.
+  cursor the server did not issue). Each page retries a 429 that carries `Retry-After`, as
+  `submit` does. A `metadata` that is not a map of strings reads as `{}` and a non-string value
+  is dropped, on jobs and list items alike, instead of raising. Labels work on a deployment's
+  address. Comfy Cloud refuses them for now: `submit` raises `ComfyError` code
+  `metadata_not_supported` and `list_jobs` raises code `not_implemented` (HTTP 501). A
+  self-hosted `comfy-api-proxy` does not keep labels: it refuses a label map with code
+  `invalid_request`, its list ignores the filters, and its string `metadata` reads as `{}`.
 - `models.list()` and `models.schema()`, so you can discover Comfy Router models from Python
   as the TypeScript SDK already can. `list(cursor=, limit=, timeout=)` returns an iterable that
   walks the catalog (`GET /v2/models`), following `next_cursor` while `has_more` is true, and

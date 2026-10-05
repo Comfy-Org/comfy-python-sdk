@@ -339,18 +339,29 @@ for summary in client.list_jobs(metadata={"client": "acme"}):
 ```
 
 Labels work on jobs sent to a deployment: point the client at the deployment's
-address with `COMFY_BASE_URL`. Comfy Cloud refuses them for now, with a
-`ComfyError` whose `code` is `"metadata_not_supported"`.
+address with `COMFY_BASE_URL`. Elsewhere:
+
+- **Comfy Cloud** refuses labels for now: `submit()` raises a `ComfyError` whose
+  `code` is `"metadata_not_supported"`, and `list_jobs()` raises a `ComfyError`
+  whose `code` is `"not_implemented"` (HTTP 501).
+- **A self-hosted `comfy-api-proxy`** does not keep labels. Its own job
+  `metadata` is a single string, so it refuses a label map on `submit()` with a
+  `ComfyError` whose `code` is `"invalid_request"`. Its job list ignores the
+  `metadata` filters, so `list_jobs()` returns every job it has, and the SDK
+  reads the proxy's string `metadata` as no labels (`{}`).
 
 Labels are fixed when the job is submitted. `job.metadata` is an empty dict for a
-job with none. `list_jobs()` returns the newest jobs first and keeps only the
-ones whose labels include every key you pass, with exactly that value. It fetches
-page after page until there are no more; `limit=` sets the page size, not a cap
-on the total. Each item is a `JobSummary` (`id`, `status`, `create_time`,
-`update_time`, `deployment_id`, `metadata`, and `data`, the item as the server
-sent it); call `client.jobs.get(summary.id)` for
-the full job and its outputs. On `AsyncComfy`, iterate with
-`async for summary in client.list_jobs(...)`.
+job with none. A `metadata` that is not a map of strings reads as `{}`, and a
+value that is not a string is dropped, rather than raising.
+
+`list_jobs()` returns the newest jobs first and keeps only the ones whose labels
+include every key you pass, with exactly that value. It fetches page after page
+until there are no more; `limit=` sets the page size, not a cap on the total.
+Each item is a `JobSummary` (`id`, `status`, `create_time`, `update_time`,
+`deployment_id`, `metadata`, and `data`, the item as the server sent it); call
+`client.jobs.get(summary.id)` for the full job and its outputs. On `AsyncComfy`, iterate with
+`async for summary in client.list_jobs(...)`. A page answered 429 with
+`Retry-After` is fetched again after that wait, the same way `submit()` retries.
 
 The server sets the limits on labels and filters, and the SDK does not check
 them first. A map it refuses raises `ComfyError` with `code ==

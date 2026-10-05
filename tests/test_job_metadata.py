@@ -9,10 +9,16 @@ caller with the key it named. Everything runs against the stub in
 
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
+from conftest import _job_json
 
+from comfy_low.models import Job as LowJob
+from comfy_low.models import JobStatus
 from comfy_sdk import AsyncComfy, Comfy, ComfyError, InvalidWorkflow, JobSummary
 
 _GRAPH = {"3": {"class_type": "KSampler", "inputs": {}}}
@@ -26,7 +32,7 @@ def _wf(client: Comfy | AsyncComfy):
 def _item(job_id: str, metadata: dict[str, str] | None = None) -> dict:
     item = {
         "id": job_id,
-        "status": "completed",
+        "status": "succeeded",
         "create_time": "2026-10-05T12:00:00Z",
         "update_time": "2026-10-05T12:01:00Z",
         "deployment_id": "dep_01",
@@ -142,6 +148,85 @@ async def test_an_async_fetched_job_exposes_its_metadata(server) -> None:
         assert job.metadata == _LABELS
 
 
+def test_a_cancelled_job_keeps_its_metadata(server) -> None:
+    server.state.job_metadata = _LABELS
+    with Comfy() as client:
+        job = client.jobs.get("job_01")
+        assert job.cancel().metadata == _LABELS
+
+
+async def test_an_async_cancelled_job_keeps_its_metadata(server) -> None:
+    server.state.job_metadata = _LABELS
+    async with AsyncComfy() as client:
+        job = await client.jobs.get("job_01")
+        assert (await job.cancel()).metadata == _LABELS
+
+
+# --- metadata that is not a map of strings ----------------------------------
+
+# What a server might send that is not a map of strings. The self-hosted proxy
+# has its own `metadata`, a plain string; and nothing on the wire stops a map
+# value being a number or null. None of these may raise: on submit the job
+# already exists by the time the answer is read.
+_ODD_METADATA = [
+    pytest.param({"n": 1}, {}, id="number-value"),
+    pytest.param({"n": None, "client": "acme"}, {"client": "acme"}, id="null-value"),
+    pytest.param("batch-7", {}, id="string"),
+    pytest.param(["batch-7"], {}, id="list"),
+]
+
+
+@pytest.mark.parametrize(("sent", "read"), _ODD_METADATA)
+def test_odd_metadata_on_a_job_reads_as_labels_and_never_raises(server, sent, read) -> None:
+    server.state.job_metadata = sent
+    with Comfy() as client:
+        job = client.submit(_wf(client))
+        assert job.metadata == read
+        assert client.jobs.get(job.id).metadata == read
+        assert job.refresh().metadata == read
+        assert job.wait().metadata == read
+        assert job.cancel().metadata == read
+
+
+@pytest.mark.parametrize(("sent", "read"), _ODD_METADATA)
+async def test_async_odd_metadata_on_a_job_reads_as_labels_and_never_raises(
+    server, sent, read
+) -> None:
+    server.state.job_metadata = sent
+    async with AsyncComfy() as client:
+        job = await client.submit(_wf(client))
+        assert job.metadata == read
+        assert (await client.jobs.get(job.id)).metadata == read
+        assert (await job.refresh()).metadata == read
+        assert (await job.wait()).metadata == read
+        assert (await job.cancel()).metadata == read
+
+
+@pytest.mark.parametrize(("sent", "read"), _ODD_METADATA)
+def test_odd_metadata_on_a_list_item_reads_as_labels_and_never_raises(server, sent, read) -> None:
+    item: dict[str, Any] = {**_item("job_01"), "metadata": sent}
+    server.state.job_list_pages = [[item]]
+    with Comfy() as client:
+        (summary,) = client.list_jobs()
+    assert summary.metadata == read
+    assert summary.data["metadata"] == sent
+
+
+def test_odd_metadata_still_reads_once_the_generated_job_declares_a_strict_field() -> None:
+    # A spec sync will add `metadata: dict[str, str]` to the generated `Job`.
+    # Simulate that model and check the transport's lenient reading still wins.
+    from comfy_low.transport import _with_lenient_metadata
+
+    class SyncedJob(LowJob):
+        metadata: dict[str, str] | None = None
+
+    body = _job_json("job_01", "queued", metadata={"n": 1, "client": "acme"})
+    with pytest.raises(ValueError):
+        SyncedJob.model_validate(body)
+    model = _with_lenient_metadata(SyncedJob).model_validate(body)
+    assert getattr(model, "metadata", None) == {"client": "acme"}
+
+
 # --- list_jobs ------------------------------------------------------------
 
 
@@ -185,6 +270,8 @@ def test_list_jobs_with_no_arguments_sends_no_query(server) -> None:
         found = list(client.list_jobs())
     assert [j.id for j in found] == ["job_01"]
     assert server.state.job_list_queries == [{}]
+    # The bare path, not `/jobs?`.
+    assert server.state.job_list_paths == ["/api/v2/jobs"]
 
 
 def test_list_jobs_items_keep_the_server_fields(server) -> None:
@@ -194,7 +281,9 @@ def test_list_jobs_items_keep_the_server_fields(server) -> None:
         (summary,) = client.list_jobs()
     assert isinstance(summary, JobSummary)
     assert summary.id == "job_01"
-    assert summary.status == "completed"
+    # A JobStatus value, the same string `Job.status` reports for that state.
+    assert summary.status == "succeeded"
+    assert JobStatus(summary.status) is JobStatus.succeeded
     assert summary.create_time == datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
     assert summary.update_time == datetime(2026, 10, 5, 12, 1, tzinfo=timezone.utc)
     assert summary.deployment_id == "dep_01"
@@ -202,8 +291,71 @@ def test_list_jobs_items_keep_the_server_fields(server) -> None:
     assert summary.data == item
 
 
+def test_a_job_summary_can_be_hashed(server) -> None:
+    server.state.job_list_pages = [[_item("job_01", _LABELS)]]
+    with Comfy() as client:
+        (summary,) = client.list_jobs()
+    assert summary in {summary}
+
+
+def test_a_page_without_jobs_yields_nothing_and_paging_continues(server) -> None:
+    server.state.job_list_pages = [None, [_item("job_01")]]
+    with Comfy() as client:
+        found = list(client.list_jobs())
+    assert [j.id for j in found] == ["job_01"]
+
+
+def test_a_last_page_without_jobs_yields_nothing(server) -> None:
+    server.state.job_list_pages = [None]
+    with Comfy() as client:
+        assert list(client.list_jobs()) == []
+
+
+async def test_async_a_page_without_jobs_yields_nothing_and_paging_continues(server) -> None:
+    server.state.job_list_pages = [None, [_item("job_01")]]
+    async with AsyncComfy() as client:
+        found = [j async for j in client.list_jobs()]
+    assert [j.id for j in found] == ["job_01"]
+
+
+def test_list_jobs_retries_a_429_on_each_page_at_the_servers_pace(server, monkeypatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    server.state.job_list_pages = [[_item("job_02")], [_item("job_01")]]
+    # The first request for each page is answered 429 `Retry-After: 3`.
+    server.state.job_list_429_at = {0, 2}
+    server.state.job_list_retry_after = "3"
+    with Comfy() as client:
+        found = list(client.list_jobs(metadata={"client": "acme"}, limit=1))
+    assert [j.id for j in found] == ["job_02", "job_01"]
+    assert sleeps == [3, 3]
+    queries = server.state.job_list_queries
+    assert len(queries) == 4
+    # The retry asks for the same page with the same filters.
+    assert queries[1] == queries[0]
+    assert queries[3] == queries[2]
+    assert queries[3]["cursor"] == ["page-1"]
+
+
+async def test_async_list_jobs_retries_a_429_on_each_page(server, monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def _no_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    server.state.job_list_pages = [[_item("job_02")], [_item("job_01")]]
+    server.state.job_list_429_at = {0, 2}
+    server.state.job_list_retry_after = "3"
+    async with AsyncComfy() as client:
+        found = [j async for j in client.list_jobs(limit=1)]
+    assert [j.id for j in found] == ["job_02", "job_01"]
+    assert sleeps == [3, 3]
+    assert len(server.state.job_list_queries) == 4
+
+
 def test_list_jobs_items_without_optional_fields_read_as_none(server) -> None:
-    server.state.job_list_pages = [[{"id": "job_01", "status": "pending"}]]
+    server.state.job_list_pages = [[{"id": "job_01", "status": "queued"}]]
     with Comfy() as client:
         (summary,) = client.list_jobs()
     assert summary.create_time is None
@@ -215,7 +367,7 @@ def test_list_jobs_items_without_optional_fields_read_as_none(server) -> None:
 def test_list_jobs_reads_nanosecond_times_and_tolerates_unreadable_ones(server) -> None:
     item = {
         "id": "job_01",
-        "status": "completed",
+        "status": "succeeded",
         "create_time": "2026-10-05T12:00:00.123456789Z",
         "update_time": "not a time",
     }
@@ -248,6 +400,18 @@ def test_list_jobs_surfaces_a_refused_cursor(server) -> None:
     assert excinfo.value.code == "invalid_cursor"
     assert excinfo.value.http_status == 400
     assert not isinstance(excinfo.value, InvalidWorkflow)
+
+
+def test_list_jobs_on_a_host_that_cannot_list_raises_not_implemented(server) -> None:
+    # Comfy Cloud's answer until it lists jobs.
+    server.state.job_list_error = (501, "not_implemented", "listing jobs is not supported here")
+    with Comfy() as client:
+        with pytest.raises(ComfyError) as excinfo:
+            list(client.list_jobs())
+    assert excinfo.value.code == "not_implemented"
+    assert excinfo.value.http_status == 501
+    # A 501 is final: the page is not retried.
+    assert len(server.state.job_list_queries) == 1
 
 
 async def test_async_list_jobs_surfaces_a_refused_filter(server) -> None:

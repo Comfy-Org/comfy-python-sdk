@@ -65,15 +65,24 @@ class ServerState:
     job_error: tuple[int, str] | None = None
     # The message that envelope carries; None means a generic one.
     job_error_message: str | None = None
-    # The `metadata` GET /jobs/{id} reports; None omits the field, as the
-    # server does for a job with no labels.
-    job_metadata: dict[str, str] | None = None
-    # GET /jobs (the list): one entry per page, each a list of list items. Page
-    # i carries `next_cursor` "page-{i+1}" unless it is the last.
-    job_list_pages: list[list[dict[str, Any]]] = field(default_factory=lambda: [[]])
+    # The `metadata` every job answer reports (GET /jobs/{id}, the cancel, and
+    # the submit, which otherwise echoes what was sent), served exactly as
+    # given, so a test can send a shape the SDK did not ask for. None omits the
+    # field, as the server does for a job with no labels.
+    job_metadata: Any = None
+    # GET /jobs (the list): one entry per page, each a list of list items, or
+    # None for a page with no `jobs` key at all. Page i carries `next_cursor`
+    # "page-{i+1}" unless it is the last.
+    job_list_pages: list[list[dict[str, Any]] | None] = field(default_factory=lambda: [[]])
     # GET /jobs answers this (status, code, message) instead of a page.
     job_list_error: tuple[int, str, str] | None = None
-    # The parsed query string of every GET /jobs, in arrival order.
+    # GET /jobs answers 429 `rate_limited` with `Retry-After:
+    # job_list_retry_after` to the requests at these 0-based arrival indexes.
+    job_list_429_at: set[int] = field(default_factory=set)
+    job_list_retry_after: str = "0"
+    # The raw path (with query) and the parsed query string of every GET /jobs,
+    # in arrival order.
+    job_list_paths: list[str] = field(default_factory=list)
     job_list_queries: list[dict[str, list[str]]] = field(default_factory=list)
     # GET /jobs/{id} answers 404 job_not_found instead of the job.
     job_not_found: bool = False
@@ -451,7 +460,7 @@ def _job_json(
     job_id: str,
     status: str,
     outputs: list[dict] | None = None,
-    metadata: dict[str, str] | None = None,
+    metadata: Any = None,
 ) -> dict:
     job = {
         "id": job_id,
@@ -693,14 +702,25 @@ def _make_handler(state: ServerState):
 
         def _serve_job_list(self) -> None:
             query = parse_qs(urlsplit(self.path).query)
+            arrival = len(state.job_list_queries)
+            state.job_list_paths.append(self.path)
             state.job_list_queries.append(query)
             if state.job_list_error is not None:
                 status, code, message = state.job_list_error
                 self._err(status, code, message)
                 return
+            if arrival in state.job_list_429_at:
+                self._json(
+                    429,
+                    {"error": {"code": "rate_limited", "message": "slow down"}},
+                    headers={"Retry-After": state.job_list_retry_after},
+                )
+                return
             cursor = query.get("cursor", ["page-0"])[0]
             index = int(cursor.removeprefix("page-"))
-            page: dict[str, Any] = {"jobs": state.job_list_pages[index]}
+            page: dict[str, Any] = {}
+            if state.job_list_pages[index] is not None:
+                page["jobs"] = state.job_list_pages[index]
             if index + 1 < len(state.job_list_pages):
                 page["next_cursor"] = f"page-{index + 1}"
             self._json(200, page)
@@ -797,7 +817,7 @@ def _make_handler(state: ServerState):
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
-                self._json(200, _job_json(m.group(1), "canceling"))
+                self._json(200, _job_json(m.group(1), "canceling", metadata=state.job_metadata))
                 return
             self._read_body()
             self._err(404, "not_found")
@@ -1231,7 +1251,10 @@ def _make_handler(state: ServerState):
             job_id = f"job_{state.submit_count:02d}"
             if key:
                 state.idempotency[key] = job_id
-            self._json(201, _job_json(job_id, "queued", metadata=body.get("metadata")))
+            metadata = (
+                state.job_metadata if state.job_metadata is not None else body.get("metadata")
+            )
+            self._json(201, _job_json(job_id, "queued", metadata=metadata))
 
     return Handler
 

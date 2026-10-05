@@ -59,10 +59,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
-from typing import Any, BinaryIO, NoReturn, cast
+from typing import Annotated, Any, BinaryIO, NoReturn, cast
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
+from pydantic import BeforeValidator, create_model
 
 from . import _multipart
 from .errors import ApiError, clean_body_excerpt, clean_request_id, error_from_envelope
@@ -915,17 +916,33 @@ async def _async_multipart_body(chunks: Iterator[bytes]) -> AsyncIterator[bytes]
         yield chunk
 
 
-class _JobWithMetadata(Job):
-    """``Job`` plus its optional ``metadata`` map of caller-chosen string labels.
+def job_labels(raw: Any) -> dict[str, str]:
+    """A job's ``metadata`` as string labels, read leniently.
+
+    Anything that is not an object reads as ``{}``, and a pair whose value is
+    not a string is dropped. Never raises: a submit answer is read after the
+    server created the job, and a self-hosted proxy sends its own ``metadata``
+    as a plain string.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _with_lenient_metadata(base: type[Job]) -> type[Job]:
+    """``base`` with a ``metadata`` field that reads through :func:`job_labels`.
 
     The v2 contract gained ``metadata`` on the job object, but the vendored spec
     the models are generated from does not carry it yet. Declared here, in the
     hand-written layer, rather than in the generated models, so the field is
-    read today and this subclass becomes a no-op once the spec sync adds the
-    same field to ``Job`` itself.
+    read today. It overrides the field rather than adding one, so it keeps
+    reading leniently after a spec sync adds a strict ``metadata`` to ``Job``.
     """
+    lenient = Annotated[dict[str, str] | None, BeforeValidator(job_labels)]
+    return create_model(f"{base.__name__}WithMetadata", __base__=base, metadata=(lenient, None))
 
-    metadata: dict[str, str] | None = None
+
+_JobWithMetadata = _with_lenient_metadata(Job)
 
 
 def _job(data: dict[str, Any]) -> Job:
@@ -957,9 +974,10 @@ def _jobs_list_path(
 ) -> str:
     """Sans-IO path (with query) for one page of ``GET /api/v2/jobs``.
 
-    Each metadata filter is sent as ``metadata[<key>]=<value>`` (the
-    ``deepObject`` style the route declares). Nothing is checked here: the
-    server owns the filter rules and answers a bad filter with its own error.
+    Each metadata filter is sent as ``metadata[<key>]=<value>``, the
+    ``deepObject`` style the v2 contract's ``listJobs`` declares (the vendored
+    spec does not carry that route yet). Nothing is checked here: the server
+    owns the filter rules and answers a bad filter with its own error.
     """
     params: list[tuple[str, str]] = [(f"metadata[{k}]", v) for k, v in (metadata or {}).items()]
     if limit is not None:

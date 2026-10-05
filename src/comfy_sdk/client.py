@@ -407,18 +407,36 @@ class Comfy:
         issue raises :class:`~comfy_sdk.exceptions.ComfyError` with ``code ==
         "invalid_cursor"``.
 
-        Yields :class:`~comfy_sdk.jobs.JobSummary` items; call
-        ``client.jobs.get(summary.id)`` for a full job and its outputs.
+        Each page retries a 429 that carries ``Retry-After`` the way
+        :meth:`submit` does, at the server's pace and within the same budget.
+
+        Comfy Cloud does not list jobs yet: it answers ``code ==
+        "not_implemented"`` (HTTP 501). Yields :class:`~comfy_sdk.jobs.JobSummary`
+        items; call ``client.jobs.get(summary.id)`` for a full job and its outputs.
         """
         cursor: str | None = None
         while True:
-            with translating():
-                page = self._low.list_jobs(metadata=metadata, limit=limit, cursor=cursor)
+            page = self._list_page(metadata, limit, cursor)
             for item in page.get("jobs") or []:
                 yield JobSummary._from_item(item)
             cursor = page.get("next_cursor")
             if not cursor:
                 return
+
+    def _list_page(
+        self, metadata: Mapping[str, str] | None, limit: int | None, cursor: str | None
+    ) -> dict[str, Any]:
+        """One page of :meth:`list_jobs`, retrying a paced 429 like :meth:`submit`."""
+        deadline = _now() + _QUEUE_RETRY_BUDGET
+        with translating():
+            while True:
+                try:
+                    return self._low.list_jobs(metadata=metadata, limit=limit, cursor=cursor)
+                except ApiError as exc:
+                    delay = _retry_delay(exc, deadline)
+                    if delay is None:
+                        raise to_sdk_error(exc) from exc
+                    time.sleep(delay)
 
 
 def _run_with_timeout(job: Job, timeout: float) -> Job:
@@ -552,10 +570,26 @@ class AsyncComfy:
         """Async :meth:`Comfy.list_jobs` — ``async for summary in client.list_jobs(...)``."""
         cursor: str | None = None
         while True:
-            with translating():
-                page = await self._low.list_jobs(metadata=metadata, limit=limit, cursor=cursor)
+            page = await self._list_page(metadata, limit, cursor)
             for item in page.get("jobs") or []:
                 yield JobSummary._from_item(item)
             cursor = page.get("next_cursor")
             if not cursor:
                 return
+
+    async def _list_page(
+        self, metadata: Mapping[str, str] | None, limit: int | None, cursor: str | None
+    ) -> dict[str, Any]:
+        """Async :meth:`Comfy._list_page`."""
+        import asyncio
+
+        deadline = _now() + _QUEUE_RETRY_BUDGET
+        with translating():
+            while True:
+                try:
+                    return await self._low.list_jobs(metadata=metadata, limit=limit, cursor=cursor)
+                except ApiError as exc:
+                    delay = _retry_delay(exc, deadline)
+                    if delay is None:
+                        raise to_sdk_error(exc) from exc
+                    await asyncio.sleep(delay)

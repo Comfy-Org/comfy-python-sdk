@@ -22,7 +22,7 @@ from pydantic import TypeAdapter, ValidationError
 from comfy_low.errors import ApiError
 from comfy_low.models import Job as LowJob
 from comfy_low.models import Output as LowOutput
-from comfy_low.transport import AsyncComfyLow, ComfyLow
+from comfy_low.transport import AsyncComfyLow, ComfyLow, job_labels
 
 from . import _core
 from .events import Event, StatusChange, event_from_raw
@@ -53,7 +53,8 @@ class JobWorkflow:
 def _metadata_of(model: LowJob) -> dict[str, str]:
     # `getattr` because the generated `Job` does not declare the field until the
     # spec sync lands; the transport validates into a subclass that does.
-    return dict(getattr(model, "metadata", None) or {})
+    # `job_labels` returns a new dict, so the caller gets a copy.
+    return job_labels(getattr(model, "metadata", None))
 
 
 _TIME = TypeAdapter(datetime)
@@ -96,7 +97,12 @@ class JobSummary:
     """
 
     metadata: dict[str, str]
-    """The job's labels, or an empty dict when it has none."""
+    """The job's labels, or an empty dict when it has none.
+
+    Read leniently: a ``metadata`` that is not an object (a self-hosted proxy
+    sends its own as a string) reads as ``{}``, and a non-string value is
+    dropped. ``data`` keeps what the server sent.
+    """
 
     data: dict[str, Any]
     """The list item exactly as the server sent it, for fields not lifted above."""
@@ -114,7 +120,7 @@ class JobSummary:
             create_time=_parse_time(item.get("create_time")),
             update_time=_parse_time(item.get("update_time")),
             deployment_id=item.get("deployment_id"),
-            metadata=dict(item.get("metadata") or {}),
+            metadata=job_labels(item.get("metadata")),
             data=item,
         )
 
@@ -148,7 +154,9 @@ class Job:
         """The string labels given at submit, or an empty dict when there are none.
 
         Fixed when the job is submitted; nothing changes them later. A copy, so
-        editing it does not change this handle.
+        editing it does not change this handle. A ``metadata`` that is not a map
+        of strings (a self-hosted proxy sends its own as a string) reads as
+        ``{}``, and a non-string value is dropped, rather than raising.
         """
         return _metadata_of(self._model)
 
