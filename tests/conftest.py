@@ -77,9 +77,10 @@ class ServerState:
     # GET /jobs answers this (status, code, message) instead of a page.
     job_list_error: tuple[int, str, str] | None = None
     # GET /jobs answers 429 `rate_limited` with `Retry-After:
-    # job_list_retry_after` to the requests at these 0-based arrival indexes.
+    # job_list_retry_after` (no header when None) to the requests at these
+    # 0-based arrival indexes.
     job_list_429_at: set[int] = field(default_factory=set)
-    job_list_retry_after: str = "0"
+    job_list_retry_after: str | None = "0"
     # The raw path (with query) and the parsed query string of every GET /jobs,
     # in arrival order.
     job_list_paths: list[str] = field(default_factory=list)
@@ -710,10 +711,11 @@ def _make_handler(state: ServerState):
                 self._err(status, code, message)
                 return
             if arrival in state.job_list_429_at:
+                retry_after = state.job_list_retry_after
                 self._json(
                     429,
                     {"error": {"code": "rate_limited", "message": "slow down"}},
-                    headers={"Retry-After": state.job_list_retry_after},
+                    headers={"Retry-After": retry_after} if retry_after is not None else None,
                 )
                 return
             cursor = query.get("cursor", ["page-0"])[0]

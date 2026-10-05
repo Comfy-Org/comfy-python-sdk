@@ -45,7 +45,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from comfy_low.errors import ApiError
-from comfy_low.transport import ROUTER_BASE_URL, AsyncComfyLow, ComfyLow, origin
+from comfy_low.transport import (
+    ROUTER_BASE_URL,
+    AsyncComfyLow,
+    ComfyLow,
+    metadata_filter_pairs,
+    origin,
+)
 
 from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
@@ -106,10 +112,11 @@ def _retry_delay(exc: ApiError, deadline: float) -> float | None:
 def _has_labels(summary: JobSummary, metadata: Mapping[str, str] | None) -> bool:
     """Whether ``summary`` carries every ``metadata`` filter pair (always, with none).
 
-    Each value is compared as the text the query string sends (``str(v)``), as
-    the server compares it, so ``{"run": 7}`` matches the label ``"7"``.
+    Each pair is compared as the text the query string sends, as the server
+    compares it, so ``{"run": 7}`` matches the label ``"7"`` and ``{1: "a"}``
+    the key ``"1"``.
     """
-    return all(summary.metadata.get(k) == str(v) for k, v in (metadata or {}).items())
+    return all(summary.metadata.get(k) == v for k, v in metadata_filter_pairs(metadata))
 
 
 def _resolve_env_url(var: str, default: str) -> str:
@@ -427,8 +434,9 @@ class Comfy:
         ends.
 
         Each page retries a 429 that carries ``Retry-After`` the way
-        :meth:`submit` does, at the server's pace (at least one second) and
-        within the same budget.
+        :meth:`submit` does, at the server's pace (at least one second). Each
+        page has its own 60-second retry budget, the length :meth:`submit`
+        gets, so a long list is not cut short by 429s on earlier pages.
 
         Comfy Cloud does not list jobs yet: it answers ``code ==
         "not_implemented"`` (HTTP 501). Yields :class:`~comfy_sdk.jobs.JobSummary`

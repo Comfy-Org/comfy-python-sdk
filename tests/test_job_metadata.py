@@ -10,6 +10,7 @@ caller with the key it named. Everything runs against the stub in
 from __future__ import annotations
 
 import asyncio
+import pickle
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -17,9 +18,11 @@ from typing import Any
 import pytest
 from conftest import _job_json
 
+import comfy_sdk.client as _client_module
 from comfy_low.models import Job as LowJob
 from comfy_low.models import JobStatus
 from comfy_sdk import AsyncComfy, Comfy, ComfyError, InvalidWorkflow, JobSummary
+from comfy_sdk.router_exceptions import RateLimited
 
 _GRAPH = {"3": {"class_type": "KSampler", "inputs": {}}}
 _LABELS = {"client": "acme", "run": "nightly-42"}
@@ -233,6 +236,34 @@ def test_every_string_label_survives_whatever_its_key(server) -> None:
     assert summary.metadata == _ODD_KEYS
 
 
+def test_a_job_with_metadata_pickles(server) -> None:
+    server.state.job_metadata = _LABELS
+    with Comfy() as client:
+        low = client._low
+        for model in (
+            low.post_jobs(_GRAPH),
+            low.get_job("job_01"),
+            low.cancel_job("job_01"),
+        ):
+            copy = pickle.loads(pickle.dumps(model))
+            assert copy == model
+            assert copy.metadata == _LABELS
+
+
+async def test_an_async_job_with_metadata_pickles(server) -> None:
+    server.state.job_metadata = _LABELS
+    async with AsyncComfy() as client:
+        low = client._low
+        for model in (
+            await low.post_jobs(_GRAPH),
+            await low.get_job("job_01"),
+            await low.cancel_job("job_01"),
+        ):
+            copy = pickle.loads(pickle.dumps(model))
+            assert copy == model
+            assert copy.metadata == _LABELS
+
+
 def test_odd_metadata_still_reads_once_the_generated_job_declares_a_strict_field() -> None:
     # A spec sync will add `metadata: dict[str, str]` to the generated `Job`.
     # Simulate that model and check the transport's lenient reading still wins.
@@ -340,6 +371,23 @@ def test_a_filtered_list_compares_values_as_the_text_the_query_sends(server) -> 
     assert server.state.job_list_queries[0]["metadata[run]"] == ["7"]
 
 
+@pytest.mark.parametrize(
+    ("filters", "sent"),
+    [
+        pytest.param({1: "a"}, ("metadata[1]", "a"), id="int-key"),
+        pytest.param({"1": b"a"}, ("metadata[1]", "a"), id="bytes-value"),
+    ],
+)
+def test_a_filtered_list_compares_exactly_the_pairs_the_query_sends(server, filters, sent) -> None:
+    # The check must compare the key and the value as sent, not as given.
+    server.state.job_list_pages = [[_item("job_02", {"1": "a"}), _item("job_01", {"1": "b"})]]
+    with Comfy() as client:
+        found = list(client.list_jobs(metadata=filters))
+    assert [j.id for j in found] == ["job_02"]
+    key, value = sent
+    assert server.state.job_list_queries[0][key] == [value]
+
+
 async def test_async_filtered_list_skips_items_whose_labels_do_not_match(server) -> None:
     server.state.job_list_pages = [[_item("job_02"), _item("job_01", _LABELS)]]
     async with AsyncComfy() as client:
@@ -352,6 +400,40 @@ def test_a_filtered_list_on_a_host_without_labels_yields_nothing(server) -> None
     server.state.job_list_pages = [[{**_item("job_01"), "metadata": "batch-7"}]]
     with Comfy() as client:
         assert list(client.list_jobs(metadata={"client": "acme"})) == []
+
+
+def test_a_list_page_still_rate_limited_after_its_budget_raises(server, monkeypatch) -> None:
+    monkeypatch.setattr(_client_module, "_QUEUE_RETRY_BUDGET", 5.0)
+    clock = [100.0, 101.0, 106.0]  # the page's deadline is 105
+
+    def _now() -> float:
+        return clock.pop(0) if len(clock) > 1 else clock[0]
+
+    monkeypatch.setattr(_client_module, "_now", _now)
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    server.state.job_list_pages = [[_item("job_01")]]
+    # Ten 429s, then the page: only a deadline stops the retries before it.
+    server.state.job_list_429_at = set(range(10))
+    server.state.job_list_retry_after = "3"
+    with Comfy() as client:
+        with pytest.raises(RateLimited):
+            list(client.list_jobs())
+    assert sleeps == [3]
+    assert len(server.state.job_list_queries) == 2
+
+
+def test_a_list_page_429_without_retry_after_raises_at_once(server, monkeypatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    server.state.job_list_pages = [[_item("job_01")]]
+    server.state.job_list_429_at = {0}
+    server.state.job_list_retry_after = None
+    with Comfy() as client:
+        with pytest.raises(RateLimited):
+            list(client.list_jobs())
+    assert sleeps == []
+    assert len(server.state.job_list_queries) == 1
 
 
 def test_list_jobs_waits_at_least_a_second_on_retry_after_zero(server, monkeypatch) -> None:

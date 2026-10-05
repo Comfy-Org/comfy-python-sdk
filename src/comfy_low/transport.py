@@ -937,9 +937,12 @@ def _with_lenient_metadata(base: type[Job]) -> type[Job]:
     hand-written layer, rather than in the generated models, so the field is
     read today. It overrides the field rather than adding one, so it keeps
     reading leniently after a spec sync adds a strict ``metadata`` to ``Job``.
+
+    The class is named ``_<base>WithMetadata``, so for ``Job`` its name is the
+    module attribute it is bound to below, which is what pickle looks up.
     """
     lenient = Annotated[dict[str, str] | None, BeforeValidator(job_labels)]
-    return create_model(f"{base.__name__}WithMetadata", __base__=base, metadata=(lenient, None))
+    return create_model(f"_{base.__name__}WithMetadata", __base__=base, metadata=(lenient, None))
 
 
 _JobWithMetadata = _with_lenient_metadata(Job)
@@ -966,6 +969,22 @@ def _jobs_body(
     return body
 
 
+def _query_text(value: Any) -> str:
+    # Bytes as their UTF-8 text, anything else as `str()`, so the pair sent is
+    # the pair the caller meant: `b"x"` is `x`, not `b'x'`.
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+
+
+def metadata_filter_pairs(metadata: Mapping[Any, Any] | None) -> list[tuple[str, str]]:
+    """Each ``list_jobs`` metadata filter as the (key, value) text the query sends.
+
+    The one place that turns a filter into text: the query is built from these
+    pairs, and the client-side check of each list item compares against them,
+    so the two cannot disagree (``{1: "a"}`` is the key ``"1"``).
+    """
+    return [(_query_text(k), _query_text(v)) for k, v in (metadata or {}).items()]
+
+
 def _jobs_list_path(
     *,
     metadata: Mapping[str, str] | None = None,
@@ -979,7 +998,7 @@ def _jobs_list_path(
     spec does not carry that route yet). Nothing is checked here: the server
     owns the filter rules and answers a bad filter with its own error.
     """
-    params: list[tuple[str, str]] = [(f"metadata[{k}]", v) for k, v in (metadata or {}).items()]
+    params = [(f"metadata[{k}]", v) for k, v in metadata_filter_pairs(metadata)]
     if limit is not None:
         params.append(("limit", str(limit)))
     if cursor is not None:
