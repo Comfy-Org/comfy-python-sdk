@@ -79,6 +79,9 @@ ROUTER_BASE_URL_ENV_VAR = "COMFY_ROUTER_BASE_URL"
 API_KEY_ENV_VAR = "COMFY_API_KEY"
 
 _DEFAULT_RETRY_AFTER = 2
+# The shortest wait before a 429 retry, so a `Retry-After: 0` (or a negative
+# one) cannot drive a tight loop against the server.
+_MIN_RETRY_DELAY = 1.0
 _now = time.monotonic
 
 
@@ -97,7 +100,12 @@ def _retry_delay(exc: ApiError, deadline: float) -> float | None:
     remaining = deadline - _now()
     if remaining <= 0:
         return None
-    return max(0.0, min(raw_delay, remaining))
+    return min(max(raw_delay, _MIN_RETRY_DELAY), remaining)
+
+
+def _has_labels(summary: JobSummary, metadata: Mapping[str, str] | None) -> bool:
+    """Whether ``summary`` carries every ``metadata`` filter pair (always, with none)."""
+    return all(summary.metadata.get(k) == v for k, v in (metadata or {}).items())
 
 
 def _resolve_env_url(var: str, default: str) -> str:
@@ -407,8 +415,14 @@ class Comfy:
         issue raises :class:`~comfy_sdk.exceptions.ComfyError` with ``code ==
         "invalid_cursor"``.
 
+        The filters are also checked on each item, and an item that does not
+        carry every pair is skipped. A host that ignores the filters (a
+        self-hosted proxy, which keeps no labels) therefore yields nothing for a
+        filtered list rather than every job.
+
         Each page retries a 429 that carries ``Retry-After`` the way
-        :meth:`submit` does, at the server's pace and within the same budget.
+        :meth:`submit` does, at the server's pace (at least one second) and
+        within the same budget.
 
         Comfy Cloud does not list jobs yet: it answers ``code ==
         "not_implemented"`` (HTTP 501). Yields :class:`~comfy_sdk.jobs.JobSummary`
@@ -418,7 +432,9 @@ class Comfy:
         while True:
             page = self._list_page(metadata, limit, cursor)
             for item in page.get("jobs") or []:
-                yield JobSummary._from_item(item)
+                summary = JobSummary._from_item(item)
+                if _has_labels(summary, metadata):
+                    yield summary
             cursor = page.get("next_cursor")
             if not cursor:
                 return
@@ -572,7 +588,9 @@ class AsyncComfy:
         while True:
             page = await self._list_page(metadata, limit, cursor)
             for item in page.get("jobs") or []:
-                yield JobSummary._from_item(item)
+                summary = JobSummary._from_item(item)
+                if _has_labels(summary, metadata):
+                    yield summary
             cursor = page.get("next_cursor")
             if not cursor:
                 return

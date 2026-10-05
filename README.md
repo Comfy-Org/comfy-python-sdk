@@ -346,9 +346,9 @@ address with `COMFY_BASE_URL`. Elsewhere:
   whose `code` is `"not_implemented"` (HTTP 501).
 - **A self-hosted `comfy-api-proxy`** does not keep labels. Its own job
   `metadata` is a single string, so it refuses a label map on `submit()` with a
-  `ComfyError` whose `code` is `"invalid_request"`. Its job list ignores the
-  `metadata` filters, so `list_jobs()` returns every job it has, and the SDK
-  reads the proxy's string `metadata` as no labels (`{}`).
+  `ComfyError` whose `code` is `"invalid_request"`. The SDK reads the proxy's
+  string `metadata` as no labels (`{}`), so a filtered `list_jobs()` yields
+  nothing there, and an unfiltered one yields every job.
 
 Labels are fixed when the job is submitted. `job.metadata` is an empty dict for a
 job with none. A `metadata` that is not a map of strings reads as `{}`, and a
@@ -361,7 +361,12 @@ Each item is a `JobSummary` (`id`, `status`, `create_time`, `update_time`,
 `deployment_id`, `metadata`, and `data`, the item as the server sent it); call
 `client.jobs.get(summary.id)` for the full job and its outputs. On `AsyncComfy`, iterate with
 `async for summary in client.list_jobs(...)`. A page answered 429 with
-`Retry-After` is fetched again after that wait, the same way `submit()` retries.
+`Retry-After` is fetched again after that wait (at least one second), the same
+way `submit()` retries.
+
+`list_jobs()` also checks the filters itself: an item whose labels do not include
+every pair you passed is skipped, even if the server sent it. So on a host that
+ignores the filters, a filtered `list_jobs()` yields only real matches.
 
 The server sets the limits on labels and filters, and the SDK does not check
 them first. A map it refuses raises `ComfyError` with `code ==
@@ -876,8 +881,10 @@ many times the default 60-second budget on its own, leaving no room for the
 retry you just asked for. `collect_max_elapsed` does not help here — that budget
 is the collect class's alone.
 
-`retry` governs `client.models` only. `submit()`/`run()` on the client keep
-their own 429 handling, which follows the server's `Retry-After`.
+`retry` governs `client.models` only. `submit()`/`run()` and `list_jobs()` on
+the client keep their own 429 handling, which follows the server's
+`Retry-After` but waits at least one second, so `Retry-After: 0` cannot drive a
+tight retry loop.
 
 ### Collecting a generation after a lost response
 

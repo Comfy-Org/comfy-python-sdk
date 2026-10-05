@@ -212,6 +212,26 @@ def test_odd_metadata_on_a_list_item_reads_as_labels_and_never_raises(server, se
     assert summary.data["metadata"] == sent
 
 
+# Keys the lenient read must keep exactly as sent, whatever they look like.
+_ODD_KEYS = {
+    "__proto__": "a",
+    "constructor": "b",
+    "": "empty key",
+    "a.b-c_d": "punctuation",
+    "ключ": "значение",
+}
+
+
+def test_every_string_label_survives_whatever_its_key(server) -> None:
+    server.state.job_metadata = _ODD_KEYS
+    server.state.job_list_pages = [[_item("job_01", _ODD_KEYS)]]
+    with Comfy() as client:
+        assert client.submit(_wf(client)).metadata == _ODD_KEYS
+        assert client.jobs.get("job_01").metadata == _ODD_KEYS
+        (summary,) = client.list_jobs()
+    assert summary.metadata == _ODD_KEYS
+
+
 def test_odd_metadata_still_reads_once_the_generated_job_declares_a_strict_field() -> None:
     # A spec sync will add `metadata: dict[str, str]` to the generated `Job`.
     # Simulate that model and check the transport's lenient reading still wins.
@@ -253,7 +273,7 @@ def test_list_jobs_sends_filters_and_follows_the_cursor_to_the_last_page(server)
 
 
 async def test_async_list_jobs_sends_filters_and_follows_the_cursor(server) -> None:
-    server.state.job_list_pages = [[_item("job_02")], [_item("job_01")]]
+    server.state.job_list_pages = [[_item("job_02", _LABELS)], [_item("job_01", _LABELS)]]
     async with AsyncComfy() as client:
         found = [j async for j in client.list_jobs(metadata={"client": "acme"}, limit=1)]
     assert [j.id for j in found] == ["job_02", "job_01"]
@@ -291,6 +311,66 @@ def test_list_jobs_items_keep_the_server_fields(server) -> None:
     assert summary.data == item
 
 
+def test_a_filtered_list_skips_items_whose_labels_do_not_match(server) -> None:
+    # A host that ignores the filters (a self-hosted proxy, or a gateway
+    # without label support) sends every job; the SDK keeps only the matches.
+    server.state.job_list_pages = [
+        [
+            _item("job_06", _LABELS),
+            _item("job_05", {"client": "other", "run": "nightly-42"}),
+            _item("job_04", {"client": "acme"}),
+            _item("job_03"),
+        ],
+        [{**_item("job_02"), "metadata": "client=acme"}, _item("job_01", _LABELS)],
+    ]
+    with Comfy() as client:
+        found = list(client.list_jobs(metadata={"client": "acme", "run": "nightly-42"}))
+    assert [j.id for j in found] == ["job_06", "job_01"]
+    assert len(server.state.job_list_queries) == 2
+
+
+async def test_async_filtered_list_skips_items_whose_labels_do_not_match(server) -> None:
+    server.state.job_list_pages = [[_item("job_02"), _item("job_01", _LABELS)]]
+    async with AsyncComfy() as client:
+        found = [j async for j in client.list_jobs(metadata={"client": "acme"})]
+    assert [j.id for j in found] == ["job_01"]
+
+
+def test_a_filtered_list_on_a_host_without_labels_yields_nothing(server) -> None:
+    # The self-hosted proxy's list: no filtering, and its `metadata` a string.
+    server.state.job_list_pages = [[{**_item("job_01"), "metadata": "batch-7"}]]
+    with Comfy() as client:
+        assert list(client.list_jobs(metadata={"client": "acme"})) == []
+
+
+def test_list_jobs_waits_at_least_a_second_on_retry_after_zero(server, monkeypatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    server.state.job_list_pages = [[_item("job_01")]]
+    server.state.job_list_429_at = {0}
+    server.state.job_list_retry_after = "0"
+    with Comfy() as client:
+        assert [j.id for j in client.list_jobs()] == ["job_01"]
+    assert sleeps == [1.0]
+
+
+async def test_async_list_jobs_waits_at_least_a_second_on_retry_after_zero(
+    server, monkeypatch
+) -> None:
+    sleeps: list[float] = []
+
+    async def _no_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    server.state.job_list_pages = [[_item("job_01")]]
+    server.state.job_list_429_at = {0}
+    server.state.job_list_retry_after = "0"
+    async with AsyncComfy() as client:
+        assert [j.id async for j in client.list_jobs()] == ["job_01"]
+    assert sleeps == [1.0]
+
+
 def test_a_job_summary_can_be_hashed(server) -> None:
     server.state.job_list_pages = [[_item("job_01", _LABELS)]]
     with Comfy() as client:
@@ -321,7 +401,7 @@ async def test_async_a_page_without_jobs_yields_nothing_and_paging_continues(ser
 def test_list_jobs_retries_a_429_on_each_page_at_the_servers_pace(server, monkeypatch) -> None:
     sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", sleeps.append)
-    server.state.job_list_pages = [[_item("job_02")], [_item("job_01")]]
+    server.state.job_list_pages = [[_item("job_02", _LABELS)], [_item("job_01", _LABELS)]]
     # The first request for each page is answered 429 `Retry-After: 3`.
     server.state.job_list_429_at = {0, 2}
     server.state.job_list_retry_after = "3"

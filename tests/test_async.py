@@ -193,7 +193,7 @@ async def test_async_submit_negative_retry_after_does_not_storm(server, monkeypa
     # Where the sync loop crashes on `time.sleep(-5)` (ValueError), the async
     # loop's `asyncio.sleep(-5)` returns instantly and would busy-loop the
     # server for the whole retry budget with no pause. The clamp floors the
-    # delay at 0 either way; this proves the async side specifically.
+    # delay at the one-second minimum either way; this proves the async side.
     sleeps: list[float] = []
 
     async def _fake_sleep(seconds: float) -> None:
@@ -204,7 +204,7 @@ async def test_async_submit_negative_retry_after_does_not_storm(server, monkeypa
     async with AsyncComfy() as client:
         job = await client.submit(_wf(client))
     assert job.id.startswith("job_")
-    assert sleeps == [0.0]
+    assert sleeps == [1.0]
 
 
 async def test_async_delete_asset_by_id(server) -> None:

@@ -21,13 +21,15 @@ the fuller account of each version, including verification notes.
   `metadata`, `data`); on `AsyncComfy` it is an async iterator. The SDK leaves the label limits
   to the server: a refused map raises `ComfyError` with code `metadata_invalid`, and a
   refused filter raises `ComfyError` with code `invalid_metadata_filter` (`invalid_cursor` for a
-  cursor the server did not issue). Each page retries a 429 that carries `Retry-After`, as
-  `submit` does. A `metadata` that is not a map of strings reads as `{}` and a non-string value
+  cursor the server did not issue). `list_jobs` also checks the filters on each item and skips
+  one whose labels do not match, so a host that ignores the filters yields only real matches.
+  Each page retries a 429 that carries `Retry-After`, as `submit` does. A `metadata` that is not a map of strings reads as `{}` and a non-string value
   is dropped, on jobs and list items alike, instead of raising. Labels work on a deployment's
   address. Comfy Cloud refuses them for now: `submit` raises `ComfyError` code
   `metadata_not_supported` and `list_jobs` raises code `not_implemented` (HTTP 501). A
   self-hosted `comfy-api-proxy` does not keep labels: it refuses a label map with code
-  `invalid_request`, its list ignores the filters, and its string `metadata` reads as `{}`.
+  `invalid_request`, its string `metadata` reads as `{}`, and a filtered `list_jobs` yields
+  nothing there.
 - `models.list()` and `models.schema()`, so you can discover Comfy Router models from Python
   as the TypeScript SDK already can. `list(cursor=, limit=, timeout=)` returns an iterable that
   walks the catalog (`GET /v2/models`), following `next_cursor` while `has_more` is true, and
@@ -151,6 +153,8 @@ the fuller account of each version, including verification notes.
   through `run()` already worked.
 
 ### Changed
+- `submit` (and the new `list_jobs`) wait at least one second before retrying a 429, so a
+  `Retry-After: 0` or a negative one no longer retries at once.
 - **Because those three buckets are now one class each, they descend from `RouterError` on the
   workflow surface too**: a `POST /jobs` call that fails `401`/`403`/`402` raises a `RouterError`
   subclass. `except Unauthorized` / `except Forbidden` / `except InsufficientCredits` (from either
