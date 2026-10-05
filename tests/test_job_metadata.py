@@ -229,6 +229,16 @@ def test_list_jobs_surfaces_a_refused_filter(server) -> None:
     assert excinfo.value.http_status == 400
 
 
+def test_list_jobs_surfaces_a_refused_cursor(server) -> None:
+    server.state.job_list_error = (400, "invalid_cursor", "cursor was not issued by this list")
+    with Comfy() as client:
+        with pytest.raises(ComfyError) as excinfo:
+            list(client.list_jobs())
+    assert excinfo.value.code == "invalid_cursor"
+    assert excinfo.value.http_status == 400
+    assert not isinstance(excinfo.value, InvalidWorkflow)
+
+
 async def test_async_list_jobs_surfaces_a_refused_filter(server) -> None:
     server.state.job_list_error = (400, "invalid_metadata_filter", "at most 3 metadata filters")
     async with AsyncComfy() as client:

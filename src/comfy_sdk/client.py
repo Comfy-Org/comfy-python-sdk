@@ -401,7 +401,9 @@ class Comfy:
         the total: iteration follows ``next_cursor`` until the last page. The
         server owns the filter rules (how many keys, which characters) and
         refuses a bad filter with :class:`~comfy_sdk.exceptions.ComfyError`
-        (``code == "invalid_metadata_filter"``).
+        (``code == "invalid_metadata_filter"``). A cursor the server did not
+        issue raises :class:`~comfy_sdk.exceptions.ComfyError` with ``code ==
+        "invalid_cursor"``.
 
         Yields :class:`~comfy_sdk.jobs.JobSummary` items; call
         ``client.jobs.get(summary.id)`` for a full job and its outputs.

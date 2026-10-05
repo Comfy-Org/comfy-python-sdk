@@ -89,7 +89,11 @@ class JobSummary:
     """When the job last changed; ``None`` when the item has no readable time."""
 
     deployment_id: str | None
-    """The deployment that ran the job, or ``None`` when the item has none."""
+    """The id of the deployment copy that ran the job, or ``None`` when the item has none.
+
+    A deployment update makes a new copy, so for a job that ran before the
+    update this can differ from the deployment's current id.
+    """
 
     metadata: dict[str, str]
     """The job's labels, or an empty dict when it has none."""
