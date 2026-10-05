@@ -48,6 +48,44 @@ class JobWorkflow:
     format: Literal["save", "api"]
 
 
+def _metadata_of(model: LowJob) -> dict[str, str]:
+    # `getattr` because the generated `Job` does not declare the field until the
+    # spec sync lands; the transport validates into a subclass that does.
+    return dict(getattr(model, "metadata", None) or {})
+
+
+@dataclass(frozen=True, slots=True)
+class JobSummary:
+    """One job as :meth:`comfy_sdk.Comfy.list_jobs` yields it.
+
+    A list item is a lighter shape than a full job (no outputs, no follow-up
+    links), so this is not a :class:`Job` handle. Call
+    ``client.jobs.get(summary.id)`` for the full job and its outputs.
+    """
+
+    id: str
+    status: str
+    metadata: dict[str, str]
+    """The job's labels, or an empty dict when it has none."""
+
+    data: dict[str, Any]
+    """The list item exactly as the server sent it, for fields not lifted above."""
+
+    def __hash__(self) -> int:
+        # The generated hash would cover the two dicts and raise; the id alone
+        # identifies a job.
+        return hash(self.id)
+
+    @classmethod
+    def _from_item(cls, item: dict[str, Any]) -> JobSummary:
+        return cls(
+            id=item["id"],
+            status=item["status"],
+            metadata=dict(item.get("metadata") or {}),
+            data=item,
+        )
+
+
 class Job:
     """Synchronous job handle."""
 
@@ -71,6 +109,15 @@ class Job:
     @property
     def error(self) -> Any:
         return self._model.error
+
+    @property
+    def metadata(self) -> dict[str, str]:
+        """The string labels given at submit, or an empty dict when there are none.
+
+        Fixed when the job is submitted; nothing changes them later. A copy, so
+        editing it does not change this handle.
+        """
+        return _metadata_of(self._model)
 
     def get_outputs(self, node_id: str) -> list[Output]:
         """The outputs produced by one node, in server order.
@@ -204,6 +251,11 @@ class AsyncJob:
     @property
     def error(self) -> Any:
         return self._model.error
+
+    @property
+    def metadata(self) -> dict[str, str]:
+        """:attr:`Job.metadata` — the labels given at submit, ``{}`` when none."""
+        return _metadata_of(self._model)
 
     def get_outputs(self, node_id: str) -> list[AsyncOutput]:
         """:meth:`Job.get_outputs`, bound to async outputs. Not a coroutine —

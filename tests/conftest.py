@@ -63,6 +63,18 @@ class ServerState:
     retryable_429_code: str = "deployment_not_ready"
     # POST /jobs returns this error envelope (status, code) instead of 201.
     job_error: tuple[int, str] | None = None
+    # The message that envelope carries; None means a generic one.
+    job_error_message: str | None = None
+    # The `metadata` GET /jobs/{id} reports; None omits the field, as the
+    # server does for a job with no labels.
+    job_metadata: dict[str, str] | None = None
+    # GET /jobs (the list): one entry per page, each a list of list items. Page
+    # i carries `next_cursor` "page-{i+1}" unless it is the last.
+    job_list_pages: list[list[dict[str, Any]]] = field(default_factory=lambda: [[]])
+    # GET /jobs answers this (status, code, message) instead of a page.
+    job_list_error: tuple[int, str, str] | None = None
+    # The parsed query string of every GET /jobs, in arrival order.
+    job_list_queries: list[dict[str, list[str]]] = field(default_factory=list)
     # GET /jobs/{id} answers 404 job_not_found instead of the job.
     job_not_found: bool = False
     # GET /jobs/{id}/events answers this (status, code) instead of connecting.
@@ -435,8 +447,13 @@ def _asset_json(asset_id: str, hash_: str, created_new: bool, size: int) -> dict
     }
 
 
-def _job_json(job_id: str, status: str, outputs: list[dict] | None = None) -> dict:
-    return {
+def _job_json(
+    job_id: str,
+    status: str,
+    outputs: list[dict] | None = None,
+    metadata: dict[str, str] | None = None,
+) -> dict:
+    job = {
         "id": job_id,
         "status": status,
         "created_at": "2026-07-10T18:20:00Z",
@@ -454,6 +471,9 @@ def _job_json(job_id: str, status: str, outputs: list[dict] | None = None) -> di
             "cancel": f"/api/v2/jobs/{job_id}/cancel",
         },
     }
+    if metadata is not None:
+        job["metadata"] = metadata
+    return job
 
 
 def _output_json(node_id: str, asset_id: str) -> dict:
@@ -609,6 +629,9 @@ def _make_handler(state: ServerState):
             if m:
                 self._serve_schema(unquote(m.group(1)), unquote(m.group(2)))
                 return
+            if urlsplit(self.path).path == "/api/v2/jobs":
+                self._serve_job_list()
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)/events$", self.path)
             if m:
                 self._serve_events(m.group(1))
@@ -666,7 +689,21 @@ def _make_handler(state: ServerState):
             else:
                 status = "running"
                 outputs = []
-            self._json(200, _job_json(job_id, status, outputs))
+            self._json(200, _job_json(job_id, status, outputs, state.job_metadata))
+
+        def _serve_job_list(self) -> None:
+            query = parse_qs(urlsplit(self.path).query)
+            state.job_list_queries.append(query)
+            if state.job_list_error is not None:
+                status, code, message = state.job_list_error
+                self._err(status, code, message)
+                return
+            cursor = query.get("cursor", ["page-0"])[0]
+            index = int(cursor.removeprefix("page-"))
+            page: dict[str, Any] = {"jobs": state.job_list_pages[index]}
+            if index + 1 < len(state.job_list_pages):
+                page["next_cursor"] = f"page-{index + 1}"
+            self._json(200, page)
 
         def _serve_job_workflow(self, job_id: str) -> None:
             if state.job_workflow_not_found:
@@ -1188,13 +1225,13 @@ def _make_handler(state: ServerState):
 
             if state.job_error is not None:
                 status, code = state.job_error
-                self._err(status, code, f"job error {code}")
+                self._err(status, code, state.job_error_message or f"job error {code}")
                 return
 
             job_id = f"job_{state.submit_count:02d}"
             if key:
                 state.idempotency[key] = job_id
-            self._json(201, _job_json(job_id, "queued"))
+            self._json(201, _job_json(job_id, "queued", metadata=body.get("metadata")))
 
     return Handler
 

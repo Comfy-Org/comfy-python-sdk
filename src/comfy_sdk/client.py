@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -49,7 +50,7 @@ from comfy_low.transport import ROUTER_BASE_URL, AsyncComfyLow, ComfyLow, origin
 from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
 from .exceptions import MissingApiKey, WorkflowFormatUi, to_sdk_error, translating
-from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory
+from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory, JobSummary
 from .models import AsyncModels, Models
 from .retry import DEFAULT_RETRY, RetryPolicy
 from .workflows import Workflow, WorkflowFactory
@@ -300,6 +301,7 @@ class Comfy:
         *,
         api_key: str | None = None,
         idempotency_key: str | None = None,
+        metadata: Mapping[str, str] | None = None,
     ) -> Job:
         """Submit a workflow. Retries any 429 that carries ``Retry-After``.
 
@@ -336,6 +338,13 @@ class Comfy:
         token this client was constructed with. It is never persisted or
         logged by the SDK, and is sent as ``extra_data.api_key_comfy_org``
         only when supplied; omitted from the request entirely otherwise.
+
+        ``metadata`` is a map of string labels stored on the job (for example
+        ``{"client": "acme"}``), read back from :attr:`Job.metadata` and
+        matched by :meth:`list_jobs`. It is sent as given: the server owns the
+        limits on keys, values and count, and a map it refuses raises
+        :class:`~comfy_sdk.exceptions.ComfyError` with ``code ==
+        "metadata_invalid"`` and a message naming the offending key.
         """
         _guard_ui_format(workflow)
         # Validated before any bytes move, like `models.run`: `""` used to
@@ -356,7 +365,9 @@ class Comfy:
         with translating(idempotency_key=key):
             while True:
                 try:
-                    model = self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
+                    model = self._low.post_jobs(
+                        graph, idempotency_key=key, extra_data=extra_data, metadata=metadata
+                    )
                     return Job(self._low, model)
                 except ApiError as exc:
                     err = to_sdk_error(exc)
@@ -376,6 +387,34 @@ class Comfy:
         """Submit, then poll to terminal (authoritative). Raises on failure."""
         job = self.submit(workflow, api_key=api_key)
         return job.result() if timeout is None else _run_with_timeout(job, timeout)
+
+    def list_jobs(
+        self,
+        *,
+        metadata: Mapping[str, str] | None = None,
+        limit: int | None = None,
+    ) -> Iterator[JobSummary]:
+        """Every job this client can see, newest first, one page at a time.
+
+        ``metadata`` keeps only the jobs whose labels include every given
+        key with exactly that value. ``limit`` is the page size, not a cap on
+        the total: iteration follows ``next_cursor`` until the last page. The
+        server owns the filter rules (how many keys, which characters) and
+        refuses a bad filter with :class:`~comfy_sdk.exceptions.ComfyError`
+        (``code == "invalid_metadata_filter"``).
+
+        Yields :class:`~comfy_sdk.jobs.JobSummary` items; call
+        ``client.jobs.get(summary.id)`` for a full job and its outputs.
+        """
+        cursor: str | None = None
+        while True:
+            with translating():
+                page = self._low.list_jobs(metadata=metadata, limit=limit, cursor=cursor)
+            for item in page.get("jobs") or []:
+                yield JobSummary._from_item(item)
+            cursor = page.get("next_cursor")
+            if not cursor:
+                return
 
 
 def _run_with_timeout(job: Job, timeout: float) -> Job:
@@ -450,8 +489,9 @@ class AsyncComfy:
         *,
         api_key: str | None = None,
         idempotency_key: str | None = None,
+        metadata: Mapping[str, str] | None = None,
     ) -> AsyncJob:
-        """Mirrors :meth:`Comfy.submit` — see there for ``api_key`` details."""
+        """Mirrors :meth:`Comfy.submit` — see there for ``api_key`` and ``metadata``."""
         import asyncio
 
         _guard_ui_format(workflow)
@@ -469,7 +509,7 @@ class AsyncComfy:
             while True:
                 try:
                     model = await self._low.post_jobs(
-                        graph, idempotency_key=key, extra_data=extra_data
+                        graph, idempotency_key=key, extra_data=extra_data, metadata=metadata
                     )
                     return AsyncJob(self._low, model)
                 except ApiError as exc:
@@ -498,3 +538,20 @@ class AsyncComfy:
         if job.status != SUCCESS:
             raise JobFailed(f"job {job.id} ended {job.status}", error=job.error)
         return job
+
+    async def list_jobs(
+        self,
+        *,
+        metadata: Mapping[str, str] | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[JobSummary]:
+        """Async :meth:`Comfy.list_jobs` — ``async for summary in client.list_jobs(...)``."""
+        cursor: str | None = None
+        while True:
+            with translating():
+                page = await self._low.list_jobs(metadata=metadata, limit=limit, cursor=cursor)
+            for item in page.get("jobs") or []:
+                yield JobSummary._from_item(item)
+            cursor = page.get("next_cursor")
+            if not cursor:
+                return

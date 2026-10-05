@@ -325,6 +325,33 @@ controls — jobs submitted through this SDK always get `"api"` today, since v2
 submission has no version-pinning fields yet. (`AsyncJob.get_workflow()`
 mirrors this with `await`.)
 
+## Labelling jobs with metadata
+
+Pass `metadata` to `submit()` to store string labels on a job, then find those
+jobs again with `list_jobs()`:
+
+```python
+job = client.submit(wf, metadata={"client": "acme", "batch": "2026-10-05"})
+job.metadata                     # {"client": "acme", "batch": "2026-10-05"}
+
+for summary in client.list_jobs(metadata={"client": "acme"}):
+    print(summary.id, summary.status, summary.metadata)
+```
+
+Labels are fixed when the job is submitted. `job.metadata` is an empty dict for a
+job with none. `list_jobs()` returns the newest jobs first and keeps only the
+ones whose labels include every key you pass, with exactly that value. It fetches
+page after page until there are no more; `limit=` sets the page size, not a cap
+on the total. Each item is a `JobSummary` (`id`, `status`, `metadata`, and
+`data`, the item as the server sent it); call `client.jobs.get(summary.id)` for
+the full job and its outputs. On `AsyncComfy`, iterate with
+`async for summary in client.list_jobs(...)`.
+
+The server sets the limits on labels and filters, and the SDK does not check
+them first. A map it refuses raises `ComfyError` with `code ==
+"metadata_invalid"` and a message naming the key; a filter it refuses raises
+`ComfyError` with `code == "invalid_metadata_filter"`.
+
 ## Downloading outputs
 
 A finished job exposes its results as `Output` handles — `job.outputs`, or
