@@ -338,6 +338,10 @@ for summary in client.list_jobs(metadata={"client": "acme"}):
     print(summary.id, summary.status, summary.metadata)
 ```
 
+Labels work on jobs sent to a deployment: point the client at the deployment's
+address with `COMFY_BASE_URL`. Comfy Cloud refuses them for now, with a
+`ComfyError` whose `code` is `"metadata_not_supported"`.
+
 Labels are fixed when the job is submitted. `job.metadata` is an empty dict for a
 job with none. `list_jobs()` returns the newest jobs first and keeps only the
 ones whose labels include every key you pass, with exactly that value. It fetches

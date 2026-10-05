@@ -103,6 +103,17 @@ async def test_async_refused_map_raises_the_servers_error_naming_the_key(server)
     assert "k16" in str(excinfo.value)
 
 
+def test_a_host_without_label_support_refuses_with_its_own_code(server) -> None:
+    server.state.job_error = (422, "metadata_not_supported")
+    with Comfy() as client:
+        with pytest.raises(ComfyError) as excinfo:
+            client.submit(_wf(client), metadata=_LABELS)
+    assert excinfo.value.code == "metadata_not_supported"
+    assert excinfo.value.http_status == 422
+    assert not isinstance(excinfo.value, InvalidWorkflow)
+    assert server.state.submit_count == 1
+
+
 # --- reading a job --------------------------------------------------------
 
 

@@ -344,7 +344,9 @@ class Comfy:
         matched by :meth:`list_jobs`. It is sent as given: the server owns the
         limits on keys, values and count, and a map it refuses raises
         :class:`~comfy_sdk.exceptions.ComfyError` with ``code ==
-        "metadata_invalid"`` and a message naming the offending key.
+        "metadata_invalid"`` and a message naming the offending key. Labels
+        work on a deployment's address; Comfy Cloud refuses them for now with
+        ``code == "metadata_not_supported"``.
         """
         _guard_ui_format(workflow)
         # Validated before any bytes move, like `models.run`: `""` used to
