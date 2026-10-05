@@ -126,9 +126,6 @@ class JobFailed(ComfyError):
 #: shape where neither ``except`` clause is wrong.
 _BY_CODE: dict[str, type[ComfyError]] = {
     "invalid_workflow": InvalidWorkflow,
-    # A refused job metadata map on `POST /jobs` — a 422 on the submit body,
-    # like a refused workflow. `.code` keeps the wire code to tell them apart.
-    "metadata_invalid": InvalidWorkflow,
     "workflow_format_ui": WorkflowFormatUi,
     "missing_asset": MissingAsset,
     "hash_mismatch": HashMismatch,

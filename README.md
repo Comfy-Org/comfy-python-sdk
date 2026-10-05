@@ -349,7 +349,7 @@ the full job and its outputs. On `AsyncComfy`, iterate with
 `async for summary in client.list_jobs(...)`.
 
 The server sets the limits on labels and filters, and the SDK does not check
-them first. A map it refuses raises `InvalidWorkflow` with `code ==
+them first. A map it refuses raises `ComfyError` with `code ==
 "metadata_invalid"` and a message naming the key; a filter it refuses raises
 `ComfyError` with `code == "invalid_metadata_filter"`.
 

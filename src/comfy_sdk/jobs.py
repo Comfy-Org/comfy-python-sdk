@@ -13,9 +13,11 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 import httpx
+from pydantic import TypeAdapter, ValidationError
 
 from comfy_low.errors import ApiError
 from comfy_low.models import Job as LowJob
@@ -54,6 +56,21 @@ def _metadata_of(model: LowJob) -> dict[str, str]:
     return dict(getattr(model, "metadata", None) or {})
 
 
+_TIME = TypeAdapter(datetime)
+
+
+def _parse_time(raw: Any) -> datetime | None:
+    # pydantic rather than `datetime.fromisoformat`, which on 3.10 reads
+    # neither a trailing `Z` nor nanosecond fractions. An unreadable value is
+    # `None` rather than an error: the raw string is still on `JobSummary.data`.
+    if not isinstance(raw, str):
+        return None
+    try:
+        return _TIME.validate_python(raw)
+    except ValidationError:
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class JobSummary:
     """One job as :meth:`comfy_sdk.Comfy.list_jobs` yields it.
@@ -65,11 +82,11 @@ class JobSummary:
 
     id: str
     status: str
-    create_time: str | None
-    """When the job was created, as the server's timestamp string."""
+    create_time: datetime | None
+    """When the job was created; ``None`` when the item has no readable time."""
 
-    update_time: str | None
-    """When the job last changed, as the server's timestamp string."""
+    update_time: datetime | None
+    """When the job last changed; ``None`` when the item has no readable time."""
 
     deployment_id: str | None
     """The deployment that ran the job, or ``None`` when the item has none."""
@@ -90,8 +107,8 @@ class JobSummary:
         return cls(
             id=item["id"],
             status=item["status"],
-            create_time=item.get("create_time"),
-            update_time=item.get("update_time"),
+            create_time=_parse_time(item.get("create_time")),
+            update_time=_parse_time(item.get("update_time")),
             deployment_id=item.get("deployment_id"),
             metadata=dict(item.get("metadata") or {}),
             data=item,

@@ -19,7 +19,7 @@ the fuller account of each version, including verification notes.
   each filter as `metadata[<key>]=<value>`, follows `next_cursor` to the last page, and yields
   `JobSummary` items (`id`, `status`, `create_time`, `update_time`, `deployment_id`,
   `metadata`, `data`); on `AsyncComfy` it is an async iterator. The SDK leaves the label limits
-  to the server: a refused map raises `InvalidWorkflow` with code `metadata_invalid`, and a
+  to the server: a refused map raises `ComfyError` with code `metadata_invalid`, and a
   refused filter raises `ComfyError` with code `invalid_metadata_filter`. Needs a server that supports job metadata.
 - `models.list()` and `models.schema()`, so you can discover Comfy Router models from Python
   as the TypeScript SDK already can. `list(cursor=, limit=, timeout=)` returns an iterable that

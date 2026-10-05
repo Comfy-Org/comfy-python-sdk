@@ -343,7 +343,7 @@ class Comfy:
         ``{"client": "acme"}``), read back from :attr:`Job.metadata` and
         matched by :meth:`list_jobs`. It is sent as given: the server owns the
         limits on keys, values and count, and a map it refuses raises
-        :class:`~comfy_sdk.exceptions.InvalidWorkflow` with ``code ==
+        :class:`~comfy_sdk.exceptions.ComfyError` with ``code ==
         "metadata_invalid"`` and a message naming the offending key.
         """
         _guard_ui_format(workflow)

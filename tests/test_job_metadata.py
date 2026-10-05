@@ -9,6 +9,8 @@ caller with the key it named. Everything runs against the stub in
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from comfy_sdk import AsyncComfy, Comfy, ComfyError, InvalidWorkflow, JobSummary
@@ -77,10 +79,12 @@ def test_a_refused_map_raises_the_servers_error_naming_the_key(server) -> None:
         'metadata key "bad key" has a character outside A-Z a-z 0-9 _ - .'
     )
     with Comfy() as client:
-        with pytest.raises(InvalidWorkflow) as excinfo:
+        with pytest.raises(ComfyError) as excinfo:
             client.submit(_wf(client), metadata={"bad key": "x"})
     assert excinfo.value.code == "metadata_invalid"
     assert excinfo.value.http_status == 422
+    # The base class, not the workflow error: the workflow itself was fine.
+    assert not isinstance(excinfo.value, InvalidWorkflow)
     assert "bad key" in str(excinfo.value)
     # A 422 is final: the submit is not retried.
     assert server.state.submit_count == 1
@@ -90,10 +94,12 @@ async def test_async_refused_map_raises_the_servers_error_naming_the_key(server)
     server.state.job_error = (422, "metadata_invalid")
     server.state.job_error_message = 'metadata key "k16" is one pair too many (17 > 16)'
     async with AsyncComfy() as client:
-        with pytest.raises(InvalidWorkflow) as excinfo:
+        with pytest.raises(ComfyError) as excinfo:
             await client.submit(_wf(client), metadata={f"k{i}": "v" for i in range(17)})
     assert excinfo.value.code == "metadata_invalid"
     assert excinfo.value.http_status == 422
+    # The base class, not the workflow error: the workflow itself was fine.
+    assert not isinstance(excinfo.value, InvalidWorkflow)
     assert "k16" in str(excinfo.value)
 
 
@@ -178,8 +184,8 @@ def test_list_jobs_items_keep_the_server_fields(server) -> None:
     assert isinstance(summary, JobSummary)
     assert summary.id == "job_01"
     assert summary.status == "completed"
-    assert summary.create_time == "2026-10-05T12:00:00Z"
-    assert summary.update_time == "2026-10-05T12:01:00Z"
+    assert summary.create_time == datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+    assert summary.update_time == datetime(2026, 10, 5, 12, 1, tzinfo=timezone.utc)
     assert summary.deployment_id == "dep_01"
     assert summary.metadata == {}
     assert summary.data == item
@@ -193,6 +199,25 @@ def test_list_jobs_items_without_optional_fields_read_as_none(server) -> None:
     assert summary.update_time is None
     assert summary.deployment_id is None
     assert summary.metadata == {}
+
+
+def test_list_jobs_reads_nanosecond_times_and_tolerates_unreadable_ones(server) -> None:
+    item = {
+        "id": "job_01",
+        "status": "completed",
+        "create_time": "2026-10-05T12:00:00.123456789Z",
+        "update_time": "not a time",
+    }
+    server.state.job_list_pages = [[item]]
+    with Comfy() as client:
+        (summary,) = client.list_jobs()
+    assert summary.create_time is not None
+    assert summary.create_time.tzinfo is not None
+    assert summary.create_time.replace(microsecond=0) == datetime(
+        2026, 10, 5, 12, 0, tzinfo=timezone.utc
+    )
+    assert summary.update_time is None
+    assert summary.data["update_time"] == "not a time"
 
 
 def test_list_jobs_surfaces_a_refused_filter(server) -> None:
