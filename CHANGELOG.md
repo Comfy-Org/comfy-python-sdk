@@ -23,10 +23,12 @@ the fuller account of each version, including verification notes.
   server's message (naming the key when one key or value breaks a rule, giving the count
   when there are more than 16 pairs), and a
   refused filter raises `ComfyError` with code `invalid_metadata_filter` (`invalid_cursor` for a
-  cursor the server did not issue). A list item without `id` or `status` raises `ComfyError`
-  with code `invalid_response` naming the missing field, rather than being skipped. `list_jobs` also checks the filters on each item and skips
+  cursor the server did not issue). A list item whose `id` or `status` is missing or null raises `ComfyError`
+  with code `invalid_response` naming the missing field, as does an item that is not a JSON object;
+  the item is not skipped. `list_jobs` also checks the filters on each item and skips
   one whose labels do not match (comparing each key and value as the text the query sends), so a host
-  that ignores the filters yields only real matches, after reading as many pages as it takes.
+  that ignores the filters yields only real matches (on one that pages, after reading as many
+  pages as it takes).
   Each page retries a 429 that carries `Retry-After`, as `submit` does. A `metadata` that is not a map of strings reads as `{}` and a non-string value
   is dropped, on jobs and list items alike, instead of raising. Labels work on a deployment's
   address. Comfy Cloud refuses them for now: `submit` raises `ComfyError` code

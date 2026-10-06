@@ -560,29 +560,47 @@ def test_list_jobs_items_without_optional_fields_read_as_none(server) -> None:
     assert summary.metadata == {}
 
 
-@pytest.mark.parametrize("field", ["id", "status"])
-def test_a_list_item_without_id_or_status_raises_invalid_response(server, field) -> None:
-    # Raised, not skipped: skipping would hide a job from the caller.
+def _without(field: str) -> dict:
     item = _item("job_01")
     del item[field]
+    return item
+
+
+def _with_null(field: str) -> dict:
+    item = _item("job_01")
+    item[field] = None
+    return item
+
+
+# Each case: the list item the server sends, and the text the error must name.
+_BAD_LIST_ITEMS = [
+    pytest.param(_without("id"), "id", id="id-missing"),
+    pytest.param(_without("status"), "status", id="status-missing"),
+    pytest.param(_with_null("id"), "id", id="id-null"),
+    pytest.param(_with_null("status"), "status", id="status-null"),
+    pytest.param("job_01", "not a JSON object", id="not-an-object"),
+]
+
+
+@pytest.mark.parametrize(("item", "named"), _BAD_LIST_ITEMS)
+def test_a_bad_list_item_raises_invalid_response(server, item, named) -> None:
+    # Raised, not skipped: skipping would hide a job from the caller.
     server.state.job_list_pages = [[item]]
     with Comfy() as client:
         with pytest.raises(ComfyError) as excinfo:
             list(client.list_jobs())
     assert excinfo.value.code == "invalid_response"
-    assert field in str(excinfo.value)
+    assert named in str(excinfo.value)
 
 
-@pytest.mark.parametrize("field", ["id", "status"])
-async def test_async_list_item_without_id_or_status_raises_invalid_response(server, field) -> None:
-    item = _item("job_01")
-    del item[field]
+@pytest.mark.parametrize(("item", "named"), _BAD_LIST_ITEMS)
+async def test_async_bad_list_item_raises_invalid_response(server, item, named) -> None:
     server.state.job_list_pages = [[item]]
     async with AsyncComfy() as client:
         with pytest.raises(ComfyError) as excinfo:
             [j async for j in client.list_jobs()]
     assert excinfo.value.code == "invalid_response"
-    assert field in str(excinfo.value)
+    assert named in str(excinfo.value)
 
 
 def test_list_jobs_reads_nanosecond_times_and_tolerates_unreadable_ones(server) -> None:

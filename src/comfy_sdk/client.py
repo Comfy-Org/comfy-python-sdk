@@ -419,8 +419,9 @@ class Comfy:
         """Every job this client can see, newest first, one page at a time.
 
         ``metadata`` keeps only the jobs whose labels include every given
-        key with exactly that value. ``limit`` is the page size, not a cap on
-        the total: iteration follows ``next_cursor`` until the last page. The
+        key with exactly that value. Iteration follows ``next_cursor`` until
+        the last page; on a host that pages, ``limit`` is the page size, not a
+        cap on the total. The
         server owns the filter rules (how many keys, which characters) and
         refuses a bad filter with :class:`~comfy_sdk.exceptions.ComfyError`
         (``code == "invalid_metadata_filter"``). A cursor the server did not
@@ -428,13 +429,14 @@ class Comfy:
         "invalid_cursor"``.
 
         The filters are also checked on each item, and an item that does not
-        carry every pair is skipped. A host that ignores the filters (a
-        self-hosted proxy, which keeps no labels) therefore yields nothing for a
-        filtered list rather than every job. On such a host one step of the
-        iteration can read several pages, or every page, before it yields or
-        ends. The proxy also sends no ``next_cursor``: an unfiltered list there
-        yields its newest jobs (50 by default, up to 100 with ``limit``) and
-        stops.
+        carry every pair is skipped, so a host that ignores the filters yields
+        only real matches. On such a host that pages (a gateway without label
+        support, for example), one step of the iteration can read several
+        pages, or every page, before it yields or ends. A self-hosted proxy
+        keeps no labels, so a filtered list there yields nothing rather than
+        every job. The proxy reads one page and sends no ``next_cursor``: an
+        unfiltered list there yields its newest jobs (50 by default, up to 100
+        with ``limit``) and stops.
 
         Each page retries a 429 that carries ``Retry-After`` the way
         :meth:`submit` does, at the server's pace (at least one second). Each

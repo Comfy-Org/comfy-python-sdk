@@ -350,7 +350,8 @@ address with `COMFY_BASE_URL`. Elsewhere:
   string `metadata` as no labels (`{}`), so a filtered `list_jobs()` yields
   nothing there, and an unfiltered one yields the proxy's newest jobs (50 by
   default, up to 100 with `limit`), each with `metadata` `{}`, and stops there
-  since the proxy sends no next cursor. Its list items carry `created_at` rather than `create_time`, so
+  since the proxy sends one page and no next cursor. A `limit` over 100 is
+  refused with HTTP 400, a `ComfyError` whose `code` is `"invalid_request"`. Its list items carry `created_at` rather than `create_time`, so
   `create_time` reads as `None` there (the raw value stays in `data`).
 
 Labels are fixed when the job is submitted. `job.metadata` is an empty dict for a
@@ -359,7 +360,8 @@ value that is not a string is dropped, rather than raising.
 
 `list_jobs()` returns the newest jobs first and keeps only the ones whose labels
 include every key you pass, with exactly that value. It fetches page after page
-until there are no more; `limit=` sets the page size, not a cap on the total.
+until there are no more; on a host that pages, `limit=` sets the page size, not
+a cap on the total (the self-hosted proxy above sends a single page).
 Each item is a `JobSummary` (`id`, `status`, `create_time`, `update_time`,
 `deployment_id`, `metadata`, and `data`, the item as the server sent it); call
 `client.jobs.get(summary.id)` for the full job and its outputs. On `AsyncComfy`, iterate with
@@ -372,7 +374,8 @@ every pair you passed is skipped, even if the server sent it. Keys and values ar
 compared as the text the query sends, so `metadata={"run": 7}` matches the label
 `"7"`.
 So on a host that ignores the filters, a filtered `list_jobs()` yields only real
-matches; there, one step of the iteration can read several pages, or every page,
+matches. On such a host that pages (a gateway without label support, for
+example), one step of the iteration can read several pages, or every page,
 before it yields or ends.
 
 The server sets the limits on labels and filters, and the SDK does not check
