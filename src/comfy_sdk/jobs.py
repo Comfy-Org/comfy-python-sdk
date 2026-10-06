@@ -26,7 +26,7 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow, job_labels
 
 from . import _core
 from .events import Event, StatusChange, event_from_raw
-from .exceptions import JobFailed, to_sdk_error, translating
+from .exceptions import ComfyError, JobFailed, to_sdk_error, translating
 from .outputs import AsyncOutput, Output
 
 _RECONNECT_PAUSE = 0.1
@@ -113,7 +113,15 @@ class JobSummary:
         return hash(self.id)
 
     @classmethod
-    def _from_item(cls, item: dict[str, Any]) -> JobSummary:
+    def _from_item(cls, item: Any) -> JobSummary:
+        # Raised rather than skipped: skipping would hide a job from the caller.
+        if not isinstance(item, dict):
+            raise ComfyError("job list item is not a JSON object", code="invalid_response")
+        missing = [field for field in ("id", "status") if item.get(field) is None]
+        if missing:
+            raise ComfyError(
+                f"job list item is missing {' and '.join(missing)}", code="invalid_response"
+            )
         return cls(
             id=item["id"],
             status=item["status"],

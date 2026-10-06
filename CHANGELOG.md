@@ -21,7 +21,8 @@ the fuller account of each version, including verification notes.
   `metadata`, `data`); on `AsyncComfy` it is an async iterator. The SDK leaves the label limits
   to the server: a refused map raises `ComfyError` with code `metadata_invalid`, and a
   refused filter raises `ComfyError` with code `invalid_metadata_filter` (`invalid_cursor` for a
-  cursor the server did not issue). `list_jobs` also checks the filters on each item and skips
+  cursor the server did not issue). A list item without `id` or `status` raises `ComfyError`
+  with code `invalid_response` naming the missing field, rather than being skipped. `list_jobs` also checks the filters on each item and skips
   one whose labels do not match (comparing each key and value as the text the query sends), so a host
   that ignores the filters yields only real matches, after reading as many pages as it takes.
   Each page retries a 429 that carries `Retry-After`, as `submit` does. A `metadata` that is not a map of strings reads as `{}` and a non-string value
