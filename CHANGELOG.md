@@ -24,14 +24,17 @@ the fuller account of each version, including verification notes.
   when there are more than 16 pairs), and a
   refused filter raises `ComfyError` with code `invalid_metadata_filter` (`invalid_cursor` for a
   cursor the server did not issue). A list item whose `id` or `status` is missing or null raises `ComfyError`
-  with code `invalid_response` naming the missing field, as does an item that is not a JSON object;
-  the item is not skipped. `list_jobs` also checks the filters on each item and skips
+  with code `invalid_response` naming the missing field, as does an item that is not a JSON object
+  (the item is not skipped) and a page whose `jobs` is not an array (a missing or null `jobs` reads
+  as an empty page). `list_jobs` also checks the filters on each item and skips
   one whose labels do not match (comparing each key and value as the text the query sends), so a host
   that ignores the filters yields only real matches (on one that pages, after reading as many
   pages as it takes).
   Each page retries a 429 that carries `Retry-After`, as `submit` does. A `metadata` that is not a map of strings reads as `{}` and a non-string value
   is dropped, on jobs and list items alike, instead of raising. Labels work on a deployment's
-  address. Comfy Cloud refuses them for now: `submit` raises `ComfyError` code
+  address, and need a deployment gateway with job-label support. An older gateway accepts
+  `metadata` on `submit` but does not keep it, and ignores the `list_jobs` filters, so a filtered
+  `list_jobs` yields nothing there (the SDK's own filter check drops every job). Comfy Cloud refuses them for now: `submit` raises `ComfyError` code
   `metadata_not_supported` and `list_jobs` raises code `not_implemented` (HTTP 501). A
   self-hosted `comfy-api-proxy` does not keep labels: it refuses a label map with code
   `invalid_request`, its string `metadata` reads as `{}`, a filtered `list_jobs` yields

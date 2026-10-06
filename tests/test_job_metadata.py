@@ -603,6 +603,36 @@ async def test_async_bad_list_item_raises_invalid_response(server, item, named) 
     assert named in str(excinfo.value)
 
 
+# A page whose `jobs` is not an array: an object would otherwise iterate its keys.
+_BAD_JOBS_FIELDS = [
+    pytest.param(42, id="integer"),
+    pytest.param("job_01", id="string"),
+    pytest.param({"id": "job_01", "status": "queued"}, id="object"),
+]
+
+
+@pytest.mark.parametrize("jobs", _BAD_JOBS_FIELDS)
+def test_a_page_whose_jobs_is_not_an_array_raises_invalid_response(server, jobs) -> None:
+    server.state.job_list_pages = [jobs]
+    with Comfy() as client:
+        with pytest.raises(ComfyError) as excinfo:
+            list(client.list_jobs())
+    assert excinfo.value.code == "invalid_response"
+    assert "'jobs' is not an array" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("jobs", _BAD_JOBS_FIELDS)
+async def test_async_a_page_whose_jobs_is_not_an_array_raises_invalid_response(
+    server, jobs
+) -> None:
+    server.state.job_list_pages = [jobs]
+    async with AsyncComfy() as client:
+        with pytest.raises(ComfyError) as excinfo:
+            [j async for j in client.list_jobs()]
+    assert excinfo.value.code == "invalid_response"
+    assert "'jobs' is not an array" in str(excinfo.value)
+
+
 def test_list_jobs_reads_nanosecond_times_and_tolerates_unreadable_ones(server) -> None:
     item = {
         "id": "job_01",

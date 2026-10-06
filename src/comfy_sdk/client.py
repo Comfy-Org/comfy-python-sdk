@@ -55,7 +55,7 @@ from comfy_low.transport import (
 
 from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
-from .exceptions import MissingApiKey, WorkflowFormatUi, to_sdk_error, translating
+from .exceptions import ComfyError, MissingApiKey, WorkflowFormatUi, to_sdk_error, translating
 from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory, JobSummary
 from .models import AsyncModels, Models
 from .retry import DEFAULT_RETRY, RetryPolicy
@@ -107,6 +107,16 @@ def _retry_delay(exc: ApiError, deadline: float) -> float | None:
     if remaining <= 0:
         return None
     return min(max(raw_delay, _MIN_RETRY_DELAY), remaining)
+
+
+def _page_jobs(page: dict[str, Any]) -> list[Any]:
+    """The ``jobs`` list of one :meth:`Comfy.list_jobs` page (empty when absent or null)."""
+    jobs = page.get("jobs")
+    if jobs is None:
+        return []
+    if not isinstance(jobs, list):
+        raise ComfyError("job list response field 'jobs' is not an array", code="invalid_response")
+    return jobs
 
 
 def _has_labels(summary: JobSummary, metadata: Mapping[str, str] | None) -> bool:
@@ -450,7 +460,7 @@ class Comfy:
         cursor: str | None = None
         while True:
             page = self._list_page(metadata, limit, cursor)
-            for item in page.get("jobs") or []:
+            for item in _page_jobs(page):
                 summary = JobSummary._from_item(item)
                 if _has_labels(summary, metadata):
                     yield summary
@@ -606,7 +616,7 @@ class AsyncComfy:
         cursor: str | None = None
         while True:
             page = await self._list_page(metadata, limit, cursor)
-            for item in page.get("jobs") or []:
+            for item in _page_jobs(page):
                 summary = JobSummary._from_item(item)
                 if _has_labels(summary, metadata):
                     yield summary

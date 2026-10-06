@@ -341,6 +341,10 @@ for summary in client.list_jobs(metadata={"client": "acme"}):
 Labels work on jobs sent to a deployment: point the client at the deployment's
 address with `COMFY_BASE_URL`. Elsewhere:
 
+- **A deployment whose gateway predates job labels** accepts `metadata` on
+  `submit()` but does not keep it, and ignores the `list_jobs()` filters, so a
+  filtered `list_jobs()` yields nothing there (the SDK's own filter check, below,
+  drops every job).
 - **Comfy Cloud** refuses labels for now: `submit()` raises a `ComfyError` whose
   `code` is `"metadata_not_supported"`, and `list_jobs()` raises a `ComfyError`
   whose `code` is `"not_implemented"` (HTTP 501).
