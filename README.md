@@ -348,8 +348,9 @@ address with `COMFY_BASE_URL`. Elsewhere:
   `metadata` is a single string, so it refuses a label map on `submit()` with a
   `ComfyError` whose `code` is `"invalid_request"`. The SDK reads the proxy's
   string `metadata` as no labels (`{}`), so a filtered `list_jobs()` yields
-  nothing there, and an unfiltered one yields every job, each with `metadata`
-  `{}`. Its list items carry `created_at` rather than `create_time`, so
+  nothing there, and an unfiltered one yields the proxy's newest jobs (50 by
+  default, up to 100 with `limit`), each with `metadata` `{}`, and stops there
+  since the proxy sends no next cursor. Its list items carry `created_at` rather than `create_time`, so
   `create_time` reads as `None` there (the raw value stays in `data`).
 
 Labels are fixed when the job is submitted. `job.metadata` is an empty dict for a
@@ -376,7 +377,10 @@ before it yields or ends.
 
 The server sets the limits on labels and filters, and the SDK does not check
 them first. A map it refuses raises `ComfyError` with `code ==
-"metadata_invalid"` and a message naming the key; a filter it refuses raises
+"metadata_invalid"` (HTTP 422) and the server's message: it names the key when
+one key or value breaks a rule (a key is 1 to 40 characters from
+`A-Z a-z 0-9 _ - .`; a value is a string of at most 256 bytes in UTF-8 with no
+NUL character), and gives the count when there are more than 16 pairs. A filter it refuses raises
 `ComfyError` with `code == "invalid_metadata_filter"`, and a page cursor it did
 not issue raises `ComfyError` with `code == "invalid_cursor"`. A job's
 `deployment_id` names the deployment copy that ran it, so after a deployment

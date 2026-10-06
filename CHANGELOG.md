@@ -19,7 +19,9 @@ the fuller account of each version, including verification notes.
   each filter as `metadata[<key>]=<value>`, follows `next_cursor` to the last page, and yields
   `JobSummary` items (`id`, `status`, `create_time`, `update_time`, `deployment_id`,
   `metadata`, `data`); on `AsyncComfy` it is an async iterator. The SDK leaves the label limits
-  to the server: a refused map raises `ComfyError` with code `metadata_invalid`, and a
+  to the server: a refused map raises `ComfyError` with code `metadata_invalid` and the
+  server's message (naming the key when one key or value breaks a rule, giving the count
+  when there are more than 16 pairs), and a
   refused filter raises `ComfyError` with code `invalid_metadata_filter` (`invalid_cursor` for a
   cursor the server did not issue). A list item without `id` or `status` raises `ComfyError`
   with code `invalid_response` naming the missing field, rather than being skipped. `list_jobs` also checks the filters on each item and skips
@@ -30,8 +32,10 @@ the fuller account of each version, including verification notes.
   address. Comfy Cloud refuses them for now: `submit` raises `ComfyError` code
   `metadata_not_supported` and `list_jobs` raises code `not_implemented` (HTTP 501). A
   self-hosted `comfy-api-proxy` does not keep labels: it refuses a label map with code
-  `invalid_request`, its string `metadata` reads as `{}`, and a filtered `list_jobs` yields
-  nothing there.
+  `invalid_request`, its string `metadata` reads as `{}`, a filtered `list_jobs` yields
+  nothing there, and an unfiltered one yields the proxy's newest jobs (50 by default, up to
+  100 with `limit`) and stops, since the proxy sends no next cursor. Printing a `JobSummary`
+  leaves out `data`, the raw item.
 - `models.list()` and `models.schema()`, so you can discover Comfy Router models from Python
   as the TypeScript SDK already can. `list(cursor=, limit=, timeout=)` returns an iterable that
   walks the catalog (`GET /v2/models`), following `next_cursor` while `has_more` is true, and

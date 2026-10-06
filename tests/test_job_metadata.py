@@ -3,13 +3,14 @@
 The server owns every rule about the labels (how many, which key characters,
 how long a value), so these tests pin only what the SDK does: what it sends,
 what it reads back, how it pages, and that the server's refusal reaches the
-caller with the key it named. Everything runs against the stub in
-``conftest.py``.
+caller with the server's own message: the key it named, or the count of pairs.
+Everything runs against the stub in ``conftest.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import pickle
 import time
 from datetime import datetime, timezone
@@ -84,8 +85,9 @@ async def test_async_submit_without_metadata_sends_the_body_it_always_did(server
 
 def test_a_refused_map_raises_the_servers_error_naming_the_key(server) -> None:
     server.state.job_error = (422, "metadata_invalid")
+    # The gateway's message for a bad key: it names the key.
     server.state.job_error_message = (
-        'metadata key "bad key" has a character outside A-Z a-z 0-9 _ - .'
+        'metadata key "bad key" must be 1 to 40 characters from A-Z a-z 0-9 _ - .'
     )
     with Comfy() as client:
         with pytest.raises(ComfyError) as excinfo:
@@ -99,9 +101,11 @@ def test_a_refused_map_raises_the_servers_error_naming_the_key(server) -> None:
     assert server.state.submit_count == 1
 
 
-async def test_async_refused_map_raises_the_servers_error_naming_the_key(server) -> None:
+async def test_async_too_many_pairs_raises_the_servers_error_with_the_count(server) -> None:
+    # The gateway's message for too many pairs: the count and the limit, no key.
+    message = "metadata has 17 pairs; at most 16 are allowed"
     server.state.job_error = (422, "metadata_invalid")
-    server.state.job_error_message = 'metadata key "k16" is one pair too many (17 > 16)'
+    server.state.job_error_message = message
     async with AsyncComfy() as client:
         with pytest.raises(ComfyError) as excinfo:
             await client.submit(_wf(client), metadata={f"k{i}": "v" for i in range(17)})
@@ -109,7 +113,9 @@ async def test_async_refused_map_raises_the_servers_error_naming_the_key(server)
     assert excinfo.value.http_status == 422
     # The base class, not the workflow error: the workflow itself was fine.
     assert not isinstance(excinfo.value, InvalidWorkflow)
-    assert "k16" in str(excinfo.value)
+    assert message in str(excinfo.value)
+    # A 422 is final: the submit is not retried.
+    assert server.state.submit_count == 1
 
 
 def test_a_host_without_label_support_refuses_with_its_own_code(server) -> None:
@@ -344,8 +350,8 @@ def test_list_jobs_items_keep_the_server_fields(server) -> None:
 
 
 def test_a_filtered_list_skips_items_whose_labels_do_not_match(server) -> None:
-    # A host that ignores the filters (a self-hosted proxy, or a gateway
-    # without label support) sends every job; the SDK keeps only the matches.
+    # A host that ignores the filters (a gateway without label support) sends
+    # its jobs unfiltered, page after page; the SDK keeps only the matches.
     server.state.job_list_pages = [
         [
             _item("job_06", _LABELS),
@@ -396,7 +402,8 @@ async def test_async_filtered_list_skips_items_whose_labels_do_not_match(server)
 
 
 def test_a_filtered_list_on_a_host_without_labels_yields_nothing(server) -> None:
-    # The self-hosted proxy's list: no filtering, and its `metadata` a string.
+    # The self-hosted proxy's list: one page of its newest jobs, no filtering,
+    # no `next_cursor`, and its `metadata` a string.
     server.state.job_list_pages = [[{**_item("job_01"), "metadata": "batch-7"}]]
     with Comfy() as client:
         assert list(client.list_jobs(metadata={"client": "acme"})) == []
@@ -469,6 +476,22 @@ def test_a_job_summary_can_be_hashed(server) -> None:
     with Comfy() as client:
         (summary,) = client.list_jobs()
     assert summary in {summary}
+
+
+def test_a_job_summary_prints_without_the_raw_item(server) -> None:
+    # The raw item can hold the workflow and node logs; printing a summary must
+    # not write them into the caller's logs, as printing a `Job` does not.
+    item = {**_item("job_01", _LABELS), "workflow": {"secret_node": {"inputs": {}}}}
+    server.state.job_list_pages = [[item]]
+    with Comfy() as client:
+        (summary,) = client.list_jobs()
+    printed = repr(summary)
+    assert "job_01" in printed
+    assert "secret_node" not in printed
+    assert ", data=" not in printed
+    # Still part of equality: two summaries of different items differ.
+    assert summary != dataclasses.replace(summary, data={**item, "extra": 1})
+    assert hash(summary) == hash(dataclasses.replace(summary, data={}))
 
 
 def test_a_page_without_jobs_yields_nothing_and_paging_continues(server) -> None:

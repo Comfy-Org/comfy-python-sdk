@@ -363,9 +363,10 @@ class Comfy:
         matched by :meth:`list_jobs`. It is sent as given: the server owns the
         limits on keys, values and count, and a map it refuses raises
         :class:`~comfy_sdk.exceptions.ComfyError` with ``code ==
-        "metadata_invalid"`` and a message naming the offending key. Labels
-        work on a deployment's address; Comfy Cloud refuses them for now with
-        ``code == "metadata_not_supported"``.
+        "metadata_invalid"`` (HTTP 422) and the server's message: it names the
+        key when one key or value breaks a rule, and gives the count when there
+        are more than 16 pairs. Labels work on a deployment's address; Comfy
+        Cloud refuses them for now with ``code == "metadata_not_supported"``.
         """
         _guard_ui_format(workflow)
         # Validated before any bytes move, like `models.run`: `""` used to
@@ -431,7 +432,9 @@ class Comfy:
         self-hosted proxy, which keeps no labels) therefore yields nothing for a
         filtered list rather than every job. On such a host one step of the
         iteration can read several pages, or every page, before it yields or
-        ends.
+        ends. The proxy also sends no ``next_cursor``: an unfiltered list there
+        yields its newest jobs (50 by default, up to 100 with ``limit``) and
+        stops.
 
         Each page retries a 429 that carries ``Retry-After`` the way
         :meth:`submit` does, at the server's pace (at least one second). Each

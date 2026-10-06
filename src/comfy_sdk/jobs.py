@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
@@ -104,8 +104,13 @@ class JobSummary:
     dropped. ``data`` keeps what the server sent.
     """
 
-    data: dict[str, Any]
-    """The list item exactly as the server sent it, for fields not lifted above."""
+    data: dict[str, Any] = field(repr=False)
+    """The list item exactly as the server sent it, for fields not lifted above.
+
+    Left out of the printout (``repr``), which shows the fields above, so
+    printing or logging a summary does not write the whole item (which can
+    hold the workflow and node logs) into the caller's logs.
+    """
 
     def __hash__(self) -> int:
         # The generated hash would cover the two dicts and raise; the id alone
@@ -117,7 +122,7 @@ class JobSummary:
         # Raised rather than skipped: skipping would hide a job from the caller.
         if not isinstance(item, dict):
             raise ComfyError("job list item is not a JSON object", code="invalid_response")
-        missing = [field for field in ("id", "status") if item.get(field) is None]
+        missing = [name for name in ("id", "status") if item.get(name) is None]
         if missing:
             raise ComfyError(
                 f"job list item is missing {' and '.join(missing)}", code="invalid_response"
