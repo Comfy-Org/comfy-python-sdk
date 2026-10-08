@@ -352,6 +352,10 @@ Elsewhere:
 - **Comfy Cloud** refuses labels for now: `submit()` raises a `ComfyError` whose
   `code` is `"metadata_not_supported"`, and `list_jobs()` raises a `ComfyError`
   whose `code` is `"not_implemented"` (HTTP 501).
+- **The public demo deployment**, which takes no credential, keeps no labels: a
+  labelled `submit()` raises a `ComfyError` whose `code` is
+  `"metadata_not_supported"` (HTTP 422), and `list_jobs()` raises a `ComfyError`
+  whose `code` is `"public_deployment_no_list"` (HTTP 403, not `Forbidden`).
 - **A self-hosted `comfy-api-proxy`** does not keep labels. Its own job
   `metadata` is a single string, so it refuses a label map on `submit()` with a
   `ComfyError` whose `code` is `"invalid_request"`. The SDK reads the proxy's

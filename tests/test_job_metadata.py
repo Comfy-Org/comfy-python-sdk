@@ -707,13 +707,36 @@ async def test_async_list_jobs_stops_when_the_server_repeats_a_cursor(server) ->
     assert len(server.state.job_list_queries) == 2
 
 
-@pytest.mark.parametrize("cursor", [7, ["page-1"]], ids=["integer", "array"])
+# Falsy ones included: only null and "" end the list, so a `0`, `false` or `[]`
+# is a bad cursor, not a last page.
+_NON_STRING_CURSORS = pytest.mark.parametrize(
+    "cursor",
+    [7, ["page-1"], 0, False, []],
+    ids=["integer", "array", "zero", "false", "empty-array"],
+)
+
+
+@_NON_STRING_CURSORS
 def test_a_next_cursor_that_is_not_a_string_raises_invalid_response(server, cursor) -> None:
     server.state.job_list_pages = [[_item("job_02")], [_item("job_01")]]
     server.state.job_list_next_cursor_at = {0: cursor}
     with Comfy() as client:
         with pytest.raises(ComfyError) as excinfo:
             list(client.list_jobs())
+    assert excinfo.value.code == "invalid_response"
+    assert "'next_cursor' is not a string" in str(excinfo.value)
+    assert len(server.state.job_list_queries) == 1
+
+
+@_NON_STRING_CURSORS
+async def test_async_a_next_cursor_that_is_not_a_string_raises_invalid_response(
+    server, cursor
+) -> None:
+    server.state.job_list_pages = [[_item("job_02")], [_item("job_01")]]
+    server.state.job_list_next_cursor_at = {0: cursor}
+    async with AsyncComfy() as client:
+        with pytest.raises(ComfyError) as excinfo:
+            [j async for j in client.list_jobs()]
     assert excinfo.value.code == "invalid_response"
     assert "'next_cursor' is not a string" in str(excinfo.value)
     assert len(server.state.job_list_queries) == 1

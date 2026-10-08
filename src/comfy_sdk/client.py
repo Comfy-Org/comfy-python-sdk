@@ -124,12 +124,13 @@ def _page_jobs(page: Any) -> list[Any]:
 def _next_list_cursor(page: dict[str, Any], sent: set[str]) -> str | None:
     """The cursor for the :meth:`Comfy.list_jobs` page after ``page``; ``None`` ends the list.
 
-    A missing, null or empty ``next_cursor`` is the last page. A cursor this
-    iteration already sent would fetch a page it already read, again and
-    again, so it raises instead of being followed.
+    A missing, null or empty ``next_cursor`` is the last page; any other value
+    that is not a string (``0``, ``false`` and ``[]`` included) raises. A
+    cursor this iteration already sent would fetch a page it already read,
+    again and again, so it raises instead of being followed.
     """
     cursor = page.get("next_cursor")
-    if not cursor:
+    if cursor is None or cursor == "":
         return None
     if not isinstance(cursor, str):
         raise ComfyError(
