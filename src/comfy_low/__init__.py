@@ -5,8 +5,10 @@ Two parts:
 * ``comfy_low.models`` — pydantic v2 models generated from ``spec/openapi.yaml``
   (do not hand-edit; regenerate with ``scripts/gen_models.sh``).
 * ``comfy_low.transport`` — a hand-written thin ``httpx`` transport (sync +
-  async) with one function per ``operationId`` and the mandatory escape hatches
-  (raw response, streaming bodies, all headers, per-request timeout/abort).
+  async) with one function per ``operationId`` in ``spec/openapi.yaml``, plus
+  ``list_jobs`` for the v2 ``GET /jobs`` route that the vendored spec does not
+  carry yet, and the mandatory escape hatches (raw response, streaming bodies,
+  all headers, per-request timeout/abort).
 
 This layer is deliberately boring: no orchestration, retries, hashing, or SSE
 reconnection. Those live in ``comfy_sdk``.

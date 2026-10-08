@@ -40,16 +40,23 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
 from comfy_low.errors import ApiError
-from comfy_low.transport import ROUTER_BASE_URL, AsyncComfyLow, ComfyLow, origin
+from comfy_low.transport import (
+    ROUTER_BASE_URL,
+    AsyncComfyLow,
+    ComfyLow,
+    metadata_filter_pairs,
+    origin,
+)
 
 from . import _core
 from .assets import AssetFactory, AsyncAssetFactory
-from .exceptions import MissingApiKey, WorkflowFormatUi, to_sdk_error, translating
-from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory
+from .exceptions import ComfyError, MissingApiKey, WorkflowFormatUi, to_sdk_error, translating
+from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory, JobSummary
 from .models import AsyncModels, Models
 from .retry import DEFAULT_RETRY, RetryPolicy
 from .workflows import Workflow, WorkflowFactory
@@ -78,6 +85,9 @@ ROUTER_BASE_URL_ENV_VAR = "COMFY_ROUTER_BASE_URL"
 API_KEY_ENV_VAR = "COMFY_API_KEY"
 
 _DEFAULT_RETRY_AFTER = 2
+# The shortest wait before a 429 retry, so a `Retry-After: 0` (or a negative
+# one) cannot drive a tight loop against the server.
+_MIN_RETRY_DELAY = 1.0
 _now = time.monotonic
 
 
@@ -96,7 +106,53 @@ def _retry_delay(exc: ApiError, deadline: float) -> float | None:
     remaining = deadline - _now()
     if remaining <= 0:
         return None
-    return max(0.0, min(raw_delay, remaining))
+    return min(max(raw_delay, _MIN_RETRY_DELAY), remaining)
+
+
+def _page_jobs(page: Any) -> list[Any]:
+    """The ``jobs`` list of one :meth:`Comfy.list_jobs` page (empty when absent or null)."""
+    if not isinstance(page, dict):
+        raise ComfyError("job list response is not a JSON object", code="invalid_response")
+    jobs = page.get("jobs")
+    if jobs is None:
+        return []
+    if not isinstance(jobs, list):
+        raise ComfyError("job list response field 'jobs' is not an array", code="invalid_response")
+    return jobs
+
+
+def _next_list_cursor(page: dict[str, Any], sent: set[str]) -> str | None:
+    """The cursor for the :meth:`Comfy.list_jobs` page after ``page``; ``None`` ends the list.
+
+    A missing, null or empty ``next_cursor`` is the last page; any other value
+    that is not a string (``0``, ``false`` and ``[]`` included) raises. A
+    cursor this iteration already sent would fetch a page it already read,
+    again and again, so it raises instead of being followed.
+    """
+    cursor = page.get("next_cursor")
+    if cursor is None or cursor == "":
+        return None
+    if not isinstance(cursor, str):
+        raise ComfyError(
+            "job list response field 'next_cursor' is not a string", code="invalid_response"
+        )
+    if cursor in sent:
+        raise ComfyError(
+            "job list returned a cursor it already returned; stopping to avoid a loop",
+            code="invalid_response",
+        )
+    sent.add(cursor)
+    return cursor
+
+
+def _has_labels(summary: JobSummary, metadata: Mapping[str, str] | None) -> bool:
+    """Whether ``summary`` carries every ``metadata`` filter pair (always, with none).
+
+    Each pair is compared as the text the query string sends, as the server
+    compares it, so ``{"run": 7}`` matches the label ``"7"`` and ``{1: "a"}``
+    the key ``"1"``.
+    """
+    return all(summary.metadata.get(k) == v for k, v in metadata_filter_pairs(metadata))
 
 
 def _resolve_env_url(var: str, default: str) -> str:
@@ -300,6 +356,7 @@ class Comfy:
         *,
         api_key: str | None = None,
         idempotency_key: str | None = None,
+        metadata: Mapping[str, str] | None = None,
     ) -> Job:
         """Submit a workflow. Retries any 429 that carries ``Retry-After``.
 
@@ -336,6 +393,16 @@ class Comfy:
         token this client was constructed with. It is never persisted or
         logged by the SDK, and is sent as ``extra_data.api_key_comfy_org``
         only when supplied; omitted from the request entirely otherwise.
+
+        ``metadata`` is a map of string labels stored on the job (for example
+        ``{"client": "acme"}``), read back from :attr:`Job.metadata` and
+        matched by :meth:`list_jobs`. It is sent as given: the server owns the
+        limits on keys, values and count, and a map it refuses raises
+        :class:`~comfy_sdk.exceptions.ComfyError` with ``code ==
+        "metadata_invalid"`` (HTTP 422) and the server's message: it names the
+        key when one key or value breaks a rule, and gives the count when there
+        are more than 16 pairs. Labels work on a deployment's address; Comfy
+        Cloud refuses them for now with ``code == "metadata_not_supported"``.
         """
         _guard_ui_format(workflow)
         # Validated before any bytes move, like `models.run`: `""` used to
@@ -356,7 +423,9 @@ class Comfy:
         with translating(idempotency_key=key):
             while True:
                 try:
-                    model = self._low.post_jobs(graph, idempotency_key=key, extra_data=extra_data)
+                    model = self._low.post_jobs(
+                        graph, idempotency_key=key, extra_data=extra_data, metadata=metadata
+                    )
                     return Job(self._low, model)
                 except ApiError as exc:
                     err = to_sdk_error(exc)
@@ -376,6 +445,76 @@ class Comfy:
         """Submit, then poll to terminal (authoritative). Raises on failure."""
         job = self.submit(workflow, api_key=api_key)
         return job.result() if timeout is None else _run_with_timeout(job, timeout)
+
+    def list_jobs(
+        self,
+        *,
+        metadata: Mapping[str, str] | None = None,
+        limit: int | None = None,
+    ) -> Iterator[JobSummary]:
+        """Every job this client can see, newest first, one page at a time.
+
+        At a deployment's address that is the deployment's jobs; at the
+        workspace address (``COMFY_BASE_URL=https://platformapi.comfy.org``,
+        which serves the job list only), every job in the workspace.
+
+        ``metadata`` keeps only the jobs whose labels include every given
+        key with exactly that value. Iteration follows ``next_cursor`` until
+        the last page; on a host that pages, ``limit`` is the page size, not a
+        cap on the total. The
+        server owns the filter rules (how many keys, which characters) and
+        refuses a bad filter with :class:`~comfy_sdk.exceptions.ComfyError`
+        (``code == "invalid_metadata_filter"``). A cursor the server did not
+        issue raises :class:`~comfy_sdk.exceptions.ComfyError` with ``code ==
+        "invalid_cursor"``; a page that hands back a cursor this iteration
+        already sent, or one that is not a string, raises ``code ==
+        "invalid_response"`` rather than being followed.
+
+        The filters are also checked on each item, and an item that does not
+        carry every pair is skipped, so a host that ignores the filters yields
+        only real matches. On such a host that pages (a gateway without label
+        support, for example), one step of the iteration can read several
+        pages, or every page, before it yields or ends. A self-hosted proxy
+        keeps no labels, so a filtered list there yields nothing rather than
+        every job. The proxy reads one page and sends no ``next_cursor``: an
+        unfiltered list there yields its newest jobs (50 by default, up to 100
+        with ``limit``) and stops.
+
+        Each page retries a 429 that carries ``Retry-After`` the way
+        :meth:`submit` does, at the server's pace (at least one second). Each
+        page has its own 60-second retry budget, the length :meth:`submit`
+        gets, so a long list is not cut short by 429s on earlier pages.
+
+        Comfy Cloud does not list jobs yet: it answers ``code ==
+        "not_implemented"`` (HTTP 501). Yields :class:`~comfy_sdk.jobs.JobSummary`
+        items; call ``client.jobs.get(summary.id)`` for a full job and its outputs.
+        """
+        cursor: str | None = None
+        sent: set[str] = set()
+        while True:
+            page = self._list_page(metadata, limit, cursor)
+            for item in _page_jobs(page):
+                summary = JobSummary._from_item(item)
+                if _has_labels(summary, metadata):
+                    yield summary
+            cursor = _next_list_cursor(page, sent)
+            if cursor is None:
+                return
+
+    def _list_page(
+        self, metadata: Mapping[str, str] | None, limit: int | None, cursor: str | None
+    ) -> dict[str, Any]:
+        """One page of :meth:`list_jobs`, retrying a paced 429 like :meth:`submit`."""
+        deadline = _now() + _QUEUE_RETRY_BUDGET
+        with translating():
+            while True:
+                try:
+                    return self._low.list_jobs(metadata=metadata, limit=limit, cursor=cursor)
+                except ApiError as exc:
+                    delay = _retry_delay(exc, deadline)
+                    if delay is None:
+                        raise to_sdk_error(exc) from exc
+                    time.sleep(delay)
 
 
 def _run_with_timeout(job: Job, timeout: float) -> Job:
@@ -450,8 +589,9 @@ class AsyncComfy:
         *,
         api_key: str | None = None,
         idempotency_key: str | None = None,
+        metadata: Mapping[str, str] | None = None,
     ) -> AsyncJob:
-        """Mirrors :meth:`Comfy.submit` — see there for ``api_key`` details."""
+        """Mirrors :meth:`Comfy.submit` — see there for ``api_key`` and ``metadata``."""
         import asyncio
 
         _guard_ui_format(workflow)
@@ -469,7 +609,7 @@ class AsyncComfy:
             while True:
                 try:
                     model = await self._low.post_jobs(
-                        graph, idempotency_key=key, extra_data=extra_data
+                        graph, idempotency_key=key, extra_data=extra_data, metadata=metadata
                     )
                     return AsyncJob(self._low, model)
                 except ApiError as exc:
@@ -498,3 +638,39 @@ class AsyncComfy:
         if job.status != SUCCESS:
             raise JobFailed(f"job {job.id} ended {job.status}", error=job.error)
         return job
+
+    async def list_jobs(
+        self,
+        *,
+        metadata: Mapping[str, str] | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[JobSummary]:
+        """Async :meth:`Comfy.list_jobs` — ``async for summary in client.list_jobs(...)``."""
+        cursor: str | None = None
+        sent: set[str] = set()
+        while True:
+            page = await self._list_page(metadata, limit, cursor)
+            for item in _page_jobs(page):
+                summary = JobSummary._from_item(item)
+                if _has_labels(summary, metadata):
+                    yield summary
+            cursor = _next_list_cursor(page, sent)
+            if cursor is None:
+                return
+
+    async def _list_page(
+        self, metadata: Mapping[str, str] | None, limit: int | None, cursor: str | None
+    ) -> dict[str, Any]:
+        """Async :meth:`Comfy._list_page`."""
+        import asyncio
+
+        deadline = _now() + _QUEUE_RETRY_BUDGET
+        with translating():
+            while True:
+                try:
+                    return await self._low.list_jobs(metadata=metadata, limit=limit, cursor=cursor)
+                except ApiError as exc:
+                    delay = _retry_delay(exc, deadline)
+                    if delay is None:
+                        raise to_sdk_error(exc) from exc
+                    await asyncio.sleep(delay)
