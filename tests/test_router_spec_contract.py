@@ -571,7 +571,11 @@ def test_an_exempt_field_is_really_unmoved_by_the_headers_it_skips() -> None:
     The one shape this still cannot see is a field lifted from a header that is
     neither pinned here nor declared by the spec, since nothing in the repo
     then knows the name to send. Closing that needs the source read, which the
-    rest of this block deliberately refuses to do.
+    rest of this block deliberately refuses to do. A narrower one: a field
+    lifted from a header the spec declares but ``_HEADER_PROBES`` has no entry
+    for is sent the generic ``"probe"`` fallback below, and if its parser
+    rejects that value the field reads the same either way -- so a misfiled
+    lift only fails here once its header has a parser-valid probe there.
     """
     # From ``_HEADER_PROBES``, not ``_CONTRACT_HEADER_LIFTS``: a misfiled lift
     # has no lift entry, and must still be sent a value its parser accepts.
