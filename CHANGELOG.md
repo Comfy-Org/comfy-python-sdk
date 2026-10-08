@@ -26,8 +26,11 @@ the fuller account of each version, including verification notes.
   cursor the server did not issue). A list item whose `id` or `status` is missing, null or not a string, or
   whose `deployment_id` is neither a string nor null, raises `ComfyError` with code
   `invalid_response` naming the field, as does an item that is not a JSON object (the item is
-  not skipped), a page body that is not a JSON object, and a page whose `jobs` is not an array (a
-  missing or null `jobs` reads as an empty page). `list_jobs` also checks the filters on each item and skips
+  not skipped), a page body that is not a JSON object, a page whose `jobs` is not an array (a
+  missing or null `jobs` reads as an empty page), and a page whose `next_cursor` is not a string
+  or repeats a cursor the same `list_jobs` iteration already sent (raised before that page is
+  requested again, so the iteration ends instead of looping; a missing, null or empty
+  `next_cursor` still ends the list). `list_jobs` also checks the filters on each item and skips
   one whose labels do not match (comparing each key and value as the text the query sends), so a host
   that ignores the filters yields only real matches (on one that pages, after reading as many
   pages as it takes).

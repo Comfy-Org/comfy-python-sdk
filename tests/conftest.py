@@ -84,6 +84,9 @@ class ServerState:
     # 0-based arrival indexes.
     job_list_429_at: set[int] = field(default_factory=set)
     job_list_retry_after: str | None = "0"
+    # GET /jobs answers the request at each 0-based arrival index with this
+    # `next_cursor`, exactly as given, instead of the page's own.
+    job_list_next_cursor_at: dict[int, Any] = field(default_factory=dict)
     # The raw path (with query) and the parsed query string of every GET /jobs,
     # in arrival order.
     job_list_paths: list[str] = field(default_factory=list)
@@ -731,6 +734,8 @@ def _make_handler(state: ServerState):
                 page["jobs"] = state.job_list_pages[index]
             if index + 1 < len(state.job_list_pages):
                 page["next_cursor"] = f"page-{index + 1}"
+            if arrival in state.job_list_next_cursor_at:
+                page["next_cursor"] = state.job_list_next_cursor_at[arrival]
             self._json(200, page)
 
         def _serve_job_workflow(self, job_id: str) -> None:

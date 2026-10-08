@@ -121,6 +121,29 @@ def _page_jobs(page: Any) -> list[Any]:
     return jobs
 
 
+def _next_list_cursor(page: dict[str, Any], sent: set[str]) -> str | None:
+    """The cursor for the :meth:`Comfy.list_jobs` page after ``page``; ``None`` ends the list.
+
+    A missing, null or empty ``next_cursor`` is the last page. A cursor this
+    iteration already sent would fetch a page it already read, again and
+    again, so it raises instead of being followed.
+    """
+    cursor = page.get("next_cursor")
+    if not cursor:
+        return None
+    if not isinstance(cursor, str):
+        raise ComfyError(
+            "job list response field 'next_cursor' is not a string", code="invalid_response"
+        )
+    if cursor in sent:
+        raise ComfyError(
+            "job list returned a cursor it already returned; stopping to avoid a loop",
+            code="invalid_response",
+        )
+    sent.add(cursor)
+    return cursor
+
+
 def _has_labels(summary: JobSummary, metadata: Mapping[str, str] | None) -> bool:
     """Whether ``summary`` carries every ``metadata`` filter pair (always, with none).
 
@@ -442,7 +465,9 @@ class Comfy:
         refuses a bad filter with :class:`~comfy_sdk.exceptions.ComfyError`
         (``code == "invalid_metadata_filter"``). A cursor the server did not
         issue raises :class:`~comfy_sdk.exceptions.ComfyError` with ``code ==
-        "invalid_cursor"``.
+        "invalid_cursor"``; a page that hands back a cursor this iteration
+        already sent, or one that is not a string, raises ``code ==
+        "invalid_response"`` rather than being followed.
 
         The filters are also checked on each item, and an item that does not
         carry every pair is skipped, so a host that ignores the filters yields
@@ -464,14 +489,15 @@ class Comfy:
         items; call ``client.jobs.get(summary.id)`` for a full job and its outputs.
         """
         cursor: str | None = None
+        sent: set[str] = set()
         while True:
             page = self._list_page(metadata, limit, cursor)
             for item in _page_jobs(page):
                 summary = JobSummary._from_item(item)
                 if _has_labels(summary, metadata):
                     yield summary
-            cursor = page.get("next_cursor")
-            if not cursor:
+            cursor = _next_list_cursor(page, sent)
+            if cursor is None:
                 return
 
     def _list_page(
@@ -620,14 +646,15 @@ class AsyncComfy:
     ) -> AsyncIterator[JobSummary]:
         """Async :meth:`Comfy.list_jobs` — ``async for summary in client.list_jobs(...)``."""
         cursor: str | None = None
+        sent: set[str] = set()
         while True:
             page = await self._list_page(metadata, limit, cursor)
             for item in _page_jobs(page):
                 summary = JobSummary._from_item(item)
                 if _has_labels(summary, metadata):
                     yield summary
-            cursor = page.get("next_cursor")
-            if not cursor:
+            cursor = _next_list_cursor(page, sent)
+            if cursor is None:
                 return
 
     async def _list_page(
