@@ -34,7 +34,8 @@ the fuller account of each version, including verification notes.
   Each page retries a 429 that carries `Retry-After`, as `submit` does. A `metadata` that is not a map of strings reads as `{}` and a non-string value
   is dropped, on jobs and list items alike, instead of raising. Labels work on a deployment's
   address, and need a deployment gateway with job-label support; `list_jobs` there lists the
-  deployment's jobs, and at the workspace address every job in the workspace. An older gateway accepts
+  deployment's jobs, and at the workspace address (`COMFY_BASE_URL=https://platformapi.comfy.org`, which serves
+  the job list only) every job in the workspace. An older gateway accepts
   `metadata` on `submit` but does not keep it, and ignores the `list_jobs` filters, so a filtered
   `list_jobs` yields nothing there (the SDK's own filter check drops every job). Comfy Cloud refuses them for now: `submit` raises `ComfyError` code
   `metadata_not_supported` and `list_jobs` raises code `not_implemented` (HTTP 501). A

@@ -340,8 +340,10 @@ for summary in client.list_jobs(metadata={"client": "acme"}):
 
 Labels work on jobs sent to a deployment: point the client at the deployment's
 address with `COMFY_BASE_URL`. There, `list_jobs()` lists that deployment's
-jobs; at the workspace address it lists every job in your workspace, across its
-deployments. Elsewhere:
+jobs. To list every job in your workspace, across its deployments, set
+`COMFY_BASE_URL` to the workspace address, `https://platformapi.comfy.org`; that
+address serves the job list only, so submit through the deployment's address.
+Elsewhere:
 
 - **A deployment whose gateway predates job labels** accepts `metadata` on
   `submit()` but does not keep it, and ignores the `list_jobs()` filters, so a

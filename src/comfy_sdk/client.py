@@ -431,7 +431,8 @@ class Comfy:
         """Every job this client can see, newest first, one page at a time.
 
         At a deployment's address that is the deployment's jobs; at the
-        workspace address, every job in the workspace.
+        workspace address (``COMFY_BASE_URL=https://platformapi.comfy.org``,
+        which serves the job list only), every job in the workspace.
 
         ``metadata`` keeps only the jobs whose labels include every given
         key with exactly that value. Iteration follows ``next_cursor`` until
