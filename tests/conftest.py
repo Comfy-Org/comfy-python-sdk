@@ -74,6 +74,9 @@ class ServerState:
     # None for a page with no `jobs` key at all. Page i carries `next_cursor`
     # "page-{i+1}" unless it is the last.
     job_list_pages: list[list[dict[str, Any]] | None] = field(default_factory=lambda: [[]])
+    # GET /jobs answers 200 with this JSON body, exactly as given, instead of a
+    # page built from job_list_pages; None serves the pages.
+    job_list_body: Any = None
     # GET /jobs answers this (status, code, message) instead of a page.
     job_list_error: tuple[int, str, str] | None = None
     # GET /jobs answers 429 `rate_limited` with `Retry-After:
@@ -717,6 +720,9 @@ def _make_handler(state: ServerState):
                     {"error": {"code": "rate_limited", "message": "slow down"}},
                     headers={"Retry-After": retry_after} if retry_after is not None else None,
                 )
+                return
+            if state.job_list_body is not None:
+                self._json(200, state.job_list_body)
                 return
             cursor = query.get("cursor", ["page-0"])[0]
             index = int(cursor.removeprefix("page-"))

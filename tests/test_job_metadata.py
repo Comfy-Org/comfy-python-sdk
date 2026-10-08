@@ -578,6 +578,11 @@ _BAD_LIST_ITEMS = [
     pytest.param(_without("status"), "status", id="status-missing"),
     pytest.param(_with_null("id"), "id", id="id-null"),
     pytest.param(_with_null("status"), "status", id="status-null"),
+    pytest.param({**_item("job_01"), "id": 5}, "id", id="id-not-a-string"),
+    pytest.param({**_item("job_01"), "status": 1}, "status", id="status-not-a-string"),
+    pytest.param(
+        {**_item("job_01"), "deployment_id": 7}, "deployment_id", id="deployment-id-not-a-string"
+    ),
     pytest.param("job_01", "not a JSON object", id="not-an-object"),
 ]
 
@@ -601,6 +606,41 @@ async def test_async_bad_list_item_raises_invalid_response(server, item, named) 
             [j async for j in client.list_jobs()]
     assert excinfo.value.code == "invalid_response"
     assert named in str(excinfo.value)
+
+
+@pytest.mark.parametrize("item", [_with_null("deployment_id"), _without("deployment_id")])
+def test_a_null_or_absent_deployment_id_reads_as_none(server, item) -> None:
+    server.state.job_list_pages = [[item]]
+    with Comfy() as client:
+        (summary,) = client.list_jobs()
+    assert summary.deployment_id is None
+
+
+# A page body that is valid JSON but not an object.
+_BAD_PAGE_BODIES = [
+    pytest.param([{"id": "job_01", "status": "queued"}], id="array"),
+    pytest.param("jobs", id="string"),
+]
+
+
+@pytest.mark.parametrize("body", _BAD_PAGE_BODIES)
+def test_a_page_that_is_not_an_object_raises_invalid_response(server, body) -> None:
+    server.state.job_list_body = body
+    with Comfy() as client:
+        with pytest.raises(ComfyError) as excinfo:
+            list(client.list_jobs())
+    assert excinfo.value.code == "invalid_response"
+    assert "not a JSON object" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("body", _BAD_PAGE_BODIES)
+async def test_async_a_page_that_is_not_an_object_raises_invalid_response(server, body) -> None:
+    server.state.job_list_body = body
+    async with AsyncComfy() as client:
+        with pytest.raises(ComfyError) as excinfo:
+            [j async for j in client.list_jobs()]
+    assert excinfo.value.code == "invalid_response"
+    assert "not a JSON object" in str(excinfo.value)
 
 
 # A page whose `jobs` is not an array: an object would otherwise iterate its keys.
@@ -652,8 +692,13 @@ def test_list_jobs_reads_nanosecond_times_and_tolerates_unreadable_ones(server) 
     assert summary.data["update_time"] == "not a time"
 
 
+# The gateway's messages for a 4th filter and for a cursor it did not issue.
+_FOUR_FILTERS_REFUSED = "at most 3 metadata filters are allowed; got 4"
+_CURSOR_REFUSED = "cursor is not well-formed: pass back a page's next_cursor unchanged"
+
+
 def test_list_jobs_surfaces_a_refused_filter(server) -> None:
-    server.state.job_list_error = (400, "invalid_metadata_filter", "at most 3 metadata filters")
+    server.state.job_list_error = (400, "invalid_metadata_filter", _FOUR_FILTERS_REFUSED)
     with Comfy() as client:
         with pytest.raises(ComfyError) as excinfo:
             list(client.list_jobs(metadata={"a": "1", "b": "2", "c": "3", "d": "4"}))
@@ -662,7 +707,7 @@ def test_list_jobs_surfaces_a_refused_filter(server) -> None:
 
 
 def test_list_jobs_surfaces_a_refused_cursor(server) -> None:
-    server.state.job_list_error = (400, "invalid_cursor", "cursor was not issued by this list")
+    server.state.job_list_error = (400, "invalid_cursor", _CURSOR_REFUSED)
     with Comfy() as client:
         with pytest.raises(ComfyError) as excinfo:
             list(client.list_jobs())
@@ -684,7 +729,7 @@ def test_list_jobs_on_a_host_that_cannot_list_raises_not_implemented(server) -> 
 
 
 async def test_async_list_jobs_surfaces_a_refused_filter(server) -> None:
-    server.state.job_list_error = (400, "invalid_metadata_filter", "at most 3 metadata filters")
+    server.state.job_list_error = (400, "invalid_metadata_filter", _FOUR_FILTERS_REFUSED)
     async with AsyncComfy() as client:
         with pytest.raises(ComfyError) as excinfo:
             [j async for j in client.list_jobs(metadata={"a": "1", "b": "2", "c": "3", "d": "4"})]

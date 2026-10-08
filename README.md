@@ -339,7 +339,9 @@ for summary in client.list_jobs(metadata={"client": "acme"}):
 ```
 
 Labels work on jobs sent to a deployment: point the client at the deployment's
-address with `COMFY_BASE_URL`. Elsewhere:
+address with `COMFY_BASE_URL`. There, `list_jobs()` lists that deployment's
+jobs; at the workspace address it lists every job in your workspace, across its
+deployments. Elsewhere:
 
 - **A deployment whose gateway predates job labels** accepts `metadata` on
   `submit()` but does not keep it, and ignores the `list_jobs()` filters, so a
@@ -387,7 +389,11 @@ them first. A map it refuses raises `ComfyError` with `code ==
 "metadata_invalid"` (HTTP 422) and the server's message: it names the key when
 one key or value breaks a rule (a key is 1 to 40 characters from
 `A-Z a-z 0-9 _ - .`; a value is a string of at most 256 bytes in UTF-8 with no
-NUL character), and gives the count when there are more than 16 pairs. A filter it refuses raises
+control or bidirectional formatting characters: U+0000 to U+001F, tab and newline
+included, U+007F to U+009F, and the bidirectional embeddings, overrides and
+isolates U+202A to U+202E and U+2066 to U+2069), and gives the count when there
+are more than 16 pairs. A filter it refuses (more than 3 of them, for example, or a
+value holding one of those characters) raises
 `ComfyError` with `code == "invalid_metadata_filter"`, and a page cursor it did
 not issue raises `ComfyError` with `code == "invalid_cursor"`. A job's
 `deployment_id` names the deployment copy that ran it, so after a deployment

@@ -109,8 +109,10 @@ def _retry_delay(exc: ApiError, deadline: float) -> float | None:
     return min(max(raw_delay, _MIN_RETRY_DELAY), remaining)
 
 
-def _page_jobs(page: dict[str, Any]) -> list[Any]:
+def _page_jobs(page: Any) -> list[Any]:
     """The ``jobs`` list of one :meth:`Comfy.list_jobs` page (empty when absent or null)."""
+    if not isinstance(page, dict):
+        raise ComfyError("job list response is not a JSON object", code="invalid_response")
     jobs = page.get("jobs")
     if jobs is None:
         return []
@@ -427,6 +429,9 @@ class Comfy:
         limit: int | None = None,
     ) -> Iterator[JobSummary]:
         """Every job this client can see, newest first, one page at a time.
+
+        At a deployment's address that is the deployment's jobs; at the
+        workspace address, every job in the workspace.
 
         ``metadata`` keeps only the jobs whose labels include every given
         key with exactly that value. Iteration follows ``next_cursor`` until

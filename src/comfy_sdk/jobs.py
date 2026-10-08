@@ -127,12 +127,20 @@ class JobSummary:
             raise ComfyError(
                 f"job list item is missing {' and '.join(missing)}", code="invalid_response"
             )
+        deployment_id = item.get("deployment_id")
+        wrong = [name for name in ("id", "status") if not isinstance(item[name], str)]
+        if deployment_id is not None and not isinstance(deployment_id, str):
+            wrong.append("deployment_id")
+        if wrong:
+            raise ComfyError(
+                f"job list item has a non-string {' and '.join(wrong)}", code="invalid_response"
+            )
         return cls(
             id=item["id"],
             status=item["status"],
             create_time=_parse_time(item.get("create_time")),
             update_time=_parse_time(item.get("update_time")),
-            deployment_id=item.get("deployment_id"),
+            deployment_id=deployment_id,
             metadata=job_labels(item.get("metadata")),
             data=item,
         )
