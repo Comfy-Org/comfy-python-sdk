@@ -58,6 +58,12 @@ def _metadata_of(model: LowJob) -> dict[str, str]:
     return job_labels(getattr(model, "metadata", None))
 
 
+def _metrics_of(model: LowJob) -> dict[str, int | None] | None:
+    # A copy, like `_metadata_of`: `refresh()` and `events()` read the handle's
+    # own model, so a caller editing the dict must not edit what they read.
+    return None if model.metrics is None else dict(model.metrics)
+
+
 _TIME = TypeAdapter(datetime)
 
 
@@ -240,9 +246,10 @@ class Job:
     def metrics(self) -> dict[str, int | None] | None:
         """Server-reported timings in milliseconds (e.g. ``queue_ms``,
         ``execution_ms``), or ``None``. Individual values are nullable too: a
-        metric that is not available yet is ``None`` rather than absent.
+        metric that is not available yet is ``None`` rather than absent. A
+        copy, so editing it does not change this handle.
         """
-        return self._model.metrics
+        return _metrics_of(self._model)
 
     @property
     def urls(self) -> JobUrls:
@@ -250,9 +257,10 @@ class Job:
 
         Follow these rather than building URLs. A link may be host-relative,
         and one pointing off the deployment's own origin is never sent the
-        API key.
+        API key. A copy, so editing it does not change the links this handle
+        follows.
         """
-        return self._model.urls
+        return self._model.urls.model_copy()
 
     def get_outputs(self, node_id: str) -> list[Output]:
         """The outputs produced by one node, in server order.
@@ -428,12 +436,12 @@ class AsyncJob:
     @property
     def metrics(self) -> dict[str, int | None] | None:
         """:attr:`Job.metrics`."""
-        return self._model.metrics
+        return _metrics_of(self._model)
 
     @property
     def urls(self) -> JobUrls:
         """:attr:`Job.urls`."""
-        return self._model.urls
+        return self._model.urls.model_copy()
 
     def get_outputs(self, node_id: str) -> list[AsyncOutput]:
         """:meth:`Job.get_outputs`, bound to async outputs. Not a coroutine —

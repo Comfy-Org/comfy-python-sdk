@@ -150,6 +150,21 @@ def test_refresh_updates_the_lifecycle_view(server) -> None:
         assert job.progress == _PROGRESS
 
 
+def test_object_properties_hand_back_copies(server) -> None:
+    # `metrics` and `urls` are the two mutable values a read hands out; editing
+    # what came back must not rewrite the handle, whose `urls.events` is what
+    # `events()` follows. Same contract as `metadata`, and as the TypeScript SDK.
+    _populated(server.state)
+    with Comfy() as client:
+        job = client.jobs.get("job_abc")
+
+        job.metrics["queue_ms"] = 0
+        job.urls.events = "https://elsewhere.invalid/"
+
+        assert job.metrics == _METRICS
+        assert job.urls.events == "/api/v2/jobs/job_abc/events"
+
+
 # --- async ---------------------------------------------------------------
 
 
@@ -190,6 +205,18 @@ async def test_async_lifecycle_properties_null(server) -> None:
         assert job.created_at == _CREATED
         assert job.expires_at == _EXPIRES
         assert job.urls.self == "/api/v2/jobs/job_abc"
+
+
+async def test_async_object_properties_hand_back_copies(server) -> None:
+    _populated(server.state)
+    async with AsyncComfy() as client:
+        job = await client.jobs.get("job_abc")
+
+        job.metrics["queue_ms"] = 0
+        job.urls.events = "https://elsewhere.invalid/"
+
+        assert job.metrics == _METRICS
+        assert job.urls.events == "/api/v2/jobs/job_abc/events"
 
 
 async def test_async_lifecycle_properties_do_not_refetch(server) -> None:

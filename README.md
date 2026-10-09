@@ -329,7 +329,8 @@ Every one of these is a view onto the state the handle already holds — the
 same as `status` and `outputs`, and for the same reason: nothing here
 re-fetches, so `refresh()` (or `wait()` / `result()`, which call it) is what
 moves them. `AsyncJob` exposes all of them identically, and none of them is
-awaitable — there is nothing to await in a read of local state.
+awaitable — there is nothing to await in a read of local state. `metrics` and
+`urls` hand back copies, so editing one does not change the handle.
 
 `job.progress` is whatever snapshot came back on the last poll, and not every
 surface fills that in — `None` there means "nothing on this handle", not "no
