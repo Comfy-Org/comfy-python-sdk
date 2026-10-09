@@ -232,9 +232,17 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
         # response carried the array. `_detail_from` is a plain module-level
         # import now that `ComfyError` lives in `comfy_sdk._errors` — the cycle
         # that forced the lazy one is what this change removed.
+        #
+        # `error_type` is the class's own bucket when it has one. Every table
+        # keys a bucket class by that bucket, so for those this IS `exc.code`;
+        # the exception is a non-bucket code mapped onto a bucket class
+        # (``sso_required`` -> `Forbidden`), which keeps its wire value on
+        # `code` while `error_type` stays inside the closed set. The base
+        # `RouterError` has no bucket and carries the unknown one it was sent.
         return cls(
             str(exc),
-            error_type=exc.code,
+            error_type=cls.error_type or exc.code,
+            code=exc.code,
             http_status=exc.http_status,
             details=exc.details,
             request_id=exc.request_id,

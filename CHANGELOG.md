@@ -15,7 +15,7 @@ the fuller account of each version, including verification notes.
 - `sso_required` (403) now raises `Forbidden` (code preserved) and carries `organization_id`, the
   organization to start SSO with. `organization_id` is a new attribute on `ComfyError` and on
   `comfy_low.ApiError`, `None` on every other code and when the server does not name the
-  organization.
+  organization (or names it in a shape that is not an id). `error_type` stays `forbidden`.
 - Job metadata. `submit(..., metadata={"client": "acme"})` on `Comfy` and `AsyncComfy` stores
   string labels on a job, sent as the `metadata` field of `POST /api/v2/jobs` (omitted when
   not given, so the request is unchanged). `Job.metadata` / `AsyncJob.metadata` read them back

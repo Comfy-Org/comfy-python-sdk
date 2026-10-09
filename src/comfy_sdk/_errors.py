@@ -84,7 +84,8 @@ class ComfyError(Exception):
 
     #: On ``sso_required``: the organization whose single sign-on governs this
     #: key — the ``organization`` query parameter of Comfy Cloud's SSO start.
-    #: ``None`` on every other code and when the server does not know it. An
+    #: ``None`` on every other code, when the server does not know it, and on a
+    #: ``HEAD`` probe (no body to read it from). An
     #: ``sso_required`` refusal is raised as
     #: :class:`~comfy_sdk.router_exceptions.Forbidden` with ``code`` kept as
     #: ``sso_required``, so a caller tells it from a plain ``forbidden`` by

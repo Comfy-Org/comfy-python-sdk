@@ -43,7 +43,8 @@ class ServerState:
     content_bytes: bytes = b"\x89PNG-stub-output-bytes-0123456789"
     # Require an Authorization header (Cloud/serverless).
     require_auth: bool = False
-    # When set, every authenticated request answers 403 `sso_required` — the
+    # When set, every authenticated GET/POST/PUT/DELETE answers 403
+    # `sso_required` (HEAD is unaffected: it has no body to carry it) — the
     # gateway's refusal of a personal key whose account an SSO organization
     # holds. `{"organization_id": "org_..."}` sends the org beside `code`
     # inside `error`; `{"organization_id": None}` omits it, as the gateway does
