@@ -24,6 +24,11 @@ hand-*invented*. It stays out of ``comfy_low.OPERATION_IDS`` (which is the
 — and ``tests/test_router_spec_contract.py`` plus ``scripts/check_drift.py``
 fail if that constant and the vendored path disagree.
 
+It is also the one binding whose success may not be JSON: that route's ``200``
+declares a ``*/*`` ``format: binary`` branch beside its ``application/json``
+one, so it returns ``dict | BinaryResult`` and parses through
+:meth:`_Prepared.parse_run_result` rather than :meth:`_Prepared.parse_or_raise`.
+
 The four ``post_model_submit`` / ``get_model_request_status`` /
 ``get_model_request_result`` / ``put_model_request_cancel`` bindings are the
 same story one step earlier: they are the *queued* form of that one operation,
@@ -32,6 +37,11 @@ spec does not carry them yet and there is nothing for the contract test to pin
 them against. Their routes are confined to the ``_MODEL_REQUEST*`` constants
 for exactly the reason the run path was, and they are the one part of this
 change a spec sync is expected to correct.
+
+``get_model_catalog`` / ``get_model_schema`` bind the two discovery reads of
+the same contract (``listRouterModels``, ``getRouterModelInputSchema``), and
+follow the run path's rule: their routes live in :data:`_MODEL_CATALOG_PATH` /
+:data:`_MODEL_SCHEMA_PATH_TEMPLATE` alone, pinned against the vendored file.
 
 This layer contains no orchestration, retries, hashing, or reconnection — those
 live in ``comfy_sdk``.
@@ -45,13 +55,15 @@ import secrets
 import sys
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
-from typing import Any, BinaryIO
+from typing import Annotated, Any, BinaryIO, NoReturn, cast
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
+from pydantic import BeforeValidator, create_model
 
 from . import _multipart
 from .errors import ApiError, clean_body_excerpt, clean_request_id, error_from_envelope
@@ -119,12 +131,126 @@ _MODEL_REQUEST_PATH_TEMPLATE = _MODEL_REQUESTS_PATH_TEMPLATE + "/{request_id}"
 _MODEL_REQUEST_STATUS_PATH_TEMPLATE = _MODEL_REQUEST_PATH_TEMPLATE + "/status"
 _MODEL_REQUEST_CANCEL_PATH_TEMPLATE = _MODEL_REQUEST_PATH_TEMPLATE + "/cancel"
 
+#: Routes for model *discovery* — the catalog (``operationId:
+#: listRouterModels``) and one model's input/output schema document
+#: (``operationId: getRouterModelInputSchema``), verbatim from
+#: ``spec/router-openapi.yaml``. Pinned against the vendored file by
+#: ``tests/test_router_spec_contract.py`` exactly as
+#: :data:`_MODEL_RUN_PATH_TEMPLATE` is, so a sync that moves either route fails.
+_MODEL_CATALOG_PATH = "/v2/models"
+_MODEL_SCHEMA_PATH_TEMPLATE = _MODEL_RUN_PATH_TEMPLATE + "/openapi.json"
+
+#: Default timeout for a discovery read. Both routes answer from a catalog the
+#: server already holds, so nothing here waits on a generation — the bound is
+#: the client's ordinary 30s, stated here so it does not silently follow a
+#: client configured with a much longer (or shorter) timeout for other calls.
+DISCOVERY_TIMEOUT = httpx.Timeout(30.0)
+
 #: Longest request id accepted into a path. The contract mints UUIDs (36
 #: characters); the bound exists so a server-controlled value that is NOT one
 #: cannot reach the public handle, a log line or an exception message unbounded.
 _MAX_REQUEST_ID_LENGTH = 256
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+#: Longest ``Content-Type`` kept on a :class:`BinaryResult`. Generous next to
+#: any real media type and its parameters (``audio/L16; rate=16000; channels=1``
+#: is 34 characters), short enough that a partner-controlled header cannot
+#: flood the log line or REPL echo that prints it.
+_CONTENT_TYPE_LIMIT = 128
+
+
+@dataclass(frozen=True)
+class BinaryResult:
+    """A completed model run whose native output is bytes rather than JSON.
+
+    What ``post_model_run`` and ``get_model_request_result`` — and so
+    ``comfy_sdk.models.run`` and the queued surface's own result fetch — return
+    instead of a ``dict`` when Comfy Router answers under a media type that is
+    not JSON. Router forwards the partner model's output *unchanged*, and for a
+    model whose partner answers a generation directly as bytes (the ElevenLabs
+    audio models are the first in the catalog) that output is raw audio under
+    the partner's own ``Content-Type``. Both routes' ``200`` declare the same
+    two branches — ``application/json`` and a ``*/*`` ``format: binary`` one —
+    and the spec tells clients to branch on the response ``Content-Type``.
+
+    The bytes are handed over exactly as they arrived: not base64-encoded, not
+    wrapped in a dict, not decoded or transcoded. The point of the surface is
+    that the partner's native output comes back unchanged, so writing
+    ``result.content`` to a file gives you the file the partner produced.
+
+    Frozen because it is a value, not a handle: two runs that produced the same
+    bytes under the same media type are the same result.
+    """
+
+    #: The response body verbatim — the partner's own file bytes.
+    content: bytes
+    #: The response's ``Content-Type`` as sent, parameters included
+    #: (``audio/mpeg``, ``audio/L16; rate=16000``, ...), because for some
+    #: partner media types the parameters are part of what the bytes are.
+    #: Bounded and stripped of unprintable characters, which no real media type
+    #: has. Empty string when the response carried no ``Content-Type`` at all.
+    content_type: str
+    #: The server-minted ``X-Comfy-Request-Id`` for the call, or ``None`` when
+    #: the response named none. The id to quote in a support request — the same
+    #: one a failure of this call would have carried on ``exc.request_id``.
+    #:
+    #: ``None`` is also the one signal that distinguishes a partner's native
+    #: output from an intermediary's error page. Router's contract marks this
+    #: header ``required`` on every answer it sends, so a 200 that omits it did
+    #: not come from Router — it is the ``text/html`` interstitial or the
+    #: ``no healthy upstream`` text a proxy served in its place. The SDK hands
+    #: those back rather than raising (see :meth:`_Prepared.parse_run_result`),
+    #: so a caller who would rather not write one to disk should check this
+    #: before trusting ``content``.
+    request_id: str | None
+
+    def __repr__(self) -> str:
+        # Written out rather than inherited: the dataclass default would render
+        # the whole body, and this object lands in tracebacks, REPL echoes and
+        # CI logs holding a multi-megabyte audio file. The length is the part
+        # anyone reading a repr actually wants.
+        return (
+            f"{type(self).__name__}(content=<{len(self.content)} bytes>, "
+            f"content_type={self.content_type!r}, request_id={self.request_id!r})"
+        )
+
+
+def media_type(content_type: str | None) -> str:
+    """The bare, lowercased media type of a ``Content-Type`` header value.
+
+    ``"application/json; charset=utf-8"`` -> ``"application/json"``. Returns
+    ``""`` for ``None`` or for a header that names no type at all, which is the
+    "the response said nothing" case callers branch on separately from "the
+    response said something that is not JSON".
+
+    A comma ends the type as surely as a semicolon does. ``httpx.Headers.get``
+    joins a header sent *twice* with ``", "`` — the same joining
+    :func:`comfy_low.errors.clean_request_id` already has to allow for — and
+    intermediaries do duplicate ``Content-Type``, so a perfectly ordinary JSON
+    answer can arrive as ``"application/json, application/json"``. Splitting on
+    the semicolon alone would read that as a type of its own, decide it is not
+    JSON, and hand a decodable result back as opaque bytes.
+    """
+    if not content_type:
+        return ""
+    head = content_type.split(";", 1)[0]
+    return head.split(",", 1)[0].strip().lower()
+
+
+def is_json_media_type(media: str) -> bool:
+    """Whether ``media`` (a bare media type) denotes a JSON document.
+
+    ``application/json`` and the ``+json`` structured suffix (RFC 6839), which
+    is what the run route's ``application/json`` branch covers and what a
+    partner returning a JSON-shaped result arrives under. Everything else is
+    the ``*/*`` binary branch as far as this SDK is concerned — deliberately
+    including ``text/plain`` and ``text/html``: the SDK cannot tell a partner's
+    native text output from a proxy interstitial, and on this route the
+    contract says the body is the partner's, so it hands the bytes back rather
+    than throwing away a generation the caller was billed for.
+    """
+    return media == "application/json" or media.endswith("+json")
 
 
 def parse_model_id(model: str) -> tuple[str, str]:
@@ -330,6 +456,80 @@ def model_request_path(model: str, request_id: str, template: str) -> str:
     )
 
 
+def model_catalog_path(cursor: str | None = None, limit: int | None = None) -> str:
+    """Sans-IO path (with query) for one page of the Router model catalog.
+
+    Each parameter is sent only when given, so a bare call is the first page at
+    the server's default size. ``limit`` is passed through unchanged, including
+    a value above the declared maximum of 100: the route clamps rather than
+    rejects it and echoes the size it actually served, so refusing it here would
+    only disagree with the server.
+    """
+    params: list[tuple[str, str]] = []
+    if cursor is not None:
+        params.append(("cursor", cursor))
+    if limit is not None:
+        params.append(("limit", str(limit)))
+    query = urlencode(params)
+    return f"{_MODEL_CATALOG_PATH}?{query}" if query else _MODEL_CATALOG_PATH
+
+
+def model_schema_path(model: str) -> str:
+    """Sans-IO path for one model's input/output schema document.
+
+    Addressed by the same ``{provider}/{model}`` id, validated and
+    percent-encoded exactly as :func:`model_run_request` does it, so an id that
+    runs is an id whose schema can be read.
+    """
+    provider, name = parse_model_id(model)
+    return _MODEL_SCHEMA_PATH_TEMPLATE.format(
+        provider=quote(provider, safe=""), model=quote(name, safe="")
+    )
+
+
+def model_schema_headers(etag: str | None) -> dict[str, str] | None:
+    """``If-None-Match`` for a conditional schema read, or ``None`` for a plain one.
+
+    Raises ``ValueError`` before any request for an empty or non-ASCII tag: an
+    empty header makes the read effectively unconditional, so a ``304`` to it
+    could not honestly mean "your copy is current", and a non-ASCII value would
+    fail inside httpx's header encoding as an untyped ``UnicodeEncodeError``.
+    """
+    if etag is None:
+        return None
+    if not isinstance(etag, str):
+        raise TypeError(f"etag must be a str, got {type(etag).__name__}")
+    if not etag or not etag.isascii():
+        raise ValueError(f"etag must be a non-empty ASCII string; got {etag!r}")
+    return {"If-None-Match": etag}
+
+
+def model_schema_answer(
+    p: _Prepared, resp: httpx.Response, etag: str | None
+) -> dict[str, Any] | None:
+    """The schema document, or ``None`` for a ``304`` to a conditional read.
+
+    ``None`` is reserved for the ``304`` so the SDK can read it as "unchanged":
+    a ``200`` whose body decodes to anything but a JSON object (``null``, a list,
+    a scalar) is raised as ``invalid_response`` rather than passed through.
+    """
+    # Only an answer to a conditional read: a 304 to a request that sent no tag
+    # cannot mean "your copy is current", so it falls through and is raised
+    # like any other unexpected status.
+    if resp.status_code == 304 and etag is not None:
+        return None
+    body: Any = p.parse_or_raise(resp, (200,))
+    if not isinstance(body, dict):
+        raise ApiError(
+            f"The {resp.status_code} schema response is not a JSON object",
+            code="invalid_response",
+            http_status=resp.status_code,
+            request_id=_request_id(resp),
+            body_excerpt=_body_excerpt(resp),
+        )
+    return body
+
+
 def _build_user_agent(client_info: str | None) -> str:
     """SDK identity sent on every request. This is request metadata (not
     telemetry — no phone-home), so adoption is measurable server-side from
@@ -498,28 +698,133 @@ class _Prepared:
 
     def parse_or_raise(self, resp: httpx.Response, ok: tuple[int, ...]) -> dict[str, Any]:
         if resp.status_code in ok:
+            return self._decode_json(resp)
+        self._raise_for_response(resp)
+
+    def parse_run_result(
+        self, resp: httpx.Response, ok: tuple[int, ...]
+    ) -> dict[str, Any] | BinaryResult:
+        """:meth:`parse_or_raise` for an operation whose success may not be JSON.
+
+        Used by ``post_model_run`` and ``get_model_request_result`` — the
+        awaited and the queued routes for collecting a model run's result —
+        and nothing else. Comfy Router forwards the partner model's native
+        output **under the partner's own media type** on both: each route's
+        ``200`` declares an ``application/json`` branch *and* a ``*/*``
+        ``format: binary`` branch, and the spec says in as many words that a
+        client MUST branch on the response ``Content-Type`` rather than assume
+        a JSON document. So this is the one place that does, and every other
+        operation keeps :meth:`parse_or_raise` — including its reading of an
+        undecodable success as an interstitial, which stays correct for a
+        route whose only declared success media type is JSON.
+
+        The branch is on the declared type, not on whether the bytes happen to
+        parse: an ``audio/mpeg`` body that coincidentally started with ``{``
+        would still be audio, and JSON that arrived under ``application/json``
+        but will not parse is still the truncated/interstitial failure the
+        caller needs raised rather than handed back as opaque bytes.
+
+        **A non-JSON 2xx is handed back even when it looks like an error page,
+        and even when it is empty.** A ``text/html`` interstitial and a
+        zero-length ``audio/mpeg`` body both reach the caller as a
+        :class:`BinaryResult` rather than raising. That is deliberate and it is
+        the asymmetry that decides it: this route's 200 means a generation ran
+        and was billed, so raising on a body the SDK merely finds suspicious
+        destroys something the caller paid for and cannot get back, while
+        returning an inspectable object costs them a check. The check is cheap
+        and it is exact — ``request_id is None`` means no Router answer was
+        seen at all (the header is ``required`` on every one it sends), and
+        ``not content`` means nothing was delivered. Gating the branch on
+        either instead would make this SDK discard a real generation whenever
+        an intermediary stripped a header or a partner served an empty file,
+        which is the failure the whole surface exists to stop.
+
+        A success carrying no ``Content-Type`` at all is the one case with
+        nothing to branch on. An empty body stays ``{}`` (what every other
+        operation does with one) and a body that parses as a JSON **object**
+        stays a dict; anything else non-empty becomes a :class:`BinaryResult`,
+        with ``content_type=""`` to say the response never named one.
+
+        "Object", not merely "valid JSON", because this branch is a *probe* of
+        arbitrary bytes rather than a decode of a document the response
+        promised. ``null``, ``[...]`` and a bare number are all valid JSON and
+        none of them is the run result this method is declared to return, so
+        accepting one would hand back a ``None``/``list``/``int`` from a
+        ``dict | BinaryResult`` signature and break the caller who narrowed with
+        ``isinstance(result, BinaryResult)``. It would also re-open the very
+        failure this method exists to fix: a short binary body that happens to
+        be all ASCII digits parses as an ``int``, and the generation's bytes are
+        gone. Only a dict is a result; everything else is bytes.
+        """
+        if resp.status_code in ok:
+            media = media_type(resp.headers.get("Content-Type"))
+            if media:
+                if is_json_media_type(media):
+                    return self._decode_json(resp)
+                return self._binary_result(resp)
             if not resp.content:
                 return {}
             try:
-                return resp.json()
-            except ValueError as exc:
-                # A success status whose body will not decode — a proxy
-                # interstitial served as 200, a response truncated mid-stream.
-                # Raised as an ApiError rather than escaping as the raw
-                # `json.JSONDecodeError` so it lands on the surface the SDK
-                # translates and stamps: on `models.run` this is a generation
-                # that ran and was billed with the result lost, which is
-                # exactly the failure the Idempotency-Key has to ride out on.
-                raise ApiError(
-                    f"Could not decode the {resp.status_code} response body as JSON",
-                    code="invalid_response",
-                    http_status=resp.status_code,
-                    request_id=_request_id(resp),
-                    # Whatever was served instead is the only description of
-                    # what answered — the interstitial's own text names the
-                    # proxy, and it is discarded with the response otherwise.
-                    body_excerpt=_body_excerpt(resp),
-                ) from exc
+                probed = resp.json()
+            except (ValueError, RecursionError):
+                # `RecursionError` beside `ValueError` because this probes bytes
+                # that were never claimed to be JSON: a long run of `[` is
+                # syntactically valid and nests until the decoder blows the
+                # stack, which is not a `ValueError` and would escape as a raw
+                # exception instead of falling through to the bytes.
+                return self._binary_result(resp)
+            if isinstance(probed, dict):
+                return cast("dict[str, Any]", probed)
+            return self._binary_result(resp)
+        self._raise_for_response(resp)
+
+    def _binary_result(self, resp: httpx.Response) -> BinaryResult:
+        # The whole header rather than the bare media type: the partner's
+        # parameters are part of what the bytes are (`audio/L16; rate=16000`
+        # says nothing without its `rate`), and the whole point of the surface
+        # is that the native output comes back unchanged.
+        #
+        # Filtered the way every other server-supplied string this SDK surfaces
+        # is — `request_id` through `clean_request_id`, body text through
+        # `clean_body_excerpt` — because the README tells callers to print this
+        # one, and a partner-controlled header is unbounded and can carry the
+        # C1/ESC bytes that repaint the terminal reading it. For every media
+        # type this route actually serves the filter is a no-op, so the value
+        # stays verbatim exactly where "verbatim" means anything.
+        return BinaryResult(
+            content=resp.content,
+            content_type=clean_body_excerpt(
+                resp.headers.get("Content-Type"), limit=_CONTENT_TYPE_LIMIT
+            )
+            or "",
+            request_id=_request_id(resp),
+        )
+
+    def _decode_json(self, resp: httpx.Response) -> dict[str, Any]:
+        if not resp.content:
+            return {}
+        try:
+            return cast("dict[str, Any]", resp.json())
+        except ValueError as exc:
+            # A success status whose body will not decode — a proxy
+            # interstitial served as 200, a response truncated mid-stream.
+            # Raised as an ApiError rather than escaping as the raw
+            # `json.JSONDecodeError` so it lands on the surface the SDK
+            # translates and stamps: on `models.run` this is a generation
+            # that ran and was billed with the result lost, which is
+            # exactly the failure the Idempotency-Key has to ride out on.
+            raise ApiError(
+                f"Could not decode the {resp.status_code} response body as JSON",
+                code="invalid_response",
+                http_status=resp.status_code,
+                request_id=_request_id(resp),
+                # Whatever was served instead is the only description of
+                # what answered — the interstitial's own text names the
+                # proxy, and it is discarded with the response otherwise.
+                body_excerpt=_body_excerpt(resp),
+            ) from exc
+
+    def _raise_for_response(self, resp: httpx.Response) -> NoReturn:
         body: dict[str, Any] | None
         try:
             body = resp.json()
@@ -609,6 +914,97 @@ async def _async_multipart_body(chunks: Iterator[bytes]) -> AsyncIterator[bytes]
         if chunk is None:
             return
         yield chunk
+
+
+def job_labels(raw: Any) -> dict[str, str]:
+    """A job's ``metadata`` as string labels, read leniently.
+
+    Anything that is not an object reads as ``{}``, and a pair whose value is
+    not a string is dropped. Never raises: a submit answer is read after the
+    server created the job, and a self-hosted proxy sends its own ``metadata``
+    as a plain string.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _with_lenient_metadata(base: type[Job]) -> type[Job]:
+    """``base`` with a ``metadata`` field that reads through :func:`job_labels`.
+
+    The v2 contract gained ``metadata`` on the job object, but the vendored spec
+    the models are generated from does not carry it yet. Declared here, in the
+    hand-written layer, rather than in the generated models, so the field is
+    read today. It overrides the field rather than adding one, so it keeps
+    reading leniently after a spec sync adds a strict ``metadata`` to ``Job``.
+
+    The class is named ``_<base>WithMetadata``, so for ``Job`` its name is the
+    module attribute it is bound to below, which is what pickle looks up.
+    """
+    lenient = Annotated[dict[str, str] | None, BeforeValidator(job_labels)]
+    return create_model(f"_{base.__name__}WithMetadata", __base__=base, metadata=(lenient, None))
+
+
+_JobWithMetadata = _with_lenient_metadata(Job)
+
+
+def _job(data: dict[str, Any]) -> Job:
+    """A job response body as a ``Job`` that keeps its ``metadata``."""
+    return _JobWithMetadata.model_validate(data)
+
+
+def _jobs_body(
+    workflow: dict[str, Any],
+    extra_data: dict[str, Any] | None,
+    metadata: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    """The ``POST /jobs`` body. Optional fields are omitted when empty, so a
+    caller that passes none of them sends exactly the body it always did.
+    """
+    body: dict[str, Any] = {"workflow": workflow}
+    if extra_data:
+        body["extra_data"] = extra_data
+    if metadata:
+        body["metadata"] = dict(metadata)
+    return body
+
+
+def _query_text(value: Any) -> str:
+    # Bytes as their UTF-8 text, anything else as `str()`, so the pair sent is
+    # the pair the caller meant: `b"x"` is `x`, not `b'x'`.
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+
+
+def metadata_filter_pairs(metadata: Mapping[Any, Any] | None) -> list[tuple[str, str]]:
+    """Each ``list_jobs`` metadata filter as the (key, value) text the query sends.
+
+    The one place that turns a filter into text: the query is built from these
+    pairs, and the client-side check of each list item compares against them,
+    so the two cannot disagree (``{1: "a"}`` is the key ``"1"``).
+    """
+    return [(_query_text(k), _query_text(v)) for k, v in (metadata or {}).items()]
+
+
+def _jobs_list_path(
+    *,
+    metadata: Mapping[str, str] | None = None,
+    limit: int | None = None,
+    cursor: str | None = None,
+) -> str:
+    """Sans-IO path (with query) for one page of ``GET /api/v2/jobs``.
+
+    Each metadata filter is sent as ``metadata[<key>]=<value>``, the
+    ``deepObject`` style the v2 contract's ``listJobs`` declares (the vendored
+    spec does not carry that route yet). Nothing is checked here: the server
+    owns the filter rules and answers a bad filter with its own error.
+    """
+    params = [(f"metadata[{k}]", v) for k, v in metadata_filter_pairs(metadata)]
+    if limit is not None:
+        params.append(("limit", str(limit)))
+    if cursor is not None:
+        params.append(("cursor", cursor))
+    query = urlencode(params)
+    return f"/jobs?{query}" if query else "/jobs"
 
 
 class ComfyLow:
@@ -885,6 +1281,7 @@ class ComfyLow:
         *,
         idempotency_key: str | None = None,
         extra_data: dict[str, Any] | None = None,
+        metadata: Mapping[str, str] | None = None,
         timeout: Any = _UNSET,
     ) -> Job:
         """POST /api/v2/jobs.
@@ -893,29 +1290,45 @@ class ComfyLow:
         ``workflow`` in the body, never nested inside it. Omitted from the
         request entirely when ``None`` — the server rejects an empty
         ``extra_data`` object, and a caller with no partner key should never
-        send one.
+        send one. ``metadata`` (string labels stored on the job) is also a
+        sibling, sent as given and omitted when ``None`` or empty.
         """
         headers: dict[str, str] = {}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        body: dict[str, Any] = {"workflow": workflow}
-        if extra_data:
-            body["extra_data"] = extra_data
         resp = self.raw_request(
             "POST",
             "/jobs",
             headers=headers,
-            json=body,
+            json=_jobs_body(workflow, extra_data, metadata),
             timeout=timeout,
         )
         data = self._p.parse_or_raise(resp, (201,))
-        return Job.model_validate(data)
+        return _job(data)
+
+    def list_jobs(
+        self,
+        *,
+        metadata: Mapping[str, str] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        timeout: Any = _UNSET,
+    ) -> dict[str, Any]:
+        """GET /api/v2/jobs — one page of jobs, newest first, as the raw body.
+
+        The body is ``{"jobs": [...], "next_cursor": "..."}``; ``next_cursor``
+        is absent on the last page. List items are returned as dicts rather
+        than ``Job`` models because they are a lighter shape than a full job.
+        """
+        path = _jobs_list_path(metadata=metadata, limit=limit, cursor=cursor)
+        resp = self.raw_request("GET", path, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,))
 
     def get_job(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> Job:
         """GET /api/v2/jobs/{id} (or an absolute self link)."""
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}"
         resp = self.raw_request("GET", path, timeout=timeout)
-        return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
+        return _job(self._p.parse_or_raise(resp, (200,)))
 
     def get_job_events(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> Iterator[RawEvent]:
         """GET /api/v2/jobs/{id}/events — raw live SSE iterator (escape hatch).
@@ -940,7 +1353,7 @@ class ComfyLow:
         """POST /api/v2/jobs/{id}/cancel — idempotent."""
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/cancel"
         resp = self.raw_request("POST", path, timeout=timeout)
-        return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
+        return _job(self._p.parse_or_raise(resp, (200,)))
 
     def get_job_workflow(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> JobWorkflowResponse:
         """GET /api/v2/jobs/{id}/workflow — the workflow graph behind a job."""
@@ -961,7 +1374,7 @@ class ComfyLow:
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> tuple[dict[str, Any], Mapping[str, str]]:
+    ) -> tuple[dict[str, Any] | BinaryResult, Mapping[str, str]]:
         """POST ``{router_base_url}/v2/models/{provider}/{model}`` — awaited server-side.
 
         Addressed to Comfy Router, not to the ``/api/v2`` deployment
@@ -977,10 +1390,23 @@ class ComfyLow:
 
         ``arguments`` is sent as the body verbatim (the partner model's native
         JSON input) and the response body is returned verbatim (its native
-        output), with no model class layered over either. This is not an
+        output), with no model class layered over either — a non-JSON output
+        reaches the caller as the :class:`BinaryResult` carrier described
+        below, which holds the bytes rather than modelling them. This is not an
         ``operationId`` of ``spec/openapi.yaml``; it is ``runRouterModel`` of
         ``spec/router-openapi.yaml``, hand-bound — see
         :data:`_MODEL_RUN_PATH_TEMPLATE`.
+
+        **"Verbatim" includes not being JSON.** Router forwards the partner's
+        output under the partner's own media type, so the return type is
+        ``dict`` *or* :class:`BinaryResult`, decided by the response's
+        ``Content-Type``: ``application/json`` (or a ``+json`` suffix type)
+        decodes to a dict as before, anything else comes back as a
+        ``BinaryResult`` holding the bytes unchanged. That is the route's
+        published ``200``, which declares an ``application/json`` branch and a
+        ``*/*`` ``format: binary`` one; the models whose partner answers a
+        generation directly as bytes are the ElevenLabs audio models. See
+        :meth:`_Prepared.parse_run_result` for the no-``Content-Type`` case.
 
         Returns ``(body, headers)`` rather than the bare body, matching the four
         ``*_model_request*`` queue methods beside it. The response headers are
@@ -1004,7 +1430,7 @@ class ComfyLow:
         )
         url = self._p.router_base_url + path
         resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200, 201)), resp.headers
+        return self._p.parse_run_result(resp, (200, 201)), resp.headers
 
     # -- models: the queued form ------------------------------------------
     #
@@ -1069,18 +1495,23 @@ class ComfyLow:
 
     def get_model_request_result(
         self, model: str, request_id: str, *, timeout: Any = _UNSET
-    ) -> tuple[dict[str, Any], httpx.Headers]:
+    ) -> tuple[dict[str, Any] | BinaryResult, httpx.Headers]:
         """GET the finished result of one submitted request.
 
         The body is the provider's own payload, exactly as
         :meth:`post_model_run` returns it — this route is where a queued
-        request's result is collected, not a differently-shaped one.
+        request's result is collected, not a differently-shaped one. That
+        includes the same ``dict`` / :class:`BinaryResult` branch: this route's
+        published ``200`` declares the identical ``application/json`` and
+        ``*/*`` ``format: binary`` pair, so a model whose partner answers a
+        generation directly as bytes is not a JSON document here either. See
+        :meth:`_Prepared.parse_run_result`.
         """
         url = self._p.router_base_url + model_request_path(
             model, request_id, _MODEL_REQUEST_PATH_TEMPLATE
         )
         resp = self.raw_request("GET", url, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200,)), resp.headers
+        return self._p.parse_run_result(resp, (200,)), resp.headers
 
     def put_model_request_cancel(
         self, model: str, request_id: str, *, timeout: Any = _UNSET
@@ -1097,6 +1528,47 @@ class ComfyLow:
         )
         resp = self.raw_request("PUT", url, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 202, 204)), resp.headers
+
+    # -- models: discovery ------------------------------------------------
+    def get_model_catalog(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        timeout: Any = DISCOVERY_TIMEOUT,
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """GET ``{router_base_url}/v2/models`` — one page of the model catalog.
+
+        ``listRouterModels`` of ``spec/router-openapi.yaml``, hand-bound — see
+        :data:`_MODEL_CATALOG_PATH`. Returns ``(body, headers)`` so the caller
+        can read ``X-Comfy-Request-Id`` off a success.
+        """
+        url = self._p.router_base_url + model_catalog_path(cursor, limit)
+        resp = self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    def get_model_schema(
+        self,
+        model: str,
+        *,
+        etag: str | None = None,
+        timeout: Any = DISCOVERY_TIMEOUT,
+    ) -> tuple[dict[str, Any] | None, httpx.Headers]:
+        """GET ``{router_base_url}/v2/models/{provider}/{model}/openapi.json``.
+
+        ``getRouterModelInputSchema`` of ``spec/router-openapi.yaml``. With
+        ``etag`` the request carries ``If-None-Match``, and a ``304`` — the
+        document is unchanged — is a success, returned as a ``None`` body
+        rather than raised: it is the answer the caller asked for.
+
+        Raises ``TypeError``/``ValueError`` before any request when ``model``
+        is not a ``{provider}/{model}`` id (:func:`parse_model_id`) or ``etag``
+        is not a non-empty ASCII string (:func:`model_schema_headers`).
+        """
+        url = self._p.router_base_url + model_schema_path(model)
+        headers = model_schema_headers(etag)
+        resp = self.raw_request("GET", url, headers=headers, timeout=timeout)
+        return model_schema_answer(self._p, resp, etag), resp.headers
 
 
 class AsyncComfyLow:
@@ -1342,29 +1814,40 @@ class AsyncComfyLow:
         *,
         idempotency_key: str | None = None,
         extra_data: dict[str, Any] | None = None,
+        metadata: Mapping[str, str] | None = None,
         timeout: Any = _UNSET,
     ) -> Job:
-        """POST /api/v2/jobs — see the sync ``post_jobs`` for ``extra_data``."""
+        """POST /api/v2/jobs — see the sync ``post_jobs`` for ``extra_data`` and ``metadata``."""
         headers: dict[str, str] = {}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        body: dict[str, Any] = {"workflow": workflow}
-        if extra_data:
-            body["extra_data"] = extra_data
         resp = await self.raw_request(
             "POST",
             "/jobs",
             headers=headers,
-            json=body,
+            json=_jobs_body(workflow, extra_data, metadata),
             timeout=timeout,
         )
         data = self._p.parse_or_raise(resp, (201,))
-        return Job.model_validate(data)
+        return _job(data)
+
+    async def list_jobs(
+        self,
+        *,
+        metadata: Mapping[str, str] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        timeout: Any = _UNSET,
+    ) -> dict[str, Any]:
+        """GET /api/v2/jobs — see the sync ``list_jobs``."""
+        path = _jobs_list_path(metadata=metadata, limit=limit, cursor=cursor)
+        resp = await self.raw_request("GET", path, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,))
 
     async def get_job(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> Job:
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}"
         resp = await self.raw_request("GET", path, timeout=timeout)
-        return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
+        return _job(self._p.parse_or_raise(resp, (200,)))
 
     async def get_job_events(
         self, job_id_or_url: str, *, timeout: Any = _UNSET
@@ -1386,7 +1869,7 @@ class AsyncComfyLow:
     async def cancel_job(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> Job:
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/cancel"
         resp = await self.raw_request("POST", path, timeout=timeout)
-        return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
+        return _job(self._p.parse_or_raise(resp, (200,)))
 
     async def get_job_workflow(
         self, job_id_or_url: str, *, timeout: Any = _UNSET
@@ -1409,8 +1892,8 @@ class AsyncComfyLow:
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> tuple[dict[str, Any], Mapping[str, str]]:
-        """Async :meth:`ComfyLow.post_model_run`."""
+    ) -> tuple[dict[str, Any] | BinaryResult, Mapping[str, str]]:
+        """Async :meth:`ComfyLow.post_model_run` — same ``dict | BinaryResult`` body."""
         path, body, headers = model_run_request(
             model,
             arguments,
@@ -1421,7 +1904,7 @@ class AsyncComfyLow:
         )
         url = self._p.router_base_url + path
         resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200, 201)), resp.headers
+        return self._p.parse_run_result(resp, (200, 201)), resp.headers
 
     # -- models: the queued form ------------------------------------------
     async def post_model_submit(
@@ -1450,13 +1933,13 @@ class AsyncComfyLow:
 
     async def get_model_request_result(
         self, model: str, request_id: str, *, timeout: Any = _UNSET
-    ) -> tuple[dict[str, Any], httpx.Headers]:
+    ) -> tuple[dict[str, Any] | BinaryResult, httpx.Headers]:
         """Async :meth:`ComfyLow.get_model_request_result`."""
         url = self._p.router_base_url + model_request_path(
             model, request_id, _MODEL_REQUEST_PATH_TEMPLATE
         )
         resp = await self.raw_request("GET", url, timeout=timeout)
-        return self._p.parse_or_raise(resp, (200,)), resp.headers
+        return self._p.parse_run_result(resp, (200,)), resp.headers
 
     async def put_model_request_cancel(
         self, model: str, request_id: str, *, timeout: Any = _UNSET
@@ -1468,9 +1951,35 @@ class AsyncComfyLow:
         resp = await self.raw_request("PUT", url, timeout=timeout)
         return self._p.parse_or_raise(resp, (200, 202, 204)), resp.headers
 
+    # -- models: discovery ------------------------------------------------
+    async def get_model_catalog(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        timeout: Any = DISCOVERY_TIMEOUT,
+    ) -> tuple[dict[str, Any], httpx.Headers]:
+        """Async :meth:`ComfyLow.get_model_catalog`."""
+        url = self._p.router_base_url + model_catalog_path(cursor, limit)
+        resp = await self.raw_request("GET", url, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,)), resp.headers
+
+    async def get_model_schema(
+        self,
+        model: str,
+        *,
+        etag: str | None = None,
+        timeout: Any = DISCOVERY_TIMEOUT,
+    ) -> tuple[dict[str, Any] | None, httpx.Headers]:
+        """Async :meth:`ComfyLow.get_model_schema` — a ``304`` is a ``None`` body."""
+        url = self._p.router_base_url + model_schema_path(model)
+        headers = model_schema_headers(etag)
+        resp = await self.raw_request("GET", url, headers=headers, timeout=timeout)
+        return model_schema_answer(self._p, resp, etag), resp.headers
+
 
 def _looks_like_path(s: str) -> bool:
     return s.startswith("http") or s.startswith("/")
 
 
-__all__ = ["ComfyLow", "AsyncComfyLow", "ApiError"]
+__all__ = ["ComfyLow", "AsyncComfyLow", "ApiError", "BinaryResult"]

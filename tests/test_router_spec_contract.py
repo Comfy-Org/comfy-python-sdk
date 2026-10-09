@@ -12,7 +12,9 @@ restated here:
   ``post.operationId`` is ``runRouterModel``, and the ``servers[0].url`` it is
   addressed against -- compared against
   :data:`comfy_low.transport._MODEL_RUN_PATH_TEMPLATE` and
-  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL`.
+  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL` -- and, the same way, the two
+  discovery routes ``models.list()`` / ``models.schema()`` read, by their
+  ``get.operationId`` (``listRouterModels``, ``getRouterModelInputSchema``).
 
 Neither is generated, so a Router spec sync is the moment they can drift. The
 failures guarded against are a sync landing a new bucket that then reaches
@@ -30,15 +32,22 @@ which is the gate that catches it even for someone who only ran the linters.
 
 from __future__ import annotations
 
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 
-from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE
+from comfy_low.transport import (
+    _MODEL_CATALOG_PATH,
+    _MODEL_RUN_PATH_TEMPLATE,
+    _MODEL_SCHEMA_PATH_TEMPLATE,
+    model_catalog_path,
+)
 from comfy_sdk import COMFY_ROUTER_BASE_URL
-from comfy_sdk.models import _run_result
+from comfy_sdk.models import RouterRunResult, _run_result
 from comfy_sdk.router_exceptions import (
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
@@ -265,6 +274,51 @@ def test_run_path_matches_vendored_spec() -> None:
     )
 
 
+def _declared_get_paths(operation_id: str) -> list[str]:
+    """Every path whose ``get.operationId`` is ``operation_id``, in spec order."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    return [
+        path
+        for path, item in (doc.get("paths") or {}).items()
+        if isinstance(item, dict)
+        and isinstance(item.get("get"), dict)
+        and item["get"].get("operationId") == operation_id
+    ]
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "bound", "constant"),
+    [
+        ("listRouterModels", _MODEL_CATALOG_PATH, "_MODEL_CATALOG_PATH"),
+        ("getRouterModelInputSchema", _MODEL_SCHEMA_PATH_TEMPLATE, "_MODEL_SCHEMA_PATH_TEMPLATE"),
+    ],
+)
+def test_the_discovery_routes_match_the_vendored_spec(
+    operation_id: str, bound: str, constant: str
+) -> None:
+    # `models.list()` / `models.schema()` are hand-bound exactly as the run
+    # route is, so a sync that moves either route has to fail here rather than
+    # ship an SDK that GETs a path the server no longer serves.
+    declared = _declared_get_paths(operation_id)
+    assert declared == [bound], (
+        f"the vendored spec declares {operation_id} at {declared} and the SDK reads "
+        f"{bound!r} -- update comfy_low.transport.{constant}"
+    )
+
+
+def test_the_catalog_query_parameters_are_the_ones_the_spec_declares() -> None:
+    # `model_catalog_path` sends `cursor` and `limit` by name; a sync renaming
+    # either would otherwise be silently ignored by the server.
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    params = doc["paths"][_MODEL_CATALOG_PATH]["get"]["parameters"]
+    shared = doc["components"]["parameters"]
+    names = {
+        shared[p["$ref"].rsplit("/", 1)[-1]]["name"] if "$ref" in p else p["name"] for p in params
+    }
+    assert names == {"cursor", "limit"}
+    assert model_catalog_path("c", 5) == f"{_MODEL_CATALOG_PATH}?cursor=c&limit=5"
+
+
 def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None:
     # `model_run_request` fills `{provider}` and `{model}` by name; a sync that
     # renamed or added a template variable would silently KeyError at call time
@@ -272,6 +326,55 @@ def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None
     assert _MODEL_RUN_PATH_TEMPLATE.count("{") == 2
     assert "{provider}" in _MODEL_RUN_PATH_TEMPLATE
     assert "{model}" in _MODEL_RUN_PATH_TEMPLATE
+
+
+# --- the two media types the run route's 200 can answer under ------------
+
+
+def _run_200_content() -> dict[str, Any]:
+    """The ``content`` map of ``runRouterModel``'s ``200``, read out of the spec."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    item = (doc.get("paths") or {})[_MODEL_RUN_PATH_TEMPLATE]
+    content = item["post"]["responses"]["200"]["content"]
+    assert isinstance(content, dict) and content, "runRouterModel's 200 declares no content"
+    return content
+
+
+def test_the_run_200_declares_both_a_json_and_a_binary_branch() -> None:
+    """The contract behind ``post_model_run`` returning ``dict | BinaryResult``.
+
+    Read out of the spec rather than restated, for the same reason the route is:
+    the day a sync drops the ``*/*`` branch (or adds a third one), the SDK's
+    two-way branch is either dead code or newly incomplete, and nothing else in
+    the suite would notice — the binary tests drive a *stub*, which asserts the
+    SDK's behaviour rather than the server's contract.
+    """
+    content = _run_200_content()
+    assert set(content) == {"application/json", "*/*"}, (
+        f"the vendored spec's runRouterModel 200 declares {sorted(content)}; "
+        "comfy_low.transport._Prepared.parse_run_result branches on exactly two "
+        "cases (JSON -> dict, anything else -> BinaryResult)"
+    )
+
+
+def test_the_binary_branch_is_declared_as_raw_bytes() -> None:
+    # `format: binary` is what says the body is bytes rather than a base64
+    # string or a JSON document — i.e. that `BinaryResult.content` is the
+    # partner's file and needs no decoding on the way out.
+    schema = _run_200_content()["*/*"].get("schema") or {}
+    assert schema.get("type") == "string"
+    assert schema.get("format") == "binary"
+
+
+def test_the_200_promises_the_headers_a_binary_result_is_built_from() -> None:
+    # `BinaryResult.request_id` reads `X-Comfy-Request-Id` off a *success*, and
+    # the SDK takes the partner's `Content-Type` at its word — which is only
+    # safe because the route sends `X-Content-Type-Options: nosniff`.
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    headers = doc["paths"][_MODEL_RUN_PATH_TEMPLATE]["post"]["responses"]["200"]["headers"]
+    assert "X-Comfy-Request-Id" in headers
+    assert "X-Content-Type-Options" in headers
+    assert "Idempotent-Replayed" in headers
 
 
 # --- run_detailed's header lifts, pinned against the contract -----------------
@@ -284,32 +387,71 @@ def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None
 # the lift read `X-Comfy-Idempotent-Replayed`, a name the contract does not
 # use, leaving `replayed` permanently `False` against a real deployment.
 #
-# These tests close that gap from both ends: the name must be declared by the
-# spec, AND the lift must actually be reading that declared name.
+# These tests close that gap from three ends: the name must be declared by the
+# spec, the lift must actually be reading that declared name, AND every
+# header-derived field must be listed here to be checked at all.
 
-#: field on :class:`RouterRunResult` -> the 200 response header it is lifted
-#: from, for the lifts whose names the vendored contract declares.
-_CONTRACT_HEADER_LIFTS = {
-    "serving_provider": "X-Comfy-Router-Fallback-Provider",
-    "dropped_params": "X-Comfy-Router-Dropped-Params",
-    "replayed": "Idempotent-Replayed",
-    "request_id": "X-Comfy-Request-Id",
-    "credits_used": "X-Comfy-Credits-Used",
+#: 200 response header -> a header value its field's own normaliser accepts.
+#:
+#: Keyed by header, not by field, and kept apart from the lift classification
+#: below on purpose: the exemption test hands ``_run_result`` these values to
+#: prove a ``_NON_HEADER_FIELDS`` entry is not secretly a lift. If the probes
+#: lived only in ``_CONTRACT_HEADER_LIFTS``, misfiling a lift as an exemption
+#: would drop its valid probe along with its lift entry, the header would be
+#: sent as the generic fallback its parser rejects, and the field would read
+#: the same with and without it -- so the misfiling would pass the very test
+#: meant to catch it.
+#:
+#: The probe value is per-header rather than one shared literal because the
+#: normalisers disagree about what is even a value: ``_credits_used`` reports
+#: anything that is not a finite decimal as ``None``, so a generic ``"x"``
+#: makes a correct lift look like it read some other name entirely. Each entry
+#: is the spec's own ``example`` for that header, rendered as the string it
+#: arrives as on the wire (``Idempotent-Replayed`` declares the YAML boolean
+#: ``true``), so "a value the contract itself would send" is literal rather
+#: than aspirational. ``X-Comfy-Router-Fallback-Provider`` is the one header
+#: declaring no example, so its probe is just a provider the spec names
+#: elsewhere. The examples are copied, not asserted against: pinning a probe to
+#: the spec byte-for-byte would churn this table on an example-only sync while
+#: catching nothing, since these tests only ever compare present against
+#: absent.
+#:
+#: Copying the example verbatim is why ``dropped_params`` carries a
+#: comma-bearing entry rather than a tidied-up one -- that comma is the
+#: property its parser exists to preserve (asserted on the parsed value in
+#: ``test_models_run.py``, not here).
+_HEADER_PROBES = {
+    "X-Comfy-Router-Fallback-Provider": "fal",
+    "X-Comfy-Router-Dropped-Params": (
+        '["moderation (fal applies its own, non-configurable safety filtering)"]'
+    ),
+    "Idempotent-Replayed": "true",
+    "X-Comfy-Request-Id": "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21",
+    "X-Comfy-Credits-Used": "12.5",
 }
 
-#: A value the lift will actually keep, for the lifts that validate what they
-#: read. ``credits_used`` reports a non-decimal as ``None`` -- the same as an
-#: absent header -- so probing it with an arbitrary string would make a correct
-#: lift look like one reading the wrong name. ``12.5`` is the spec's own
-#: example for the header. Anything not listed is probed with ``"x"``.
-_LIFT_PROBE_VALUES = {"X-Comfy-Credits-Used": "12.5"}
+#: field on :class:`RouterRunResult` -> (the 200 response header it is lifted
+#: from, that header's probe from ``_HEADER_PROBES``). Every header-derived
+#: field belongs here; the completeness test at the bottom of this file is what
+#: keeps that true as fields are added.
+_CONTRACT_HEADER_LIFTS = {
+    field: (header, _HEADER_PROBES[header])
+    for field, header in {
+        "serving_provider": "X-Comfy-Router-Fallback-Provider",
+        "dropped_params": "X-Comfy-Router-Dropped-Params",
+        "replayed": "Idempotent-Replayed",
+        "request_id": "X-Comfy-Request-Id",
+        "credits_used": "X-Comfy-Credits-Used",
+    }.items()
+}
 
-#: Lifted by the SDK but NOT declared on the contract's 200 -- see the tripwire
-#: test at the bottom of this file. Empty today: ``credits_used`` sat here until
-#: a spec sync declared ``X-Comfy-Credits-Used``, and was moved up into
-#: ``_CONTRACT_HEADER_LIFTS`` then. Kept, rather than deleted with its test, so
-#: the next lift the SDK reads ahead of the contract has somewhere to go.
-_UNDECLARED_HEADER_LIFTS: dict[str, str] = {}
+#: :class:`RouterRunResult` fields that are NOT lifted from a response header,
+#: and so are exempt from the completeness test at the bottom of this file.
+#:
+#: Being listed here exempts a field from BOTH pins above, so the exemption is
+#: itself checked -- see
+#: ``test_an_exempt_field_is_really_unmoved_by_the_headers_it_skips``.
+_NON_HEADER_FIELDS = {"output"}
 
 
 def _declared_run_response_headers() -> set[str]:
@@ -324,8 +466,20 @@ def _declared_run_response_headers() -> set[str]:
     raise AssertionError("the vendored spec declares no runRouterModel operation")
 
 
-@pytest.mark.parametrize(("field", "header"), sorted(_CONTRACT_HEADER_LIFTS.items()))
+@pytest.mark.parametrize(
+    ("field", "header"),
+    sorted((field, header) for field, (header, _probe) in _CONTRACT_HEADER_LIFTS.items()),
+)
 def test_every_lifted_header_is_declared_by_the_contract(field: str, header: str) -> None:
+    """The other half of the pin below: Router must actually send this name.
+
+    Reading the declared name is worth nothing if the name is not in the
+    contract at all, which is the failure ``credits_used`` shipped with -- a
+    lift nothing could check, because every other test in the suite configures
+    its stub to emit the exact literal the lift reads. Asserted against the
+    vendored spec, so a sync that renames or drops a header fails here rather
+    than silently turning the field into a permanent default in production.
+    """
     declared = _declared_run_response_headers()
     assert header in declared, (
         f"RouterRunResult.{field} is lifted from {header!r}, which the vendored spec does "
@@ -334,43 +488,109 @@ def test_every_lifted_header_is_declared_by_the_contract(field: str, header: str
     )
 
 
-@pytest.mark.parametrize(("field", "header"), sorted(_CONTRACT_HEADER_LIFTS.items()))
-def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> None:
+@pytest.mark.parametrize(
+    ("field", "header", "probe"),
+    sorted((field, header, probe) for field, (header, probe) in _CONTRACT_HEADER_LIFTS.items()),
+)
+def test_the_lift_actually_reads_the_declared_name(field: str, header: str, probe: str) -> None:
     """Declaring the right name is half of it; the lift must also read it.
 
     Asserted through ``_run_result`` rather than by re-reading the source, so
     this fails if the constant above and the code drift apart -- the constant
     is a restatement otherwise, and a restatement would pass the sync it exists
     to fail.
+
+    The probe is an ``httpx.Headers`` and not a plain dict because that is what
+    production hands ``_run_result`` -- ``Models.run_detailed`` passes the
+    transport's own response headers straight through. A dict's ``.get`` is
+    case-sensitive; ``httpx.Headers`` is not. Probing with a dict would make a
+    spec sync that only re-cased a declared name fail here even though the SDK
+    still reads it correctly, and the only way to get green again would be a
+    no-op edit to the source spelling.
     """
-    absent = getattr(_run_result({}, {}), field)
-    present = getattr(_run_result({}, {header: _LIFT_PROBE_VALUES.get(header, "x")}), field)
+    absent = getattr(_run_result({}, httpx.Headers()), field)
+    present = getattr(_run_result({}, httpx.Headers({header: probe})), field)
     assert present != absent, (
         f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
         f"the header and without it, so the lift is reading some other name."
     )
 
 
-@pytest.mark.parametrize(("field", "header"), sorted(_UNDECLARED_HEADER_LIFTS.items()))
-def test_an_undeclared_lift_stays_undeclared_until_someone_reconciles_it(
-    field: str, header: str
-) -> None:
-    """Tripwire, and deliberately asserting the *absence*.
+def test_every_header_derived_field_is_pinned_against_the_contract() -> None:
+    """No lift may escape the two tests above by simply not being listed.
 
-    For a lift the SDK reads from a header the vendored contract does not yet
-    declare. Nothing in the suite can catch a wrong name for such a lift,
-    because every test configures its stub to emit the exact literal the lift
-    reads -- so the gap is tracked, not accepted: this test fails the moment a
-    spec sync declares the header, which is the signal to move the entry up
-    into ``_CONTRACT_HEADER_LIFTS`` and get it pinned like the rest.
+    Both tests above are parametrized over ``_CONTRACT_HEADER_LIFTS``, so a
+    field added to :class:`RouterRunResult` without an entry there is pinned by
+    nothing -- and a misspelled header name is invisible in every other test in
+    the suite, because each one configures its stub to emit the exact literal
+    the lift reads. That is not hypothetical: ``credits_used`` landed unpinned,
+    under a tripwire asserting the spec did *not* declare
+    ``X-Comfy-Credits-Used`` -- and the spec sync that declared it merged 35
+    seconds before the lift itself did, so the tripwire was already stale when
+    it landed and main went red on the next run.
 
-    ``credits_used`` (``X-Comfy-Credits-Used``) went through exactly that: it
-    was lifted ahead of the contract, this test fired on the sync that declared
-    it, and it now lives in ``_CONTRACT_HEADER_LIFTS``. With nothing left
-    undeclared the parametrization is empty, which pytest reports as a skip.
+    So the list is closed from the other end: every field on the dataclass is
+    either lifted from a header named here, or named in ``_NON_HEADER_FIELDS``
+    as deliberately not a lift. Adding a field forces one of those two, which
+    is the decision the tripwire used to defer.
     """
-    declared = _declared_run_response_headers()
-    assert header not in declared, (
-        f"the vendored spec now declares {header!r}: move {field!r} from "
-        f"_UNDECLARED_HEADER_LIFTS into _CONTRACT_HEADER_LIFTS so it is pinned."
+    overlap = set(_CONTRACT_HEADER_LIFTS) & _NON_HEADER_FIELDS
+    assert not overlap, (
+        f"{sorted(overlap)} are classified as BOTH lifted from a header and not a lift. "
+        f"The union below would accept that contradiction silently, and the field would be "
+        f"skipped by the exemption test while still being pinned as a lift. Pick one."
     )
+    declared = {f.name for f in fields(RouterRunResult)}
+    accounted = set(_CONTRACT_HEADER_LIFTS) | _NON_HEADER_FIELDS
+    assert declared == accounted, (
+        f"RouterRunResult fields and the pinned lift list disagree. Unpinned fields: "
+        f"{sorted(declared - accounted)}; listed but not fields: {sorted(accounted - declared)}. "
+        f"Add each new field to _CONTRACT_HEADER_LIFTS (with the header it is lifted from) "
+        f"or to _NON_HEADER_FIELDS."
+    )
+
+
+def test_an_exempt_field_is_really_unmoved_by_the_headers_it_skips() -> None:
+    """``_NON_HEADER_FIELDS`` has to earn the exemption, not just assert it.
+
+    Listing a field there exempts it from BOTH pins above, so on its own it is
+    an unverified escape hatch that partly reopens the gap this block exists to
+    close -- and it is the *convenient* hatch, because a field lifted from a
+    header the vendored spec has not declared yet fails
+    ``test_every_lifted_header_is_declared_by_the_contract`` if it is filed
+    honestly in ``_CONTRACT_HEADER_LIFTS``. That is not a hypothetical shape:
+    it is exactly the state ``credits_used`` was in, and the one-way spec sync
+    makes it recurring.
+
+    So the claim is tested: hand ``_run_result`` every header that could move a
+    field -- the ones this file pins, plus every other name the contract
+    declares on the ``200`` -- and an exempt field must read the same as it
+    does against no headers at all. A lift misfiled as an exemption moves, and
+    fails here instead of passing silently.
+
+    The one shape this still cannot see is a field lifted from a header that is
+    neither pinned here nor declared by the spec, since nothing in the repo
+    then knows the name to send. Closing that needs the source read, which the
+    rest of this block deliberately refuses to do. A narrower one: a field
+    lifted from a header the spec declares but ``_HEADER_PROBES`` has no entry
+    for is sent the generic ``"probe"`` fallback below, and if its parser
+    rejects that value the field reads the same either way -- so a misfiled
+    lift only fails here once its header has a parser-valid probe there.
+    """
+    # From ``_HEADER_PROBES``, not ``_CONTRACT_HEADER_LIFTS``: a misfiled lift
+    # has no lift entry, and must still be sent a value its parser accepts.
+    probes = dict(_HEADER_PROBES)
+    # Declared-but-unpinned names (the X-Committed-Spend-* trio, nosniff) have
+    # no field and so no normaliser to satisfy; any non-empty value will do,
+    # and one that moves a field is the finding.
+    probes |= {name: "probe" for name in _declared_run_response_headers() - probes.keys()}
+
+    bare = _run_result({}, httpx.Headers())
+    loaded = _run_result({}, httpx.Headers(probes))
+    for field in sorted(_NON_HEADER_FIELDS):
+        assert getattr(loaded, field) == getattr(bare, field), (
+            f"RouterRunResult.{field} is listed in _NON_HEADER_FIELDS as not header-derived, "
+            f"but it changed from {getattr(bare, field)!r} to {getattr(loaded, field)!r} when "
+            f"the contract's 200 headers were supplied. It IS a lift: move it into "
+            f"_CONTRACT_HEADER_LIFTS with the header it reads, so both pins apply to it."
+        )

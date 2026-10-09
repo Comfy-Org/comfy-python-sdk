@@ -325,6 +325,86 @@ controls — jobs submitted through this SDK always get `"api"` today, since v2
 submission has no version-pinning fields yet. (`AsyncJob.get_workflow()`
 mirrors this with `await`.)
 
+## Labelling jobs with metadata
+
+Pass `metadata` to `submit()` to store string labels on a job, then find those
+jobs again with `list_jobs()`:
+
+```python
+job = client.submit(wf, metadata={"client": "acme", "batch": "2026-10-05"})
+job.metadata                     # {"client": "acme", "batch": "2026-10-05"}
+
+for summary in client.list_jobs(metadata={"client": "acme"}):
+    print(summary.id, summary.status, summary.metadata)
+```
+
+Labels work on jobs sent to a deployment: point the client at the deployment's
+address with `COMFY_BASE_URL`. There, `list_jobs()` lists that deployment's
+jobs. To list every job in your workspace, across its deployments, set
+`COMFY_BASE_URL` to the workspace address, `https://platformapi.comfy.org`; that
+address serves the job list only, so submit through the deployment's address.
+Elsewhere:
+
+- **A deployment whose gateway predates job labels** accepts `metadata` on
+  `submit()` but does not keep it, and ignores the `list_jobs()` filters, so a
+  filtered `list_jobs()` yields nothing there (the SDK's own filter check, below,
+  drops every job).
+- **Comfy Cloud** refuses labels for now: `submit()` raises a `ComfyError` whose
+  `code` is `"metadata_not_supported"`, and `list_jobs()` raises a `ComfyError`
+  whose `code` is `"not_implemented"` (HTTP 501).
+- **The public demo deployment**, which takes no credential, keeps no labels: a
+  labelled `submit()` raises a `ComfyError` whose `code` is
+  `"metadata_not_supported"` (HTTP 422), and `list_jobs()` raises a `ComfyError`
+  whose `code` is `"public_deployment_no_list"` (HTTP 403, not `Forbidden`).
+- **A self-hosted `comfy-api-proxy`** does not keep labels. Its own job
+  `metadata` is a single string, so it refuses a label map on `submit()` with a
+  `ComfyError` whose `code` is `"invalid_request"`. The SDK reads the proxy's
+  string `metadata` as no labels (`{}`), so a filtered `list_jobs()` yields
+  nothing there, and an unfiltered one yields the proxy's newest jobs (50 by
+  default, up to 100 with `limit`), each with `metadata` `{}`, and stops there
+  since the proxy sends one page and no next cursor. A `limit` over 100 is
+  refused with HTTP 400, a `ComfyError` whose `code` is `"invalid_request"`. Its list items carry `created_at` rather than `create_time`, so
+  `create_time` reads as `None` there (the raw value stays in `data`).
+
+Labels are fixed when the job is submitted. `job.metadata` is an empty dict for a
+job with none. A `metadata` that is not a map of strings reads as `{}`, and a
+value that is not a string is dropped, rather than raising.
+
+`list_jobs()` returns the newest jobs first and keeps only the ones whose labels
+include every key you pass, with exactly that value. It fetches page after page
+until there are no more; on a host that pages, `limit=` sets the page size, not
+a cap on the total (the self-hosted proxy above sends a single page).
+Each item is a `JobSummary` (`id`, `status`, `create_time`, `update_time`,
+`deployment_id`, `metadata`, and `data`, the item as the server sent it); call
+`client.jobs.get(summary.id)` for the full job and its outputs. On `AsyncComfy`, iterate with
+`async for summary in client.list_jobs(...)`. A page answered 429 with
+`Retry-After` is fetched again after that wait (at least one second), the same
+way `submit()` retries.
+
+`list_jobs()` also checks the filters itself: an item whose labels do not include
+every pair you passed is skipped, even if the server sent it. Keys and values are
+compared as the text the query sends, so `metadata={"run": 7}` matches the label
+`"7"`.
+So on a host that ignores the filters, a filtered `list_jobs()` yields only real
+matches. On such a host that pages (a gateway without label support, for
+example), one step of the iteration can read several pages, or every page,
+before it yields or ends.
+
+The server sets the limits on labels and filters, and the SDK does not check
+them first. A map it refuses raises `ComfyError` with `code ==
+"metadata_invalid"` (HTTP 422) and the server's message: it names the key when
+one key or value breaks a rule (a key is 1 to 40 characters from
+`A-Z a-z 0-9 _ - .`; a value is a string of at most 256 bytes in UTF-8 with no
+control or bidirectional formatting characters: U+0000 to U+001F, tab and newline
+included, U+007F to U+009F, and the bidirectional embeddings, overrides and
+isolates U+202A to U+202E and U+2066 to U+2069), and gives the count when there
+are more than 16 pairs. A filter it refuses (more than 3 of them, for example, or a
+value holding one of those characters) raises
+`ComfyError` with `code == "invalid_metadata_filter"`, and a page cursor it did
+not issue raises `ComfyError` with `code == "invalid_cursor"`. A job's
+`deployment_id` names the deployment copy that ran it, so after a deployment
+update it can differ from the deployment's current id.
+
 ## Downloading outputs
 
 A finished job exposes its results as `Output` handles — `job.outputs`, or
@@ -403,7 +483,9 @@ two variables.
 `base_url` and `timeout` are a read-only view of that configuration; model
 operations are added to this namespace as they land. There are two ways to run
 a model on it — `run`, which waits, and `submit`, which queues — and they send
-the same request.
+the same request. Two more read-only calls tell you what to run before you run
+it: `list`, the model catalog, and `schema`, one model's input and output
+schemas.
 
 ### `models.run` — one call, one result
 
@@ -433,8 +515,12 @@ Three things follow from that, and they are the whole contract of this method:
 `run` returns when the generation is **complete**. There is no submit step and
 nothing to poll: where the platform has to submit-and-poll an upstream
 provider, that happens server side inside this one call. The value you get back
-is the provider's own payload — decoded JSON, handed over as-is, with no
-wrapper class between you and the fields the provider documented.
+is the provider's own payload, handed over as-is. For a model that answers
+JSON — most of them — that is a `dict` with no wrapper class between you and
+what the provider produced. For a model whose partner answers a generation
+directly as bytes, it is a `BinaryResult` carrying those bytes unchanged
+alongside the `content_type` and `request_id` that came with them; see "Two
+result shapes" below.
 
 The awaitable form is the **async client**, not a differently-named method:
 
@@ -445,6 +531,133 @@ async with AsyncComfy(api_key="comfyui-...") as client:
 
 There is no `run_async()`, and there will not be one — one operation, one name,
 and `await` is what makes it asynchronous.
+
+### Two result shapes — JSON, or the model's own bytes
+
+Router forwards the partner's output *under the partner's own media type*, so
+`run` returns one of two things, decided by the response's `Content-Type`:
+
+| The model answers with | You get back | Read it as |
+|---|---|---|
+| a JSON document (`application/json`, or a `+json` type) | `dict` | `result["images"][0]["url"]` |
+| raw bytes under its own media type (`audio/mpeg`, ...) | `BinaryResult` | `result.content`, `result.content_type`, `result.request_id` |
+
+Almost every model in the catalog is the first row, and that shape is unchanged.
+The second row is for a model whose partner answers a generation *directly as a
+file* — the ElevenLabs audio models are the first of these. The bytes come back
+exactly as they arrived: not base64-encoded, not wrapped in a dict, not decoded
+or transcoded. Write them to a file and you have the file the partner produced:
+
+```python
+from pathlib import Path
+
+from comfy_sdk import BinaryResult, Comfy
+
+client = Comfy(api_key="comfyui-...")
+result = client.models.run(
+    "elevenlabs/eleven_v3",
+    {"inputs": [{"text": "Hello from Comfy Router.", "voice_id": "..."}]},
+)
+
+assert isinstance(result, BinaryResult)
+print(result.content_type)          # 'audio/mpeg'
+print(result.request_id)            # the server's X-Comfy-Request-Id, or None
+Path("hello.mp3").write_bytes(result.content)
+```
+
+`BinaryResult` is importable from `comfy_sdk` for exactly this `isinstance`
+check. Which shape a given model returns is in its own contract —
+[`models.schema`](#modelsschema--what-a-model-takes-and-what-it-returns)
+fetches it — whose `200` is `application/json` for a JSON model and `*/*` with
+`format: binary` for a bytes one.
+
+Note `content_type` keeps the header's **parameters**, because for some media
+types the parameters are part of what the bytes are — ElevenLabs' `pcm_*` output
+formats come back as `audio/L16; rate=16000`, and the sample rate is not
+decoration. It is bounded and stripped of unprintable characters first, the way
+every other server-supplied string this SDK hands you is; no real media type
+contains either, so what you get is what was sent. And a `200` whose
+`Content-Type` *claims* JSON but whose body will not parse is still an error
+(`ComfyError`, `code="invalid_response"`), not bytes: there the response
+promised a document and did not deliver one.
+
+A non-JSON `200` reaches you even when it is an intermediary's error page or an
+empty body — this route's `200` means a generation ran and was billed, so the
+SDK will not destroy one it merely finds suspicious. Two checks tell you:
+`result.request_id is None` means no Router answer was seen at all (Router's
+contract marks that header required on every answer it sends, so an HTML
+interstitial from a proxy in front of it has none), and `not result.content`
+means nothing was delivered. Check them before writing `content` to disk.
+
+### `models.list` — what you can run
+
+```python
+from comfy_sdk import Comfy
+
+with Comfy(api_key="comfyui-...") as client:
+    for model in client.models.list():
+        print(model.id, model.billing)
+```
+
+That walks Router's model catalog — `GET https://api.comfy.org/v2/models` —
+page by page, following `next_cursor` while `has_more` is true, and yields one
+`CatalogModel` per entry: `id` (the `{provider}/{model}` id `models.run` takes),
+`provider`, `model`, and `billing` (per-model billing facts such as
+`charges_on_policy_rejection`, never prices). Nothing is fetched until you
+iterate, and each loop is a fresh walk.
+
+For one page and its paging facts instead, call `.page()`:
+
+```python
+page = client.models.list(limit=50).page()
+page.data          # tuple of CatalogModel
+page.has_more      # walk on this, not on a short page
+page.next_cursor   # pass back as list(cursor=...) for the next page
+page.limit         # the page size the server actually served
+page.request_id    # X-Comfy-Request-Id, for a support request
+```
+
+`limit` is sent as given. The server defaults to 20 and clamps anything above
+100 down to 100 rather than rejecting it, so read `page.limit` for the size you
+got. The cursor is opaque and only good for the walk that produced it. On
+`AsyncComfy` it is `async for model in client.models.list():` and
+`await client.models.list().page()`.
+
+### `models.schema` — what a model takes, and what it returns
+
+```python
+with Comfy(api_key="comfyui-...") as client:
+    result = client.models.schema("bfl/flux-2-pro")
+    document = result.document   # the model's own OpenAPI document
+    etag = result.etag           # keep it for the next call
+```
+
+That is `GET https://api.comfy.org/v2/models/bfl/flux-2-pro/openapi.json`: the
+model's input schema (the body `models.run` sends) and its output schema, as a
+standalone OpenAPI document. The id is validated exactly as `models.run`
+validates it, before any request.
+
+Pass a tag you stored earlier to make the read conditional. When the document
+has not changed, the server answers `304` with no body, and you get
+`unchanged=True` back rather than an exception:
+
+```python
+result = client.models.schema("bfl/flux-2-pro", etag=etag)
+if result.unchanged:
+    ...  # your cached document is still current; result.document is None
+else:
+    document, etag = result.document, result.etag
+```
+
+The SDK keeps no cache, so storing the tag and the document is up to you. An
+unknown model raises `ModelNotFound`, and `await client.models.schema(...)` is the
+async form.
+
+Both methods use the same host and credential as `models.run`, raise the same
+typed Router exceptions (see
+[Catching Comfy Router errors](#catching-comfy-router-errors)), and default to
+a 30-second timeout. Pass `timeout=` seconds, an `httpx.Timeout`, or `None` to
+wait indefinitely.
 
 ### Image to image — upload an asset first
 
@@ -498,8 +711,10 @@ result = client.models.run(
 )
 ```
 
-Which form a model takes is in its input schema — `GET
-/v2/models/{provider}/{model}/openapi.json`, or the model's page in the
+Which form a model takes is in its input schema —
+`client.models.schema("bfl/flux-2-pro").document` (see
+[`models.schema`](#modelsschema--what-a-model-takes-and-what-it-returns)), or
+the model's page in the
 [Router model catalog](https://docs.comfy.org/development/comfy-router/models).
 
 Because the server may legitimately hold the connection for minutes, `run` uses
@@ -535,7 +750,7 @@ The handle carries four operations:
 | | |
 |---|---|
 | `handle.status()` | one authoritative poll, returned as a `QueueUpdate` (`status`, `queue_position`, `error_type`, `retry_after`, `raw`) |
-| `handle.get(timeout=None)` | poll to completion, then return the provider's own payload — the same value `run` would have returned |
+| `handle.get(timeout=None)` | poll to completion, then return the provider's own payload — the same value `run` would have returned, including the `BinaryResult` branch from "Two result shapes" above |
 | `handle.cancel()` | ask the server to cancel. A request, not a guarantee: a request that already completed stays completed |
 | `handle.iter_events(timeout=None)` | the poll loop with its updates exposed — yields the first observation, every change of status or queue position, and the completion |
 
@@ -704,8 +919,10 @@ many times the default 60-second budget on its own, leaving no room for the
 retry you just asked for. `collect_max_elapsed` does not help here — that budget
 is the collect class's alone.
 
-`retry` governs `client.models` only. `submit()`/`run()` on the client keep
-their own 429 handling, which follows the server's `Retry-After`.
+`retry` governs `client.models` only. `submit()`/`run()` and `list_jobs()` on
+the client keep their own 429 handling, which follows the server's
+`Retry-After` but waits at least one second, so `Retry-After: 0` cannot drive a
+tight retry loop.
 
 ### Collecting a generation after a lost response
 

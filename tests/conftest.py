@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
@@ -63,6 +63,34 @@ class ServerState:
     retryable_429_code: str = "deployment_not_ready"
     # POST /jobs returns this error envelope (status, code) instead of 201.
     job_error: tuple[int, str] | None = None
+    # The message that envelope carries; None means a generic one.
+    job_error_message: str | None = None
+    # The `metadata` every job answer reports (GET /jobs/{id}, the cancel, and
+    # the submit, which otherwise echoes what was sent), served exactly as
+    # given, so a test can send a shape the SDK did not ask for. None omits the
+    # field, as the server does for a job with no labels.
+    job_metadata: Any = None
+    # GET /jobs (the list): one entry per page, each a list of list items, or
+    # None for a page with no `jobs` key at all. Page i carries `next_cursor`
+    # "page-{i+1}" unless it is the last.
+    job_list_pages: list[list[dict[str, Any]] | None] = field(default_factory=lambda: [[]])
+    # GET /jobs answers 200 with this JSON body, exactly as given, instead of a
+    # page built from job_list_pages; None serves the pages.
+    job_list_body: Any = None
+    # GET /jobs answers this (status, code, message) instead of a page.
+    job_list_error: tuple[int, str, str] | None = None
+    # GET /jobs answers 429 `rate_limited` with `Retry-After:
+    # job_list_retry_after` (no header when None) to the requests at these
+    # 0-based arrival indexes.
+    job_list_429_at: set[int] = field(default_factory=set)
+    job_list_retry_after: str | None = "0"
+    # GET /jobs answers the request at each 0-based arrival index with this
+    # `next_cursor`, exactly as given, instead of the page's own.
+    job_list_next_cursor_at: dict[int, Any] = field(default_factory=dict)
+    # The raw path (with query) and the parsed query string of every GET /jobs,
+    # in arrival order.
+    job_list_paths: list[str] = field(default_factory=list)
+    job_list_queries: list[dict[str, list[str]]] = field(default_factory=list)
     # GET /jobs/{id} answers 404 job_not_found instead of the job.
     job_not_found: bool = False
     # GET /jobs/{id}/events answers this (status, code) instead of connecting.
@@ -122,6 +150,21 @@ class ServerState:
     # interstitial served under a 200, a response truncated mid-stream. The
     # generation ran and was billed; only the result is unreadable.
     model_run_undecodable_body: bool = False
+    # The Content-Type that undecodable body is served under. `application/json`
+    # by default, because that is the case that is still an ERROR: the response
+    # promised a JSON document and did not deliver one. Point it at `text/html`
+    # and the same body is instead a success carrying non-JSON bytes, which is
+    # what the run route's `*/*` branch says to do with it — the SDK cannot tell
+    # a proxy's interstitial from a partner's native text output, and on this
+    # route the contract says the body is the partner's.
+    model_run_undecodable_content_type: str = "application/json"
+    # Answer a successful run with these raw bytes under
+    # `model_run_binary_content_type` instead of `model_run_result` as JSON —
+    # the ElevenLabs-shaped direct-return binary 200. `None` serves JSON.
+    model_run_binary_body: bytes | None = None
+    # Content-Type for `model_run_binary_body`. `None` sends no Content-Type
+    # header at all, which is the header-stripping-intermediary case.
+    model_run_binary_content_type: str | None = "audio/mpeg"
     # Model the deployment `retry_possibly_in_flight` exists for: one that
     # *replays* a repeated Idempotency-Key rather than rejecting it, so a key
     # is released rather than claimed when a request fails 5xx. Default False
@@ -151,8 +194,10 @@ class ServerState:
     # 409). `None` sends no header at all, which is the same failure the policy
     # must *not* retry.
     model_run_retry_after: str | None = None
-    # Sent as X-Comfy-Request-Id alongside a failed run. `None` sends no header,
-    # which is the response an intermediary that never reached the router gives.
+    # Sent as X-Comfy-Request-Id on a model run's answer, success or failure —
+    # Router stamps it on both, and `BinaryResult.request_id` is read off a
+    # success. `None` sends no header, which is the response an intermediary
+    # that never reached the router gives.
     model_run_request_id: str | None = None
     # Extra response headers stamped on a SUCCESSFUL model run, for the
     # disclosure headers the body cannot carry (X-Comfy-Credits-Used,
@@ -174,6 +219,12 @@ class ServerState:
     # fronted by Router, so this is the shape a real deployment's 504 arrives
     # in, and the bucket-keyed collect rule has to read it.
     model_run_router_error_shape: bool = False
+    # The human-readable string a failed run answers with, in place of the
+    # generated `model run error <code>`. Exists so a test can send the kind of
+    # string a server, a proxy or a provider actually can -- one carrying
+    # control characters, escape sequences or kilobytes of padding -- and watch
+    # what the SDK hands a caller after the whole parse chain has run on it.
+    model_run_error_detail: str | None = None
     # Answer the model run with Router's *per-field* validation failure: a
     # `422` whose body is `{"detail": [...]}` -- this list, verbatim -- with the
     # coarse bucket on `X-Comfy-Error-Type` and no `error_type` in the body,
@@ -184,6 +235,49 @@ class ServerState:
     model_run_validation_detail: list[Any] | None = None
     # The bucket sent on `X-Comfy-Error-Type` alongside it.
     model_run_validation_error_type: str = "invalid_input"
+
+    # --- model discovery: GET /v2/models and .../openapi.json ---
+    # Catalog pages keyed by the `cursor` that fetches them (`None` is the first
+    # page). Each value is the whole response body, so a test states the
+    # paging facts (`has_more`, `next_cursor`, `limit`) it is about.
+    catalog_pages: dict[str | None, dict[str, Any]] = field(
+        default_factory=lambda: {
+            None: {
+                "data": [
+                    {
+                        "id": "bfl/flux-2-pro",
+                        "provider": "bfl",
+                        "model": "flux-2-pro",
+                        "billing": {"charges_on_policy_rejection": "unknown"},
+                    }
+                ],
+                "has_more": False,
+                "next_cursor": None,
+                "limit": 20,
+            }
+        }
+    )
+    # (status, code) answered instead of a catalog page.
+    catalog_error: tuple[int, str] | None = None
+    # Catalog requests answered 429 rate_limited (Retry-After: 1) before one is
+    # served — the transient path the client's retry policy rides out.
+    catalog_fail_times: int = 0
+    # Every catalog request's decoded query, in arrival order.
+    catalog_queries: list[dict[str, list[str]]] = field(default_factory=list)
+    # The document `.../openapi.json` serves, and the ETag it is served under.
+    schema_document: dict[str, Any] = field(
+        default_factory=lambda: {"openapi": "3.1.0", "info": {"title": "bfl/flux-2-pro"}}
+    )
+    schema_etag: str = '"schema-v1"'
+    # Models the schema route knows; any other id answers 404 model_not_found.
+    schema_models: set[str] = field(default_factory=lambda: {"bfl/flux-2-pro"})
+    # (status, code) answered instead of the document, for every model.
+    schema_error: tuple[int, str] | None = None
+    # Raw request path and If-None-Match of every schema request.
+    schema_paths: list[str] = field(default_factory=list)
+    schema_if_none_match: list[str | None] = field(default_factory=list)
+    # The `X-Comfy-Request-Id` both discovery routes stamp on their answers.
+    discovery_request_id: str = "req_discovery_01"
 
     # --- the queued model surface (submit / status / result / cancel) ---
     # POST .../requests answers this status with a body naming a request id.
@@ -239,6 +333,13 @@ class ServerState:
             "seed": 7,
         }
     )
+    # Answer a completed result with these raw bytes under
+    # `queue_result_binary_content_type` instead of `queue_result` as JSON —
+    # the queued sibling of `model_run_binary_body`. `None` serves JSON.
+    queue_result_binary_body: bytes | None = None
+    # Content-Type for `queue_result_binary_body`. `None` sends no Content-Type
+    # header at all, which is the header-stripping-intermediary case.
+    queue_result_binary_content_type: str | None = "audio/mpeg"
     # Status code for the cancel response; 204 exercises the empty-body path.
     queue_cancel_status: int = 200
     # Cancels that answer a transient failure (status, code) before one is
@@ -314,7 +415,16 @@ class ServerState:
     # Idempotency-Key -> the result recorded for it under
     # `model_run_replays_lost_result`, served verbatim to a later request
     # presenting the same key.
-    model_run_replay_store: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #
+    # The whole answer is recorded, not just the JSON payload: `(payload,
+    # binary_body, binary_content_type)` as they stood when the generation
+    # completed. A replay has to serve *that record* rather than re-read the
+    # knobs, or a test asserting the recorded result came back would pass even
+    # with the per-key record wrong or empty -- on the one path where serving
+    # the wrong record means double-billing.
+    model_run_replay_store: dict[str, tuple[dict[str, Any], bytes | None, str | None]] = field(
+        default_factory=dict
+    )
     # How many times the model actually *ran*, as distinct from how many
     # requests arrived (`model_run_count`). A replay serves a recorded result
     # and does not increment this, which is what lets a test tell a real replay
@@ -359,8 +469,13 @@ def _asset_json(asset_id: str, hash_: str, created_new: bool, size: int) -> dict
     }
 
 
-def _job_json(job_id: str, status: str, outputs: list[dict] | None = None) -> dict:
-    return {
+def _job_json(
+    job_id: str,
+    status: str,
+    outputs: list[dict] | None = None,
+    metadata: Any = None,
+) -> dict:
+    job = {
         "id": job_id,
         "status": status,
         "created_at": "2026-07-10T18:20:00Z",
@@ -378,6 +493,9 @@ def _job_json(job_id: str, status: str, outputs: list[dict] | None = None) -> di
             "cancel": f"/api/v2/jobs/{job_id}/cancel",
         },
     }
+    if metadata is not None:
+        job["metadata"] = metadata
+    return job
 
 
 def _output_json(node_id: str, asset_id: str) -> dict:
@@ -424,12 +542,25 @@ def _make_handler(state: ServerState):
             self.end_headers()
             self.wfile.write(body)
 
-        def _raw(self, status: int, body: bytes, content_type: str) -> None:
+        def _raw(
+            self,
+            status: int,
+            body: bytes,
+            content_type: str | None,
+            headers: dict | None = None,
+        ) -> None:
             """A response whose body is *not* JSON — the case a client that
-            calls ``.json()`` unguarded on a success status falls over on."""
+            calls ``.json()`` unguarded on a success status falls over on.
+
+            ``content_type=None`` sends **no** ``Content-Type`` header at all,
+            which is a real shape (an intermediary that strips it) and the one a
+            client branching on the header has nothing to branch on."""
             self.send_response(status)
-            self.send_header("Content-Type", content_type)
+            if content_type is not None:
+                self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -511,6 +642,18 @@ def _make_handler(state: ServerState):
             if m:
                 self._serve_queue_result(m.group(3))
                 return
+            # Comfy Router's discovery routes — the catalog (query-string
+            # paged) and one model's schema document.
+            if urlsplit(self.path).path == "/v2/models":
+                self._serve_catalog()
+                return
+            m = re.match(r"/v2/models/([^/]+)/([^/]+)/openapi\.json$", self.path)
+            if m:
+                self._serve_schema(unquote(m.group(1)), unquote(m.group(2)))
+                return
+            if urlsplit(self.path).path == "/api/v2/jobs":
+                self._serve_job_list()
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)/events$", self.path)
             if m:
                 self._serve_events(m.group(1))
@@ -568,7 +711,38 @@ def _make_handler(state: ServerState):
             else:
                 status = "running"
                 outputs = []
-            self._json(200, _job_json(job_id, status, outputs))
+            self._json(200, _job_json(job_id, status, outputs, state.job_metadata))
+
+        def _serve_job_list(self) -> None:
+            query = parse_qs(urlsplit(self.path).query)
+            arrival = len(state.job_list_queries)
+            state.job_list_paths.append(self.path)
+            state.job_list_queries.append(query)
+            if state.job_list_error is not None:
+                status, code, message = state.job_list_error
+                self._err(status, code, message)
+                return
+            if arrival in state.job_list_429_at:
+                retry_after = state.job_list_retry_after
+                self._json(
+                    429,
+                    {"error": {"code": "rate_limited", "message": "slow down"}},
+                    headers={"Retry-After": retry_after} if retry_after is not None else None,
+                )
+                return
+            if state.job_list_body is not None:
+                self._json(200, state.job_list_body)
+                return
+            cursor = query.get("cursor", ["page-0"])[0]
+            index = int(cursor.removeprefix("page-"))
+            page: dict[str, Any] = {}
+            if state.job_list_pages[index] is not None:
+                page["jobs"] = state.job_list_pages[index]
+            if index + 1 < len(state.job_list_pages):
+                page["next_cursor"] = f"page-{index + 1}"
+            if arrival in state.job_list_next_cursor_at:
+                page["next_cursor"] = state.job_list_next_cursor_at[arrival]
+            self._json(200, page)
 
         def _serve_job_workflow(self, job_id: str) -> None:
             if state.job_workflow_not_found:
@@ -662,7 +836,7 @@ def _make_handler(state: ServerState):
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
-                self._json(200, _job_json(m.group(1), "canceling"))
+                self._json(200, _job_json(m.group(1), "canceling", metadata=state.job_metadata))
                 return
             self._read_body()
             self._err(404, "not_found")
@@ -750,6 +924,11 @@ def _make_handler(state: ServerState):
         def _serve_queue_result(self, request_id: str) -> None:
             state.queue_result_count += 1
             state.queue_paths.append(self.path)
+            if state.queue_result_binary_body is not None:
+                self._raw(
+                    200, state.queue_result_binary_body, state.queue_result_binary_content_type
+                )
+                return
             if state.queue_result_raw is not None:
                 self._json(200, state.queue_result_raw)
                 return
@@ -794,6 +973,50 @@ def _make_handler(state: ServerState):
                 },
             )
 
+        def _serve_catalog(self) -> None:
+            query = parse_qs(urlsplit(self.path).query)
+            state.catalog_queries.append(query)
+            if state.catalog_fail_times > 0:
+                state.catalog_fail_times -= 1
+                self._router_err(429, "rate_limited", retry_after="1")
+                return
+            if state.catalog_error:
+                status, code = state.catalog_error
+                self._router_err(status, code)
+                return
+            cursor = query.get("cursor", [None])[0]
+            if cursor not in state.catalog_pages:
+                self._router_err(400, "invalid_input", "unknown cursor")
+                return
+            self._json(
+                200,
+                state.catalog_pages[cursor],
+                headers={"X-Comfy-Request-Id": state.discovery_request_id},
+            )
+
+        def _serve_schema(self, provider: str, model: str) -> None:
+            state.schema_paths.append(self.path)
+            state.schema_if_none_match.append(self.headers.get("If-None-Match"))
+            if state.schema_error:
+                status, code = state.schema_error
+                self._router_err(status, code)
+                return
+            if f"{provider}/{model}" not in state.schema_models:
+                self._router_err(404, "model_not_found", "no such model")
+                return
+            headers = {
+                "X-Comfy-Request-Id": state.discovery_request_id,
+                "ETag": state.schema_etag,
+                "Cache-Control": "public, max-age=300",
+            }
+            if self.headers.get("If-None-Match") == state.schema_etag:
+                self.send_response(304)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                return
+            self._json(200, state.schema_document, headers=headers)
+
         def _router_err(
             self, status: int, code: str, message: str = "err", retry_after: str | None = None
         ) -> None:
@@ -822,18 +1045,20 @@ def _make_handler(state: ServerState):
             # rather than rejecting the resend, and the model does not run
             # again — which is the whole point of asking under the same key.
             if key and key in state.model_run_replay_store:
+                recorded_payload, recorded_body, recorded_type = state.model_run_replay_store[key]
                 # `model_run_response_headers` is merged in here as well as on
                 # the fresh-run path below, because a replay is the canonical
                 # reported-zero and the only response where `credits_used` and
                 # `replayed` are both meaningful at once. Stamped first, so the
                 # replay marker itself cannot be overwritten by a test's dict.
-                self._json(
+                self._serve_run_result(
                     200,
-                    state.model_run_replay_store[key],
+                    recorded_payload,
                     headers={
                         **state.model_run_response_headers,
                         "Idempotent-Replayed": "true",
                     },
+                    binary=(recorded_body, recorded_type),
                 )
                 return
 
@@ -889,12 +1114,18 @@ def _make_handler(state: ServerState):
                 state.model_run_idempotency[key] = "claimed"
 
             def fail(status: int, code: str, message: str) -> None:
+                if state.model_run_error_detail is not None:
+                    message = state.model_run_error_detail
                 claim_if_outcome_unknown(status, code)
                 if state.model_run_replays_lost_result and key and status >= 500:
                     # The generation completed; only the answer was lost. Bill
                     # it once and record it, so the same key collects it.
                     state.model_run_generations += 1
-                    state.model_run_replay_store[key] = state.model_run_result
+                    state.model_run_replay_store[key] = (
+                        state.model_run_result,
+                        state.model_run_binary_body,
+                        state.model_run_binary_content_type,
+                    )
                 headers: dict[str, str] = {}
                 if state.model_run_retry_after is not None:
                     headers["Retry-After"] = state.model_run_retry_after
@@ -944,14 +1175,47 @@ def _make_handler(state: ServerState):
                 self._raw(
                     state.model_run_status,
                     b"<html><body>502 from an intermediary</body></html>",
-                    "text/html",
+                    state.model_run_undecodable_content_type,
                 )
                 return
-            self._json(
+            self._serve_run_result(
                 state.model_run_status,
                 state.model_run_result,
                 headers=state.model_run_response_headers or None,
             )
+
+        def _serve_run_result(
+            self,
+            status: int,
+            payload: dict,
+            headers: dict | None = None,
+            binary: tuple[bytes | None, str | None] | None = None,
+        ) -> None:
+            """A successful run's body — the partner's JSON, or its own bytes.
+
+            Both shapes go through one helper so the *replay* of a claimed key
+            answers in whichever shape the run itself would have: the route's
+            ``Idempotent-Replayed`` 200 carries the recorded result, and a
+            recorded result that was audio is still audio.
+
+            ``binary`` is that record's own ``(body, content_type)``, passed by
+            the replay branch so the replay serves what was stored against the
+            key instead of whatever the knobs say *now*. A fresh run passes
+            none and reads the knobs, which for it are the same thing.
+            """
+            body, content_type = (
+                binary
+                if binary is not None
+                else (state.model_run_binary_body, state.model_run_binary_content_type)
+            )
+            if state.model_run_request_id is not None:
+                # Router stamps the id on every answer, not only on failures;
+                # `BinaryResult.request_id` is read off a *success*.
+                headers = {**(headers or {}), "X-Comfy-Request-Id": state.model_run_request_id}
+            if body is not None:
+                self._raw(status, body, content_type, headers=headers)
+                return
+            self._json(status, payload, headers=headers)
 
         def _post_jobs(self) -> None:
             state.submit_count += 1
@@ -1002,13 +1266,16 @@ def _make_handler(state: ServerState):
 
             if state.job_error is not None:
                 status, code = state.job_error
-                self._err(status, code, f"job error {code}")
+                self._err(status, code, state.job_error_message or f"job error {code}")
                 return
 
             job_id = f"job_{state.submit_count:02d}"
             if key:
                 state.idempotency[key] = job_id
-            self._json(201, _job_json(job_id, "queued"))
+            metadata = (
+                state.job_metadata if state.job_metadata is not None else body.get("metadata")
+            )
+            self._json(201, _job_json(job_id, "queued", metadata=metadata))
 
     return Handler
 
