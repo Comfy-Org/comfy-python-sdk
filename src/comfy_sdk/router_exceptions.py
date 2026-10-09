@@ -53,9 +53,9 @@ catchable exception carrying its raw ``error_type`` -- treat one like
 ``internal_error``. A client that rejected the unknown value would fail hardest
 exactly when something has already gone wrong.
 
-Three of these names -- ``Unauthorized``, ``Forbidden``, ``InsufficientCredits``
--- also exist in :mod:`comfy_sdk.exceptions`, which is where the workflow
-surface's error codes are mapped. **They are the same class object, defined
+Four of these names -- ``Unauthorized``, ``Forbidden``, ``InsufficientCredits``,
+``RateLimited`` -- also exist in :mod:`comfy_sdk.exceptions`, which is where
+the workflow surface's error codes are mapped. **They are the same class object, defined
 here and re-exported there**, so ``comfy_sdk.exceptions.Unauthorized is
 comfy_sdk.router_exceptions.Unauthorized`` and either import catches whatever
 the other one does. ``tests/test_exception_modules.py`` asserts that of every
@@ -68,11 +68,12 @@ than a naming nit: the class ``to_sdk_error`` actually raised for a router
 for insufficient credits, a rejected key or a model the caller is not entitled
 to compiled, type-checked, and caught nothing. Merging them is what makes the
 broad catch honest. The consequence to know is the other direction: a *workflow*
-call that fails ``401``/``403``/``402`` now raises a :class:`RouterError`
-subclass too, because one class cannot be a ``RouterError`` on one surface and
-not on the other. ``except Unauthorized`` (from either module) is unchanged;
-``except RouterError`` is wider than the name suggests for exactly those three
-buckets.
+call that fails ``401``/``403``/``402``, or a v2 jobs/assets call refused
+``429 rate_limited``, now raises a :class:`RouterError` subclass too, because
+one class cannot be a ``RouterError`` on one surface and not on the other.
+``except Unauthorized`` (from either module) is unchanged; ``except
+RouterError`` is wider than the name suggests for exactly those four buckets:
+``unauthorized``, ``forbidden``, ``insufficient_credits`` and ``rate_limited``.
 
 This module is still deliberately *not* star-re-exported from the package root:
 lifting :class:`NotEnabled` there while ``comfy_sdk.InvalidInput`` stayed a name
@@ -471,7 +472,12 @@ class RateLimited(RouterError):
     It shares ``429`` with :class:`ConcurrencyLimitExceeded` and is not the same
     thing: that one clears the moment one of the caller's own in-flight calls
     finishes, so retrying in seconds is right, whereas nothing the caller does
-    drains this one early. ``detail`` names the window.
+    drains this one early. On the Router surface, ``detail`` names the window.
+
+    The v2 jobs/assets gateway raises this same class for its per-account
+    request rate limit (``code == "rate_limited"``), with ``retry_after`` read
+    from ``Retry-After`` when the response sent one: both surfaces spell the
+    windowed allowance identically, so one class serves both.
     """
 
     error_type = "rate_limited"

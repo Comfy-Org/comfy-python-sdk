@@ -219,6 +219,13 @@ the fuller account of each version, including verification notes.
   body's `error_type`), or `None` when it named none — which is also how the SDK tells which
   surface answered.
 
+### Changed
+
+- `rate_limited` is now listed explicitly in `comfy_sdk.exceptions._BY_CODE` beside the three
+  other codes both surfaces share; a v2 jobs/assets throttle raised
+  `comfy_sdk.router_exceptions.RateLimited` before and still does. README and docstrings now say
+  so. `RateLimited` is also re-exported from `comfy_sdk.exceptions`, as the other three are.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added
