@@ -44,6 +44,7 @@ import re
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator, Mapping
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -433,8 +434,13 @@ def _estimate_of(payload: Any) -> CostEstimate | None:
     )
     if quote.is_exact and quote.amount is None:
         return None
-    if quote.is_estimated and (quote.min_amount is None or quote.max_amount is None):
-        return None
+    if quote.is_estimated:
+        if quote.min_amount is None or quote.max_amount is None:
+            return None
+        # Both already match `_DECIMAL_AMOUNT`, so `Decimal` cannot raise; a
+        # reversed range is a quote nobody can act on.
+        if Decimal(quote.min_amount) > Decimal(quote.max_amount):
+            return None
     return quote
 
 

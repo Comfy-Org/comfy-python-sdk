@@ -197,6 +197,7 @@ def test_no_estimate_on_the_201_is_none(server, fast_poll) -> None:
         {**EXACT_ESTIMATE, "amount": "1e9"},
         {key: value for key, value in EXACT_ESTIMATE.items() if key != "amount"},
         {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "0.02"},
+        {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "0.08", "max_amount": "0.02"},
     ],
 )
 def test_a_malformed_estimate_is_no_quote_and_never_fails_the_submit(
@@ -207,6 +208,19 @@ def test_a_malformed_estimate_is_no_quote_and_never_fails_the_submit(
         handle = client.models.submit(MODEL, ARGS)
     assert handle.request_id == server.state.queue_request_id
     assert handle.estimate is None
+
+
+def test_an_estimated_range_may_be_a_single_point(server, fast_poll) -> None:
+    server.state.queue_submit_estimate = {
+        **EXACT_ESTIMATE,
+        "source": "estimated",
+        "min_amount": "0.04",
+        "max_amount": "0.040",
+    }
+    estimate = _submitted_estimate()
+
+    assert estimate is not None
+    assert (estimate.min_amount, estimate.max_amount) == ("0.04", "0.040")
 
 
 def test_a_mistyped_optional_estimate_field_is_left_none(server, fast_poll) -> None:
