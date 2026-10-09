@@ -31,6 +31,7 @@ from comfy_sdk.router_exceptions import (
     NotEnabled,
     ProviderError,
     ProviderTimeout,
+    QueueBacklogFull,
     QueueTimeout,
     RateLimited,
     RequestNotFound,
@@ -49,7 +50,8 @@ REQUEST_ID = "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21"
 # The statuses are part of the case on purpose: they document the pairing a
 # retry policy keys on (502 provider_error vs 504 provider_timeout), and the
 # four status collisions the widened set introduced -- 403 forbidden vs
-# not_enabled, 429 concurrency_limit_exceeded vs rate_limited, 504
+# not_enabled, 429 concurrency_limit_exceeded vs rate_limited (and, since,
+# queue_backlog_full), 504
 # provider_timeout vs deadline_exceeded, 500 internal_error vs the 503
 # service_unavailable it is deliberately NOT merged with.
 CASES: list[tuple[str, int, type[RouterError]]] = [
@@ -71,6 +73,7 @@ CASES: list[tuple[str, int, type[RouterError]]] = [
     ("cancelled", 409, Cancelled),
     ("queue_timeout", 504, QueueTimeout),
     ("request_not_found", 404, RequestNotFound),
+    ("queue_backlog_full", 429, QueueBacklogFull),
 ]
 
 # Deliberately not in the set this SDK version knows: a later milestone adds it,
@@ -403,6 +406,22 @@ def test_a_rate_limited_429_is_not_the_concurrency_429() -> None:
         {"detail": "10 requests per minute.", "error_type": "rate_limited"},
     )
     assert type(exc) is RateLimited
+    assert type(error_from_response(429, {}, None)) is ConcurrencyLimitExceeded
+
+
+def test_a_queue_backlog_full_429_is_not_the_concurrency_429() -> None:
+    # The queue parks a submit at the in-flight limit; this is the separate
+    # bound on how many a caller may leave waiting, and it clears only as the
+    # caller's own queued requests finish -- not when one sync call returns.
+    exc = error_from_response(
+        429,
+        {ERROR_TYPE_HEADER: "queue_backlog_full"},
+        {"detail": "Too many queued requests.", "error_type": "queue_backlog_full"},
+    )
+    assert type(exc) is QueueBacklogFull
+    assert not isinstance(exc, ConcurrencyLimitExceeded)
+    # A bare 429 from an intermediary still reads as plain throttling: the
+    # backlog bound is Router's own claim, which a proxy cannot be making.
     assert type(error_from_response(429, {}, None)) is ConcurrencyLimitExceeded
 
 
