@@ -20,7 +20,7 @@ the fuller account of each version, including verification notes.
   `JobSummary` items (`id`, `status`, `create_time`, `update_time`, `deployment_id`,
   `release_version`, `metadata`, `data`); `deployment_id` is the deployment the job was sent
   to (the id in the address it was posted at, unchanged when the deployment moves to another
-  release; best-effort, since the v2 contract does not declare it), and `release_version` is
+  release; a host may leave it out, since the v2 contract does not declare it), and `release_version` is
   the version of the release that ran the job (`None` where the server does not report it); on `AsyncComfy` it is an async iterator. The SDK leaves the label limits
   to the server: a refused map raises `ComfyError` with code `metadata_invalid` and the
   server's message (naming the key when one key or value breaks a rule, giving the count

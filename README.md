@@ -404,7 +404,8 @@ value holding one of those characters) raises
 not issue raises `ComfyError` with `code == "invalid_cursor"`. A job's
 `deployment_id` names the deployment it was sent to (the id in the address it
 was posted at), which stays the same when the deployment moves to another
-release; the v2 contract does not declare it, so treat it as best-effort.
+release; the v2 contract does not declare it, so another host may leave it
+out, and it then reads as `None`.
 `release_version` is the version of the release that ran the job (`None` where
 the server does not report it), which is how to tell which release produced a
 job after the deployment moves on.

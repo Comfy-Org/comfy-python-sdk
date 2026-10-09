@@ -95,7 +95,9 @@ class JobSummary:
     This is the id in the address the job was posted at, which stays the same
     when the deployment moves to another release. The serverless platform sends
     it on every list item today, but the v2 ``JobListItem`` contract does not
-    declare it, so treat it as best-effort.
+    declare it, so another host may leave it out (it then reads as ``None``).
+    A value that is present but is not a string still raises ``ComfyError``
+    with code ``invalid_response``.
     """
 
     release_version: int | None
