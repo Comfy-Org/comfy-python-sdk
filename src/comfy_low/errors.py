@@ -109,6 +109,7 @@ class ApiError(Exception):
         body_excerpt: str | None = None,
         error_type: str | None = None,
         validation_errors: Sequence[Mapping[str, Any]] = (),
+        organization_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -176,6 +177,12 @@ class ApiError(Exception):
         #: :func:`error_from_envelope` enforces that, so a set excerpt always
         #: means ``message`` is one this SDK synthesised.
         self.body_excerpt = body_excerpt
+        #: On ``sso_required``: the organization whose single sign-on governs
+        #: this key — the ``organization`` query parameter of Comfy Cloud's SSO
+        #: start. ``None`` on every other code and when the server does not
+        #: know it. Read off the envelope's ``error.organization_id``, a
+        #: sibling of ``code`` and ``message``.
+        self.organization_id = organization_id
 
     def __str__(self) -> str:
         """``message``, plus the body excerpt whenever there is one.
@@ -254,6 +261,11 @@ _BY_CODE: dict[str, type[ApiError]] = {
         Forbidden,
     )
 }
+# The key is valid but the account must sign in through its organization's
+# SSO. A `Forbidden` so an auth `except` sees it; `code` stays `sso_required`
+# and `organization_id` names the org. Deliberately no class of its own: the
+# Router exception surface is one class per bucket, and this is not a bucket.
+_BY_CODE["sso_required"] = Forbidden
 
 
 def _clean(value: Any) -> str | None:
@@ -533,6 +545,11 @@ def error_from_envelope(
     # capped, instead of verbatim at whatever length it was sent.
     message = clean_body_excerpt((err or {}).get("message") if isinstance(err, dict) else None)
     details = (err or {}).get("details") if isinstance(err, dict) else None
+    # `_clean`ed so a non-string or empty value reads as absent. Only the
+    # `sso_required` envelope carries it today, but it is read off any envelope
+    # rather than gated on the code: the field means the same thing wherever
+    # it appears, and the server omits it everywhere else.
+    organization_id = _clean((err or {}).get("organization_id")) if isinstance(err, dict) else None
 
     # Read whether or not `code` already won: the bucket is how a caller tells
     # a Router response from a v2 one, and on the three buckets both surfaces
@@ -607,6 +624,7 @@ def error_from_envelope(
         body_excerpt=body_excerpt,
         error_type=bucket,
         validation_errors=validation_errors,
+        organization_id=organization_id,
     )
 
 

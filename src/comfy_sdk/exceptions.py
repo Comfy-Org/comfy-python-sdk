@@ -141,6 +141,12 @@ _BY_CODE: dict[str, type[ComfyError]] = {
     "asset_not_found": NotFound,
     "unauthorized": Unauthorized,
     "forbidden": Forbidden,
+    # The key is valid but the account must sign in through its organization's
+    # SSO. A `Forbidden` so an auth `except` sees it; `code` stays
+    # `sso_required` and `organization_id` names the org. No class of its own:
+    # `Forbidden` is a Router bucket class and that surface is one class per
+    # bucket, which `sso_required` is not.
+    "sso_required": Forbidden,
 }
 
 
@@ -208,6 +214,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
             http_status=exc.http_status,
             details=exc.details,
             request_id=exc.request_id,
+            organization_id=exc.organization_id,
         )
     cls = _class_for(exc)
     if issubclass(cls, RouterError):
@@ -233,6 +240,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
             request_id=exc.request_id,
             retry_after=exc.retry_after,
             errors=tuple(_detail_from(entry) for entry in exc.validation_errors),
+            organization_id=exc.organization_id,
         )
     # No `errors=` below, deliberately: `.errors` is a `RouterError` attribute
     # and none of the remaining classes takes the argument. A validation body
@@ -262,6 +270,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
         # collects an already-billed generation, and dropping it here left the
         # caller told to wait with nothing to wait on.
         retry_after=exc.retry_after,
+        organization_id=exc.organization_id,
     )
 
 
@@ -289,7 +298,7 @@ _STAMPABLE: tuple[type[BaseException], ...] = (
 #: :data:`_STAMPABLE` so an attribute added to :class:`ComfyError` for the
 #: caller to read inside an ``except`` block is added here too —
 #: ``tests/test_error_contract.py`` pins the pairing.
-_STAMPED_ATTRIBUTES = ("request_id", "retry_after")
+_STAMPED_ATTRIBUTES = ("request_id", "retry_after", "organization_id")
 
 #: Stamped like :data:`_STAMPED_ATTRIBUTES`, but defaulted to ``False``
 #: rather than ``None``: these are booleans a caller tests directly, and a

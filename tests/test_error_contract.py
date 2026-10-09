@@ -175,6 +175,7 @@ _BASE_ATTRIBUTES = (
     "request_id",
     "idempotency_key",
     "retry_after",
+    "organization_id",
 )
 
 
@@ -183,7 +184,9 @@ def test_the_base_error_answers_to_its_whole_attribute_surface(name: str) -> Non
     assert hasattr(ComfyError("boom"), name)
 
 
-@pytest.mark.parametrize("name", ("request_id", "idempotency_key", "retry_after"))
+@pytest.mark.parametrize(
+    "name", ("request_id", "idempotency_key", "retry_after", "organization_id")
+)
 def test_those_attributes_default_to_none_rather_than_being_absent(name: str) -> None:
     # An operation that sends no Idempotency-Key, and a response that named no
     # request id, both leave the attribute readable as `None`. A caller writes

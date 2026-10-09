@@ -211,9 +211,16 @@ class RouterError(ComfyError):
         request_id: str | None = None,
         retry_after: int | None = None,
         errors: Sequence[ValidationErrorDetail] = (),
+        organization_id: str | None = None,
     ) -> None:
         resolved = error_type if error_type is not None else self.error_type
-        super().__init__(detail, code=resolved or None, http_status=http_status, details=details)
+        super().__init__(
+            detail,
+            code=resolved or None,
+            http_status=http_status,
+            details=details,
+            organization_id=organization_id,
+        )
         if error_type is not None:
             self.error_type = error_type
         #: Human-readable description of the failure, safe to show a user. Not

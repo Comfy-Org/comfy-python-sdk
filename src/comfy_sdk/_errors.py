@@ -82,6 +82,15 @@ class ComfyError(Exception):
     #: failures by :func:`_stamp`, so the attribute is always readable.
     resend_refused: bool = False
 
+    #: On ``sso_required``: the organization whose single sign-on governs this
+    #: key — the ``organization`` query parameter of Comfy Cloud's SSO start.
+    #: ``None`` on every other code and when the server does not know it. An
+    #: ``sso_required`` refusal is raised as
+    #: :class:`~comfy_sdk.router_exceptions.Forbidden` with ``code`` kept as
+    #: ``sso_required``, so a caller tells it from a plain ``forbidden`` by
+    #: ``code`` and reads the organization to sign in with here.
+    organization_id: str | None = None
+
     def __init__(
         self,
         message: str,
@@ -91,6 +100,7 @@ class ComfyError(Exception):
         details: dict[str, Any] | None = None,
         request_id: str | None = None,
         retry_after: int | None = None,
+        organization_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -99,6 +109,7 @@ class ComfyError(Exception):
         self.details = details
         self.request_id = request_id
         self.retry_after = retry_after
+        self.organization_id = organization_id
 
 
 __all__ = ["ComfyError"]
