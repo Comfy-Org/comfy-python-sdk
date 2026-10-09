@@ -824,6 +824,26 @@ class _Prepared:
                 body_excerpt=_body_excerpt(resp),
             ) from exc
 
+    def raise_for_head_refusal(self, resp: httpx.Response) -> NoReturn:
+        """Raise the typed error for a refused ``HEAD`` — which has no body.
+
+        A ``HEAD`` response never carries the error envelope (the gateway drops
+        the body), so :func:`error_from_envelope` would fall back to
+        :data:`~comfy_low.errors._CODE_BY_STATUS` and read an account rate limit
+        as ``queue_full``. On a ``HEAD`` a ``429`` is the gateway's
+        ``rate_limited`` refusal, so that code is synthesized from the status
+        instead; ``Retry-After`` is still read off the header. Every other
+        status takes the generic path (a ``403`` is already ``forbidden``).
+        """
+        if resp.status_code == 429:
+            raise error_from_envelope(
+                429,
+                {"error": {"code": "rate_limited", "message": "Rate limited"}},
+                retry_after=_retry_after(resp),
+                request_id=_request_id(resp),
+            )
+        self._raise_for_response(resp)
+
     def _raise_for_response(self, resp: httpx.Response) -> NoReturn:
         body: dict[str, Any] | None
         try:
@@ -1199,13 +1219,19 @@ class ComfyLow:
         return Asset.model_validate(data)
 
     def head_asset_by_hash(self, hash: str, *, timeout: Any = _UNSET) -> bool:
-        """HEAD /api/v2/assets/by-hash/{hash} — existence probe."""
+        """HEAD /api/v2/assets/by-hash/{hash} — existence probe.
+
+        ``True`` on ``200``, ``False`` on ``404``. Any other status raises; a
+        refusal has no body, so its code is synthesized from the status — a
+        ``429`` raises ``code="rate_limited"`` (not ``queue_full``) with
+        ``retry_after`` from the header.
+        """
         resp = self.raw_request("HEAD", f"/assets/by-hash/{hash}", timeout=timeout)
         if resp.status_code == 200:
             return True
         if resp.status_code == 404:
             return False
-        return bool(self._p.parse_or_raise(resp, (200,)))  # raises typed error
+        self._p.raise_for_head_refusal(resp)
 
     def get_asset(self, asset_id: str, *, timeout: Any = _UNSET) -> Asset:
         """GET /api/v2/assets/{id} — metadata with a fresh content URL."""
@@ -1757,7 +1783,8 @@ class AsyncComfyLow:
             return True
         if resp.status_code == 404:
             return False
-        return bool(self._p.parse_or_raise(resp, (200,)))
+        # Bodiless refusal: see `ComfyLow.head_asset_by_hash`.
+        self._p.raise_for_head_refusal(resp)
 
     async def get_asset(self, asset_id: str, *, timeout: Any = _UNSET) -> Asset:
         resp = await self.raw_request("GET", f"/assets/{asset_id}", timeout=timeout)

@@ -71,6 +71,13 @@ the fuller account of each version, including verification notes.
 
 ### Fixed
 
+- **An account rate limit on the asset dedup probe raised `QueueFull`.** `Asset.commit()` first
+  probes `HEAD /api/v2/assets/by-hash/{hash}`, and a refused `HEAD` carries no body, so the
+  `429` fell back to the status-derived `queue_full` code. `head_asset_by_hash` (sync and
+  async) now reads a `429` there as `code="rate_limited"`, keeping `retry_after` from the
+  `Retry-After` header, so `commit()` raises a `ComfyError` with that code instead of
+  `QueueFull`. A bodiless `403` still raises `Forbidden`. The status fallback elsewhere is
+  unchanged.
 - **`RouterRunResult.replayed` was always `False` against a real deployment.** It was lifted
   from `X-Comfy-Idempotent-Replayed`; the header Comfy Router actually sends — and the only
   spelling `spec/router-openapi.yaml` declares, on the `200` as on the `400`/`409`/`422` — is
