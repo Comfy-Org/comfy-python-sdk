@@ -169,6 +169,9 @@ def test_an_unrecognised_source_reads_as_unknown(server, fast_poll) -> None:
     assert estimate is not None
     assert estimate.source == "something_new"
     assert estimate.is_unknown and not estimate.is_exact
+    # Read as `unknown`, so no figure — the verbatim body keeps it.
+    assert (estimate.amount, estimate.amount_cents, estimate.credits) == (None, None, None)
+    assert estimate.raw["amount"] == "0.04"
 
 
 def test_no_estimate_on_the_201_is_none(server, fast_poll) -> None:
@@ -184,7 +187,16 @@ def test_no_estimate_on_the_201_is_none(server, fast_poll) -> None:
         "nope",
         {"source": 5},
         {**EXACT_ESTIMATE, "pricing_as_of": None},
+        {**EXACT_ESTIMATE, "model": "  "},
         [EXACT_ESTIMATE],
+        # The figure `source` promises cannot be read: a half-read quote.
+        {**EXACT_ESTIMATE, "amount": 0.04},
+        {**EXACT_ESTIMATE, "amount": ""},
+        {**EXACT_ESTIMATE, "amount": "NaN"},
+        {**EXACT_ESTIMATE, "amount": "-1"},
+        {**EXACT_ESTIMATE, "amount": "1e9"},
+        {key: value for key, value in EXACT_ESTIMATE.items() if key != "amount"},
+        {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "0.02"},
     ],
 )
 def test_a_malformed_estimate_is_no_quote_and_never_fails_the_submit(
@@ -200,7 +212,6 @@ def test_a_malformed_estimate_is_no_quote_and_never_fails_the_submit(
 def test_a_mistyped_optional_estimate_field_is_left_none(server, fast_poll) -> None:
     server.state.queue_submit_estimate = {
         **EXACT_ESTIMATE,
-        "amount": 0.04,
         "amount_cents": "4",
         "credits": True,
     }
@@ -208,7 +219,27 @@ def test_a_mistyped_optional_estimate_field_is_left_none(server, fast_poll) -> N
 
     assert estimate is not None
     assert estimate.is_exact
-    assert (estimate.amount, estimate.amount_cents, estimate.credits) == (None, None, None)
+    assert estimate.amount == "0.04"
+    assert (estimate.amount_cents, estimate.credits) == (None, None)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -4.0, 10**400])
+def test_a_non_finite_or_negative_number_is_left_none(server, fast_poll, bad: Any) -> None:
+    # httpx decodes `NaN` / `Infinity` and `1e400`; NaN would slip past any
+    # `amount_cents > budget` guard.
+    server.state.queue_submit_estimate = {**EXACT_ESTIMATE, "amount_cents": bad, "credits": bad}
+    estimate = _submitted_estimate()
+
+    assert estimate is not None
+    assert (estimate.amount_cents, estimate.credits) == (None, None)
+
+
+def test_an_estimate_is_hashable(server, fast_poll) -> None:
+    server.state.queue_submit_estimate = EXACT_ESTIMATE
+    estimate = _submitted_estimate()
+
+    assert estimate is not None
+    assert estimate in {estimate}
 
 
 def test_a_rehydrated_handle_has_no_estimate(server, fast_poll) -> None:

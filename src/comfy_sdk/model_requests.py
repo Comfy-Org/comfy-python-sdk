@@ -39,6 +39,8 @@ differences follow from the surface rather than from taste:
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -144,6 +146,11 @@ class QueueUpdate:
 #: which is the spec's own rule for the field.
 _QUOTED_SOURCES = ("exact", "estimated")
 
+#: A money string as the spec writes one: a plain non-negative decimal. Any
+#: other string -- blank, ``NaN``, ``-1``, ``1e9`` -- is no figure, so a caller
+#: can always hand :attr:`CostEstimate.amount` to ``Decimal``.
+_DECIMAL_AMOUNT = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
 
 @dataclass(frozen=True)
 class CostEstimate:
@@ -157,8 +164,11 @@ class CostEstimate:
     ``exact`` carries :attr:`amount`; ``estimated`` carries :attr:`min_amount`
     and :attr:`max_amount` and no :attr:`amount`; ``unknown`` carries neither,
     and a :attr:`reason`. Any other value is read as ``unknown``
-    (:attr:`is_unknown`), as the spec directs. An absent :attr:`amount` is
-    never "free".
+    (:attr:`is_unknown`), as the spec directs, and its figures are dropped
+    (they stay in :attr:`raw`). An absent :attr:`amount` is never "free".
+    The figure the ``source`` promises is always present: an ``exact`` quote
+    whose :attr:`amount`, or an ``estimated`` one whose bounds, cannot be read
+    is no quote at all.
 
     Money is the server's decimal **string**, kept verbatim and never coerced
     to a float, so ``"0.04"`` stays exactly ``"0.04"``; the ``*_cents`` and
@@ -200,8 +210,9 @@ class CostEstimate:
     #: ``pricing_unavailable``, and an open string like :attr:`source`.
     reason: str | None = None
     #: The decoded ``estimate`` object, unmodified — the escape hatch for a
-    #: field this dataclass does not model yet.
-    raw: Mapping[str, Any] = field(default_factory=dict)
+    #: field this dataclass does not model yet. Left out of the hash, so a
+    #: quote stays hashable like the frozen value it is.
+    raw: Mapping[str, Any] = field(default_factory=dict, hash=False)
 
     @property
     def is_exact(self) -> bool:
@@ -360,16 +371,25 @@ def _estimate_of(payload: Any) -> CostEstimate | None:
 
     def text(name: str) -> str | None:
         value = estimate.get(name)
-        return value if isinstance(value, str) else None
+        return value if isinstance(value, str) and value.strip() else None
+
+    def money(name: str) -> str | None:
+        value = estimate.get(name)
+        if isinstance(value, str) and _DECIMAL_AMOUNT.fullmatch(value):
+            return value
+        return None
 
     def number(name: str) -> float | None:
         value = estimate.get(name)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
         try:
-            return float(value)
+            result = float(value)
         except OverflowError:  # an integer too large for a float is no figure
             return None
+        # NaN slips past every comparison a spend guard makes, and a negative
+        # charge is no figure either.
+        return result if math.isfinite(result) and result >= 0 else None
 
     source = text("source")
     currency = text("currency")
@@ -384,15 +404,26 @@ def _estimate_of(payload: Any) -> CostEstimate | None:
         or pricing_as_of is None
     ):
         return None
-    return CostEstimate(
+    if source not in _QUOTED_SOURCES:
+        # Read as `unknown`, which carries no figure whatever else arrived.
+        return CostEstimate(
+            source=source,
+            currency=currency,
+            provider=provider,
+            model=model,
+            pricing_as_of=pricing_as_of,
+            reason=text("reason"),
+            raw=dict(estimate),
+        )
+    quote = CostEstimate(
         source=source,
         currency=currency,
         provider=provider,
         model=model,
         pricing_as_of=pricing_as_of,
-        amount=text("amount"),
-        min_amount=text("min_amount"),
-        max_amount=text("max_amount"),
+        amount=money("amount"),
+        min_amount=money("min_amount"),
+        max_amount=money("max_amount"),
         amount_cents=number("amount_cents"),
         min_amount_cents=number("min_amount_cents"),
         max_amount_cents=number("max_amount_cents"),
@@ -400,6 +431,11 @@ def _estimate_of(payload: Any) -> CostEstimate | None:
         reason=text("reason"),
         raw=dict(estimate),
     )
+    if quote.is_exact and quote.amount is None:
+        return None
+    if quote.is_estimated and (quote.min_amount is None or quote.max_amount is None):
+        return None
+    return quote
 
 
 def _raise_for_completion(payload: Any, *, request_id: str, envelope_only: bool = False) -> None:
