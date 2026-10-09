@@ -59,10 +59,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
-from typing import Any, BinaryIO, NoReturn, cast
+from typing import Annotated, Any, BinaryIO, NoReturn, cast
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
+from pydantic import BeforeValidator, create_model
 
 from . import _multipart
 from .errors import ApiError, clean_body_excerpt, clean_request_id, error_from_envelope
@@ -918,6 +919,97 @@ async def _async_multipart_body(chunks: Iterator[bytes]) -> AsyncIterator[bytes]
         yield chunk
 
 
+def job_labels(raw: Any) -> dict[str, str]:
+    """A job's ``metadata`` as string labels, read leniently.
+
+    Anything that is not an object reads as ``{}``, and a pair whose value is
+    not a string is dropped. Never raises: a submit answer is read after the
+    server created the job, and a self-hosted proxy sends its own ``metadata``
+    as a plain string.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _with_lenient_metadata(base: type[Job]) -> type[Job]:
+    """``base`` with a ``metadata`` field that reads through :func:`job_labels`.
+
+    The v2 contract gained ``metadata`` on the job object, but the vendored spec
+    the models are generated from does not carry it yet. Declared here, in the
+    hand-written layer, rather than in the generated models, so the field is
+    read today. It overrides the field rather than adding one, so it keeps
+    reading leniently after a spec sync adds a strict ``metadata`` to ``Job``.
+
+    The class is named ``_<base>WithMetadata``, so for ``Job`` its name is the
+    module attribute it is bound to below, which is what pickle looks up.
+    """
+    lenient = Annotated[dict[str, str] | None, BeforeValidator(job_labels)]
+    return create_model(f"_{base.__name__}WithMetadata", __base__=base, metadata=(lenient, None))
+
+
+_JobWithMetadata = _with_lenient_metadata(Job)
+
+
+def _job(data: dict[str, Any]) -> Job:
+    """A job response body as a ``Job`` that keeps its ``metadata``."""
+    return _JobWithMetadata.model_validate(data)
+
+
+def _jobs_body(
+    workflow: dict[str, Any],
+    extra_data: dict[str, Any] | None,
+    metadata: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    """The ``POST /jobs`` body. Optional fields are omitted when empty, so a
+    caller that passes none of them sends exactly the body it always did.
+    """
+    body: dict[str, Any] = {"workflow": workflow}
+    if extra_data:
+        body["extra_data"] = extra_data
+    if metadata:
+        body["metadata"] = dict(metadata)
+    return body
+
+
+def _query_text(value: Any) -> str:
+    # Bytes as their UTF-8 text, anything else as `str()`, so the pair sent is
+    # the pair the caller meant: `b"x"` is `x`, not `b'x'`.
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+
+
+def metadata_filter_pairs(metadata: Mapping[Any, Any] | None) -> list[tuple[str, str]]:
+    """Each ``list_jobs`` metadata filter as the (key, value) text the query sends.
+
+    The one place that turns a filter into text: the query is built from these
+    pairs, and the client-side check of each list item compares against them,
+    so the two cannot disagree (``{1: "a"}`` is the key ``"1"``).
+    """
+    return [(_query_text(k), _query_text(v)) for k, v in (metadata or {}).items()]
+
+
+def _jobs_list_path(
+    *,
+    metadata: Mapping[str, str] | None = None,
+    limit: int | None = None,
+    cursor: str | None = None,
+) -> str:
+    """Sans-IO path (with query) for one page of ``GET /api/v2/jobs``.
+
+    Each metadata filter is sent as ``metadata[<key>]=<value>``, the
+    ``deepObject`` style the v2 contract's ``listJobs`` declares (the vendored
+    spec does not carry that route yet). Nothing is checked here: the server
+    owns the filter rules and answers a bad filter with its own error.
+    """
+    params = [(f"metadata[{k}]", v) for k, v in metadata_filter_pairs(metadata)]
+    if limit is not None:
+        params.append(("limit", str(limit)))
+    if cursor is not None:
+        params.append(("cursor", cursor))
+    query = urlencode(params)
+    return f"/jobs?{query}" if query else "/jobs"
+
+
 class ComfyLow:
     """Synchronous protocol bindings."""
 
@@ -1192,6 +1284,7 @@ class ComfyLow:
         *,
         idempotency_key: str | None = None,
         extra_data: dict[str, Any] | None = None,
+        metadata: Mapping[str, str] | None = None,
         timeout: Any = _UNSET,
     ) -> Job:
         """POST /api/v2/jobs.
@@ -1200,29 +1293,45 @@ class ComfyLow:
         ``workflow`` in the body, never nested inside it. Omitted from the
         request entirely when ``None`` — the server rejects an empty
         ``extra_data`` object, and a caller with no partner key should never
-        send one.
+        send one. ``metadata`` (string labels stored on the job) is also a
+        sibling, sent as given and omitted when ``None`` or empty.
         """
         headers: dict[str, str] = {}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        body: dict[str, Any] = {"workflow": workflow}
-        if extra_data:
-            body["extra_data"] = extra_data
         resp = self.raw_request(
             "POST",
             "/jobs",
             headers=headers,
-            json=body,
+            json=_jobs_body(workflow, extra_data, metadata),
             timeout=timeout,
         )
         data = self._p.parse_or_raise(resp, (201,))
-        return Job.model_validate(data)
+        return _job(data)
+
+    def list_jobs(
+        self,
+        *,
+        metadata: Mapping[str, str] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        timeout: Any = _UNSET,
+    ) -> dict[str, Any]:
+        """GET /api/v2/jobs — one page of jobs, newest first, as the raw body.
+
+        The body is ``{"jobs": [...], "next_cursor": "..."}``; ``next_cursor``
+        is absent on the last page. List items are returned as dicts rather
+        than ``Job`` models because they are a lighter shape than a full job.
+        """
+        path = _jobs_list_path(metadata=metadata, limit=limit, cursor=cursor)
+        resp = self.raw_request("GET", path, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,))
 
     def get_job(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> Job:
         """GET /api/v2/jobs/{id} (or an absolute self link)."""
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}"
         resp = self.raw_request("GET", path, timeout=timeout)
-        return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
+        return _job(self._p.parse_or_raise(resp, (200,)))
 
     def get_job_events(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> Iterator[RawEvent]:
         """GET /api/v2/jobs/{id}/events — raw live SSE iterator (escape hatch).
@@ -1247,7 +1356,7 @@ class ComfyLow:
         """POST /api/v2/jobs/{id}/cancel — idempotent."""
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/cancel"
         resp = self.raw_request("POST", path, timeout=timeout)
-        return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
+        return _job(self._p.parse_or_raise(resp, (200,)))
 
     def get_job_workflow(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> JobWorkflowResponse:
         """GET /api/v2/jobs/{id}/workflow — the workflow graph behind a job."""
@@ -1708,29 +1817,40 @@ class AsyncComfyLow:
         *,
         idempotency_key: str | None = None,
         extra_data: dict[str, Any] | None = None,
+        metadata: Mapping[str, str] | None = None,
         timeout: Any = _UNSET,
     ) -> Job:
-        """POST /api/v2/jobs — see the sync ``post_jobs`` for ``extra_data``."""
+        """POST /api/v2/jobs — see the sync ``post_jobs`` for ``extra_data`` and ``metadata``."""
         headers: dict[str, str] = {}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        body: dict[str, Any] = {"workflow": workflow}
-        if extra_data:
-            body["extra_data"] = extra_data
         resp = await self.raw_request(
             "POST",
             "/jobs",
             headers=headers,
-            json=body,
+            json=_jobs_body(workflow, extra_data, metadata),
             timeout=timeout,
         )
         data = self._p.parse_or_raise(resp, (201,))
-        return Job.model_validate(data)
+        return _job(data)
+
+    async def list_jobs(
+        self,
+        *,
+        metadata: Mapping[str, str] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        timeout: Any = _UNSET,
+    ) -> dict[str, Any]:
+        """GET /api/v2/jobs — see the sync ``list_jobs``."""
+        path = _jobs_list_path(metadata=metadata, limit=limit, cursor=cursor)
+        resp = await self.raw_request("GET", path, timeout=timeout)
+        return self._p.parse_or_raise(resp, (200,))
 
     async def get_job(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> Job:
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}"
         resp = await self.raw_request("GET", path, timeout=timeout)
-        return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
+        return _job(self._p.parse_or_raise(resp, (200,)))
 
     async def get_job_events(
         self, job_id_or_url: str, *, timeout: Any = _UNSET
@@ -1752,7 +1872,7 @@ class AsyncComfyLow:
     async def cancel_job(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> Job:
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/cancel"
         resp = await self.raw_request("POST", path, timeout=timeout)
-        return Job.model_validate(self._p.parse_or_raise(resp, (200,)))
+        return _job(self._p.parse_or_raise(resp, (200,)))
 
     async def get_job_workflow(
         self, job_id_or_url: str, *, timeout: Any = _UNSET

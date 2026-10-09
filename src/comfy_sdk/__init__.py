@@ -68,7 +68,7 @@ from .exceptions import (
     Unauthorized,
     WorkflowFormatUi,
 )
-from .jobs import AsyncJob, Job, JobWorkflow
+from .jobs import AsyncJob, Job, JobSummary, JobWorkflow
 from .model_requests import COMPLETED, AsyncRequestHandle, QueueUpdate, RequestHandle
 from .models import BinaryResult
 from .outputs import AsyncOutput, DownloadUrl, Output
@@ -112,6 +112,7 @@ __all__ = [
     "WorkflowFactory",
     "Job",
     "AsyncJob",
+    "JobSummary",
     "JobWorkflow",
     # queued model requests
     "RequestHandle",

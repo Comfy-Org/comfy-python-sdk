@@ -325,6 +325,86 @@ controls — jobs submitted through this SDK always get `"api"` today, since v2
 submission has no version-pinning fields yet. (`AsyncJob.get_workflow()`
 mirrors this with `await`.)
 
+## Labelling jobs with metadata
+
+Pass `metadata` to `submit()` to store string labels on a job, then find those
+jobs again with `list_jobs()`:
+
+```python
+job = client.submit(wf, metadata={"client": "acme", "batch": "2026-10-05"})
+job.metadata                     # {"client": "acme", "batch": "2026-10-05"}
+
+for summary in client.list_jobs(metadata={"client": "acme"}):
+    print(summary.id, summary.status, summary.metadata)
+```
+
+Labels work on jobs sent to a deployment: point the client at the deployment's
+address with `COMFY_BASE_URL`. There, `list_jobs()` lists that deployment's
+jobs. To list every job in your workspace, across its deployments, set
+`COMFY_BASE_URL` to the workspace address, `https://platformapi.comfy.org`; that
+address serves the job list only, so submit through the deployment's address.
+Elsewhere:
+
+- **A deployment whose gateway predates job labels** accepts `metadata` on
+  `submit()` but does not keep it, and ignores the `list_jobs()` filters, so a
+  filtered `list_jobs()` yields nothing there (the SDK's own filter check, below,
+  drops every job).
+- **Comfy Cloud** refuses labels for now: `submit()` raises a `ComfyError` whose
+  `code` is `"metadata_not_supported"`, and `list_jobs()` raises a `ComfyError`
+  whose `code` is `"not_implemented"` (HTTP 501).
+- **The public demo deployment**, which takes no credential, keeps no labels: a
+  labelled `submit()` raises a `ComfyError` whose `code` is
+  `"metadata_not_supported"` (HTTP 422), and `list_jobs()` raises a `ComfyError`
+  whose `code` is `"public_deployment_no_list"` (HTTP 403, not `Forbidden`).
+- **A self-hosted `comfy-api-proxy`** does not keep labels. Its own job
+  `metadata` is a single string, so it refuses a label map on `submit()` with a
+  `ComfyError` whose `code` is `"invalid_request"`. The SDK reads the proxy's
+  string `metadata` as no labels (`{}`), so a filtered `list_jobs()` yields
+  nothing there, and an unfiltered one yields the proxy's newest jobs (50 by
+  default, up to 100 with `limit`), each with `metadata` `{}`, and stops there
+  since the proxy sends one page and no next cursor. A `limit` over 100 is
+  refused with HTTP 400, a `ComfyError` whose `code` is `"invalid_request"`. Its list items carry `created_at` rather than `create_time`, so
+  `create_time` reads as `None` there (the raw value stays in `data`).
+
+Labels are fixed when the job is submitted. `job.metadata` is an empty dict for a
+job with none. A `metadata` that is not a map of strings reads as `{}`, and a
+value that is not a string is dropped, rather than raising.
+
+`list_jobs()` returns the newest jobs first and keeps only the ones whose labels
+include every key you pass, with exactly that value. It fetches page after page
+until there are no more; on a host that pages, `limit=` sets the page size, not
+a cap on the total (the self-hosted proxy above sends a single page).
+Each item is a `JobSummary` (`id`, `status`, `create_time`, `update_time`,
+`deployment_id`, `metadata`, and `data`, the item as the server sent it); call
+`client.jobs.get(summary.id)` for the full job and its outputs. On `AsyncComfy`, iterate with
+`async for summary in client.list_jobs(...)`. A page answered 429 with
+`Retry-After` is fetched again after that wait (at least one second), the same
+way `submit()` retries.
+
+`list_jobs()` also checks the filters itself: an item whose labels do not include
+every pair you passed is skipped, even if the server sent it. Keys and values are
+compared as the text the query sends, so `metadata={"run": 7}` matches the label
+`"7"`.
+So on a host that ignores the filters, a filtered `list_jobs()` yields only real
+matches. On such a host that pages (a gateway without label support, for
+example), one step of the iteration can read several pages, or every page,
+before it yields or ends.
+
+The server sets the limits on labels and filters, and the SDK does not check
+them first. A map it refuses raises `ComfyError` with `code ==
+"metadata_invalid"` (HTTP 422) and the server's message: it names the key when
+one key or value breaks a rule (a key is 1 to 40 characters from
+`A-Z a-z 0-9 _ - .`; a value is a string of at most 256 bytes in UTF-8 with no
+control or bidirectional formatting characters: U+0000 to U+001F, tab and newline
+included, U+007F to U+009F, and the bidirectional embeddings, overrides and
+isolates U+202A to U+202E and U+2066 to U+2069), and gives the count when there
+are more than 16 pairs. A filter it refuses (more than 3 of them, for example, or a
+value holding one of those characters) raises
+`ComfyError` with `code == "invalid_metadata_filter"`, and a page cursor it did
+not issue raises `ComfyError` with `code == "invalid_cursor"`. A job's
+`deployment_id` names the deployment copy that ran it, so after a deployment
+update it can differ from the deployment's current id.
+
 ## Downloading outputs
 
 A finished job exposes its results as `Output` handles — `job.outputs`, or
@@ -830,8 +910,10 @@ many times the default 60-second budget on its own, leaving no room for the
 retry you just asked for. `collect_max_elapsed` does not help here — that budget
 is the collect class's alone.
 
-`retry` governs `client.models` only. `submit()`/`run()` on the client keep
-their own 429 handling, which follows the server's `Retry-After`.
+`retry` governs `client.models` only. `submit()`/`run()` and `list_jobs()` on
+the client keep their own 429 handling, which follows the server's
+`Retry-After` but waits at least one second, so `Retry-After: 0` cannot drive a
+tight retry loop.
 
 ### Collecting a generation after a lost response
 
