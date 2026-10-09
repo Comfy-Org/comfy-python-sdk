@@ -168,3 +168,32 @@ async def test_async_events_raise_typed_error_on_terminal_error_frame(
     assert server.state.job_poll_count == poll_before
     assert excinfo.value.code == code
     assert str(excinfo.value) == "Stream ended"
+
+
+# An `error` frame whose code is not one of the documented terminal ones is not
+# known to end the job's stream for good, so it is left to the poll backstop:
+# the job finishing on that poll ends the iteration normally, with no raise.
+
+
+def test_events_unknown_error_frame_falls_back_to_poll(server) -> None:
+    server.state.sse_error_frame_code = "stream_draining"
+    server.state.polls_to_succeed = 1
+    with Comfy() as client:
+        job = client.submit(_wf(client))
+        seen = list(job.events())
+
+    assert seen[0] == StatusChange(status="running")
+    assert seen[-1] == StatusChange(status="succeeded")
+    assert server.state.job_poll_count >= 1
+
+
+async def test_async_events_unknown_error_frame_falls_back_to_poll(server) -> None:
+    server.state.sse_error_frame_code = "stream_draining"
+    server.state.polls_to_succeed = 1
+    async with AsyncComfy() as client:
+        job = await client.submit(_wf(client))
+        seen = [ev async for ev in job.events()]
+
+    assert seen[0] == StatusChange(status="running")
+    assert seen[-1] == StatusChange(status="succeeded")
+    assert server.state.job_poll_count >= 1

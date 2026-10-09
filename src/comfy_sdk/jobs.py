@@ -263,7 +263,9 @@ class Job:
         the matching SDK exception (:class:`~comfy_sdk.exceptions.Unauthorized`
         with ``code == "credential_expired"``,
         :class:`~comfy_sdk.exceptions.Forbidden`, or
-        :class:`~comfy_sdk.exceptions.NotFound`) instead of reconnecting.
+        :class:`~comfy_sdk.exceptions.NotFound`) instead of reconnecting. An
+        ``error`` frame with any other code, or no readable one, is treated as
+        the stream ending early: the polling fallback above takes over.
         """
         events_url = self._model.urls.events or self._model.id
         while True:
@@ -273,8 +275,12 @@ class Job:
                     if raw.event == "error":
                         # Terminal frame: the server is ending the stream for a
                         # reason other than the job finishing. No status follows
-                        # it — surface it, never reconnect.
-                        raise sse_error_from_frame(raw.data)
+                        # it — surface it, never reconnect. A code it does not
+                        # know is left to the poll-and-reconnect path below.
+                        frame_error = sse_error_from_frame(raw.data)
+                        if frame_error is not None:
+                            raise frame_error
+                        continue
                     ev = event_from_raw(raw, self._bind_output)
                     if ev is None:
                         continue
@@ -384,8 +390,9 @@ class AsyncJob:
     async def events(self) -> AsyncIterator[Event]:
         """Async :meth:`Job.events` — typed live stream, auto-reconnecting with
         no replay and the poll path as its backstop. A 501 ends it silently; a
-        terminal ``error`` frame raises the matching SDK exception instead of
-        reconnecting.
+        terminal ``error`` frame with a known code raises the matching SDK
+        exception instead of reconnecting, and any other one falls back to the
+        poll path.
         """
         import asyncio
 
@@ -397,8 +404,12 @@ class AsyncJob:
                     if raw.event == "error":
                         # Terminal frame: the server is ending the stream for a
                         # reason other than the job finishing. No status follows
-                        # it — surface it, never reconnect.
-                        raise sse_error_from_frame(raw.data)
+                        # it — surface it, never reconnect. A code it does not
+                        # know is left to the poll-and-reconnect path below.
+                        frame_error = sse_error_from_frame(raw.data)
+                        if frame_error is not None:
+                            raise frame_error
+                        continue
                     ev = event_from_raw(raw, self._bind_output)
                     if ev is None:
                         continue

@@ -850,31 +850,38 @@ def test_a_hostile_message_does_not_disturb_the_code_fields() -> None:
 )
 def test_sse_error_frame_maps_known_codes(code: str, cls: type, status: int) -> None:
     err = sse_error_from_frame({"error": {"code": code, "message": "Stream ended"}})
+    assert err is not None
     assert type(err) is cls
     assert err.http_status == status
     assert err.code == code  # verbatim, never normalised to the class default
     assert err.message == "Stream ended"
 
 
-def test_sse_error_frame_unknown_code_is_plain_apierror() -> None:
-    err = sse_error_from_frame({"error": {"code": "stream_quota", "message": "bye"}})
-    assert type(err) is ApiError
-    assert err.code == "stream_quota"
-    assert err.http_status == 0
-    assert isinstance(to_sdk_error(err), ComfyError)
-
-
-@pytest.mark.parametrize("data", [{}, {"error": "nope"}, {"error": {"code": 7}}])
-def test_sse_error_frame_without_a_usable_envelope_still_builds(data: dict) -> None:
-    # Raised while handling a stream that is already ending: a malformed frame
-    # must still produce an exception, not a TypeError from reading it.
-    err = sse_error_from_frame(data)
-    assert type(err) is ApiError
-    assert err.http_status == 0
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"error": {"code": "stream_draining", "message": "bye"}},
+        # Generic codes are not frame codes: a reconnect gets the real response.
+        {"error": {"code": "unauthorized", "message": "bye"}},
+        {"error": {"code": "not_found", "message": "bye"}},
+        {},
+        {"error": "nope"},
+        {"error": {"code": 7}},
+        {"raw": "not json"},
+    ],
+)
+def test_sse_error_frame_without_a_known_code_builds_nothing(data: dict) -> None:
+    # Not known to end the job's stream for good, so the caller falls back to
+    # its poll-and-reconnect path instead of raising an untyped `HTTP 0`.
+    assert sse_error_from_frame(data) is None
 
 
 def test_credential_expired_translates_to_sdk_unauthorized() -> None:
-    err = to_sdk_error(sse_error_from_frame({"error": {"code": "credential_expired"}}))
+    frame_error = sse_error_from_frame({"error": {"code": "credential_expired"}})
+    assert frame_error is not None
+    err = to_sdk_error(frame_error)
     assert isinstance(err, SdkUnauthorized)
     assert err.code == "credential_expired"
     assert err.http_status == 401
+    # `error_type` stays inside the closed Router set; the alias is on `.code`.
+    assert err.error_type == "unauthorized"

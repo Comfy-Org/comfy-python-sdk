@@ -309,7 +309,8 @@ stops streaming for a reason other than the job finishing, it sends a terminal
 `error` event, and `events()` raises it rather than reconnecting —
 `Unauthorized` (with `code == "credential_expired"`) when the credential
 expired mid-stream, `Forbidden` when access was withdrawn, `NotFound` when the
-job is gone.
+job is gone. An `error` event carrying any other code is treated like a dropped
+stream: `events()` polls the job and reconnects.
 
 ## Getting a job's workflow back
 
