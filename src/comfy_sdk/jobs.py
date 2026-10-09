@@ -12,19 +12,21 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 import httpx
+from pydantic import TypeAdapter, ValidationError
 
 from comfy_low.errors import ApiError
 from comfy_low.models import Job as LowJob
 from comfy_low.models import Output as LowOutput
-from comfy_low.transport import AsyncComfyLow, ComfyLow
+from comfy_low.transport import AsyncComfyLow, ComfyLow, job_labels
 
 from . import _core
 from .events import Event, StatusChange, event_from_raw
-from .exceptions import JobFailed, to_sdk_error, translating
+from .exceptions import ComfyError, JobFailed, to_sdk_error, translating
 from .outputs import AsyncOutput, Output
 
 _RECONNECT_PAUSE = 0.1
@@ -46,6 +48,102 @@ class JobWorkflow:
 
     graph: dict[str, Any]
     format: Literal["save", "api"]
+
+
+def _metadata_of(model: LowJob) -> dict[str, str]:
+    # `getattr` because the generated `Job` does not declare the field until the
+    # spec sync lands; the transport validates into a subclass that does.
+    # `job_labels` returns a new dict, so the caller gets a copy.
+    return job_labels(getattr(model, "metadata", None))
+
+
+_TIME = TypeAdapter(datetime)
+
+
+def _parse_time(raw: Any) -> datetime | None:
+    # pydantic rather than `datetime.fromisoformat`, which on 3.10 reads
+    # neither a trailing `Z` nor nanosecond fractions. An unreadable value is
+    # `None` rather than an error: the raw string is still on `JobSummary.data`.
+    if not isinstance(raw, str):
+        return None
+    try:
+        return _TIME.validate_python(raw)
+    except ValidationError:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class JobSummary:
+    """One job as :meth:`comfy_sdk.Comfy.list_jobs` yields it.
+
+    A list item is a lighter shape than a full job (no outputs, no follow-up
+    links), so this is not a :class:`Job` handle. Call
+    ``client.jobs.get(summary.id)`` for the full job and its outputs.
+    """
+
+    id: str
+    status: str
+    create_time: datetime | None
+    """When the job was created; ``None`` when the item has no readable time."""
+
+    update_time: datetime | None
+    """When the job last changed; ``None`` when the item has no readable time."""
+
+    deployment_id: str | None
+    """The id of the deployment copy that ran the job, or ``None`` when the item has none.
+
+    A deployment update makes a new copy, so for a job that ran before the
+    update this can differ from the deployment's current id.
+    """
+
+    metadata: dict[str, str]
+    """The job's labels, or an empty dict when it has none.
+
+    Read leniently: a ``metadata`` that is not an object (a self-hosted proxy
+    sends its own as a string) reads as ``{}``, and a non-string value is
+    dropped. ``data`` keeps what the server sent.
+    """
+
+    data: dict[str, Any] = field(repr=False)
+    """The list item exactly as the server sent it, for fields not lifted above.
+
+    Left out of the printout (``repr``), which shows the fields above, so
+    printing or logging a summary does not write the whole item (which can
+    hold the workflow and node logs) into the caller's logs.
+    """
+
+    def __hash__(self) -> int:
+        # The generated hash would cover the two dicts and raise; the id alone
+        # identifies a job.
+        return hash(self.id)
+
+    @classmethod
+    def _from_item(cls, item: Any) -> JobSummary:
+        # Raised rather than skipped: skipping would hide a job from the caller.
+        if not isinstance(item, dict):
+            raise ComfyError("job list item is not a JSON object", code="invalid_response")
+        missing = [name for name in ("id", "status") if item.get(name) is None]
+        if missing:
+            raise ComfyError(
+                f"job list item is missing {' and '.join(missing)}", code="invalid_response"
+            )
+        deployment_id = item.get("deployment_id")
+        wrong = [name for name in ("id", "status") if not isinstance(item[name], str)]
+        if deployment_id is not None and not isinstance(deployment_id, str):
+            wrong.append("deployment_id")
+        if wrong:
+            raise ComfyError(
+                f"job list item has a non-string {' and '.join(wrong)}", code="invalid_response"
+            )
+        return cls(
+            id=item["id"],
+            status=item["status"],
+            create_time=_parse_time(item.get("create_time")),
+            update_time=_parse_time(item.get("update_time")),
+            deployment_id=deployment_id,
+            metadata=job_labels(item.get("metadata")),
+            data=item,
+        )
 
 
 class Job:
@@ -71,6 +169,17 @@ class Job:
     @property
     def error(self) -> Any:
         return self._model.error
+
+    @property
+    def metadata(self) -> dict[str, str]:
+        """The string labels given at submit, or an empty dict when there are none.
+
+        Fixed when the job is submitted; nothing changes them later. A copy, so
+        editing it does not change this handle. A ``metadata`` that is not a map
+        of strings (a self-hosted proxy sends its own as a string) reads as
+        ``{}``, and a non-string value is dropped, rather than raising.
+        """
+        return _metadata_of(self._model)
 
     def get_outputs(self, node_id: str) -> list[Output]:
         """The outputs produced by one node, in server order.
@@ -204,6 +313,11 @@ class AsyncJob:
     @property
     def error(self) -> Any:
         return self._model.error
+
+    @property
+    def metadata(self) -> dict[str, str]:
+        """:attr:`Job.metadata` — the labels given at submit, ``{}`` when none."""
+        return _metadata_of(self._model)
 
     def get_outputs(self, node_id: str) -> list[AsyncOutput]:
         """:meth:`Job.get_outputs`, bound to async outputs. Not a coroutine —

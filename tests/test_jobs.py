@@ -129,27 +129,26 @@ def test_submit_negative_retry_after_does_not_crash(server, monkeypatch) -> None
     # comfy_low's header parsing is a bare `int(raw)`, so "-5" parses to -5
     # rather than None. Unclamped, `time.sleep(-5)` raises ValueError — the
     # caller would get a raw ValueError instead of the documented ComfyError
-    # contract. The clamp must floor the delay at 0.
+    # contract. The clamp floors the delay at the one-second minimum.
     sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
     server.state.queue_full_retry_after_header = "-5"
     with Comfy() as client:
         job = client.submit(_wf(client))  # must not raise ValueError
     assert job.id.startswith("job_")
-    assert sleeps == [0.0]
+    assert sleeps == [1.0]
 
 
-def test_submit_retry_after_zero_sleeps_for_zero_not_default(server, monkeypatch) -> None:
-    # Pins the incidental fix from the explicit `is not None` check: the old
-    # `retry_after or _DEFAULT_RETRY_AFTER` treated a literal `Retry-After: 0`
-    # as absent and slept the full default. Without this assertion a
-    # regression back to that pattern only shows up as CI getting slower.
+def test_submit_retry_after_zero_sleeps_the_minimum_not_default(server, monkeypatch) -> None:
+    # A literal `Retry-After: 0` is a pace, not an absent header: it waits the
+    # one-second minimum (so a server answering 0 cannot drive a tight retry
+    # loop), not the longer default an absent header gets.
     sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
     server.state.queue_full_times = 1  # stub sends Retry-After: 0
     with Comfy() as client:
         client.submit(_wf(client))
-    assert sleeps == [0.0]
+    assert sleeps == [1.0]
 
 
 def test_submit_does_not_retry_429_without_retry_after_and_non_queue_full_code(server) -> None:

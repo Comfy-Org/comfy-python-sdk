@@ -12,7 +12,9 @@ restated here:
   ``post.operationId`` is ``runRouterModel``, and the ``servers[0].url`` it is
   addressed against -- compared against
   :data:`comfy_low.transport._MODEL_RUN_PATH_TEMPLATE` and
-  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL`.
+  :data:`comfy_sdk.COMFY_ROUTER_BASE_URL` -- and, the same way, the two
+  discovery routes ``models.list()`` / ``models.schema()`` read, by their
+  ``get.operationId`` (``listRouterModels``, ``getRouterModelInputSchema``).
 
 Neither is generated, so a Router spec sync is the moment they can drift. The
 failures guarded against are a sync landing a new bucket that then reaches
@@ -36,7 +38,12 @@ from typing import Any
 import pytest
 import yaml
 
-from comfy_low.transport import _MODEL_RUN_PATH_TEMPLATE
+from comfy_low.transport import (
+    _MODEL_CATALOG_PATH,
+    _MODEL_RUN_PATH_TEMPLATE,
+    _MODEL_SCHEMA_PATH_TEMPLATE,
+    model_catalog_path,
+)
 from comfy_sdk import COMFY_ROUTER_BASE_URL
 from comfy_sdk.models import _run_result
 from comfy_sdk.router_exceptions import (
@@ -265,6 +272,51 @@ def test_run_path_matches_vendored_spec() -> None:
     )
 
 
+def _declared_get_paths(operation_id: str) -> list[str]:
+    """Every path whose ``get.operationId`` is ``operation_id``, in spec order."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    return [
+        path
+        for path, item in (doc.get("paths") or {}).items()
+        if isinstance(item, dict)
+        and isinstance(item.get("get"), dict)
+        and item["get"].get("operationId") == operation_id
+    ]
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "bound", "constant"),
+    [
+        ("listRouterModels", _MODEL_CATALOG_PATH, "_MODEL_CATALOG_PATH"),
+        ("getRouterModelInputSchema", _MODEL_SCHEMA_PATH_TEMPLATE, "_MODEL_SCHEMA_PATH_TEMPLATE"),
+    ],
+)
+def test_the_discovery_routes_match_the_vendored_spec(
+    operation_id: str, bound: str, constant: str
+) -> None:
+    # `models.list()` / `models.schema()` are hand-bound exactly as the run
+    # route is, so a sync that moves either route has to fail here rather than
+    # ship an SDK that GETs a path the server no longer serves.
+    declared = _declared_get_paths(operation_id)
+    assert declared == [bound], (
+        f"the vendored spec declares {operation_id} at {declared} and the SDK reads "
+        f"{bound!r} -- update comfy_low.transport.{constant}"
+    )
+
+
+def test_the_catalog_query_parameters_are_the_ones_the_spec_declares() -> None:
+    # `model_catalog_path` sends `cursor` and `limit` by name; a sync renaming
+    # either would otherwise be silently ignored by the server.
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    params = doc["paths"][_MODEL_CATALOG_PATH]["get"]["parameters"]
+    shared = doc["components"]["parameters"]
+    names = {
+        shared[p["$ref"].rsplit("/", 1)[-1]]["name"] if "$ref" in p else p["name"] for p in params
+    }
+    assert names == {"cursor", "limit"}
+    assert model_catalog_path("c", 5) == f"{_MODEL_CATALOG_PATH}?cursor=c&limit=5"
+
+
 def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None:
     # `model_run_request` fills `{provider}` and `{model}` by name; a sync that
     # renamed or added a template variable would silently KeyError at call time
@@ -272,6 +324,55 @@ def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None
     assert _MODEL_RUN_PATH_TEMPLATE.count("{") == 2
     assert "{provider}" in _MODEL_RUN_PATH_TEMPLATE
     assert "{model}" in _MODEL_RUN_PATH_TEMPLATE
+
+
+# --- the two media types the run route's 200 can answer under ------------
+
+
+def _run_200_content() -> dict[str, Any]:
+    """The ``content`` map of ``runRouterModel``'s ``200``, read out of the spec."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    item = (doc.get("paths") or {})[_MODEL_RUN_PATH_TEMPLATE]
+    content = item["post"]["responses"]["200"]["content"]
+    assert isinstance(content, dict) and content, "runRouterModel's 200 declares no content"
+    return content
+
+
+def test_the_run_200_declares_both_a_json_and_a_binary_branch() -> None:
+    """The contract behind ``post_model_run`` returning ``dict | BinaryResult``.
+
+    Read out of the spec rather than restated, for the same reason the route is:
+    the day a sync drops the ``*/*`` branch (or adds a third one), the SDK's
+    two-way branch is either dead code or newly incomplete, and nothing else in
+    the suite would notice — the binary tests drive a *stub*, which asserts the
+    SDK's behaviour rather than the server's contract.
+    """
+    content = _run_200_content()
+    assert set(content) == {"application/json", "*/*"}, (
+        f"the vendored spec's runRouterModel 200 declares {sorted(content)}; "
+        "comfy_low.transport._Prepared.parse_run_result branches on exactly two "
+        "cases (JSON -> dict, anything else -> BinaryResult)"
+    )
+
+
+def test_the_binary_branch_is_declared_as_raw_bytes() -> None:
+    # `format: binary` is what says the body is bytes rather than a base64
+    # string or a JSON document — i.e. that `BinaryResult.content` is the
+    # partner's file and needs no decoding on the way out.
+    schema = _run_200_content()["*/*"].get("schema") or {}
+    assert schema.get("type") == "string"
+    assert schema.get("format") == "binary"
+
+
+def test_the_200_promises_the_headers_a_binary_result_is_built_from() -> None:
+    # `BinaryResult.request_id` reads `X-Comfy-Request-Id` off a *success*, and
+    # the SDK takes the partner's `Content-Type` at its word — which is only
+    # safe because the route sends `X-Content-Type-Options: nosniff`.
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    headers = doc["paths"][_MODEL_RUN_PATH_TEMPLATE]["post"]["responses"]["200"]["headers"]
+    assert "X-Comfy-Request-Id" in headers
+    assert "X-Content-Type-Options" in headers
+    assert "Idempotent-Replayed" in headers
 
 
 # --- run_detailed's header lifts, pinned against the contract -----------------
@@ -294,25 +395,7 @@ _CONTRACT_HEADER_LIFTS = {
     "dropped_params": "X-Comfy-Router-Dropped-Params",
     "replayed": "Idempotent-Replayed",
     "request_id": "X-Comfy-Request-Id",
-    # Reconciled out of `_UNDECLARED_HEADER_LIFTS` when the vendored spec sync
-    # declared the name on `runRouterModel`'s 200, which is exactly what the
-    # tripwire at the bottom of this file exists to prompt.
-    "credits_used": "X-Comfy-Credits-Used",
 }
-
-#: Lifted by the SDK but NOT declared on the contract's 200 -- see the tripwire
-#: test at the bottom of this file. Empty today: every lift is pinned above.
-_UNDECLARED_HEADER_LIFTS: dict[str, str] = {}
-
-#: field -> a header value that must survive the lift's own normalisation.
-#: `test_the_lift_actually_reads_the_declared_name` proves a lift reads its
-#: declared name by showing the field changes when the header is present, so
-#: the probe has to be a value the field will actually keep. The default `"x"`
-#: works for the lifts that pass their header through (or merely test it for
-#: presence), but `credits_used` drops anything that is not a finite decimal --
-#: `_credits_used("x")` is `None`, the same as absent -- so probing it with
-#: `"x"` would read as "the lift ignored the header" when the lift is fine.
-_HEADER_PROBE_VALUES = {"credits_used": "1.25"}
 
 
 def _declared_run_response_headers() -> set[str]:
@@ -346,44 +429,29 @@ def test_the_lift_actually_reads_the_declared_name(field: str, header: str) -> N
     is a restatement otherwise, and a restatement would pass the sync it exists
     to fail.
     """
-    probe = _HEADER_PROBE_VALUES.get(field, "x")
     absent = getattr(_run_result({}, {}), field)
-    present = getattr(_run_result({}, {header: probe}), field)
+    present = getattr(_run_result({}, {header: "x"}), field)
     assert present != absent, (
         f"_run_result ignored {header!r}: RouterRunResult.{field} read {absent!r} both with "
-        f"the header and without it, so the lift is reading some other name. (Probed with "
-        f"{probe!r}; if the lift normalises its input, _HEADER_PROBE_VALUES may need an entry "
-        f"that survives it.)"
+        f"the header and without it, so the lift is reading some other name."
     )
 
 
-@pytest.mark.parametrize(("field", "header"), sorted(_UNDECLARED_HEADER_LIFTS.items()))
-def test_an_undeclared_lift_stays_undeclared_until_someone_reconciles_it(
-    field: str, header: str
-) -> None:
-    """Tripwire, and deliberately asserting the *absence*.
+def test_credits_used_header_is_declared_by_the_contract() -> None:
+    """``credits_used`` is pinned to its declared name here, not above.
 
-    ``_UNDECLARED_HEADER_LIFTS`` is empty today, so this parametrises to
-    nothing and skips; it is kept for the next lift added ahead of its
-    contract. Such a lift reads a header name nothing in the suite can check,
-    because every test configures its stub to emit the exact literal the lift
-    reads -- so a wrong name passes everywhere and is only caught against a
-    real deployment, which is how ``replayed`` stayed ``False`` in production.
-
-    That gap is tracked, not accepted. This test fails the moment a spec sync
-    declares the header, which is the signal to move the entry up into
-    ``_CONTRACT_HEADER_LIFTS`` and get it pinned like the rest. It also fails
-    if the header is declared under a *different* name for the same quantity,
-    because the reconciliation is the same either way.
-
-    ``credits_used`` was the last entry to make that trip: it was lifted from
-    ``X-Comfy-Credits-Used`` before the contract named it -- the 200's only
-    cost headers were the ``X-Committed-Spend-*`` trio, a different quantity
-    (USD cents of in-flight commitment, not the price of this run) -- and the
-    sync that declared it tripped this test, which is what moved it up.
+    It shares ``test_every_lifted_header_is_declared_by_the_contract``'s
+    declared-ness check, but not ``test_the_lift_actually_reads_the_declared_name``:
+    that test proves a lift reads a header by checking presence changes the
+    field's value, and does so with the literal ``"x"`` -- which
+    :func:`_credits_used` rejects as not a finite decimal, so it would come
+    back ``None`` whether or not the header were sent. `tests/test_models_run.py`
+    already pins the reads-the-declared-name half of this contract with values
+    that actually parse.
     """
     declared = _declared_run_response_headers()
-    assert header not in declared, (
-        f"the vendored spec now declares {header!r}: move {field!r} from "
-        f"_UNDECLARED_HEADER_LIFTS into _CONTRACT_HEADER_LIFTS so it is pinned."
+    assert "X-Comfy-Credits-Used" in declared, (
+        "RouterRunResult.credits_used is lifted from 'X-Comfy-Credits-Used', which the "
+        f"vendored spec does not declare on runRouterModel's 200. Declared: {sorted(declared)}. "
+        "Either a sync renamed the header or the SDK is reading a name Router never sends."
     )
