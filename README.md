@@ -375,7 +375,7 @@ include every key you pass, with exactly that value. It fetches page after page
 until there are no more; on a host that pages, `limit=` sets the page size, not
 a cap on the total (the self-hosted proxy above sends a single page).
 Each item is a `JobSummary` (`id`, `status`, `create_time`, `update_time`,
-`deployment_id`, `metadata`, and `data`, the item as the server sent it); call
+`deployment_id`, `release_version`, `metadata`, and `data`, the item as the server sent it); call
 `client.jobs.get(summary.id)` for the full job and its outputs. On `AsyncComfy`, iterate with
 `async for summary in client.list_jobs(...)`. A page answered 429 with
 `Retry-After` is fetched again after that wait (at least one second), the same
@@ -402,8 +402,12 @@ are more than 16 pairs. A filter it refuses (more than 3 of them, for example, o
 value holding one of those characters) raises
 `ComfyError` with `code == "invalid_metadata_filter"`, and a page cursor it did
 not issue raises `ComfyError` with `code == "invalid_cursor"`. A job's
-`deployment_id` names the deployment copy that ran it, so after a deployment
-update it can differ from the deployment's current id.
+`deployment_id` names the deployment it was sent to (the id in the address it
+was posted at), which stays the same when the deployment moves to another
+release; the v2 contract does not declare it, so treat it as best-effort.
+`release_version` is the version of the release that ran the job (`None` where
+the server does not report it), which is how to tell which release produced a
+job after the deployment moves on.
 
 ## Downloading outputs
 
