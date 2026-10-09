@@ -139,6 +139,100 @@ class QueueUpdate:
         )
 
 
+#: The two ``source`` values that carry a figure. Anything else -- ``unknown``
+#: or a value added server side after this SDK version -- is read as no figure,
+#: which is the spec's own rule for the field.
+_QUOTED_SOURCES = ("exact", "estimated")
+
+
+@dataclass(frozen=True)
+class CostEstimate:
+    """Router's pre-flight cost quote for one queued request.
+
+    Read from the ``estimate`` object on the queued submit's ``201`` body and
+    exposed as :attr:`RequestHandle.estimate`. It is priced before dispatch
+    from the same rate card the charge is billed against, in US dollars.
+
+    ``source`` is an **open string** and says how much to trust the figure:
+    ``exact`` carries :attr:`amount`; ``estimated`` carries :attr:`min_amount`
+    and :attr:`max_amount` and no :attr:`amount`; ``unknown`` carries neither,
+    and a :attr:`reason`. Any other value is read as ``unknown``
+    (:attr:`is_unknown`), as the spec directs. An absent :attr:`amount` is
+    never "free".
+
+    Money is the server's decimal **string**, kept verbatim and never coerced
+    to a float, so ``"0.04"`` stays exactly ``"0.04"``; the ``*_cents`` and
+    :attr:`credits` fields are the server's numbers for arithmetic.
+
+    It is **not a price lock**: the run is charged at the rates in force when
+    it is rated, not at :attr:`pricing_as_of`.
+    """
+
+    #: ``exact`` | ``estimated`` | ``unknown``, verbatim — and possibly a value
+    #: this SDK version has never heard of. Branch on :attr:`is_exact`,
+    #: :attr:`is_estimated` and :attr:`is_unknown` rather than comparing.
+    source: str
+    #: Always ``USD`` today.
+    currency: str
+    #: The provider leg the quote is for — on a queued submit, the leg that runs.
+    provider: str
+    #: The canonical ``{provider}/{model}`` id the quote is for.
+    model: str
+    #: When the rate card the quote was priced from was fetched (or, when no
+    #: card was read, when the quote was answered), as the server's string.
+    pricing_as_of: str
+    #: Dollars as a decimal string. Present only when ``source`` is ``exact``.
+    amount: str | None = None
+    #: The lower bound in dollars as a decimal string; ``estimated`` only.
+    min_amount: str | None = None
+    #: The upper bound in dollars as a decimal string; ``estimated`` only.
+    max_amount: str | None = None
+    #: :attr:`amount` in US cents, unrounded.
+    amount_cents: float | None = None
+    #: :attr:`min_amount` in US cents, unrounded.
+    min_amount_cents: float | None = None
+    #: :attr:`max_amount` in US cents.
+    max_amount_cents: float | None = None
+    #: :attr:`amount` in Comfy credits, rounded to two decimals.
+    credits: float | None = None
+    #: Why no figure could be given — present only when ``source`` is
+    #: ``unknown``: ``not_quotable``, ``unpriced_model``, ``byok`` or
+    #: ``pricing_unavailable``, and an open string like :attr:`source`.
+    reason: str | None = None
+    #: The decoded ``estimate`` object, unmodified — the escape hatch for a
+    #: field this dataclass does not model yet.
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_exact(self) -> bool:
+        """Whether the quote is a single figure, in :attr:`amount`."""
+        return self.source == "exact"
+
+    @property
+    def is_estimated(self) -> bool:
+        """Whether the quote is a range, in :attr:`min_amount` / :attr:`max_amount`."""
+        return self.source == "estimated"
+
+    @property
+    def is_unknown(self) -> bool:
+        """Whether the quote carries no figure — ``unknown``, or any unrecognised
+        ``source``."""
+        return self.source not in _QUOTED_SOURCES
+
+    def __repr__(self) -> str:
+        amounts = "".join(
+            f", {name}={value!r}"
+            for name, value in (
+                ("amount", self.amount),
+                ("min_amount", self.min_amount),
+                ("max_amount", self.max_amount),
+                ("reason", self.reason),
+            )
+            if value is not None
+        )
+        return f"CostEstimate(source={self.source!r}{amounts})"
+
+
 def _retry_after_seconds(headers: httpx.Headers) -> int | None:
     """``Retry-After`` as a positive whole number of seconds, or ``None``.
 
@@ -247,6 +341,65 @@ def _request_id_of(payload: Any) -> str:
             f"the queue named a request_id that cannot address a route: {exc}",
             code="invalid_response",
         ) from exc
+
+
+def _estimate_of(payload: Any) -> CostEstimate | None:
+    """The cost quote a submit response carries, or ``None``.
+
+    Never raises: by the time this runs the submit has succeeded and the
+    request is queued, so a quote that is absent or malformed is "no quote",
+    not a failure of the call. An optional field of the wrong type is left
+    ``None`` rather than coerced, and a missing or mistyped required field
+    drops the whole quote — a half-read quote is worse than none.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    estimate = payload.get("estimate")
+    if not isinstance(estimate, Mapping):
+        return None
+
+    def text(name: str) -> str | None:
+        value = estimate.get(name)
+        return value if isinstance(value, str) else None
+
+    def number(name: str) -> float | None:
+        value = estimate.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            return float(value)
+        except OverflowError:  # an integer too large for a float is no figure
+            return None
+
+    source = text("source")
+    currency = text("currency")
+    provider = text("provider")
+    model = text("model")
+    pricing_as_of = text("pricing_as_of")
+    if (
+        source is None
+        or currency is None
+        or provider is None
+        or model is None
+        or pricing_as_of is None
+    ):
+        return None
+    return CostEstimate(
+        source=source,
+        currency=currency,
+        provider=provider,
+        model=model,
+        pricing_as_of=pricing_as_of,
+        amount=text("amount"),
+        min_amount=text("min_amount"),
+        max_amount=text("max_amount"),
+        amount_cents=number("amount_cents"),
+        min_amount_cents=number("min_amount_cents"),
+        max_amount_cents=number("max_amount_cents"),
+        credits=number("credits"),
+        reason=text("reason"),
+        raw=dict(estimate),
+    )
 
 
 def _raise_for_completion(payload: Any, *, request_id: str, envelope_only: bool = False) -> None:
@@ -378,6 +531,7 @@ class _RequestHandleBase:
     _model: str
     _request_id: str
     _retry: RetryPolicy
+    _estimate: CostEstimate | None
 
     @property
     def model(self) -> str:
@@ -394,8 +548,29 @@ class _RequestHandleBase:
         """The server-minted id for this request — all a rehydration needs."""
         return self._request_id
 
+    @property
+    def estimate(self) -> CostEstimate | None:
+        """Router's pre-flight cost quote for this request, or ``None``.
+
+        ``None`` means **no quote is available — never "no charge"**. It is
+        ``None`` when the estimate is not enabled for the caller; when the
+        submit was answered by an idempotent replay (``Idempotent-Replayed:
+        true``), because the original quote is not stored — and the SDK's own
+        transport-level retry inside one ``submit`` can be answered by such a
+        replay; and always on a handle rebuilt with ``client.models.handle``.
+
+        Branch on ``is not None``; when a quote is present,
+        :attr:`CostEstimate.source` says how much to trust the figure. It is
+        not a price lock: the run is charged at the rates in force when rated.
+        """
+        return self._estimate
+
     def __repr__(self) -> str:
-        return f"{type(self).__name__}(model={self._model!r}, request_id={self._request_id!r})"
+        estimate = "" if self._estimate is None else f", estimate={self._estimate.source!r}"
+        return (
+            f"{type(self).__name__}(model={self._model!r}, "
+            f"request_id={self._request_id!r}{estimate})"
+        )
 
 
 class RequestHandle(_RequestHandleBase):
@@ -412,11 +587,14 @@ class RequestHandle(_RequestHandleBase):
         model: str,
         request_id: str,
         retry: RetryPolicy = DEFAULT_RETRY,
+        *,
+        estimate: CostEstimate | None = None,
     ) -> None:
         self._low = low
         self._model = model
         self._request_id = request_id
         self._retry = retry
+        self._estimate = estimate
 
     # -- polling (authoritative) ------------------------------------------
     def status(self) -> QueueUpdate:
@@ -616,11 +794,14 @@ class AsyncRequestHandle(_RequestHandleBase):
         model: str,
         request_id: str,
         retry: RetryPolicy = DEFAULT_RETRY,
+        *,
+        estimate: CostEstimate | None = None,
     ) -> None:
         self._low = low
         self._model = model
         self._request_id = request_id
         self._retry = retry
+        self._estimate = estimate
 
     async def status(self) -> QueueUpdate:
         """Awaitable :meth:`RequestHandle.status` — one authoritative poll."""
@@ -718,4 +899,4 @@ class AsyncRequestHandle(_RequestHandleBase):
                 await asyncio.sleep(delay)
 
 
-__all__ = ["COMPLETED", "AsyncRequestHandle", "QueueUpdate", "RequestHandle"]
+__all__ = ["COMPLETED", "AsyncRequestHandle", "CostEstimate", "QueueUpdate", "RequestHandle"]

@@ -35,7 +35,7 @@ from comfy_low.transport import (
 )
 from comfy_sdk import AsyncComfy, BinaryResult, Comfy, QueueUpdate
 from comfy_sdk.exceptions import ComfyError
-from comfy_sdk.model_requests import COMPLETED, AsyncRequestHandle, RequestHandle
+from comfy_sdk.model_requests import COMPLETED, AsyncRequestHandle, CostEstimate, RequestHandle
 from comfy_sdk.retry import NO_RETRY
 from comfy_sdk.router_exceptions import (
     ContentPolicyViolation,
@@ -46,6 +46,16 @@ from comfy_sdk.router_exceptions import (
 
 MODEL = "acme/fast-sdxl"
 ARGS = {"prompt": "a red bicycle"}
+EXACT_ESTIMATE = {
+    "source": "exact",
+    "currency": "USD",
+    "amount": "0.04",
+    "amount_cents": 4.0,
+    "credits": 8.44,
+    "provider": "acme",
+    "model": MODEL,
+    "pricing_as_of": "2026-10-09T00:00:00Z",
+}
 
 
 @pytest.fixture
@@ -84,6 +94,128 @@ def test_submit_posts_to_the_requests_route_under_the_model_id(server, fast_poll
         "acme",
         "fast-sdxl",
     )
+
+
+# --- the submit's cost estimate ---------------------------------------------
+
+
+def _submitted_estimate() -> CostEstimate | None:
+    with _client() as client:
+        return client.models.submit(MODEL, ARGS).estimate
+
+
+def test_an_exact_estimate_is_exposed_on_the_handle(server, fast_poll) -> None:
+    server.state.queue_submit_estimate = EXACT_ESTIMATE
+    with _client() as client:
+        handle = client.models.submit(MODEL, ARGS)
+
+    estimate = handle.estimate
+    assert estimate is not None
+    assert estimate.is_exact and not estimate.is_estimated and not estimate.is_unknown
+    # The spec's decimal string, verbatim — never coerced to a float.
+    assert estimate.amount == "0.04"
+    assert isinstance(estimate.amount, str)
+    assert estimate.amount_cents == 4.0
+    assert estimate.credits == 8.44
+    assert (estimate.currency, estimate.provider, estimate.model) == ("USD", "acme", MODEL)
+    assert estimate.pricing_as_of == "2026-10-09T00:00:00Z"
+    assert estimate.min_amount is None and estimate.reason is None
+    assert estimate.raw == EXACT_ESTIMATE
+    assert "estimate='exact'" in repr(handle)
+    assert repr(estimate) == "CostEstimate(source='exact', amount='0.04')"
+
+
+def test_an_estimated_range_carries_no_amount(server, fast_poll) -> None:
+    server.state.queue_submit_estimate = {
+        **{k: v for k, v in EXACT_ESTIMATE.items() if k not in ("amount", "amount_cents")},
+        "source": "estimated",
+        "min_amount": "0.02",
+        "max_amount": "0.08",
+        "min_amount_cents": 2.0,
+        "max_amount_cents": 8,
+    }
+    estimate = _submitted_estimate()
+
+    assert estimate is not None
+    assert estimate.is_estimated and not estimate.is_exact and not estimate.is_unknown
+    assert estimate.amount is None
+    assert (estimate.min_amount, estimate.max_amount) == ("0.02", "0.08")
+    assert (estimate.min_amount_cents, estimate.max_amount_cents) == (2.0, 8.0)
+
+
+def test_an_unknown_estimate_carries_a_reason_and_no_figure(server, fast_poll) -> None:
+    server.state.queue_submit_estimate = {
+        "source": "unknown",
+        "reason": "not_quotable",
+        "currency": "USD",
+        "provider": "acme",
+        "model": MODEL,
+        "pricing_as_of": "2026-10-09T00:00:00Z",
+    }
+    estimate = _submitted_estimate()
+
+    assert estimate is not None
+    assert estimate.is_unknown and not estimate.is_exact and not estimate.is_estimated
+    assert estimate.reason == "not_quotable"
+    assert estimate.amount is None
+
+
+def test_an_unrecognised_source_reads_as_unknown(server, fast_poll) -> None:
+    # The spec makes `source` an open string: a value added after this SDK
+    # version is read as `unknown`, and kept verbatim.
+    server.state.queue_submit_estimate = {**EXACT_ESTIMATE, "source": "something_new"}
+    estimate = _submitted_estimate()
+
+    assert estimate is not None
+    assert estimate.source == "something_new"
+    assert estimate.is_unknown and not estimate.is_exact
+
+
+def test_no_estimate_on_the_201_is_none(server, fast_poll) -> None:
+    with _client() as client:
+        handle = client.models.submit(MODEL, ARGS)
+    assert handle.estimate is None
+    assert "estimate" not in repr(handle)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "nope",
+        {"source": 5},
+        {**EXACT_ESTIMATE, "pricing_as_of": None},
+        [EXACT_ESTIMATE],
+    ],
+)
+def test_a_malformed_estimate_is_no_quote_and_never_fails_the_submit(
+    server, fast_poll, malformed: Any
+) -> None:
+    server.state.queue_submit_estimate = malformed
+    with _client() as client:
+        handle = client.models.submit(MODEL, ARGS)
+    assert handle.request_id == server.state.queue_request_id
+    assert handle.estimate is None
+
+
+def test_a_mistyped_optional_estimate_field_is_left_none(server, fast_poll) -> None:
+    server.state.queue_submit_estimate = {
+        **EXACT_ESTIMATE,
+        "amount": 0.04,
+        "amount_cents": "4",
+        "credits": True,
+    }
+    estimate = _submitted_estimate()
+
+    assert estimate is not None
+    assert estimate.is_exact
+    assert (estimate.amount, estimate.amount_cents, estimate.credits) == (None, None, None)
+
+
+def test_a_rehydrated_handle_has_no_estimate(server, fast_poll) -> None:
+    server.state.queue_submit_estimate = EXACT_ESTIMATE
+    with _client() as client:
+        rid = client.models.submit(MODEL, ARGS).request_id
+        assert client.models.handle(MODEL, rid).estimate is None
 
 
 def test_every_queue_route_is_addressed_by_both_ids(server, fast_poll) -> None:
@@ -662,6 +794,24 @@ async def test_async_submit_and_get(server, fast_poll) -> None:
         handle = await client.models.submit(MODEL, ARGS)
         assert isinstance(handle, AsyncRequestHandle)
         assert await handle.get() == server.state.queue_result
+
+
+async def test_async_submit_exposes_an_exact_estimate(server, fast_poll) -> None:
+    server.state.queue_submit_estimate = EXACT_ESTIMATE
+    async with AsyncComfy(api_key="comfyui-test-key") as client:
+        handle = await client.models.submit(MODEL, ARGS)
+
+    assert handle.estimate is not None
+    assert handle.estimate.is_exact
+    assert handle.estimate.amount == "0.04"
+    assert handle.estimate.raw == EXACT_ESTIMATE
+
+
+async def test_async_submit_without_an_estimate_is_none(server, fast_poll) -> None:
+    async with AsyncComfy(api_key="comfyui-test-key") as client:
+        handle = await client.models.submit(MODEL, ARGS)
+        assert handle.estimate is None
+        assert (await client.models.handle(MODEL, handle.request_id)).estimate is None
 
 
 async def test_async_get_returns_a_binary_result_too(server, fast_poll) -> None:

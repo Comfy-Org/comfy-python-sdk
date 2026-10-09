@@ -12,6 +12,14 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- The queued submit's cost quote. `RequestHandle.estimate` / `AsyncRequestHandle.estimate`
+  carry Router's pre-flight quote as a `CostEstimate` (`source`, `currency`, `amount` /
+  `min_amount` / `max_amount` as decimal strings, their `*_cents`, `credits`, `provider`,
+  `model`, `pricing_as_of`, `reason`, `raw`, and `is_exact` / `is_estimated` / `is_unknown`)
+  when the submit's `201` included one. `None` means no quote is available, never no charge:
+  the estimate is off for the caller, the submit was answered by an idempotent replay, or the
+  handle was rebuilt with `client.models.handle`. A malformed quote reads as `None` and never
+  fails the submit.
 - Job metadata. `submit(..., metadata={"client": "acme"})` on `Comfy` and `AsyncComfy` stores
   string labels on a job, sent as the `metadata` field of `POST /api/v2/jobs` (omitted when
   not given, so the request is unchanged). `Job.metadata` / `AsyncJob.metadata` read them back
