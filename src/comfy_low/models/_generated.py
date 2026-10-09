@@ -5,48 +5,31 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Any
 
-from pydantic import AnyUrl, AwareDatetime, BaseModel, Field
+from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field
 
 
-class Asset(BaseModel):
+class JobLogs(BaseModel):
     """
-    A user-owned record identified by a server-assigned UUID, backing an immutable blob whose content carries a server-computed blake3 hash. `hash` may be computed lazily: an asset record (and its retrievable bytes) can exist before its hash is filled in.
+    A job's captured execution log — the body of `GET /api/v2/jobs/{id}/logs`. Diagnostics, not a contract on content: this is whatever the workflow's own code and nodes wrote to standard output, in the order they wrote it, so nothing about its shape is stable between runs or between releases of a build. It is **untrusted text** — a workflow chooses what goes in it — and must be rendered as plain text rather than interpreted.
     """
 
-    id: Annotated[str, Field(examples=['9f8a1c0d-2b3e-4f56-8a7b-1c2d3e4f5a6b'])]
-    hash: Annotated[
-        str | None,
+    text: Annotated[str, Field(description='The captured output.')]
+    truncated: Annotated[
+        bool,
         Field(
-            description='`blake3:<hex>`; null while lazily computed.',
-            examples=['blake3:9f8a1c0d...'],
+            description='The BEGINNING of the captured output was discarded — `text` is the TAIL of a longer run. Implementations bound what they capture and store, so a workflow that prints megabytes keeps its last lines, where a failure normally is, instead of being dropped whole. True with an empty `text` means the log was captured and then shed entirely to fit. This describes the stored log, never the response: it does not mean a caller asked for part of one.'
         ),
     ]
-    size_bytes: Annotated[int, Field(examples=[4816293])]
-    content_type: Annotated[str, Field(examples=['image/png'])]
-    file_path: Annotated[str | None, Field(examples=['photo.png'])] = None
-    created_new: Annotated[
-        bool | None,
-        Field(
-            description='On create responses: distinguishes a brand-new blob (true) from a dedup hit against bytes the platform already had (false).'
-        ),
-    ] = None
-    created_at: AwareDatetime
-    url: Annotated[
-        AnyUrl, Field(description='Short-lived content URL (signed, or proxy-served).')
+    captured_at: Annotated[
+        AwareDatetime,
+        Field(description="When the run's output was read back off the worker."),
     ]
-    url_expires_at: AwareDatetime
-    expires_at: Annotated[
-        AwareDatetime | None,
+    complete: Annotated[
+        bool,
         Field(
-            description="Retention deadline for the asset itself (distinct from `url_expires_at`, the signed URL's validity). Null or absent means the asset is non-expiring. On a dedup-hit create response the deadline may be later than now + the requested/default retention: re-referencing content extends its retention, never shortens it."
+            description='No further output will be appended to this log. Always `true` today, because a log is read back off the worker once, when the run ends, so a log that exists is already whole. Sent so that a surface which later captures output while a run is still going can say so, and a client written now against `false` keeps working when it does. `false` does not promise that more output will arrive, only that this snapshot may not be the last one.'
         ),
-    ] = None
-    job_id: Annotated[
-        str | None,
-        Field(
-            description='ID of the job that produced this asset. Absent for uploaded assets, which have no producing job.'
-        ),
-    ] = None
+    ]
 
 
 class Format(Enum):
@@ -78,7 +61,8 @@ class JobWorkflowResponse(BaseModel):
 class JobStatus(Enum):
     """
     Lifecycle: queued → running → succeeded | failed | expired;
-    a cancel request moves running → canceling → canceled.
+    a cancel request, or the deletion of the deployment the job is running
+    on, moves running → canceling → canceled.
     Terminal states: succeeded, canceled, failed, expired.
 
     """
@@ -100,6 +84,12 @@ class JobUrls(BaseModel):
     self: str
     events: str
     cancel: str
+    logs: Annotated[
+        str | None,
+        Field(
+            description='Where to read what this run printed. Present on any surface that captures execution logs, which is why it is the one link here that is optional: absent means this surface captures none, for any job, so a client can stop looking without spending a request on an answer it already has.\nFollow this link rather than building the path from the job id. The two are not interchangeable: a surface may be mounted under a prefix this link already carries and a hand-built path would not, and a surface that does not implement the operation at all answers a routing `404` — indistinguishable, to the client, from the `404` that means the job itself is gone. Present does NOT mean this job has a log, and it is deliberately not a signal about one: a surface that captures logs offers the link on every job, including those it will answer `204` for and those whose log it withholds. Read the log, not the link.'
+        ),
+    ] = None
 
 
 class Progress(BaseModel):
@@ -138,16 +128,14 @@ class OutputType(Enum):
     latent = 'latent'
 
 
-class JobError(BaseModel):
+class JobNodeErrorReason(BaseModel):
     """
-    Execution failure detail, carried in `job.error` (not an HTTP error).
+    One problem found with a node. `type` is the code for it: ComfyUI's (for example `value_not_in_list`, `value_bigger_than_max`, `dependency_cycle`), or one of the gateway's, sent where its submit checks are switched on: `unknown_node_class` (a node class the deployment's build does not contain), `waits_for_browser` (a node the workflow would run whose class waits for a browser tab to answer while the job runs, which a deployment never has), `invalid_node` (the node is not a JSON object), `invalid_inputs` (its `inputs` is present but not an object, refused only where the deployment's ComfyUI would fail such a node anyway, so no workflow that runs today is refused), or `invalid_class_type` (its `class_type` is missing or is not a non-empty string). ComfyUI's `missing_node_type` means the same as `unknown_node_class`, found after dispatch rather than at submit. For either, `message` ends naming the node pack that provides the class where the Comfy node registry knows one. `details` usually starts with the input it is about.
     """
 
-    code: Annotated[str, Field(examples=['node_execution_error'])]
-    message: str
-    node_id: str | None = None
-    class_type: str | None = None
-    traceback: str | None = None
+    type: Annotated[str, Field(examples=['value_not_in_list'])]
+    message: Annotated[str, Field(examples=['Value not in list'])]
+    details: str | None = None
 
 
 class Error(BaseModel):
@@ -156,12 +144,33 @@ class Error(BaseModel):
         str,
         Field(examples=["Node 12 (KSampler): required input 'model' is not connected"]),
     ]
+    organization_id: Annotated[
+        str | None,
+        Field(
+            description="On `sso_required`: the organization whose single sign-on governs this key, the one that holds the account, else the one that holds the key's workspace. It is the `organization` query parameter of Comfy Cloud's single sign-on start; treat it as opaque. Absent when the organization is unknown, and on every other code.",
+            examples=['org_01HXYZEXAMPLE'],
+        ),
+    ] = None
     details: Annotated[
         dict[str, Any] | None,
         Field(
+            description="Machine-readable detail for the code. When it carries `node_errors`, that is keyed by node id and each value is a `JobNodeError`, the same shape as a job's `error.node_errors`, whether the refusal came at submit (for example `unknown_node_class`, a node class the deployment's build does not contain) or from ComfyUI after dispatch. With `unknown_node_class` errors it carries `unknown_node_classes`, the missing classes; with `waits_for_browser` errors, `browser_wait_node_classes`, the classes that wait for a browser. A submit refusal names at most fifty nodes. For `invalid_node`, `invalid_inputs` and `invalid_class_type`, when it found more than fifty, `node_errors_truncated` is true and `malformed_node_count` carries the full count; for `waits_for_browser`, `browser_wait_node_count` does. For `unknown_node_class` it names only nodes whose class is one of the at most ten listed in `unknown_node_classes`; when those nodes number more than fifty, `node_errors_truncated` is true and `unknown_node_count` is how many nodes have a listed class. Nodes whose class is past those ten are neither named nor counted.",
             examples=[
-                {'node_errors': {'12': [{'field': 'model', 'reason': 'missing_input'}]}}
-            ]
+                {
+                    'node_errors': {
+                        '12': {
+                            'class_type': 'SomeCustomNode',
+                            'errors': [
+                                {
+                                    'type': 'unknown_node_class',
+                                    'message': "this deployment's build does not contain the node class SomeCustomNode.",
+                                }
+                            ],
+                        }
+                    },
+                    'unknown_node_classes': ['SomeCustomNode'],
+                }
+            ],
         ),
     ] = None
 
@@ -172,12 +181,26 @@ class ErrorEnvelope(BaseModel):
     `invalid_workflow` (422), `workflow_format_ui` (422),
     `missing_asset` (422), `hash_mismatch` (409), `blob_not_found`
     (404), `idempotency_key_reuse` (422),
-    `queue_full` (429 + Retry-After), `insufficient_credits` (402),
-    `not_found` (404), `unauthorized` (401), `forbidden` (403).
+    `queue_full` (429 + Retry-After), `rate_limited` (429 + Retry-After:
+    the caller is past a request rate limit; retry), `insufficient_credits`
+    (402), `not_found` (404), `unauthorized` (401), `forbidden` (403).
     Deployment-scoped surfaces add: `deployment_not_ready` (429 +
-    Retry-After — the deployment can still reach ready; retry) and
+    Retry-After — the deployment can still reach ready; retry),
+    `deployment_unavailable` (429 + Retry-After: the deployment is ready
+    but its GPU provider is not taking work on it yet; retry),
     `deployment_stopped` (422 — terminal deployment state; a retry
-    cannot succeed without operator action). A 429 is disambiguated
+    cannot succeed without operator action), `invalid_request` (422:
+    a malformed asset upload or asset-from-hash field, or a jobs-list
+    `limit` that is not a positive integer), `content_blocked` (451:
+    content moderation flagged the asset's bytes) and `sso_required` (403:
+    the key is valid, but the account must sign in through its
+    organization's single sign-on, which does not accept this key). Job
+    labels add: `metadata_invalid` (422: a submitted `metadata` breaks a
+    limit; `details.key` names the key, except for too many pairs, which
+    has no `details`), `metadata_not_supported` (422:
+    this surface keeps no job labels yet), `invalid_metadata_filter` (400)
+    and `invalid_cursor` (400). A surface that does not list jobs yet
+    answers `not_implemented` (501). A 429 is disambiguated
     by `error.code` alone; clients should treat any 429 + Retry-After
     as "back off and retry".
 
@@ -246,12 +269,88 @@ class AssetReference(BaseModel):
     info: Info
 
 
+class Asset(BaseModel):
+    """
+    A user-owned record identified by a server-assigned UUID, backing an immutable blob whose content carries a server-computed blake3 hash. `hash` may be computed lazily: an asset record (and its retrievable bytes) can exist before its hash is filled in. On an output, `job_metadata` carries the labels its producing job was submitted with, so code holding only the asset knows which run it came from. It is absent for assets no job produced, for outputs of a job sent without labels, where the serving surface keeps no job labels, and when the labels could not be read: so `job_id` without `job_metadata` does not prove the job had no labels. A create whose file path and bytes match an existing output answers with that output, so its `job_id` and `job_metadata` are the output's.
+    """
+
+    id: Annotated[str, Field(examples=['9f8a1c0d-2b3e-4f56-8a7b-1c2d3e4f5a6b'])]
+    hash: Annotated[
+        str | None,
+        Field(
+            description='`blake3:<hex>`; null while lazily computed.',
+            examples=['blake3:9f8a1c0d...'],
+        ),
+    ]
+    size_bytes: Annotated[int, Field(examples=[4816293])]
+    content_type: Annotated[str, Field(examples=['image/png'])]
+    file_path: Annotated[str | None, Field(examples=['photo.png'])] = None
+    created_new: Annotated[
+        bool | None,
+        Field(
+            description='On create responses: distinguishes a brand-new blob (true) from a dedup hit against bytes the platform already had (false).'
+        ),
+    ] = None
+    created_at: AwareDatetime
+    url: Annotated[
+        AnyUrl, Field(description='Short-lived content URL (signed, or proxy-served).')
+    ]
+    url_expires_at: AwareDatetime
+    expires_at: Annotated[
+        AwareDatetime | None,
+        Field(
+            description="Retention deadline for the asset itself (distinct from `url_expires_at`, the signed URL's validity). Null or absent means the asset is non-expiring. On a dedup-hit create response the deadline may be later than now + the requested/default retention: re-referencing content extends its retention, never shortens it."
+        ),
+    ] = None
+    job_id: Annotated[
+        str | None,
+        Field(
+            description='ID of the job that produced this asset. Absent for assets no job produced, such as a fresh upload.'
+        ),
+    ] = None
+    job_metadata: Annotated[
+        dict[str, str] | None,
+        Field(
+            description='The labels the producing job was submitted with, read through `job_id` on each read. Absent for assets no job produced, for outputs of a job sent without labels, where the serving surface keeps no job labels, when the job is gone, and when the labels could not be read: so `job_id` without `job_metadata` does not prove the job had no labels.'
+        ),
+    ] = None
+
+
+class JobListItem(BaseModel):
+    """
+    A job's stored record. The fields below are stable; an item may carry more, which a client should ignore rather than rely on.
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    id: Annotated[str, Field(examples=['7f3d2c1b-9a8e-4d6f-b012-3c4d5e6f7a8b'])]
+    status: JobStatus
+    create_time: AwareDatetime
+    update_time: AwareDatetime
+    release_version: Annotated[
+        int | None,
+        Field(
+            description='The version of the release that ran the job. Absent where the serving surface does not report it or could not look it up at the time of the answer.',
+            examples=[3],
+            ge=1,
+        ),
+    ] = None
+    metadata: dict[str, str] | None = None
+
+
 class Output(BaseModel):
     """
     A committed job output. Outputs are assets: `id` is the asset UUID, retrievable via GET /api/v2/assets/{id} for as long as the job is retained. `hash` is lazily computed and may be null on the retrieval hot path.
     """
 
-    node_id: Annotated[str, Field(examples=['9'])]
+    node_id: Annotated[
+        str,
+        Field(
+            description='The workflow node that reported this file; empty when the worker named none.',
+            examples=['9'],
+        ),
+    ]
     name: Annotated[str, Field(examples=['ComfyUI_00001_.png'])]
     type: OutputType
     content_type: Annotated[str, Field(examples=['image/png'])]
@@ -266,6 +365,66 @@ class Output(BaseModel):
     url_expires_at: AwareDatetime
     job_id: Annotated[
         str | None, Field(description='ID of the job that produced this output.')
+    ] = None
+
+
+class JobNodeError(BaseModel):
+    """
+    One node that was rejected, and why: by ComfyUI when it refused the workflow after dispatch, or by the gateway when it refused the workflow at submit.
+    """
+
+    class_type: str | None = None
+    errors: list[JobNodeErrorReason]
+
+
+class JobList(BaseModel):
+    """
+    One page of `GET /api/v2/jobs`.
+    """
+
+    jobs: list[JobListItem]
+    next_cursor: Annotated[
+        str | None,
+        Field(
+            description='Pass as `cursor` to read the next page. Absent on the last page.'
+        ),
+    ] = None
+
+
+class JobError(BaseModel):
+    """
+    Execution failure detail, carried in `job.error` (not an HTTP error).
+    """
+
+    code: Annotated[str, Field(examples=['node_execution_error'])]
+    message: Annotated[
+        str,
+        Field(
+            description='Why the job failed, written for a person to read. On a serverless deployment, where ComfyUI refused the workflow, it names the rejected nodes it has room for and their reasons, which `node_errors` carries in full. Its wording may change; read `code` and `node_errors` rather than matching this text.'
+        ),
+    ]
+    node_id: str | None = None
+    class_type: str | None = None
+    traceback: str | None = None
+    node_errors: Annotated[
+        dict[str, JobNodeError] | None,
+        Field(
+            description='Every node ComfyUI rejected when it refused the workflow before running any of it (a value outside its allowed range, a model the deployment does not contain, a graph that loops back on itself), keyed by node id, under the names ComfyUI gave them. Absent when the workflow ran and a node raised: `node_id`, `class_type` and `traceback` describe that failure instead.',
+            examples=[
+                {
+                    '22': {
+                        'class_type': 'LoraLoader',
+                        'errors': [
+                            {
+                                'type': 'value_not_in_list',
+                                'message': 'Value not in list',
+                                'details': "lora_name: 'sdxl\\Hyper-SDXL-8steps-lora.safetensors' not in (list of length 40)",
+                            }
+                        ],
+                    }
+                }
+            ],
+        ),
     ] = None
 
 
@@ -302,3 +461,26 @@ class Job(BaseModel):
         ),
     ] = None
     urls: JobUrls
+    deployment_id: Annotated[
+        str | None,
+        Field(
+            description='The deployment the job was sent to: the id in the address it was posted at, which stays the same when the deployment moves to another release. Absent on a surface that runs jobs on no deployment.',
+            examples=['dep-0f19a2b3c4d5'],
+        ),
+    ] = None
+    release_id: Annotated[
+        str | None,
+        Field(
+            description="The release of the deployment's build that ran the job, which can differ from the release the deployment runs now. Absent where the serving surface does not report it.",
+            examples=['7c1e9a40-3b2d-4f6a-9e81-0c5d2a7b4f13'],
+        ),
+    ] = None
+    release_version: Annotated[
+        int | None,
+        Field(
+            description='The version of the release in `release_id`, the number its build cut it as. Absent where the serving surface does not report it or could not look it up at the time of the answer.',
+            examples=[3],
+            ge=1,
+        ),
+    ] = None
+    metadata: dict[str, str] | None = None
