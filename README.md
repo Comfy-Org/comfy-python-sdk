@@ -1056,8 +1056,11 @@ asset, job, event, and output helpers translate protocol errors, so catches of
   retries 429 responses with `Retry-After` for a bounded budget (including
   deployment warm-up), then raises the translated error if backpressure remains.
 - `RateLimited` — the account's request allowance for a time window is spent
-  (`rate_limited`, HTTP 429); carries `.retry_after` seconds. Unlike `QueueFull`
-  it clears only when the window rolls. Shared with the Router surface, as
+  (`rate_limited`, HTTP 429). `.retry_after` is the seconds to wait when the
+  response sent a delta-seconds `Retry-After`, and `None` otherwise (no header,
+  or an HTTP-date); it is not defaulted to `0` the way `QueueFull`'s is, so
+  check it before sleeping on it. Unlike `QueueFull` it clears only when the
+  window rolls. Shared with the Router surface, as
   `InsufficientCredits` is.
 - `JobFailed` — a job reached a non-`succeeded` terminal state; `.error`
   carries node-level detail when the platform provided one.

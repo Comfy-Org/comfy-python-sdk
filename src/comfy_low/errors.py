@@ -140,10 +140,10 @@ class ApiError(Exception):
         #: neither.
         #:
         #: Kept even when it is the same string as :attr:`code`, because
-        #: ``code`` cannot be read backwards: the three buckets both surfaces
+        #: ``code`` cannot be read backwards: the four buckets both surfaces
         #: spell identically (``unauthorized``, ``forbidden``,
-        #: ``insufficient_credits``) leave ``code`` saying nothing about who
-        #: answered. What it buys is at the ``comfy_sdk`` boundary — a bucket
+        #: ``insufficient_credits``, ``rate_limited``) leave ``code`` saying
+        #: nothing about who answered. What it buys is at the ``comfy_sdk`` boundary — a bucket
         #: Router adds after this SDK version was built has no class to map to,
         #: and this is what lets ``to_sdk_error`` still raise a ``RouterError``
         #: for it rather than a bare ``ComfyError`` that no Router handler
@@ -543,7 +543,7 @@ def error_from_envelope(
     details = (err or {}).get("details") if isinstance(err, dict) else None
 
     # Read whether or not `code` already won: the bucket is how a caller tells
-    # a Router response from a v2 one, and on the three buckets both surfaces
+    # a Router response from a v2 one, and on the four buckets both surfaces
     # spell identically the code string cannot answer that. See
     # `ApiError.error_type`.
     bucket = _clean(error_type) or _clean(
