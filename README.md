@@ -304,6 +304,13 @@ live UI feedback, and `wait()`/`result()`/`run()` for the definitive answer.
 output handles regardless of which node produced them (`job.get_outputs(node_id)`
 filters to one node, as in the quickstart above).
 
+A stream the server *ends* is different from one that drops: when the server
+stops streaming for a reason other than the job finishing, it sends a terminal
+`error` event, and `events()` raises it rather than reconnecting —
+`Unauthorized` (with `code == "credential_expired"`) when the credential
+expired mid-stream, `Forbidden` when access was withdrawn, `NotFound` when the
+job is gone.
+
 ## Getting a job's workflow back
 
 The SDK only holds the workflow it submitted for as long as the originating

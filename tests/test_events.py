@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from comfy_sdk import AsyncComfy, Comfy, OutputReady, Progress, StatusChange
+from comfy_sdk.exceptions import Forbidden, NotFound, Unauthorized
 
 
 def _wf(client: Comfy):
@@ -107,3 +110,61 @@ def test_preview_event_decodes_base64(server) -> None:
     ev = event_from_raw(raw, output_binder=lambda m: m)
     assert ev.data == b"jpeg-bytes"
     assert ev.node_id == "12"
+
+
+# --- the terminal `error` frame ---
+#
+# The server ends the stream with `event: error` and an error envelope when it
+# stops streaming for a reason other than the job finishing. No status frame
+# follows, so the iterator must raise it rather than poll and reconnect — for
+# `job_not_found` while `GET /jobs/{id}` still answers, a reconnect is an
+# unbounded loop.
+_SSE_ERROR_CASES = [
+    ("forbidden", Forbidden),
+    ("job_not_found", NotFound),
+    ("credential_expired", Unauthorized),
+]
+
+
+@pytest.mark.parametrize(("code", "cls"), _SSE_ERROR_CASES)
+def test_events_raise_typed_error_on_terminal_error_frame(server, code: str, cls: type) -> None:
+    server.state.sse_error_frame_code = code
+    server.state.polls_to_succeed = 1000  # a poll would report "running" and reconnect
+    seen: list = []
+    with Comfy() as client:
+        job = client.submit(_wf(client))
+        poll_before = server.state.job_poll_count
+        with pytest.raises(cls) as excinfo:
+            for ev in job.events():
+                seen.append(ev)
+                if len(seen) > 3:  # the pre-fix reconnect loop never ends
+                    break
+
+    assert seen == [StatusChange(status="running")]
+    assert server.state.events_connect_count == 1  # no reconnect
+    assert server.state.job_poll_count == poll_before  # no poll backstop either
+    assert excinfo.value.code == code
+    assert str(excinfo.value) == "Stream ended"
+
+
+@pytest.mark.parametrize(("code", "cls"), _SSE_ERROR_CASES)
+async def test_async_events_raise_typed_error_on_terminal_error_frame(
+    server, code: str, cls: type
+) -> None:
+    server.state.sse_error_frame_code = code
+    server.state.polls_to_succeed = 1000
+    seen: list = []
+    async with AsyncComfy() as client:
+        job = await client.submit(_wf(client))
+        poll_before = server.state.job_poll_count
+        with pytest.raises(cls) as excinfo:
+            async for ev in job.events():
+                seen.append(ev)
+                if len(seen) > 3:  # the pre-fix reconnect loop never ends
+                    break
+
+    assert seen == [StatusChange(status="running")]
+    assert server.state.events_connect_count == 1
+    assert server.state.job_poll_count == poll_before
+    assert excinfo.value.code == code
+    assert str(excinfo.value) == "Stream ended"

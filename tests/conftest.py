@@ -106,6 +106,10 @@ class ServerState:
     stall_seconds: float = 2.0
     # GET /jobs/{id}/events answers 501 not_implemented — a surface without SSE.
     events_not_implemented: bool = False
+    # When set, GET /jobs/{id}/events sends one `running` status frame and then
+    # the terminal `error` frame carrying this code, and closes — the server
+    # ending the stream for a reason other than the job finishing.
+    sse_error_frame_code: str | None = None
     # If set, GET /assets/{id}/content responds 302 to this URL instead of
     # serving bytes directly (simulates a signed-URL redirect to another host).
     redirect_content_to: str | None = None
@@ -770,6 +774,13 @@ def _make_handler(state: ServerState):
                 self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
                 self.wfile.flush()
 
+            if state.sse_error_frame_code is not None:
+                frame("status", {"status": "running"})
+                frame(
+                    "error",
+                    {"error": {"code": state.sse_error_frame_code, "message": "Stream ended"}},
+                )
+                return
             if state.sse_mode == "reconnect" and state.events_connect_count == 1:
                 # First connection: a progress frame, then drop without terminal.
                 frame("progress", {"value": 0.4, "nodes_done": 4, "nodes_total": 10})

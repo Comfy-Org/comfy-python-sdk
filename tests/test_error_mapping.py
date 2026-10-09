@@ -13,11 +13,13 @@ import pytest
 import comfy_low.transport as low_transport
 from comfy_low.errors import (
     ApiError,
+    Forbidden,
     HashMismatch,
     QueueFull,
     Unauthorized,
     clean_body_excerpt,
     error_from_envelope,
+    sse_error_from_frame,
 )
 from comfy_sdk.exceptions import ComfyError, NotFound, to_sdk_error
 from comfy_sdk.exceptions import HashMismatch as SdkHashMismatch
@@ -833,3 +835,46 @@ def test_a_hostile_message_does_not_disturb_the_code_fields() -> None:
     # `_clean`, so a wire token is never whitespace-collapsed or capped.
     err = error_from_envelope(500, {"error": {"code": "  boom  ", "message": HOSTILE}})
     assert err.code == "boom"
+
+
+# --- the events stream's terminal `error` frame ---
+
+
+@pytest.mark.parametrize(
+    ("code", "cls", "status"),
+    [
+        ("credential_expired", Unauthorized, 401),
+        ("forbidden", Forbidden, 403),
+        ("job_not_found", ApiError, 404),
+    ],
+)
+def test_sse_error_frame_maps_known_codes(code: str, cls: type, status: int) -> None:
+    err = sse_error_from_frame({"error": {"code": code, "message": "Stream ended"}})
+    assert type(err) is cls
+    assert err.http_status == status
+    assert err.code == code  # verbatim, never normalised to the class default
+    assert err.message == "Stream ended"
+
+
+def test_sse_error_frame_unknown_code_is_plain_apierror() -> None:
+    err = sse_error_from_frame({"error": {"code": "stream_quota", "message": "bye"}})
+    assert type(err) is ApiError
+    assert err.code == "stream_quota"
+    assert err.http_status == 0
+    assert isinstance(to_sdk_error(err), ComfyError)
+
+
+@pytest.mark.parametrize("data", [{}, {"error": "nope"}, {"error": {"code": 7}}])
+def test_sse_error_frame_without_a_usable_envelope_still_builds(data: dict) -> None:
+    # Raised while handling a stream that is already ending: a malformed frame
+    # must still produce an exception, not a TypeError from reading it.
+    err = sse_error_from_frame(data)
+    assert type(err) is ApiError
+    assert err.http_status == 0
+
+
+def test_credential_expired_translates_to_sdk_unauthorized() -> None:
+    err = to_sdk_error(sse_error_from_frame({"error": {"code": "credential_expired"}}))
+    assert isinstance(err, SdkUnauthorized)
+    assert err.code == "credential_expired"
+    assert err.http_status == 401
