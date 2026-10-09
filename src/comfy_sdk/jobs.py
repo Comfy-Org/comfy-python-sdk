@@ -30,6 +30,11 @@ from .exceptions import ComfyError, JobFailed, to_sdk_error, translating
 from .outputs import AsyncOutput, Output
 
 _RECONNECT_PAUSE = 0.1
+# Cap for the reconnect pause, which doubles from ``_RECONNECT_PAUSE`` while
+# connections keep ending without delivering a frame. ``events()`` has no
+# deadline of its own, so a dropped healthy stream must still notice a terminal
+# status within seconds; the cap matches ``_core.backoff_schedule``'s default.
+_MAX_RECONNECT_PAUSE = 5.0
 
 
 @dataclass(frozen=True)
@@ -259,13 +264,16 @@ class Job:
         poll-authoritative ``wait``/``result``, never a requirement.
         """
         events_url = self._model.urls.events or self._model.id
+        backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
         while True:
             terminal_seen = False
+            delivered = False
             try:
                 for raw in self._low.get_job_events(events_url):
                     ev = event_from_raw(raw, self._bind_output)
                     if ev is None:
                         continue
+                    delivered = True
                     if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
                         terminal_seen = True
                         yield ev
@@ -285,7 +293,11 @@ class Job:
             if _core.is_terminal(self.status):
                 yield StatusChange(status=self.status)
                 return
-            time.sleep(_RECONNECT_PAUSE)
+            if delivered:
+                # A stream that carried frames was healthy: start over at the
+                # short pause rather than inheriting earlier empty connects' backoff.
+                backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
+            time.sleep(next(backoff))
 
     def __repr__(self) -> str:
         return f"Job(id={self.id!r}, status={self.status!r})"
@@ -376,13 +388,16 @@ class AsyncJob:
         import asyncio
 
         events_url = self._model.urls.events or self._model.id
+        backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
         while True:
             terminal_seen = False
+            delivered = False
             try:
                 async for raw in self._low.get_job_events(events_url):
                     ev = event_from_raw(raw, self._bind_output)
                     if ev is None:
                         continue
+                    delivered = True
                     if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
                         terminal_seen = True
                         yield ev
@@ -400,7 +415,11 @@ class AsyncJob:
             if _core.is_terminal(self.status):
                 yield StatusChange(status=self.status)
                 return
-            await asyncio.sleep(_RECONNECT_PAUSE)
+            if delivered:
+                # A stream that carried frames was healthy: start over at the
+                # short pause rather than inheriting earlier empty connects' backoff.
+                backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
+            await asyncio.sleep(next(backoff))
 
     def __repr__(self) -> str:
         return f"AsyncJob(id={self.id!r}, status={self.status!r})"

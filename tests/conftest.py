@@ -101,8 +101,12 @@ class ServerState:
     terminal_status: str = "succeeded"
     # SSE behavior: "reconnect" drops the first stream before terminal;
     # "stall" sends a couple frames then holds the connection open, silent
-    # (a "zombie": no terminal, no close) for `stall_seconds`.
+    # (a "zombie": no terminal, no close) for `stall_seconds`; "drop" answers
+    # every connection 200 and closes it with no frames, except the connection
+    # numbered `sse_progress_on_connect` (if set), which sends one progress
+    # frame and then closes — still without a terminal.
     sse_mode: str = "normal"
+    sse_progress_on_connect: int | None = None
     stall_seconds: float = 2.0
     # GET /jobs/{id}/events answers 501 not_implemented — a surface without SSE.
     events_not_implemented: bool = False
@@ -770,6 +774,10 @@ def _make_handler(state: ServerState):
                 self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
                 self.wfile.flush()
 
+            if state.sse_mode == "drop":
+                if state.events_connect_count == state.sse_progress_on_connect:
+                    frame("progress", {"value": 0.4, "nodes_done": 4, "nodes_total": 10})
+                return
             if state.sse_mode == "reconnect" and state.events_connect_count == 1:
                 # First connection: a progress frame, then drop without terminal.
                 frame("progress", {"value": 0.4, "nodes_done": 4, "nodes_total": 10})

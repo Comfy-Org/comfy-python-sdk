@@ -78,6 +78,15 @@ the fuller account of each version, including verification notes.
 
 ### Fixed
 
+- **`Job.events()` / `AsyncJob.events()` no longer reconnect every 0.1 s against a stream that
+  keeps dropping.** When a connection ended with no terminal frame (a clean close or a dropped
+  connection) and the job was still running, the loop paused a flat 0.1 s before polling and
+  reconnecting again. A server or proxy that answered 200 and closed straight away therefore got
+  about 10 connects and 10 job polls a second for the whole life of the job. The pause now
+  doubles from 0.1 s up to a 5 s cap while connections keep ending empty, and goes back to 0.1 s
+  after any connection that delivered a frame, so a healthy stream that drops now and then still
+  reconnects quickly. The first pause is still 0.1 s. The 429 and 501 handling on the events
+  path is unchanged.
 - **`RouterRunResult.replayed` was always `False` against a real deployment.** It was lifted
   from `X-Comfy-Idempotent-Replayed`; the header Comfy Router actually sends — and the only
   spelling `spec/router-openapi.yaml` declares, on the `200` as on the `400`/`409`/`422` — is

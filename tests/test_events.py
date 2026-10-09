@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+
+import comfy_sdk.jobs as _jobs_module
 from comfy_sdk import AsyncComfy, Comfy, OutputReady, Progress, StatusChange
 
 
@@ -107,3 +112,83 @@ def test_preview_event_decodes_base64(server) -> None:
     ev = event_from_raw(raw, output_binder=lambda m: m)
     assert ev.data == b"jpeg-bytes"
     assert ev.node_id == "12"
+
+
+# -- reconnect backoff on a stream that keeps dropping -----------------------
+
+_DROP_PAUSES = [0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 5.0, 5.0]
+
+
+class _StopLoop(Exception):
+    """Aborts the otherwise endless reconnect loop once enough pauses are seen."""
+
+
+def _recording_sleep(pauses: list[float], limit: int):
+    def fake_sleep(seconds: float) -> None:
+        pauses.append(seconds)
+        if len(pauses) >= limit:
+            raise _StopLoop
+
+    return fake_sleep
+
+
+def _drop_always(server) -> None:
+    # Every connect answers 200 text/event-stream and closes with no frames,
+    # while the poll backstop keeps reporting a non-terminal job.
+    server.state.sse_mode = "drop"
+    server.state.polls_to_succeed = 1000
+
+
+def test_events_reconnect_pause_backs_off_on_empty_drops(server, monkeypatch) -> None:
+    _drop_always(server)
+    pauses: list[float] = []
+    monkeypatch.setattr(_jobs_module.time, "sleep", _recording_sleep(pauses, len(_DROP_PAUSES)))
+    with Comfy() as client:
+        job = client.submit(_wf(client))
+        polls_before = server.state.job_poll_count
+        with pytest.raises(_StopLoop):
+            list(job.events())
+
+    assert pauses == pytest.approx(_DROP_PAUSES)
+    assert server.state.events_connect_count <= len(pauses) + 1
+    assert server.state.job_poll_count - polls_before <= len(pauses) + 1
+
+
+async def test_async_events_reconnect_pause_backs_off_on_empty_drops(server, monkeypatch) -> None:
+    _drop_always(server)
+    pauses: list[float] = []
+    record = _recording_sleep(pauses, len(_DROP_PAUSES))
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        record(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    async with AsyncComfy() as client:
+        job = await client.submit(_wf(client))
+        polls_before = server.state.job_poll_count
+        with pytest.raises(_StopLoop):
+            [e async for e in job.events()]
+
+    assert pauses == pytest.approx(_DROP_PAUSES)
+    assert server.state.events_connect_count <= len(pauses) + 1
+    assert server.state.job_poll_count - polls_before <= len(pauses) + 1
+
+
+def test_events_reconnect_pause_resets_after_a_delivered_frame(server, monkeypatch) -> None:
+    # Three empty drops back the pause off; the 4th connection delivers a
+    # progress frame (no terminal) so the next pause starts over at 0.1.
+    _drop_always(server)
+    server.state.sse_progress_on_connect = 4
+    pauses: list[float] = []
+    monkeypatch.setattr(_jobs_module.time, "sleep", _recording_sleep(pauses, 6))
+    with Comfy() as client:
+        job = client.submit(_wf(client))
+        seen = []
+        with pytest.raises(_StopLoop):
+            for ev in job.events():
+                seen.append(ev)
+
+    assert pauses == pytest.approx([0.1, 0.2, 0.4, 0.1, 0.2, 0.4])
+    assert [type(e) for e in seen] == [Progress]
