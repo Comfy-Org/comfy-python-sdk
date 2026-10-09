@@ -78,6 +78,14 @@ the fuller account of each version, including verification notes.
   as a fresh generation. The prefixed spelling is *not* honoured as an alias, because Router
   does not send it. `tests/test_router_spec_contract.py` now pins every header `run_detailed`
   lifts against the name the vendored contract declares, and pins that the lift reads it.
+- **A model run that hit Router's deadline could surface as a bare client timeout.** `run`'s
+  default read timeout was 600 seconds, the same ten minutes as Router's own deadline, so the
+  client could give up at the instant Router was writing its `504 deadline_exceeded` and lose the
+  request id and `Retry-After` that answer carries. `MODEL_RUN_TIMEOUT.read` is now
+  `comfy_low.transport.ROUTER_DEADLINE` (600 seconds, new) plus a minute; `write` is 120 seconds
+  instead of following the generation wait, `pool` stays generation-scale, and `connect` stays
+  10 seconds. `run_detailed` also reads its response headers case-insensitively, so a plain
+  lowercased mapping no longer reads as every header being absent.
 - **`except RouterError` now catches every Comfy Router refusal.** `insufficient_credits`,
   `unauthorized` and `forbidden` raised a class that was *not* a `RouterError`, so the obvious
   catch-all around a `client.models.*` call caught nothing for them. Those three buckets are now
