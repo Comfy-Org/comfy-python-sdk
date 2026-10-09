@@ -221,6 +221,13 @@ class QueueFull(ApiError):
     code = "queue_full"
 
 
+class RateLimited(ApiError):
+    """The caller's request allowance over a time window is spent; unlike
+    ``queue_full`` (a bounded queue at depth), only the window rolling clears it."""
+
+    code = "rate_limited"
+
+
 class InsufficientCredits(ApiError):
     code = "insufficient_credits"
 
@@ -248,6 +255,7 @@ _BY_CODE: dict[str, type[ApiError]] = {
         BlobNotFound,
         IdempotencyKeyReuse,
         QueueFull,
+        RateLimited,
         InsufficientCredits,
         NotFound,
         Unauthorized,

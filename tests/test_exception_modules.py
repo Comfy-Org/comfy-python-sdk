@@ -202,14 +202,20 @@ def test_the_shared_names_are_the_ones_expected() -> None:
     # all -- one of them emptied, renamed, or no longer importable the way the
     # test reaches it -- the collision check would pass vacuously.
     shared = _exported(sdk_exceptions).keys() & _exported(router).keys()
-    assert {"Unauthorized", "Forbidden", "InsufficientCredits", "RouterError"} <= shared
+    assert {
+        "Unauthorized",
+        "Forbidden",
+        "InsufficientCredits",
+        "RateLimited",
+        "RouterError",
+    } <= shared
 
 
 def test_the_shared_buckets_descend_from_the_router_base() -> None:
     # Stated as its own assertion because identity alone would be satisfied by
     # merging onto the *wrong* side: one class per name that still did not
     # descend from `RouterError` would leave `except RouterError` just as dead.
-    for name in ("Unauthorized", "Forbidden", "InsufficientCredits"):
+    for name in ("Unauthorized", "Forbidden", "InsufficientCredits", "RateLimited"):
         cls = getattr(sdk_exceptions, name)
         assert issubclass(cls, RouterError), name
         assert issubclass(cls, ComfyError), name

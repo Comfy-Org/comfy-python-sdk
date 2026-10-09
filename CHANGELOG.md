@@ -75,6 +75,11 @@ the fuller account of each version, including verification notes.
   not `ConcurrencyLimitExceeded` — the queue parks a submit at the in-flight limit, and this is the
   separate bound on how many may be left waiting. It clears as the caller's own queued requests
   finish. Before this, the bucket arrived as a bare `RouterError`.
+- `RateLimited` is exported from `comfy_sdk` and `comfy_sdk.exceptions` as a fourth bucket shared
+  with the Router surface, beside `Unauthorized`, `Forbidden` and `InsufficientCredits`. It is the
+  same class as `comfy_sdk.router_exceptions.RateLimited`, and a v2 job route's `rate_limited`
+  envelope now maps to it explicitly; it carries `.retry_after`. The low layer gains
+  `comfy_low.errors.RateLimited` (also on `comfy_low`) for the same code.
 
 ### Fixed
 

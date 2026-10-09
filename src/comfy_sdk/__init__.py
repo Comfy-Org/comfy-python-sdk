@@ -64,6 +64,7 @@ from .exceptions import (
     MissingAsset,
     NotFound,
     QueueFull,
+    RateLimited,
     RouterError,
     Unauthorized,
     WorkflowFormatUi,
@@ -145,9 +146,13 @@ __all__ = [
     "MissingApiKey",
     "Unauthorized",
     "Forbidden",
+    "RateLimited",
     # Comfy Router failures. `RouterError` is the base of every one of them and
-    # is lifted here because it is the broad catch a caller writes first; the
-    # per-bucket classes stay in `comfy_sdk.router_exceptions`, which is one
+    # is lifted here because it is the broad catch a caller writes first. The
+    # four buckets both surfaces spell alike (`InsufficientCredits`,
+    # `Unauthorized`, `Forbidden`, `RateLimited`) are lifted above as workflow
+    # errors that are also `RouterError`s; the Router-only per-bucket classes
+    # stay in `comfy_sdk.router_exceptions`, which is one
     # import path for the whole closed set rather than half of it here and half
     # of it there. `AlreadyCompleted` / `CancelRefused` are the cancel route's
     # refusals, which that closed set does not name.
