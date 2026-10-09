@@ -33,7 +33,7 @@ from comfy_low.transport import (
     _MODEL_REQUESTS_PATH_TEMPLATE,
     _MODEL_RUN_PATH_TEMPLATE,
 )
-from comfy_sdk import AsyncComfy, Comfy, QueueUpdate
+from comfy_sdk import AsyncComfy, BinaryResult, Comfy, QueueUpdate
 from comfy_sdk.exceptions import ComfyError
 from comfy_sdk.model_requests import COMPLETED, AsyncRequestHandle, RequestHandle
 from comfy_sdk.retry import NO_RETRY
@@ -186,6 +186,37 @@ def test_get_polls_to_completion_then_collects_the_result(server, fast_poll) -> 
     # Three pending polls plus the completing one; the result is fetched once.
     assert server.state.queue_status_count == 4
     assert server.state.queue_result_count == 1
+
+
+def test_get_returns_a_binary_result_for_a_non_json_completion(server, fast_poll) -> None:
+    # The queued sibling of `test_an_audio_200_returns_the_bytes_verbatim` in
+    # `tests/test_models_run_binary.py`: `getRouterModelRequestResult`'s 200
+    # declares the identical `application/json` / `*/*` branch `runRouterModel`
+    # does, so a model whose partner answers a generation directly as bytes is
+    # not a JSON document on the queued result route either. Before this,
+    # `get_model_request_result` still went through `parse_or_raise`, which
+    # calls `.json()` unconditionally and raised `invalid_response` on exactly
+    # this response -- collecting through the queue, unlike `run`, threw the
+    # generation away.
+    server.state.queue_result_binary_body = b"\xff\xfb\x90\x64" + b"\xde\xad" * 64
+    server.state.queue_result_binary_content_type = "audio/mpeg"
+    with _client() as client:
+        result = client.models.submit(MODEL, ARGS).get()
+
+    assert isinstance(result, BinaryResult)
+    assert result.content == server.state.queue_result_binary_body
+    assert result.content_type == "audio/mpeg"
+
+
+def test_subscribe_returns_a_binary_result_too(server, fast_poll) -> None:
+    server.state.queue_result_binary_body = b"binary generation"
+    server.state.queue_result_binary_content_type = "audio/wav"
+    with _client() as client:
+        result = client.models.subscribe(MODEL, ARGS)
+
+    assert isinstance(result, BinaryResult)
+    assert result.content == b"binary generation"
+    assert result.content_type == "audio/wav"
 
 
 def test_iter_events_yields_the_first_state_every_change_and_the_completion(
@@ -631,6 +662,18 @@ async def test_async_submit_and_get(server, fast_poll) -> None:
         handle = await client.models.submit(MODEL, ARGS)
         assert isinstance(handle, AsyncRequestHandle)
         assert await handle.get() == server.state.queue_result
+
+
+async def test_async_get_returns_a_binary_result_too(server, fast_poll) -> None:
+    server.state.queue_result_binary_body = b"\xff\xfb\x90\x64" + b"\xde\xad" * 64
+    server.state.queue_result_binary_content_type = "audio/mpeg"
+    async with AsyncComfy(api_key="comfyui-test-key") as client:
+        handle = await client.models.submit(MODEL, ARGS)
+        result = await handle.get()
+
+    assert isinstance(result, BinaryResult)
+    assert result.content == server.state.queue_result_binary_body
+    assert result.content_type == "audio/mpeg"
 
 
 async def test_async_iter_events(server, fast_poll) -> None:

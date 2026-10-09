@@ -47,7 +47,7 @@ from typing import Any
 import httpx
 
 from comfy_low.errors import ApiError
-from comfy_low.transport import AsyncComfyLow, ComfyLow, parse_request_id
+from comfy_low.transport import AsyncComfyLow, BinaryResult, ComfyLow, parse_request_id
 
 from . import _core
 from .exceptions import ComfyError, translating
@@ -489,18 +489,19 @@ class RequestHandle(_RequestHandleBase):
             delay = _pace(update, backoff)
             time.sleep(delay if remaining is None else min(delay, remaining))
 
-    def get(self, timeout: float | None = None) -> dict[str, Any]:
+    def get(self, timeout: float | None = None) -> dict[str, Any] | BinaryResult:
         """Wait for the request to complete and return the provider's payload.
 
-        The result is the partner model's own output, decoded from JSON and
-        handed back as-is — the same value ``models.run`` returns for the same
-        model and arguments, under the same ``dict[str, Any]`` annotation. That
-        annotation is the contract: every model Router serves answers with a
-        JSON object. A partner whose native output were an array or a bare
-        value would still be handed back unchanged rather than rejected, since
-        the payload is the partner's and not this SDK's to reshape — but that
-        is robustness against an off-contract payload, not a second supported
-        return type.
+        The result is a ``dict`` for a model whose partner answers JSON and a
+        :class:`~comfy_sdk.BinaryResult` for one whose partner answers a
+        generation directly as bytes — the same ``dict | BinaryResult`` branch
+        ``models.run`` returns for the same model and arguments, since this
+        route's ``200`` declares the identical ``application/json`` / ``*/*``
+        pair. A partner's JSON output that is an array or a bare value rather
+        than an object is still handed back unchanged rather than rejected,
+        since the payload is the partner's and not this SDK's to reshape — but
+        that is robustness against an off-contract payload, not a third
+        supported return type.
 
         Raises the typed router exception
         (:mod:`comfy_sdk.router_exceptions`) when the completion carries an
@@ -517,7 +518,9 @@ class RequestHandle(_RequestHandleBase):
         completion = _last(self.iter_events(timeout=timeout))
         return self._collect(completion, budget=_remaining(deadline))
 
-    def _collect(self, completion: QueueUpdate, *, budget: float | None = None) -> dict[str, Any]:
+    def _collect(
+        self, completion: QueueUpdate, *, budget: float | None = None
+    ) -> dict[str, Any] | BinaryResult:
         """Turn an observed completion into a result, or into the typed error.
 
         Split out of :meth:`get` so ``models.subscribe`` — which has already
@@ -536,7 +539,8 @@ class RequestHandle(_RequestHandleBase):
             )
         # Checked again on the result body: which of the two responses carries
         # the `error_type` is the server's choice, and reading only one of them
-        # is how a failure gets returned as a result.
+        # is how a failure gets returned as a result. A `BinaryResult` is not a
+        # `Mapping` and so never carries one -- it is bytes, not an envelope.
         _raise_for_completion(payload, request_id=self._request_id, envelope_only=True)
         return payload
 
@@ -576,11 +580,11 @@ class RequestHandle(_RequestHandleBase):
 
     def _call(
         self,
-        send: Callable[[], tuple[dict[str, Any], httpx.Headers]],
+        send: Callable[[], tuple[dict[str, Any] | BinaryResult, httpx.Headers]],
         *,
         budget: float | None = None,
         policy: RetryPolicy | None = None,
-    ) -> tuple[dict[str, Any], httpx.Headers]:
+    ) -> tuple[dict[str, Any] | BinaryResult, httpx.Headers]:
         """Run one queue call under the client's retry policy.
 
         The same ``Retrier`` ``models.run`` uses, constructed per call because
@@ -654,7 +658,7 @@ class AsyncRequestHandle(_RequestHandleBase):
             delay = _pace(update, backoff)
             await asyncio.sleep(delay if remaining is None else min(delay, remaining))
 
-    async def get(self, timeout: float | None = None) -> dict[str, Any]:
+    async def get(self, timeout: float | None = None) -> dict[str, Any] | BinaryResult:
         """Async :meth:`RequestHandle.get` — wait, then collect or raise."""
         deadline = None if timeout is None else _now() + timeout
         completion: QueueUpdate | None = None
@@ -664,7 +668,7 @@ class AsyncRequestHandle(_RequestHandleBase):
 
     async def _collect(
         self, completion: QueueUpdate, *, budget: float | None = None
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | BinaryResult:
         """Async :meth:`RequestHandle._collect`."""
         _raise_for_completion(completion.raw, request_id=self._request_id)
         with translating():
@@ -697,11 +701,11 @@ class AsyncRequestHandle(_RequestHandleBase):
 
     async def _call(
         self,
-        send: Callable[[], Awaitable[tuple[dict[str, Any], httpx.Headers]]],
+        send: Callable[[], Awaitable[tuple[dict[str, Any] | BinaryResult, httpx.Headers]]],
         *,
         budget: float | None = None,
         policy: RetryPolicy | None = None,
-    ) -> tuple[dict[str, Any], httpx.Headers]:
+    ) -> tuple[dict[str, Any] | BinaryResult, httpx.Headers]:
         """Async :meth:`RequestHandle._call` — one queue call under the retry policy."""
         retrier = Retrier(_bounded(policy or self._retry, budget), now=_now)
         while True:
