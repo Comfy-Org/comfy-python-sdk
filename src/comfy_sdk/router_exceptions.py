@@ -462,10 +462,18 @@ class NotEnabled(RouterError):
     is *not* the same thing, because ``forbidden`` is an entitlement decision
     about the caller while this is a state of the rollout. It is **terminal**:
     do not retry, and do not treat it as an outage.
+
+    The one exception to "about the caller" is the queued submit
+    (:meth:`~comfy_sdk.models.Models.submit`), which also answers
+    ``not_enabled`` for a *model* whose partner answers a generation directly
+    as bytes: that model cannot yet be queued, so it is the model and not the
+    caller that is refused, nothing is queued or charged, and the synchronous
+    route (:meth:`~comfy_sdk.models.Models.run`) runs it instead. On a submit,
+    read ``detail`` before concluding the account is not switched on.
     """
 
     error_type = "not_enabled"
-    _spec_meaning_digest: str = "c4a48688282c"
+    _spec_meaning_digest: str = "571a30cc6ba0"
 
 
 class ServiceUnavailable(RouterError):
@@ -577,6 +585,23 @@ class RequestNotFound(RouterError):
     _spec_meaning_digest: str = "385112b3cdcf"
 
 
+class QueueBacklogFull(RouterError):
+    """The caller already has too many queued requests waiting to run, so this
+    submit was refused.
+
+    It shares ``429`` with :class:`ConcurrencyLimitExceeded` and is not the same
+    thing: that one is the synchronous route's answer for too many calls in
+    flight at once, whereas the queue accepts a submit at that limit and parks
+    it, and this bucket is the separate bound on how many a caller may leave
+    waiting -- so that parking cannot mean enqueuing without end. It clears as
+    the caller's own queued requests finish, so retry once some of them
+    complete.
+    """
+
+    error_type = "queue_backlog_full"
+    _spec_meaning_digest: str = "50745ff63044"
+
+
 # -- cancel refusals ---------------------------------------------------------
 #
 # Deliberately OUTSIDE the closed set below, and carrying no
@@ -668,6 +693,7 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     Cancelled,
     QueueTimeout,
     RequestNotFound,
+    QueueBacklogFull,
 )
 
 _BY_ERROR_TYPE: dict[str, type[RouterError]] = {cls.error_type: cls for cls in ROUTER_EXCEPTIONS}
@@ -962,6 +988,7 @@ __all__ = [
     "NotEnabled",
     "ProviderError",
     "ProviderTimeout",
+    "QueueBacklogFull",
     "QueueTimeout",
     "RateLimited",
     "RequestNotFound",
