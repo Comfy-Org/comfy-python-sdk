@@ -1101,9 +1101,12 @@ bucket newer than your installed version — Router names the bucket on every
 error it sends, and that is what types the exception. A response that never
 reached Router carries no bucket to read (an intermediary's HTML `404`, a bare
 `503 no healthy upstream`), so it arrives as a plain `ComfyError` with the
-status on `.http_status` — unless it is a v2 envelope naming one of the four
-codes both surfaces share (below), which raises that shared class instead;
-keep an `except ComfyError` outside the clause above if you need to handle those in the same place.
+status on `.http_status` — unless it lands on one of the four codes both
+surfaces share (below), which raises that shared class instead: a v2 envelope
+naming one of them, or a bare `401`/`402`/`403` whose status alone maps to
+`unauthorized`/`insufficient_credits`/`forbidden` — so `except RouterError`
+firing is not by itself proof that Router answered. Keep an `except ComfyError`
+outside the clause above if you need to handle the rest in the same place.
 
 `RouterError` is exported from the package root because it is the handler most
 callers write first. The nineteen per-bucket classes stay in

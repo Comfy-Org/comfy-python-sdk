@@ -112,10 +112,11 @@ class JobFailed(ComfyError):
         self.error = error
 
 
-#: Wire ``code`` -> the class this SDK raises for it. Only the codes the v2
-#: envelope owns are listed here; the Router buckets are looked up in
-#: :data:`comfy_sdk.router_exceptions._BY_ERROR_TYPE` instead, so that table
-#: stays the single copy of the contract's closed set.
+#: Wire ``code`` -> the class this SDK raises for it. The codes listed here are
+#: the ones the v2 envelope can send; every other Router bucket is looked up in
+#: :data:`comfy_sdk.router_exceptions._BY_ERROR_TYPE` instead, which stays the
+#: single copy of the contract's closed set -- the four shared codes below are
+#: the only Router buckets that appear in both tables.
 #:
 #: Four entries -- ``insufficient_credits``, ``unauthorized``, ``forbidden``,
 #: ``rate_limited`` -- name classes that live in
