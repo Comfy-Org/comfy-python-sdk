@@ -100,7 +100,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from comfy_low.errors import _location, clean_request_id, summarise_detail
+from comfy_low.errors import _location, clean_body_excerpt, clean_request_id, summarise_detail
 
 from ._errors import ComfyError
 
@@ -217,7 +217,15 @@ class RouterError(ComfyError):
         if error_type is not None:
             self.error_type = error_type
         #: Human-readable description of the failure, safe to show a user. Not
-        #: machine-parsed -- branch on the exception class instead.
+        #: machine-parsed -- branch on the exception class instead. Safe in the
+        #: literal sense too on everything the builders in this module return:
+        #: where the text came off the wire -- either spelling of Router's
+        #: ``detail`` -- it is run through ``comfy_low.errors.clean_body_excerpt``
+        #: first, so it reaches a caller as printable characters on a single
+        #: line, capped at 256, and cannot repaint a terminal or flood a log
+        #: line; where the response described nothing, the value is this SDK's
+        #: own status-derived sentence. Constructing the class by hand bypasses
+        #: both -- the argument is taken as given.
         self.detail = detail
         #: Server-minted id for the call, from ``X-Comfy-Request-Id``. ``None``
         #: only when the response carried no such header.
@@ -709,7 +717,13 @@ def error_from_response(
     if isinstance(body, Mapping):
         raw_detail = body.get("detail")
         if isinstance(raw_detail, str):
-            detail = raw_detail or None
+            # Reduced by the same function the array summary and every body
+            # excerpt go through, so one wire body's human-readable text is
+            # bounded, single-line and printable whichever shape carried it.
+            # This is where the string form used to reach `str(exc)` verbatim.
+            # A whitespace-only `detail` now reads as absent and falls to the
+            # status fallback below, matching `comfy_low.error_from_envelope`.
+            detail = clean_body_excerpt(raw_detail)
         elif isinstance(raw_detail, Sequence) and not isinstance(raw_detail, (str, bytes)):
             errors = tuple(
                 _detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping)
@@ -773,7 +787,10 @@ def error_from_completion(
     detail: str | None = None
     raw_detail = payload.get("detail")
     if isinstance(raw_detail, str):
-        detail = raw_detail or None
+        # Bounded and made printable like the response path's string form (see
+        # `error_from_response`): a completion body is as server-controlled as
+        # a response body, and its `detail` lands in the same displayed place.
+        detail = clean_body_excerpt(raw_detail)
     elif isinstance(raw_detail, Sequence) and not isinstance(raw_detail, (str, bytes)):
         errors = tuple(_detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping))
         # One summariser across both surfaces (see `error_from_response`), so the
