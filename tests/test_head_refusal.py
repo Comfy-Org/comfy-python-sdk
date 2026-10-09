@@ -3,7 +3,8 @@
 The gateway cannot send the error envelope on a ``HEAD``, so the generic
 status fallback would read its ``429`` account rate limit as ``queue_full``.
 ``head_asset_by_hash`` synthesizes ``rate_limited`` for that ``429`` instead,
-keeping ``Retry-After``; a ``403`` stays ``forbidden``.
+keeping ``Retry-After``; a ``429`` that names its own bucket on
+``X-Comfy-Error-Type`` keeps that bucket, and a ``403`` stays ``forbidden``.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow
 from comfy_sdk import AsyncComfy, Comfy, ComfyError
 from comfy_sdk import Forbidden as SdkForbidden
 from comfy_sdk import QueueFull as SdkQueueFull
+from comfy_sdk.router_exceptions import ConcurrencyLimitExceeded, RateLimited
 
 _HASH = "blake3:" + "0" * 64
 
@@ -24,6 +26,8 @@ def _assert_rate_limited(exc: ApiError, retry_after: int | None) -> None:
     assert exc.code == "rate_limited"
     assert exc.http_status == 429
     assert exc.retry_after == retry_after
+    # Synthesized, not read off a Router response: no bucket is claimed.
+    assert exc.error_type is None
 
 
 @pytest.mark.parametrize(("headers", "retry_after"), [({"Retry-After": "7"}, 7), ({}, None)])
@@ -41,6 +45,27 @@ async def test_bodiless_429_is_rate_limited_async(server, headers, retry_after) 
         with pytest.raises(ApiError) as info:
             await low.head_asset_by_hash(_HASH)
     _assert_rate_limited(info.value, retry_after)
+
+
+def test_bodiless_429_keeps_the_bucket_it_names(server) -> None:
+    server.state.head_refusal = (
+        429,
+        {"X-Comfy-Error-Type": "concurrency_limit_exceeded", "Retry-After": "3"},
+    )
+    with ComfyLow(server.base_url) as low, pytest.raises(ApiError) as info:
+        low.head_asset_by_hash(_HASH)
+    assert info.value.code == "concurrency_limit_exceeded"
+    assert info.value.error_type == "concurrency_limit_exceeded"
+    assert info.value.retry_after == 3
+
+
+async def test_bodiless_429_keeps_the_bucket_it_names_async(server) -> None:
+    server.state.head_refusal = (429, {"X-Comfy-Error-Type": "concurrency_limit_exceeded"})
+    async with AsyncComfyLow(server.base_url) as low:
+        with pytest.raises(ApiError) as info:
+            await low.head_asset_by_hash(_HASH)
+    assert info.value.code == "concurrency_limit_exceeded"
+    assert info.value.error_type == "concurrency_limit_exceeded"
 
 
 def test_bodiless_403_is_forbidden(server) -> None:
@@ -66,9 +91,13 @@ def test_commit_surfaces_rate_limited_not_queue_full(server, tmp_path) -> None:
     with Comfy() as client, pytest.raises(ComfyError) as info:
         client.assets.from_file(p).commit()
 
+    # The code's existing SDK class (shared with a bodied `rate_limited`),
+    # pinned exactly so a change to that mapping is a visible decision.
+    assert type(info.value) is RateLimited
     assert not isinstance(info.value, SdkQueueFull)
     assert info.value.code == "rate_limited"
     assert info.value.http_status == 429
+    assert info.value.retry_after == 7
     assert server.state.upload_count == 0
 
 
@@ -81,8 +110,19 @@ async def test_commit_surfaces_rate_limited_not_queue_full_async(server, tmp_pat
         with pytest.raises(ComfyError) as info:
             await client.assets.from_file(p).commit()
 
-    assert not isinstance(info.value, SdkQueueFull)
+    assert type(info.value) is RateLimited
     assert info.value.code == "rate_limited"
+    assert info.value.retry_after == 7
+    assert server.state.upload_count == 0
+
+
+def test_commit_surfaces_the_named_bucket(server, tmp_path) -> None:
+    p = tmp_path / "photo.png"
+    p.write_bytes(b"bucketed-bytes")
+    server.state.head_refusal = (429, {"X-Comfy-Error-Type": "concurrency_limit_exceeded"})
+
+    with Comfy() as client, pytest.raises(ConcurrencyLimitExceeded):
+        client.assets.from_file(p).commit()
 
 
 def test_commit_surfaces_forbidden(server, tmp_path) -> None:

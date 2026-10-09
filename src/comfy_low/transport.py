@@ -832,10 +832,14 @@ class _Prepared:
         :data:`~comfy_low.errors._CODE_BY_STATUS` and read an account rate limit
         as ``queue_full``. On a ``HEAD`` a ``429`` is the gateway's
         ``rate_limited`` refusal, so that code is synthesized from the status
-        instead; ``Retry-After`` is still read off the header. Every other
-        status takes the generic path (a ``403`` is already ``forbidden``).
+        instead; ``Retry-After`` is still read off the header. A ``429`` that
+        names its own bucket on ``X-Comfy-Error-Type`` is not guessed at: the
+        header survives a ``HEAD``, and a synthesized envelope ``code`` would
+        outrank it, so that response takes the generic path and keeps the bucket
+        it named. Every other status takes the generic path too (a ``403`` is
+        already ``forbidden``).
         """
-        if resp.status_code == 429:
+        if resp.status_code == 429 and not (resp.headers.get("X-Comfy-Error-Type") or "").strip():
             raise error_from_envelope(
                 429,
                 {"error": {"code": "rate_limited", "message": "Rate limited"}},

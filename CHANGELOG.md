@@ -75,8 +75,10 @@ the fuller account of each version, including verification notes.
   probes `HEAD /api/v2/assets/by-hash/{hash}`, and a refused `HEAD` carries no body, so the
   `429` fell back to the status-derived `queue_full` code. `head_asset_by_hash` (sync and
   async) now reads a `429` there as `code="rate_limited"`, keeping `retry_after` from the
-  `Retry-After` header, so `commit()` raises a `ComfyError` with that code instead of
-  `QueueFull`. A bodiless `403` still raises `Forbidden`. The status fallback elsewhere is
+  `Retry-After` header, so `commit()` raises `comfy_sdk.router_exceptions.RateLimited` (the
+  class every `rate_limited` code already maps to, a `RouterError` subclass) instead of
+  `QueueFull`. A bodiless `429` that names its bucket on `X-Comfy-Error-Type` keeps that
+  bucket. A bodiless `403` still raises `Forbidden`. The status fallback elsewhere is
   unchanged.
 - **`RouterRunResult.replayed` was always `False` against a real deployment.** It was lifted
   from `X-Comfy-Idempotent-Replayed`; the header Comfy Router actually sends — and the only
