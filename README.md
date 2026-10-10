@@ -1101,8 +1101,12 @@ bucket newer than your installed version — Router names the bucket on every
 error it sends, and that is what types the exception. A response that never
 reached Router carries no bucket to read (an intermediary's HTML `404`, a bare
 `503 no healthy upstream`), so it arrives as a plain `ComfyError` with the
-status on `.http_status`; keep an `except ComfyError` outside the clause above
-if you need to handle those in the same place.
+status on `.http_status` — unless it lands on one of the four codes both
+surfaces share (below), which raises that shared class instead: a v2 envelope
+naming one of them, or a bare `401`/`402`/`403` whose status alone maps to
+`unauthorized`/`insufficient_credits`/`forbidden` — so `except RouterError`
+firing is not by itself proof that Router answered. Keep an `except ComfyError`
+outside the clause above if you need to handle the rest in the same place.
 
 `RouterError` is exported from the package root because it is the handler most
 callers write first. The nineteen per-bucket classes stay in
@@ -1115,14 +1119,17 @@ callers write first. The nineteen per-bucket classes stay in
 for the whole set rather than half of it here and half of it there. A bucket added to Router after your installed version
 arrives as `RouterError` itself, with the raw value readable on `.error_type`.
 
-Three of those names — `Unauthorized`, `Forbidden`, `InsufficientCredits` —
-are also exported by `comfy_sdk` and `comfy_sdk.exceptions`. **They are the same
+Four of those names — `Unauthorized`, `Forbidden`, `InsufficientCredits`,
+`RateLimited` — are also exported by `comfy_sdk.exceptions` (and the first three
+by `comfy_sdk` too). **They are the same
 class**, re-exported, not a second one wearing the same name, so
 `except InsufficientCredits` catches the refusal whichever import you wrote. The
 consequence worth knowing is the other direction: because one class cannot
 descend from `RouterError` on one surface and not on the other, a *workflow*
-call that fails `401`/`403`/`402` raises a `RouterError` subclass too, so
-`except RouterError` is slightly wider than its name for exactly those three.
+call that fails `401`/`403`/`402` raises a `RouterError` subclass too, and so
+does a jobs/assets call throttled with `429 rate_limited`, which raises
+`RateLimited` — so `except RouterError` is slightly wider than its name for
+exactly those four.
 
 A `cancel()` the server declines raises `AlreadyCompleted` when the request had
 already finished — there was nothing left to stop, and the result is still

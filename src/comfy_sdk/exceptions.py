@@ -44,6 +44,7 @@ from .router_exceptions import (
     CancelRefused,
     Forbidden,
     InsufficientCredits,
+    RateLimited,
     RouterError,
     Unauthorized,
     _detail_from,
@@ -111,19 +112,25 @@ class JobFailed(ComfyError):
         self.error = error
 
 
-#: Wire ``code`` -> the class this SDK raises for it. Only the codes the v2
-#: envelope owns are listed here; the Router buckets are looked up in
-#: :data:`comfy_sdk.router_exceptions._BY_ERROR_TYPE` instead, so that table
-#: stays the single copy of the contract's closed set.
+#: Wire ``code`` -> the class this SDK raises for it. The codes listed here are
+#: the ones the v2 envelope can send; every other Router bucket is looked up in
+#: :data:`comfy_sdk.router_exceptions._BY_ERROR_TYPE` instead, which stays the
+#: single copy of the contract's closed set -- the four shared codes below are
+#: the only Router buckets that appear in both tables.
 #:
-#: Three entries -- ``insufficient_credits``, ``unauthorized``, ``forbidden`` --
-#: name classes that live in :mod:`comfy_sdk.router_exceptions` and descend from
+#: Four entries -- ``insufficient_credits``, ``unauthorized``, ``forbidden``,
+#: ``rate_limited`` -- name classes that live in
+#: :mod:`comfy_sdk.router_exceptions` and descend from
 #: :class:`~comfy_sdk.router_exceptions.RouterError`. That is deliberate and it
 #: is the fix: both surfaces spell those buckets identically, the wire ``code``
 #: alone cannot say which surface answered, and raising a class that is *not* a
 #: ``RouterError`` for a Router refusal is what made ``except RouterError`` a
 #: dead handler. One class per bucket, reachable from both modules, is the only
-#: shape where neither ``except`` clause is wrong.
+#: shape where neither ``except`` clause is wrong. The v2 contract's account rate
+#: limit (``components/responses/RateLimited`` in ``spec/openapi.yaml``) and
+#: Router's ``rate_limited`` bucket are the same windowed allowance spelled the
+#: same way, so one class serves both, and ``.error_type == "rate_limited"`` is
+#: set on it from either surface.
 _BY_CODE: dict[str, type[ComfyError]] = {
     "invalid_workflow": InvalidWorkflow,
     "workflow_format_ui": WorkflowFormatUi,
@@ -132,6 +139,7 @@ _BY_CODE: dict[str, type[ComfyError]] = {
     "blob_not_found": BlobNotFound,
     "idempotency_key_reuse": IdempotencyKeyReuse,
     "insufficient_credits": InsufficientCredits,
+    "rate_limited": RateLimited,
     "not_found": NotFound,
     # public-api currently returns entity-specific 404 codes even though the
     # spec documents the generic `not_found`; map them so a missing job/asset
@@ -150,7 +158,7 @@ def _class_for(exc: ApiError) -> type[ComfyError]:
     Three lookups in precedence order, then a fallback that depends on which
     surface answered:
 
-    1. :data:`_BY_CODE` -- the v2 envelope's codes, plus the three buckets both
+    1. :data:`_BY_CODE` -- the v2 envelope's codes, plus the four buckets both
        surfaces spell the same way.
     2. :data:`~comfy_sdk.router_exceptions._BY_ERROR_TYPE` -- the Router
        contract's closed set. The low layer preserves Router's bucket as the
@@ -249,7 +257,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
     # `_class_for` already reads it: `error_type` is set only for a response
     # that identified itself as Router's, and for those this branch is
     # unreachable — every Router bucket resolves to a `RouterError` subclass,
-    # including the three both surfaces spell alike, so the entries are
+    # including the four both surfaces spell alike, so the entries are
     # forwarded above.
     return cls(
         str(exc),
@@ -364,7 +372,7 @@ def translating(*, idempotency_key: str | None = None) -> Iterator[None]:
 
 
 #: Explicit because several of these names are re-exports rather than
-#: definitions: :class:`~comfy_sdk.router_exceptions.RouterError` and the three
+#: definitions: :class:`~comfy_sdk.router_exceptions.RouterError` and the four
 #: buckets both surfaces spell the same way are defined in
 #: :mod:`comfy_sdk.router_exceptions`, and ``ComfyError`` in
 #: :mod:`comfy_sdk._errors` -- one class object each, so a name this module and
@@ -385,6 +393,7 @@ __all__ = [
     "MissingAsset",
     "NotFound",
     "QueueFull",
+    "RateLimited",
     "RouterError",
     "Unauthorized",
     "WorkflowFormatUi",
