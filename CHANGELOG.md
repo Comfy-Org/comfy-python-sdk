@@ -12,6 +12,19 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- **`Job` and `AsyncJob` expose the rest of the job they already hold.**
+  `created_at`, `started_at`, `completed_at`, `expires_at`, `progress`,
+  `queue_position`, `metrics` and `urls` join `id` / `status` / `outputs` /
+  `error`; previously the only way to read one was the private model attribute.
+  The timestamps are timezone-aware `datetime`s, so `job.completed_at -
+  job.started_at` is the run's duration, and the nullable ones (`started_at`,
+  `completed_at`, `progress`, `queue_position`, `metrics`) are `None` rather
+  than absent. Like the existing properties, these are views onto the state on
+  the handle — nothing re-fetches.
+- `Progress` gained `current_node_class`, the one field of the contract's
+  progress schema the event decoder was dropping. It is appended to the
+  dataclass rather than placed beside `current_node`, so the existing
+  positional order is unchanged.
 - Job metadata. `submit(..., metadata={"client": "acme"})` on `Comfy` and `AsyncComfy` stores
   string labels on a job, sent as the `metadata` field of `POST /api/v2/jobs` (omitted when
   not given, so the request is unchanged). `Job.metadata` / `AsyncJob.metadata` read them back

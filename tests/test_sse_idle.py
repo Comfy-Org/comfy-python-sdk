@@ -67,7 +67,7 @@ def test_get_job_events_timeout_none_opts_out_of_idle_timeout(server, monkeypatc
 
     with Comfy() as client:
         job = client.submit(_wf(client))
-        events_url = job._model.urls.events
+        events_url = job.urls.events
         t0 = time.monotonic()
         raws = list(client._low.get_job_events(events_url, timeout=None))
         elapsed = time.monotonic() - t0
