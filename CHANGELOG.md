@@ -108,8 +108,9 @@ the fuller account of each version, including verification notes.
   a failure still carries `.idempotency_key` and an `Idempotent-Replayed`
   binary 200 comes back like a first run.
 
-  The one deliberate behaviour change beyond the fix: a non-JSON 2xx used to be
-  read as "a proxy interstitial served as 200" and raised. On this route that
+  The one deliberate behaviour change beyond no longer discarding binary
+  generations: a non-JSON 2xx used to be read as "a proxy interstitial served
+  as 200" and raised. On this route that
   reading is no longer available — the SDK cannot tell an interstitial from a
   partner's native text output, and the contract says the body is the
   partner's — so a `text/html` 200 now reaches the caller as bytes they can
@@ -215,6 +216,12 @@ the fuller account of each version, including verification notes.
   can also refuse a *model* whose partner answers a generation directly as bytes (it cannot yet be
   queued; nothing is queued or charged; `models.run` serves it). It is still terminal, but on a
   submit it no longer proves the caller is not switched on — read `.detail`.
+- **Breaking, for direct `comfy_low` callers.** The body half of the `(body, headers)` tuple
+  that `ComfyLow.post_model_run` / `AsyncComfyLow.post_model_run` and
+  `get_model_request_result` return is now `dict[str, Any] | BinaryResult` (also importable
+  from `comfy_low`), so code that indexes it must narrow first: a binary 200 that raised
+  `invalid_response` in 0.4.0 now returns a `BinaryResult`. `comfy_sdk` users are covered by
+  the `BinaryResult` entry above.
 - `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
   body's `error_type`), or `None` when it named none — which is also how the SDK tells which
   surface answered.
