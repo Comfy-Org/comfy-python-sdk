@@ -35,6 +35,9 @@ from comfy_sdk import API_KEY_ENV_VAR, BASE_URL_ENV_VAR, ROUTER_BASE_URL_ENV_VAR
 class ServerState:
     # Blobs the platform "already has" (for the dedup fast-path).
     known_hashes: set[str] = field(default_factory=set)
+    # When set, HEAD /assets/by-hash answers this (status, headers) with an
+    # empty body — how the gateway refuses a HEAD (it cannot send the envelope).
+    head_refusal: tuple[int, dict[str, str]] | None = None
     # The authoritative server-side hash returned for uploads.
     server_hash: str = "blake3:" + "ab" * 32
     # If set, POST /assets rejects with 409 hash_mismatch.
@@ -586,6 +589,13 @@ def _make_handler(state: ServerState):
             m = re.match(r"/api/v2/assets/by-hash/(.+)$", self.path)
             if m:
                 state.head_count += 1
+                if state.head_refusal is not None:
+                    status, headers = state.head_refusal
+                    self.send_response(status)
+                    for name, value in headers.items():
+                        self.send_header(name, value)
+                    self.end_headers()
+                    return
                 hash_ = m.group(1)
                 self.send_response(200 if hash_ in state.known_hashes else 404)
                 self.end_headers()
