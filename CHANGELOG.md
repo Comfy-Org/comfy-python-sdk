@@ -12,6 +12,16 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `RateLimited` is exported from `comfy_sdk` and `comfy_sdk.exceptions` as a fourth bucket shared
+  with the Router surface, beside `Unauthorized`, `Forbidden` and `InsufficientCredits`. It is the
+  same class as `comfy_sdk.router_exceptions.RateLimited`, and a v2 job route's `rate_limited`
+  envelope now maps to it explicitly; it carries `.retry_after`. The low layer gains
+  `comfy_low.errors.RateLimited` (also on `comfy_low`) for the same code.
+
+## [0.5.0] - 2026-10-10
+
+### Added
+
 - Job metadata. `submit(..., metadata={"client": "acme"})` on `Comfy` and `AsyncComfy` stores
   string labels on a job, sent as the `metadata` field of `POST /api/v2/jobs` (omitted when
   not given, so the request is unchanged). `Job.metadata` / `AsyncJob.metadata` read them back
@@ -75,11 +85,60 @@ the fuller account of each version, including verification notes.
   not `ConcurrencyLimitExceeded` — the queue parks a submit at the in-flight limit, and this is the
   separate bound on how many may be left waiting. It clears as the caller's own queued requests
   finish. Before this, the bucket arrived as a bare `RouterError`.
-- `RateLimited` is exported from `comfy_sdk` and `comfy_sdk.exceptions` as a fourth bucket shared
-  with the Router surface, beside `Unauthorized`, `Forbidden` and `InsufficientCredits`. It is the
-  same class as `comfy_sdk.router_exceptions.RateLimited`, and a v2 job route's `rate_limited`
-  envelope now maps to it explicitly; it carries `.retry_after`. The low layer gains
-  `comfy_low.errors.RateLimited` (also on `comfy_low`) for the same code.
+- `BinaryResult` — importable from `comfy_sdk` — the second shape
+  `models.run()` can return. `run` now branches on the response
+  `Content-Type`, exactly as the run route's published `200` says a client
+  must: `application/json` (or a `+json` suffix type) decodes to a `dict`
+  exactly as before, and anything else comes back as
+  `BinaryResult(content, content_type, request_id)`. The bytes are the
+  partner's file verbatim — not base64-encoded, not wrapped in a dict, not
+  decoded or transcoded — so `Path("out.mp3").write_bytes(result.content)` is
+  the whole of it. `content_type` is the header including its parameters,
+  because for some partner media types the parameters are part of what the
+  bytes are (`audio/L16; rate=16000`); it is bounded and stripped of
+  unprintable characters first, which no real media type contains, the way
+  every other server-supplied string this SDK surfaces already is. The return
+  annotation is therefore `dict[str, Any] | BinaryResult`; a caller that only
+  uses JSON models sees no behaviour change, but a type checker will now ask
+  them to narrow. `run_detailed` is the same story one level out:
+  `RouterRunResult.output` carries whichever of the two shapes the run
+  answered with.
+
+  Two boundaries worth knowing: a 2xx whose `Content-Type` claims JSON and
+  whose body will not parse still raises `invalid_response` (there the response
+  promised a document and did not deliver one), while a 2xx that names *no*
+  `Content-Type` is a `BinaryResult` unless its body is empty (`{}`, as on
+  every other operation) or parses as a JSON **object**. Object, not merely
+  valid JSON: that branch probes bytes nothing declared, so `null`, `[...]` and
+  a bare number are bytes — accepting one would return a value outside the
+  declared union, and a short binary body of all-ASCII digits parses as a
+  number. The binary path runs inside the same translation as the JSON one, so
+  a failure still carries `.idempotency_key` and an `Idempotent-Replayed`
+  binary 200 comes back like a first run.
+
+  The one deliberate behaviour change beyond no longer discarding binary
+  generations: a non-JSON 2xx used to be read as "a proxy interstitial served
+  as 200" and raised. On this route that
+  reading is no longer available — the SDK cannot tell an interstitial from a
+  partner's native text output, and the contract says the body is the
+  partner's — so a `text/html` 200 now reaches the caller as bytes they can
+  inspect, rather than discarding a generation they were billed for. Every
+  other operation keeps the old reading, because JSON is the only success media
+  type their routes declare. The same asymmetry decides the empty case: a
+  declared-binary 200 with a zero-length body is a `BinaryResult` holding no
+  bytes rather than an exception. Two checks tell an answer from an artefact —
+  `request_id is None` means no Router answer was seen at all (the header is
+  required on every one Router sends), and `not content` means nothing was
+  delivered.
+
+  The queued surface gets the identical branch: `RequestHandle.get()` /
+  `AsyncRequestHandle.get()` and `models.subscribe()` now return
+  `dict[str, Any] | BinaryResult` too, because the result route they collect
+  from (`GET .../requests/{request_id}`) declares the same `application/json` /
+  `*/*` pair `models.run()` does. Before this it still went through the
+  JSON-only decoder, so a binary generation submitted through `submit()` raised
+  `invalid_response` on collection even though the identical model run directly
+  through `run()` already worked.
 
 ### Fixed
 
@@ -141,63 +200,8 @@ the fuller account of each version, including verification notes.
   byte 0xff`, the MP3 frame sync) *after* the generation had run and been
   billed. Those models were unusable from this SDK.
 
-### Added
-
-- `BinaryResult` — importable from `comfy_sdk` — the second shape
-  `models.run()` can return. `run` now branches on the response
-  `Content-Type`, exactly as the run route's published `200` says a client
-  must: `application/json` (or a `+json` suffix type) decodes to a `dict`
-  exactly as before, and anything else comes back as
-  `BinaryResult(content, content_type, request_id)`. The bytes are the
-  partner's file verbatim — not base64-encoded, not wrapped in a dict, not
-  decoded or transcoded — so `Path("out.mp3").write_bytes(result.content)` is
-  the whole of it. `content_type` is the header including its parameters,
-  because for some partner media types the parameters are part of what the
-  bytes are (`audio/L16; rate=16000`); it is bounded and stripped of
-  unprintable characters first, which no real media type contains, the way
-  every other server-supplied string this SDK surfaces already is. The return
-  annotation is therefore `dict[str, Any] | BinaryResult`; a caller that only
-  uses JSON models sees no behaviour change, but a type checker will now ask
-  them to narrow. `run_detailed` is the same story one level out:
-  `RouterRunResult.output` carries whichever of the two shapes the run
-  answered with.
-
-  Two boundaries worth knowing: a 2xx whose `Content-Type` claims JSON and
-  whose body will not parse still raises `invalid_response` (there the response
-  promised a document and did not deliver one), while a 2xx that names *no*
-  `Content-Type` is a `BinaryResult` unless its body is empty (`{}`, as on
-  every other operation) or parses as a JSON **object**. Object, not merely
-  valid JSON: that branch probes bytes nothing declared, so `null`, `[...]` and
-  a bare number are bytes — accepting one would return a value outside the
-  declared union, and a short binary body of all-ASCII digits parses as a
-  number. The binary path runs inside the same translation as the JSON one, so
-  a failure still carries `.idempotency_key` and an `Idempotent-Replayed`
-  binary 200 comes back like a first run.
-
-  The one deliberate behaviour change beyond the fix: a non-JSON 2xx used to be
-  read as "a proxy interstitial served as 200" and raised. On this route that
-  reading is no longer available — the SDK cannot tell an interstitial from a
-  partner's native text output, and the contract says the body is the
-  partner's — so a `text/html` 200 now reaches the caller as bytes they can
-  inspect, rather than discarding a generation they were billed for. Every
-  other operation keeps the old reading, because JSON is the only success media
-  type their routes declare. The same asymmetry decides the empty case: a
-  declared-binary 200 with a zero-length body is a `BinaryResult` holding no
-  bytes rather than an exception. Two checks tell an answer from an artefact —
-  `request_id is None` means no Router answer was seen at all (the header is
-  required on every one Router sends), and `not content` means nothing was
-  delivered.
-
-  The queued surface gets the identical branch: `RequestHandle.get()` /
-  `AsyncRequestHandle.get()` and `models.subscribe()` now return
-  `dict[str, Any] | BinaryResult` too, because the result route they collect
-  from (`GET .../requests/{request_id}`) declares the same `application/json` /
-  `*/*` pair `models.run()` does. Before this it still went through the
-  JSON-only decoder, so a binary generation submitted through `submit()` raised
-  `invalid_response` on collection even though the identical model run directly
-  through `run()` already worked.
-
 ### Changed
+
 - `submit` (and the new `list_jobs`) wait at least one second before retrying a 429, so a
   `Retry-After: 0` or a negative one no longer retries at once.
 - **Because those three buckets are now one class each, they descend from `RouterError` on the
@@ -220,9 +224,34 @@ the fuller account of each version, including verification notes.
   can also refuse a *model* whose partner answers a generation directly as bytes (it cannot yet be
   queued; nothing is queued or charged; `models.run` serves it). It is still terminal, but on a
   submit it no longer proves the caller is not switched on — read `.detail`.
+- **Breaking, for direct `comfy_low` callers.** The body half of the `(body, headers)` tuple
+  that `ComfyLow.post_model_run` / `AsyncComfyLow.post_model_run` and
+  `get_model_request_result` return is now `dict[str, Any] | BinaryResult` (also importable
+  from `comfy_low`), so code that indexes it must narrow first: a binary 200 that raised
+  `invalid_response` in 0.4.0 now returns a `BinaryResult`. `comfy_sdk` users are covered by
+  the `BinaryResult` entry above.
 - `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
   body's `error_type`), or `None` when it named none — which is also how the SDK tells which
   surface answered.
+
+## [0.4.0] - 2026-09-18
+
+### Added
+
+- `model_provider`, `strict_mode` and `fallback_provider` on `models.run` / `AsyncModels.run` —
+  sent only when set, so a call that names none is byte-for-byte the request this route always
+  made. `fallback_provider` accepts a `bool`, sent as `true`/`false`.
+- `run_detailed()` (sync and async), returning a new `RouterRunResult`: the partner's native
+  `output` plus `serving_provider`, `dropped_params`, `replayed` and `request_id`. `run()` is
+  unchanged and still returns the native body. `RouterRunResult` is exported from `comfy_sdk`.
+- `Cancelled`, `QueueTimeout` and `RequestNotFound` in `comfy_sdk.router_exceptions`, for the
+  Router buckets `cancelled`, `queue_timeout` and `request_not_found`.
+
+### Changed
+
+- **Breaking, for direct `comfy_low` callers.** `ComfyLow.post_model_run` now returns
+  `(body, headers)`, matching the four `*_model_request*` queue methods beside it. `comfy_sdk`
+  users are unaffected.
 
 ## [0.3.0] - 2026-09-14
 
@@ -404,7 +433,9 @@ First public release of the Comfy API v2 Python SDK (`comfy-sdk`).
   upload/dedup inputs, submit, follow (poll or SSE), download outputs.
 - Sync and async clients. Python 3.10+.
 
-[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.3.0...HEAD
+[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.8...v0.1.9

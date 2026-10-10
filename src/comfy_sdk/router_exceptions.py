@@ -314,16 +314,23 @@ class InsufficientCredits(RouterError):
 
 
 class ModelNotFound(RouterError):
-    """No such model. An unknown provider lands here too: both are "that id
-    names nothing".
+    """No such model. An unknown provider, an unenrolled id, an id the catalog
+    has retired past its sunset date, and a catalogued id the provider does not
+    currently serve for Comfy all land here: each is "that id runs nothing".
 
-    ``detail`` carries up to three suggestions drawn from the models the caller
-    is entitled to see. A catalogued id the provider does not currently serve
-    for Comfy also lands here, and the response then carries no suggestions.
+    For a retired id, ``detail`` reads ``<id> was retired on <YYYY-MM-DD>; use
+    <successor>`` when a successor is recorded and visible to the caller, or
+    just ``<id> was retired on <YYYY-MM-DD>`` when it is not. A named successor
+    is always a live catalog id the call can be re-pointed at. A model whose
+    sunset is still in the future is not retired: it stays listed and runnable
+    until that date. Otherwise ``detail`` carries up to three suggestions drawn
+    from the models the caller is entitled to see, except for a catalogued id
+    the provider does not currently serve, whose response carries none.
+    ``detail`` is display text, not a parse target.
     """
 
     error_type = "model_not_found"
-    _spec_meaning_digest: str = "33ffb0dd68a1"
+    _spec_meaning_digest: str = "6c0e0e327e4d"
 
 
 # -- transport-level buckets -------------------------------------------------
