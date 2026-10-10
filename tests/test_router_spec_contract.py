@@ -32,7 +32,7 @@ which is the gate that catches it even for someone who only ran the linters.
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import MISSING, fields
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,7 @@ from comfy_low.transport import (
     model_catalog_path,
 )
 from comfy_sdk import COMFY_ROUTER_BASE_URL
+from comfy_sdk.model_requests import CostEstimate
 from comfy_sdk.models import RouterRunResult, _run_result
 from comfy_sdk.router_exceptions import (
     ROUTER_ERROR_TYPES,
@@ -317,6 +318,27 @@ def test_the_catalog_query_parameters_are_the_ones_the_spec_declares() -> None:
     }
     assert names == {"cursor", "limit"}
     assert model_catalog_path("c", 5) == f"{_MODEL_CATALOG_PATH}?cursor=c&limit=5"
+
+
+def test_every_cost_estimate_property_the_spec_declares_is_modelled() -> None:
+    # `CostEstimate` is read field by field out of the submit's `estimate`
+    # object; a sync that adds a property would otherwise reach callers only
+    # through `.raw`. The spec's required fields are the dataclass's
+    # positional ones, which `_estimate_of` holds a quote to.
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    schema = doc["components"]["schemas"]["RouterCostEstimate"]
+    modelled = {f.name for f in fields(CostEstimate)} - {"raw"}
+    assert set(schema["properties"]) <= modelled, set(schema["properties"]) - modelled
+    required = {
+        f.name
+        for f in fields(CostEstimate)
+        if f.default is MISSING and f.default_factory is MISSING
+    }
+    assert set(schema["required"]) == required
+    submit_fields = doc["components"]["schemas"]["RouterQueueSubmitFields"]["properties"]
+    assert [ref["$ref"] for ref in submit_fields["estimate"]["allOf"]] == [
+        "#/components/schemas/RouterCostEstimate"
+    ]
 
 
 def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None:
