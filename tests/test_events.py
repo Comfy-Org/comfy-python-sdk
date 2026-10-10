@@ -176,19 +176,61 @@ async def test_async_events_reconnect_pause_backs_off_on_empty_drops(server, mon
     assert server.state.job_poll_count - polls_before <= len(pauses) + 1
 
 
-def test_events_reconnect_pause_resets_after_a_delivered_frame(server, monkeypatch) -> None:
-    # Three empty drops back the pause off; the 4th connection delivers a
-    # progress frame (no terminal) so the next pause starts over at 0.1.
+def test_events_reconnect_pause_backs_off_on_snapshot_then_close(server, monkeypatch) -> None:
+    # Every connect delivers the on-connect status/progress snapshot and then
+    # closes: frames arrived, but the stream is no healthier than an empty one,
+    # so the pause must keep backing off rather than resetting each time.
     _drop_always(server)
-    server.state.sse_progress_on_connect = 4
+    server.state.sse_drop_snapshot = True
+    pauses: list[float] = []
+    monkeypatch.setattr(_jobs_module.time, "sleep", _recording_sleep(pauses, len(_DROP_PAUSES)))
+    with Comfy() as client:
+        job = client.submit(_wf(client))
+        polls_before = server.state.job_poll_count
+        with pytest.raises(_StopLoop):
+            list(job.events())
+
+    assert pauses == pytest.approx(_DROP_PAUSES)
+    assert server.state.events_connect_count <= len(pauses) + 1
+    assert server.state.job_poll_count - polls_before <= len(pauses) + 1
+
+
+async def test_async_events_reconnect_pause_backs_off_on_snapshot_then_close(
+    server, monkeypatch
+) -> None:
+    _drop_always(server)
+    server.state.sse_drop_snapshot = True
+    pauses: list[float] = []
+    record = _recording_sleep(pauses, len(_DROP_PAUSES))
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        record(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    async with AsyncComfy() as client:
+        job = await client.submit(_wf(client))
+        with pytest.raises(_StopLoop):
+            [e async for e in job.events()]
+
+    assert pauses == pytest.approx(_DROP_PAUSES)
+
+
+def test_events_reconnect_pause_resets_after_a_long_lived_connection(server, monkeypatch) -> None:
+    # Three short snapshot-then-close connects back the pause off; the 4th
+    # stays open past the healthy threshold (no terminal) so the next pause
+    # starts over at 0.1.
+    _drop_always(server)
+    server.state.sse_drop_snapshot = True
+    server.state.sse_hold_on_connect = 4
+    server.state.sse_hold_seconds = 0.5
+    monkeypatch.setattr(_jobs_module, "_HEALTHY_STREAM_SECONDS", 0.3)
     pauses: list[float] = []
     monkeypatch.setattr(_jobs_module.time, "sleep", _recording_sleep(pauses, 6))
     with Comfy() as client:
         job = client.submit(_wf(client))
-        seen = []
         with pytest.raises(_StopLoop):
-            for ev in job.events():
-                seen.append(ev)
+            list(job.events())
 
     assert pauses == pytest.approx([0.1, 0.2, 0.4, 0.1, 0.2, 0.4])
-    assert [type(e) for e in seen] == [Progress]

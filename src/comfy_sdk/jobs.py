@@ -31,10 +31,16 @@ from .outputs import AsyncOutput, Output
 
 _RECONNECT_PAUSE = 0.1
 # Cap for the reconnect pause, which doubles from ``_RECONNECT_PAUSE`` while
-# connections keep ending without delivering a frame. ``events()`` has no
-# deadline of its own, so a dropped healthy stream must still notice a terminal
-# status within seconds; the cap matches ``_core.backoff_schedule``'s default.
+# connections keep ending early. ``events()`` has no deadline of its own, so a
+# dropped healthy stream must still notice a terminal status within seconds;
+# the cap matches ``_core.backoff_schedule``'s default.
 _MAX_RECONNECT_PAUSE = 5.0
+# How long a connection must stay open before its end resets the pause to
+# ``_RECONNECT_PAUSE``. Delivered frames are no signal of health: every connect
+# opens with a status/progress snapshot, so a server or proxy that sends it and
+# closes would otherwise reset the backoff each time. A connection that lasted
+# at least the cap already spaces reconnects no tighter than a capped pause.
+_HEALTHY_STREAM_SECONDS = _MAX_RECONNECT_PAUSE
 
 
 @dataclass(frozen=True)
@@ -267,13 +273,12 @@ class Job:
         backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
         while True:
             terminal_seen = False
-            delivered = False
+            opened = time.monotonic()
             try:
                 for raw in self._low.get_job_events(events_url):
                     ev = event_from_raw(raw, self._bind_output)
                     if ev is None:
                         continue
-                    delivered = True
                     if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
                         terminal_seen = True
                         yield ev
@@ -285,6 +290,7 @@ class Job:
                 raise to_sdk_error(exc) from exc
             except (httpx.HTTPError, httpx.StreamError):
                 pass  # connection dropped mid-stream — reconnect below
+            lived = time.monotonic() - opened
             if terminal_seen:
                 return
             # Stream ended without a terminal frame. Poll the authoritative state:
@@ -293,9 +299,9 @@ class Job:
             if _core.is_terminal(self.status):
                 yield StatusChange(status=self.status)
                 return
-            if delivered:
-                # A stream that carried frames was healthy: start over at the
-                # short pause rather than inheriting earlier empty connects' backoff.
+            if lived >= _HEALTHY_STREAM_SECONDS:
+                # A stream that stayed open was healthy: start over at the short
+                # pause rather than inheriting earlier short connects' backoff.
                 backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
             time.sleep(next(backoff))
 
@@ -391,13 +397,12 @@ class AsyncJob:
         backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
         while True:
             terminal_seen = False
-            delivered = False
+            opened = time.monotonic()
             try:
                 async for raw in self._low.get_job_events(events_url):
                     ev = event_from_raw(raw, self._bind_output)
                     if ev is None:
                         continue
-                    delivered = True
                     if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
                         terminal_seen = True
                         yield ev
@@ -409,15 +414,16 @@ class AsyncJob:
                 raise to_sdk_error(exc) from exc
             except (httpx.HTTPError, httpx.StreamError):
                 pass
+            lived = time.monotonic() - opened
             if terminal_seen:
                 return
             await self.refresh()
             if _core.is_terminal(self.status):
                 yield StatusChange(status=self.status)
                 return
-            if delivered:
-                # A stream that carried frames was healthy: start over at the
-                # short pause rather than inheriting earlier empty connects' backoff.
+            if lived >= _HEALTHY_STREAM_SECONDS:
+                # A stream that stayed open was healthy: start over at the short
+                # pause rather than inheriting earlier short connects' backoff.
                 backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
             await asyncio.sleep(next(backoff))
 
