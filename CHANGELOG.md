@@ -20,13 +20,17 @@ the fuller account of each version, including verification notes.
   (`{}` when the job has none). `list_jobs(metadata=, limit=)` walks `GET /api/v2/jobs`, sends
   each filter as `metadata[<key>]=<value>`, follows `next_cursor` to the last page, and yields
   `JobSummary` items (`id`, `status`, `create_time`, `update_time`, `deployment_id`,
-  `metadata`, `data`); on `AsyncComfy` it is an async iterator. The SDK leaves the label limits
+  `release_version`, `metadata`, `data`); `deployment_id` is the deployment the job was sent
+  to (the id in the address it was posted at, unchanged when the deployment moves to another
+  release; a host may leave it out, since the v2 contract does not declare it), and `release_version` is
+  the version of the release that ran the job (`None` where the server does not report it); on `AsyncComfy` it is an async iterator. The SDK leaves the label limits
   to the server: a refused map raises `ComfyError` with code `metadata_invalid` and the
   server's message (naming the key when one key or value breaks a rule, giving the count
   when there are more than 16 pairs), and a
   refused filter raises `ComfyError` with code `invalid_metadata_filter` (`invalid_cursor` for a
   cursor the server did not issue). A list item whose `id` or `status` is missing, null or not a string, or
-  whose `deployment_id` is neither a string nor null, raises `ComfyError` with code
+  whose `deployment_id` is neither a string nor null, or whose `release_version` is neither an
+  integer nor null (a boolean is refused), raises `ComfyError` with code
   `invalid_response` naming the field, as does an item that is not a JSON object (the item is
   not skipped), a page body that is not a JSON object, a page whose `jobs` is not an array (a
   missing or null `jobs` reads as an empty page), and a page whose `next_cursor` is not a string
