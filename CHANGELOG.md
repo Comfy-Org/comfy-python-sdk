@@ -134,6 +134,10 @@ the fuller account of each version, including verification notes.
 
 ### Fixed
 
+- `job.events()` / async `events()` now raise a typed error (`Unauthorized` with code
+  `credential_expired`, `Forbidden`, or `NotFound`) when the server sends the terminal `error`
+  event, instead of silently reconnecting.
+
 - **`RouterRunResult.replayed` was always `False` against a real deployment.** It was lifted
   from `X-Comfy-Idempotent-Replayed`; the header Comfy Router actually sends — and the only
   spelling `spec/router-openapi.yaml` declares, on the `200` as on the `400`/`409`/`422` — is
