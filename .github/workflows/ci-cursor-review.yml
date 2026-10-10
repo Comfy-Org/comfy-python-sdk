@@ -35,7 +35,7 @@ jobs:
     # SHA-pinned. Bump this SHA to pick up upstream changes; keep
     # `workflows_ref` matching so prompts/scripts load from the same commit as
     # the workflow definition.
-    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@ede60085aab3a046afa6c6effce07a3f85dd849c # github-workflows main (ede6008)
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@cc22b08462d7d8153b7b5aa7433003d77fc61f3e # github-workflows main (cc22b08)
     with:
       # Repo-specific generated/heavy paths. `extra_generated_globs` is the
       # right knob rather than `diff_excludes`: it feeds the shared
@@ -65,7 +65,7 @@ jobs:
         src/comfy_low/models/_generated.py
         assets/**
       # Load the prompts/scripts from the same ref as `uses:`.
-      workflows_ref: ede60085aab3a046afa6c6effce07a3f85dd849c
+      workflows_ref: cc22b08462d7d8153b7b5aa7433003d77fc61f3e
     secrets:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
       # Optional — enables start/complete Slack DMs to the triggerer.
