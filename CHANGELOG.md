@@ -10,6 +10,14 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Added
+
+- `RateLimited` is exported from `comfy_sdk` and `comfy_sdk.exceptions` as a fourth bucket shared
+  with the Router surface, beside `Unauthorized`, `Forbidden` and `InsufficientCredits`. It is the
+  same class as `comfy_sdk.router_exceptions.RateLimited`, and a v2 job route's `rate_limited`
+  envelope now maps to it explicitly; it carries `.retry_after`. The low layer gains
+  `comfy_low.errors.RateLimited` (also on `comfy_low`) for the same code.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
