@@ -72,6 +72,12 @@ the fuller account of each version, including verification notes.
   for anything that constructs a `RouterRunResult` by hand.
   The vendored Router spec now declares `X-Comfy-Credits-Used` on the run route's `200`, so
   `tests/test_router_spec_contract.py` pins this lift against the contract like the other four.
+- `RouterError.refusal_subject` — which input or output a `ContentPolicyViolation` refused
+  (`input_image`, `output_text`, ...), read from the `X-Comfy-Refusal-Subject` response header
+  and falling back to the body's `refusal_subject`. It is the raw wire value, never narrowed:
+  `comfy_sdk.router_exceptions.REFUSAL_SUBJECTS` lists the ten documented values, and one this
+  version does not list still passes through. `None` when the Router did not say. Populated on
+  `models.run`, on `error_from_response`, and on a refused queued completion.
 - `QueueBacklogFull` in `comfy_sdk.router_exceptions`, for the Router bucket `queue_backlog_full`:
   a queued `submit` refused `429` because the caller already has too many requests waiting. It is
   not `ConcurrencyLimitExceeded` — the queue parks a submit at the in-flight limit, and this is the

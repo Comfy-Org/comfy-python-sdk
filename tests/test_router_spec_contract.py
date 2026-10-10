@@ -32,6 +32,7 @@ which is the gate that catches it even for someone who only ran the linters.
 
 from __future__ import annotations
 
+import re
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,8 @@ from comfy_low.transport import (
 from comfy_sdk import COMFY_ROUTER_BASE_URL
 from comfy_sdk.models import RouterRunResult, _run_result
 from comfy_sdk.router_exceptions import (
+    REFUSAL_SUBJECT_HEADER,
+    REFUSAL_SUBJECTS,
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
     RouterError,
@@ -594,3 +597,68 @@ def test_an_exempt_field_is_really_unmoved_by_the_headers_it_skips() -> None:
             f"the contract's 200 headers were supplied. It IS a lift: move it into "
             f"_CONTRACT_HEADER_LIFTS with the header it reads, so both pins apply to it."
         )
+
+
+def _closed_vocabulary(description: str) -> list[str]:
+    """The backticked values after ``closed vocabulary:``, up to the sentence end.
+
+    The contract states the ``refusal_subject`` values in prose rather than as
+    an ``enum``, so this is the one place a value list is read out of a
+    description. A rewording that moves the list breaks the parse loudly (an
+    empty result fails the equality below) rather than passing silently.
+    """
+    _, sep, rest = description.partition("closed vocabulary:")
+    assert sep, f"no 'closed vocabulary:' list in {description!r}"
+    return re.findall(r"`([a-z_]+)`", rest.split(". ", 1)[0])
+
+
+def _refusal_subject_declarations() -> list[tuple[str, str]]:
+    """Every place the contract states the vocabulary, as ``(where, description)``."""
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    components = doc["components"]
+    prop = components["schemas"]["RouterErrorResponse"]["properties"]["refusal_subject"]
+    header = components["headers"]["RouterRefusalSubjectHeader"]
+    return [
+        ("RouterErrorResponse.refusal_subject", prop["description"]),
+        ("RouterRefusalSubjectHeader", header["description"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("where", "description"),
+    _refusal_subject_declarations(),
+    ids=[where for where, _ in _refusal_subject_declarations()],
+)
+def test_refusal_subjects_match_the_contract_vocabulary(where: str, description: str) -> None:
+    """``REFUSAL_SUBJECTS`` is the vocabulary the contract states, in its order.
+
+    Both the body field and the header state the list; each is pinned, so a
+    sync that adds, drops or reorders a value in either fails here naming it.
+    """
+    declared = _closed_vocabulary(description)
+    assert list(REFUSAL_SUBJECTS) == declared, (
+        f"{where} in the vendored Router spec lists {declared}, but "
+        f"comfy_sdk.router_exceptions.REFUSAL_SUBJECTS is {list(REFUSAL_SUBJECTS)}. "
+        f"Reconcile the tuple (same values, same order) and the CHANGELOG count."
+    )
+
+
+def test_refusal_subject_header_is_the_name_the_contract_sends() -> None:
+    """``REFUSAL_SUBJECT_HEADER`` is a name some declared response carries.
+
+    The SDK reads the header before the body; a header name the contract never
+    sends would leave every refusal falling back to the body silently.
+    """
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    ref = "#/components/headers/RouterRefusalSubjectHeader"
+    sent_as = {
+        name
+        for response in (doc["components"].get("responses") or {}).values()
+        for name, header in ((response or {}).get("headers") or {}).items()
+        if isinstance(header, dict) and header.get("$ref") == ref
+    }
+    assert REFUSAL_SUBJECT_HEADER in sent_as, (
+        f"the vendored Router spec sends RouterRefusalSubjectHeader as {sorted(sent_as)}, "
+        f"not {REFUSAL_SUBJECT_HEADER!r}: reconcile "
+        f"comfy_sdk.router_exceptions.REFUSAL_SUBJECT_HEADER."
+    )
