@@ -27,6 +27,7 @@ import os
 import pytest
 
 from comfy_sdk import ROUTER_BASE_URL_ENV_VAR, AsyncComfy, Comfy
+from comfy_sdk.router_exceptions import InvalidInput, NotEnabled
 
 ROUTER_BASE_URL = os.environ.get(ROUTER_BASE_URL_ENV_VAR)
 API_KEY = os.environ.get("COMFY_API_KEY")
@@ -36,6 +37,12 @@ PROVIDER = os.environ.get("COMFY_ROUTER_E2E_PROVIDER", "fal")
 IMAGE_MODEL = os.environ.get("COMFY_ROUTER_E2E_IMAGE_MODEL", "openai/gpt-image-2")
 VIDEO_MODEL = os.environ.get(
     "COMFY_ROUTER_E2E_VIDEO_MODEL", "byteplus/dreamina-seedance-2-0-260128"
+)
+# Wavespeed is a SECOND alt-provider for nano-banana-pro, text-to-image only and
+# the native Gemini generateContent shape — so it needs its own model id + body
+# rather than the gpt-image-2-shaped IMAGE_MODEL above.
+WAVESPEED_MODEL = os.environ.get(
+    "COMFY_ROUTER_E2E_WAVESPEED_MODEL", "vertexai/gemini-3-pro-image"
 )
 RUN_TIMEOUT_S = 300  # a direct image generation, held server-side
 VIDEO_TIMEOUT_S = 600  # submit-poll video, polled server-side inside the call
@@ -150,3 +157,28 @@ def test_submit_poll_model_via_alt_provider(client: Comfy) -> None:
     content = out.get("content") if isinstance(out.get("content"), dict) else {}
     assert out.get("status") == "succeeded", f"video not succeeded: {out.get('status')!r}"
     assert content.get("video_url"), f"no video_url in terminal response: keys={list(out)}"
+
+
+def test_second_alt_provider_wavespeed_nano_banana_pro(client: Comfy) -> None:
+    """A model with more than one registered provider: model_provider=wavespeed
+    on nano-banana-pro (native Gemini generateContent, text-to-image only).
+
+    Skipped (not failed) when wavespeed is not yet deployed or its gate is off
+    on this deployment, so the suite stays green while the provider ramps.
+    """
+    try:
+        out = client.models.run(
+            WAVESPEED_MODEL,
+            {"contents": [{"role": "user", "parts": [{"text": "a red fox in a snowy forest"}]}]},
+            model_provider="wavespeed",
+            timeout=RUN_TIMEOUT_S,
+        )
+    except InvalidInput as exc:  # model_provider not recognized -> not deployed here yet
+        pytest.skip(f"wavespeed not registered on this deployment yet: {exc}")
+    except NotEnabled as exc:  # gate off for this caller on this deployment
+        pytest.skip(f"wavespeed gate not enabled on this deployment: {exc}")
+    assert isinstance(out, dict) and out, f"empty wavespeed response: {out!r}"
+    cands = out.get("candidates")
+    assert isinstance(cands, list) and cands, (
+        f"no candidates in native Gemini response: keys={list(out)}"
+    )
