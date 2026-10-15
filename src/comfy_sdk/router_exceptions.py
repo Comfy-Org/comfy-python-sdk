@@ -100,7 +100,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from comfy_low.errors import _location, clean_request_id, summarise_detail
+from comfy_low.errors import _location, clean_body_excerpt, clean_request_id, summarise_detail
 
 from ._errors import ComfyError
 
@@ -217,7 +217,15 @@ class RouterError(ComfyError):
         if error_type is not None:
             self.error_type = error_type
         #: Human-readable description of the failure, safe to show a user. Not
-        #: machine-parsed -- branch on the exception class instead.
+        #: machine-parsed -- branch on the exception class instead. Safe in the
+        #: literal sense too on everything the builders in this module return:
+        #: where the text came off the wire -- either spelling of Router's
+        #: ``detail`` -- it is run through ``comfy_low.errors.clean_body_excerpt``
+        #: first, so it reaches a caller as printable characters on a single
+        #: line, capped at 256, and cannot repaint a terminal or flood a log
+        #: line; where the response described nothing, the value is this SDK's
+        #: own status-derived sentence. Constructing the class by hand bypasses
+        #: both -- the argument is taken as given.
         self.detail = detail
         #: Server-minted id for the call, from ``X-Comfy-Request-Id``. ``None``
         #: only when the response carried no such header.
@@ -303,16 +311,23 @@ class InsufficientCredits(RouterError):
 
 
 class ModelNotFound(RouterError):
-    """No such model. An unknown provider lands here too: both are "that id
-    names nothing".
+    """No such model. An unknown provider, an unenrolled id, an id the catalog
+    has retired past its sunset date, and a catalogued id the provider does not
+    currently serve for Comfy all land here: each is "that id runs nothing".
 
-    ``detail`` carries up to three suggestions drawn from the models the caller
-    is entitled to see. A catalogued id the provider does not currently serve
-    for Comfy also lands here, and the response then carries no suggestions.
+    For a retired id, ``detail`` reads ``<id> was retired on <YYYY-MM-DD>; use
+    <successor>`` when a successor is recorded and visible to the caller, or
+    just ``<id> was retired on <YYYY-MM-DD>`` when it is not. A named successor
+    is always a live catalog id the call can be re-pointed at. A model whose
+    sunset is still in the future is not retired: it stays listed and runnable
+    until that date. Otherwise ``detail`` carries up to three suggestions drawn
+    from the models the caller is entitled to see, except for a catalogued id
+    the provider does not currently serve, whose response carries none.
+    ``detail`` is display text, not a parse target.
     """
 
     error_type = "model_not_found"
-    _spec_meaning_digest: str = "33ffb0dd68a1"
+    _spec_meaning_digest: str = "6c0e0e327e4d"
 
 
 # -- transport-level buckets -------------------------------------------------
@@ -407,10 +422,18 @@ class NotEnabled(RouterError):
     is *not* the same thing, because ``forbidden`` is an entitlement decision
     about the caller while this is a state of the rollout. It is **terminal**:
     do not retry, and do not treat it as an outage.
+
+    The one exception to "about the caller" is the queued submit
+    (:meth:`~comfy_sdk.models.Models.submit`), which also answers
+    ``not_enabled`` for a *model* whose partner answers a generation directly
+    as bytes: that model cannot yet be queued, so it is the model and not the
+    caller that is refused, nothing is queued or charged, and the synchronous
+    route (:meth:`~comfy_sdk.models.Models.run`) runs it instead. On a submit,
+    read ``detail`` before concluding the account is not switched on.
     """
 
     error_type = "not_enabled"
-    _spec_meaning_digest: str = "c4a48688282c"
+    _spec_meaning_digest: str = "571a30cc6ba0"
 
 
 class ServiceUnavailable(RouterError):
@@ -522,6 +545,23 @@ class RequestNotFound(RouterError):
     _spec_meaning_digest: str = "385112b3cdcf"
 
 
+class QueueBacklogFull(RouterError):
+    """The caller already has too many queued requests waiting to run, so this
+    submit was refused.
+
+    It shares ``429`` with :class:`ConcurrencyLimitExceeded` and is not the same
+    thing: that one is the synchronous route's answer for too many calls in
+    flight at once, whereas the queue accepts a submit at that limit and parks
+    it, and this bucket is the separate bound on how many a caller may leave
+    waiting -- so that parking cannot mean enqueuing without end. It clears as
+    the caller's own queued requests finish, so retry once some of them
+    complete.
+    """
+
+    error_type = "queue_backlog_full"
+    _spec_meaning_digest: str = "50745ff63044"
+
+
 # -- cancel refusals ---------------------------------------------------------
 #
 # Deliberately OUTSIDE the closed set below, and carrying no
@@ -613,6 +653,7 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     Cancelled,
     QueueTimeout,
     RequestNotFound,
+    QueueBacklogFull,
 )
 
 _BY_ERROR_TYPE: dict[str, type[RouterError]] = {cls.error_type: cls for cls in ROUTER_EXCEPTIONS}
@@ -709,7 +750,13 @@ def error_from_response(
     if isinstance(body, Mapping):
         raw_detail = body.get("detail")
         if isinstance(raw_detail, str):
-            detail = raw_detail or None
+            # Reduced by the same function the array summary and every body
+            # excerpt go through, so one wire body's human-readable text is
+            # bounded, single-line and printable whichever shape carried it.
+            # This is where the string form used to reach `str(exc)` verbatim.
+            # A whitespace-only `detail` now reads as absent and falls to the
+            # status fallback below, matching `comfy_low.error_from_envelope`.
+            detail = clean_body_excerpt(raw_detail)
         elif isinstance(raw_detail, Sequence) and not isinstance(raw_detail, (str, bytes)):
             errors = tuple(
                 _detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping)
@@ -773,7 +820,10 @@ def error_from_completion(
     detail: str | None = None
     raw_detail = payload.get("detail")
     if isinstance(raw_detail, str):
-        detail = raw_detail or None
+        # Bounded and made printable like the response path's string form (see
+        # `error_from_response`): a completion body is as server-controlled as
+        # a response body, and its `detail` lands in the same displayed place.
+        detail = clean_body_excerpt(raw_detail)
     elif isinstance(raw_detail, Sequence) and not isinstance(raw_detail, (str, bytes)):
         errors = tuple(_detail_from(entry) for entry in raw_detail if isinstance(entry, Mapping))
         # One summariser across both surfaces (see `error_from_response`), so the
@@ -886,6 +936,7 @@ __all__ = [
     "NotEnabled",
     "ProviderError",
     "ProviderTimeout",
+    "QueueBacklogFull",
     "QueueTimeout",
     "RateLimited",
     "RequestNotFound",

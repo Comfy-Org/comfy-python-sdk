@@ -714,8 +714,122 @@ def test_a_huge_detail_array_stops_accumulating_at_the_excerpt_budget() -> None:
     assert len(err.message) == _BODY_EXCERPT_LIMIT
 
 
+def test_an_unprintable_entry_does_not_spend_the_budget_it_cannot_fill() -> None:
+    from comfy_low.errors import summarise_detail
+
+    # The budget stops accumulation once there is enough to FILL the 256-char
+    # cap, so only text that survives the reduction may be charged to it. A
+    # control-only `msg` survives `_clean` -- `str.strip()` does not treat NUL
+    # as whitespace -- but sanitises away to nothing, so charging its raw length
+    # let one such entry exhaust the budget on its own, break the loop, and then
+    # contribute no output at all. Every readable entry behind it was lost and
+    # the caller got a bare `HTTP 422` -- the exact failure `summarise_detail`
+    # was written to end, reachable by anything that can set a response body.
+    entries = [{"msg": "\x00" * 2048}, {"loc": ["body", "seed"], "msg": "field required"}]
+    assert summarise_detail(entries) == "body.seed: field required"
+
+    err = error_from_envelope(422, {"detail": entries}, error_type="invalid_input")
+    assert err.message == "body.seed: field required"
+    # The raw entries are unaffected either way -- they are data, not display.
+    assert len(err.validation_errors) == 2
+
+    # The same for a run of them, and for the interleaved case: an entry that
+    # reduces to nothing is skipped, never merely truncated into the output.
+    # Control characters and a bidi override only -- an ANSI sequence would be
+    # a poor probe here, since only its ESC is unprintable and the `[31m` that
+    # follows is ordinary text that should and does survive.
+    noise = {"msg": "\x00\x01\u202e\x7f" * 512}
+    assert summarise_detail([noise] * 20 + [{"msg": "real"}]) == "real"
+    assert summarise_detail([{"msg": "a"}, noise, {"msg": "b"}]) == "a; b"
+    assert summarise_detail([noise] * 50) is None
+
+
 def test_a_shared_bucket_without_an_array_still_maps_by_code() -> None:
     # The array is not what types a shared bucket: a bare `unauthorized` with no
     # `detail[]` still maps by code to the one class both surfaces export.
     err = to_sdk_error(ApiError("no", code="unauthorized", http_status=401))
     assert isinstance(err, SdkUnauthorized)
+
+
+# --- the string forms are reduced too, not only the `detail[]` summary ---
+#
+# `error.message` and Router's request-level string `detail` are as
+# server-controlled as any body excerpt, and both become `str(exc)`. They used
+# to be merely `.strip()`ed, so an intermediary could put escape sequences and
+# ten thousand characters into whatever printed the exception.
+
+#: One string carrying every category the reduction exists for: an ANSI colour
+#: sequence (``Cc``), a newline that would break a one-line log record, a
+#: right-to-left override (``Cf``) that reverses how the rest reads, a NUL, and
+#: enough padding to flood the line it lands on.
+HOSTILE = "\x1b[31mBAD\x1b[0m\n\u202ereversed\x00" + "x" * 10_000
+
+
+def assert_bounded_and_printable(text: str) -> None:
+    """``text`` is one printable line no longer than the excerpt limit."""
+    import unicodedata
+
+    from comfy_low.errors import _BODY_EXCERPT_LIMIT
+
+    assert "\n" not in text
+    assert "\x1b" not in text
+    assert "\u202e" not in text
+    assert len(text) <= _BODY_EXCERPT_LIMIT
+    assert all(unicodedata.category(ch) not in {"Cc", "Cf", "Co", "Cs"} for ch in text)
+
+
+@pytest.mark.parametrize(
+    ("body", "kwargs"),
+    [
+        pytest.param(
+            {"detail": HOSTILE, "error_type": "provider_error"},
+            {"error_type": "provider_error"},
+            id="router-string-detail",
+        ),
+        pytest.param(
+            {"error": {"code": "boom", "message": HOSTILE}},
+            {},
+            id="v2-error-message",
+        ),
+    ],
+)
+def test_a_hostile_string_message_is_bounded_and_printable(body: dict, kwargs: dict) -> None:
+    from comfy_low.errors import _BODY_EXCERPT_LIMIT
+
+    status = 502 if "detail" in body else 500
+    err = error_from_envelope(status, body, **kwargs)
+
+    assert_bounded_and_printable(err.message)
+    assert_bounded_and_printable(str(err))
+    # Exactly the cap, not merely under it: the padding is long enough that a
+    # reduction which silently stopped short would still pass the bound above.
+    assert len(err.message) == _BODY_EXCERPT_LIMIT
+    # The message-found gate still holds -- a response that said something does
+    # not also carry a second copy of it as an excerpt.
+    assert err.body_excerpt is None
+
+
+def test_a_sanitised_message_keeps_the_words_the_server_sent() -> None:
+    # Reduction, not redaction: the unprintable characters become spaces and the
+    # text around them survives, so the reason is still readable.
+    err = error_from_envelope(
+        502, {"detail": "no healthy\x00upstream\n"}, error_type="provider_error"
+    )
+    assert err.message == "no healthy upstream"
+
+
+@pytest.mark.parametrize("raw", ["   ", "\n\t", "\u200b"])
+def test_a_blank_string_detail_still_falls_back_to_the_status(raw: str) -> None:
+    # Whitespace-only, and the zero-width space that reduces to whitespace: each
+    # reads as absent, exactly as it did when `_clean` did the reading, so the
+    # status-derived default fires rather than a blank description.
+    err = error_from_envelope(502, {"detail": raw}, error_type="provider_error")
+    assert err.message == "HTTP 502"
+    assert err.error_type == "provider_error"
+
+
+def test_a_hostile_message_does_not_disturb_the_code_fields() -> None:
+    # `clean_body_excerpt` is for the display text only. The code fields stay on
+    # `_clean`, so a wire token is never whitespace-collapsed or capped.
+    err = error_from_envelope(500, {"error": {"code": "  boom  ", "message": HOSTILE}})
+    assert err.code == "boom"

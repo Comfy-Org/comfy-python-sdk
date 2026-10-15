@@ -665,6 +665,42 @@ def test_the_run_and_queued_paths_agree_on_one_validation_body(server) -> None:
     )
 
 
+def test_a_hostile_string_detail_reaches_the_caller_bounded_and_printable(server) -> None:
+    """The whole chain, on the one shape a real Router failure arrives in.
+
+    `models.run` -> `transport.parse_or_raise` -> `error_from_envelope` ->
+    `to_sdk_error` is the only path the SDK itself takes to a Router string
+    `detail`, so the reduction has to hold across all four rather than only in
+    the builder that applies it. The string carries every category the
+    reduction exists for -- an ANSI colour sequence, a newline, a
+    right-to-left override, a NUL -- plus enough padding to flood the log line
+    that prints it.
+    """
+    import unicodedata
+
+    from comfy_low.errors import _BODY_EXCERPT_LIMIT
+    from comfy_sdk.router_exceptions import ProviderError
+
+    hostile = "\x1b[31mBAD\x1b[0m\n\u202ereversed\x00" + "x" * 10_000
+    server.state.model_run_router_error_shape = True
+    server.state.model_run_error = (502, "provider_error")
+    server.state.model_run_error_detail = hostile
+
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(ProviderError) as excinfo:
+            client.models.run(MODEL, ARGS)
+
+    exc = excinfo.value
+    for text in (exc.detail, str(exc)):
+        assert "\n" not in text
+        assert "\x1b" not in text
+        assert "\u202e" not in text
+        assert all(unicodedata.category(ch) not in {"Cc", "Cf", "Co", "Cs"} for ch in text)
+    assert len(exc.detail) == _BODY_EXCERPT_LIMIT
+    assert exc.error_type == "provider_error"
+    assert exc.http_status == 502
+
+
 # --- the key survives the failure ----------------------------------------
 #
 # The router's replay contract lets a caller who lost a response resend the

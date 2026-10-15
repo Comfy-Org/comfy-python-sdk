@@ -31,6 +31,7 @@ from comfy_sdk.router_exceptions import (
     NotEnabled,
     ProviderError,
     ProviderTimeout,
+    QueueBacklogFull,
     QueueTimeout,
     RateLimited,
     RequestNotFound,
@@ -38,6 +39,7 @@ from comfy_sdk.router_exceptions import (
     ServiceUnavailable,
     Unauthorized,
     ValidationErrorDetail,
+    error_from_completion,
     error_from_response,
     exception_for,
 )
@@ -48,7 +50,8 @@ REQUEST_ID = "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21"
 # The statuses are part of the case on purpose: they document the pairing a
 # retry policy keys on (502 provider_error vs 504 provider_timeout), and the
 # four status collisions the widened set introduced -- 403 forbidden vs
-# not_enabled, 429 concurrency_limit_exceeded vs rate_limited, 504
+# not_enabled, 429 concurrency_limit_exceeded vs rate_limited (and, since,
+# queue_backlog_full), 504
 # provider_timeout vs deadline_exceeded, 500 internal_error vs the 503
 # service_unavailable it is deliberately NOT merged with.
 CASES: list[tuple[str, int, type[RouterError]]] = [
@@ -70,6 +73,7 @@ CASES: list[tuple[str, int, type[RouterError]]] = [
     ("cancelled", 409, Cancelled),
     ("queue_timeout", 504, QueueTimeout),
     ("request_not_found", 404, RequestNotFound),
+    ("queue_backlog_full", 429, QueueBacklogFull),
 ]
 
 # Deliberately not in the set this SDK version knows: a later milestone adds it,
@@ -405,6 +409,22 @@ def test_a_rate_limited_429_is_not_the_concurrency_429() -> None:
     assert type(error_from_response(429, {}, None)) is ConcurrencyLimitExceeded
 
 
+def test_a_queue_backlog_full_429_is_not_the_concurrency_429() -> None:
+    # The queue parks a submit at the in-flight limit; this is the separate
+    # bound on how many a caller may leave waiting, and it clears only as the
+    # caller's own queued requests finish -- not when one sync call returns.
+    exc = error_from_response(
+        429,
+        {ERROR_TYPE_HEADER: "queue_backlog_full"},
+        {"detail": "Too many queued requests.", "error_type": "queue_backlog_full"},
+    )
+    assert type(exc) is QueueBacklogFull
+    assert not isinstance(exc, ConcurrencyLimitExceeded)
+    # A bare 429 from an intermediary still reads as plain throttling: the
+    # backlog bound is Router's own claim, which a proxy cannot be making.
+    assert type(error_from_response(429, {}, None)) is ConcurrencyLimitExceeded
+
+
 # -- never crash the client on a malformed response --------------------------
 
 
@@ -563,3 +583,107 @@ def test_the_location_rendering_is_shared_with_the_summariser() -> None:
     entry = {"loc": ["body", ["a", "b"], 0], "msg": "bad"}
     assert _detail_from(entry).location == "body.0"
     assert summarise_detail([entry]) == "body.0: bad"
+
+
+# --- the string `detail` form is reduced, not merely stripped ---
+#
+# A request-level `detail` is a string the server, a proxy or a provider chose,
+# and it becomes both `.detail` and `str(exc)`. It used to reach them verbatim.
+
+#: Every category the reduction exists for, plus enough padding to flood a log
+#: line: an ANSI colour sequence, a newline, a right-to-left override, a NUL.
+HOSTILE = "\x1b[31mBAD\x1b[0m\n\u202ereversed\x00" + "x" * 10_000
+
+
+def _assert_bounded_and_printable(text: str) -> None:
+    """``text`` is one printable line no longer than the excerpt limit."""
+    import unicodedata
+
+    from comfy_low.errors import _BODY_EXCERPT_LIMIT
+
+    assert "\n" not in text
+    assert "\x1b" not in text
+    assert "\u202e" not in text
+    assert len(text) <= _BODY_EXCERPT_LIMIT
+    assert all(unicodedata.category(ch) not in {"Cc", "Cf", "Co", "Cs"} for ch in text)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(
+            lambda detail: error_from_response(
+                502, {ERROR_TYPE_HEADER: "provider_error"}, {"detail": detail}
+            ),
+            id="from-response",
+        ),
+        pytest.param(
+            lambda detail: error_from_completion(
+                {"status": "COMPLETED", "error_type": "provider_error", "detail": detail},
+                request_id="req_1",
+            ),
+            id="from-completion",
+        ),
+    ],
+)
+def test_a_hostile_string_detail_is_bounded_and_printable(build: Any) -> None:
+    from comfy_low.errors import _BODY_EXCERPT_LIMIT
+
+    exc = build(HOSTILE)
+
+    assert isinstance(exc, ProviderError)
+    _assert_bounded_and_printable(exc.detail)
+    _assert_bounded_and_printable(str(exc))
+    # Exactly the cap: the padding is long enough that a reduction stopping
+    # short of it would still satisfy the bound above.
+    assert len(exc.detail) == _BODY_EXCERPT_LIMIT
+
+
+@pytest.mark.parametrize(
+    ("build", "expected"),
+    [
+        pytest.param(
+            lambda detail: error_from_response(
+                502, {ERROR_TYPE_HEADER: "provider_error"}, {"detail": detail}
+            ),
+            "HTTP 502",
+            id="from-response",
+        ),
+        pytest.param(
+            lambda detail: error_from_completion(
+                {"status": "COMPLETED", "error_type": "provider_error", "detail": detail},
+                request_id="req_1",
+            ),
+            "the request completed with error_type 'provider_error'",
+            id="from-completion",
+        ),
+    ],
+)
+def test_a_whitespace_only_detail_reads_as_absent(build: Any, expected: str) -> None:
+    # The behaviour change the reduction brings: `"   "` described nothing and
+    # is now treated as the nothing it is, so the caller gets the same fallback
+    # a missing `detail` produces -- and the same one `error_from_envelope`
+    # already produced for it on the awaited surface.
+    exc = build("   ")
+    assert exc.detail == expected
+    assert str(exc) == expected
+
+
+def test_a_readable_detail_survives_the_reduction() -> None:
+    # Reduction, not redaction: the words the server sent are still there.
+    exc = error_from_response(
+        502, {ERROR_TYPE_HEADER: "provider_error"}, {"detail": "no healthy\x00upstream\n"}
+    )
+    assert exc.detail == "no healthy upstream"
+
+
+def test_the_per_field_entries_stay_raw() -> None:
+    # `.errors` is data, not display text: the entries are handed to the caller
+    # exactly as the server sent them, reduction or no reduction.
+    exc = error_from_response(
+        422,
+        {ERROR_TYPE_HEADER: "invalid_input"},
+        {"detail": [{"loc": ["body", "seed"], "msg": HOSTILE, "type": "value_error"}]},
+    )
+    assert exc.errors[0].msg == HOSTILE
+    _assert_bounded_and_printable(exc.detail)

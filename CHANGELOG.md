@@ -10,6 +10,19 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A model run that hit Router's deadline could surface as a bare client timeout.** `run`'s
+  default read timeout was 600 seconds, the same ten minutes as Router's own deadline, so the
+  client could give up at the instant Router was writing its `504 deadline_exceeded` and lose the
+  request id and `Retry-After` that answer carries. `MODEL_RUN_TIMEOUT.read` is now
+  `comfy_low.transport.ROUTER_DEADLINE` (600 seconds, new) plus a minute; `write` is 120 seconds
+  instead of following the generation wait, `pool` stays generation-scale, and `connect` stays
+  10 seconds. `run_detailed` also reads its response headers case-insensitively, so a plain
+  lowercased mapping no longer reads as every header being absent.
+
+## [0.5.0] - 2026-10-10
+
 ### Added
 
 - Job metadata. `submit(..., metadata={"client": "acme"})` on `Comfy` and `AsyncComfy` stores
@@ -68,61 +81,13 @@ the fuller account of each version, including verification notes.
   with `", "`), `NaN`/`Infinity` — reports as `None` rather than passing through to break the
   `Decimal()` parse the field documents. The field defaults to `None`, so this stays additive
   for anything that constructs a `RouterRunResult` by hand.
-
-### Fixed
-
-- **`RouterRunResult.replayed` was always `False` against a real deployment.** It was lifted
-  from `X-Comfy-Idempotent-Replayed`; the header Comfy Router actually sends — and the only
-  spelling `spec/router-openapi.yaml` declares, on the `200` as on the `400`/`409`/`422` — is
-  `Idempotent-Replayed`, with no `X-Comfy-` prefix. A replayed, unbilled response was reported
-  as a fresh generation. The prefixed spelling is *not* honoured as an alias, because Router
-  does not send it. `tests/test_router_spec_contract.py` now pins every header `run_detailed`
-  lifts against the name the vendored contract declares, and pins that the lift reads it.
-- **A model run that hit Router's deadline could surface as a bare client timeout.** `run`'s
-  default read timeout was 600 seconds, the same ten minutes as Router's own deadline, so the
-  client could give up at the instant Router was writing its `504 deadline_exceeded` and lose the
-  request id and `Retry-After` that answer carries. `MODEL_RUN_TIMEOUT.read` is now
-  `comfy_low.transport.ROUTER_DEADLINE` (600 seconds, new) plus a minute; `write` is 120 seconds
-  instead of following the generation wait, `pool` stays generation-scale, and `connect` stays
-  10 seconds. `run_detailed` also reads its response headers case-insensitively, so a plain
-  lowercased mapping no longer reads as every header being absent.
-- **`except RouterError` now catches every Comfy Router refusal.** `insufficient_credits`,
-  `unauthorized` and `forbidden` raised a class that was *not* a `RouterError`, so the obvious
-  catch-all around a `client.models.*` call caught nothing for them. Those three buckets are now
-  one class each, exported from both `comfy_sdk.exceptions` and `comfy_sdk.router_exceptions` —
-  `comfy_sdk.exceptions.InsufficientCredits is comfy_sdk.router_exceptions.InsufficientCredits`,
-  so either import catches what the other does. A Router bucket this version does not know now
-  raises `RouterError` rather than a bare `ComfyError`.
-- A cancel the server refuses raises a named exception instead of an untyped `409`:
-  `AlreadyCompleted` (the `{"status": "ALREADY_COMPLETED"}` answer to cancelling finished work),
-  under the `CancelRefused` base. Nothing has to match on the response body text any more.
-  Only the refusal shapes this version recognises are typed, and `ALREADY_COMPLETED` is the whole
-  of that list today: a refusal that names no bucket and no code stays an untyped `ComfyError`,
-  because nothing in such a response identifies it as a refusal at all.
-- `models.run` now populates `RouterError.errors` from a Router 422's per-field `detail[]` and
-  uses the entries' messages as `detail`, instead of `HTTP 422`; `comfy_low.ApiError.validation_errors`
-  carries the raw entries.
-- **A Router `detail[]` summary now names its fields, and is sanitised.** Both the awaited
-  (`models.run`) and the queued (`submit`) paths build the human-readable string with one shared
-  function, so a single server response reads the same way whichever surface raised it. Each entry
-  renders as `<loc>: <msg>`, so two `field required` errors now read `body.seed: field required;
-  body.steps: field required` rather than collapsing to an unrecoverable `field required; field
-  required`. The joined line gets the same treatment every other body-derived string already gets:
-  control characters, ANSI escapes and bidi overrides reduced, whitespace collapsed, and a 256-character
-  cap — so a hostile or merely careless `msg` can no longer scribble on a terminal or flood a log line.
-  Only the summary string changes; `.errors` still carries the raw typed entries.
-- `client.models.run()` no longer throws away a generation whose model answers
-  in bytes rather than JSON. Comfy Router forwards a partner model's output
-  under the partner's *own* media type, and for a model whose partner returns a
-  generation directly as a file — the ElevenLabs audio models are the first of
-  these in the catalog — that is raw `audio/mpeg`. The SDK called `.json()` on
-  every 2xx regardless, so such a run raised `ComfyError` with
-  `code="invalid_response"` (`UnicodeDecodeError: 'utf-8' codec can't decode
-  byte 0xff`, the MP3 frame sync) *after* the generation had run and been
-  billed. Those models were unusable from this SDK.
-
-### Added
-
+  The vendored Router spec now declares `X-Comfy-Credits-Used` on the run route's `200`, so
+  `tests/test_router_spec_contract.py` pins this lift against the contract like the other four.
+- `QueueBacklogFull` in `comfy_sdk.router_exceptions`, for the Router bucket `queue_backlog_full`:
+  a queued `submit` refused `429` because the caller already has too many requests waiting. It is
+  not `ConcurrencyLimitExceeded` — the queue parks a submit at the in-flight limit, and this is the
+  separate bound on how many may be left waiting. It clears as the caller's own queued requests
+  finish. Before this, the bucket arrived as a bare `RouterError`.
 - `BinaryResult` — importable from `comfy_sdk` — the second shape
   `models.run()` can return. `run` now branches on the response
   `Content-Type`, exactly as the run route's published `200` says a client
@@ -154,8 +119,9 @@ the fuller account of each version, including verification notes.
   a failure still carries `.idempotency_key` and an `Idempotent-Replayed`
   binary 200 comes back like a first run.
 
-  The one deliberate behaviour change beyond the fix: a non-JSON 2xx used to be
-  read as "a proxy interstitial served as 200" and raised. On this route that
+  The one deliberate behaviour change beyond no longer discarding binary
+  generations: a non-JSON 2xx used to be read as "a proxy interstitial served
+  as 200" and raised. On this route that
   reading is no longer available — the SDK cannot tell an interstitial from a
   partner's native text output, and the contract says the body is the
   partner's — so a `text/html` 200 now reaches the caller as bytes they can
@@ -177,7 +143,68 @@ the fuller account of each version, including verification notes.
   `invalid_response` on collection even though the identical model run directly
   through `run()` already worked.
 
+### Fixed
+
+- **`RouterRunResult.replayed` was always `False` against a real deployment.** It was lifted
+  from `X-Comfy-Idempotent-Replayed`; the header Comfy Router actually sends — and the only
+  spelling `spec/router-openapi.yaml` declares, on the `200` as on the `400`/`409`/`422` — is
+  `Idempotent-Replayed`, with no `X-Comfy-` prefix. A replayed, unbilled response was reported
+  as a fresh generation. The prefixed spelling is *not* honoured as an alias, because Router
+  does not send it. `tests/test_router_spec_contract.py` now pins every header `run_detailed`
+  lifts against the name the vendored contract declares, and pins that the lift reads it.
+- **`except RouterError` now catches every Comfy Router refusal.** `insufficient_credits`,
+  `unauthorized` and `forbidden` raised a class that was *not* a `RouterError`, so the obvious
+  catch-all around a `client.models.*` call caught nothing for them. Those three buckets are now
+  one class each, exported from both `comfy_sdk.exceptions` and `comfy_sdk.router_exceptions` —
+  `comfy_sdk.exceptions.InsufficientCredits is comfy_sdk.router_exceptions.InsufficientCredits`,
+  so either import catches what the other does. A Router bucket this version does not know now
+  raises `RouterError` rather than a bare `ComfyError`.
+- A cancel the server refuses raises a named exception instead of an untyped `409`:
+  `AlreadyCompleted` (the `{"status": "ALREADY_COMPLETED"}` answer to cancelling finished work),
+  under the `CancelRefused` base. Nothing has to match on the response body text any more.
+  Only the refusal shapes this version recognises are typed, and `ALREADY_COMPLETED` is the whole
+  of that list today: a refusal that names no bucket and no code stays an untyped `ComfyError`,
+  because nothing in such a response identifies it as a refusal at all.
+- `models.run` now populates `RouterError.errors` from a Router 422's per-field `detail[]` and
+  uses the entries' messages as `detail`, instead of `HTTP 422`; `comfy_low.ApiError.validation_errors`
+  carries the raw entries.
+- **A Router `detail[]` summary now names its fields, and is sanitised.** Both the awaited
+  (`models.run`) and the queued (`submit`) paths build the human-readable string with one shared
+  function, so a single server response reads the same way whichever surface raised it. Each entry
+  renders as `<loc>: <msg>`, so two `field required` errors now read `body.seed: field required;
+  body.steps: field required` rather than collapsing to an unrecoverable `field required; field
+  required`. The joined line gets the same treatment every other body-derived string already gets:
+  control characters, ANSI escapes and bidi overrides reduced, whitespace collapsed, and a 256-character
+  cap — so a hostile or merely careless `msg` can no longer scribble on a terminal or flood a log line.
+  Only the summary string changes; `.errors` still carries the raw typed entries.
+  An entry that is nothing but control characters no longer costs the summary its
+  readable entries: it reduces to nothing, so it is skipped rather than charged against
+  the length budget, where before a single such entry could exhaust the budget on its own
+  and leave the caller with a bare `HTTP 422` while the fields that actually failed sat
+  unread in the same body.
+- **The string `detail` and `error.message` forms are sanitised too.** A Router request-level
+  `detail` string, and a v2 envelope's `error.message`, reached `str(exc)` exactly as sent — so a
+  server, a proxy or a provider in front of either surface could put ANSI escape sequences, a bidi
+  override, NUL bytes, newlines or ten thousand characters of padding straight into a traceback or a
+  log line. Both now get the same reduction the `detail[]` summary and the body excerpts already got:
+  control characters and format characters replaced, whitespace collapsed to one line, and a
+  256-character cap. It applies on every builder — the awaited `models.run` path and both queued
+  paths. One behaviour change falls out of it: a `detail` of nothing but whitespace now reads as
+  absent, so the error reports `HTTP <status>` (or, on a completion, the `error_type`) instead of a
+  blank description. `RouterError.errors` and `ApiError.validation_errors` are untouched — those are
+  data, and stay raw.
+- `client.models.run()` no longer throws away a generation whose model answers
+  in bytes rather than JSON. Comfy Router forwards a partner model's output
+  under the partner's *own* media type, and for a model whose partner returns a
+  generation directly as a file — the ElevenLabs audio models are the first of
+  these in the catalog — that is raw `audio/mpeg`. The SDK called `.json()` on
+  every 2xx regardless, so such a run raised `ComfyError` with
+  `code="invalid_response"` (`UnicodeDecodeError: 'utf-8' codec can't decode
+  byte 0xff`, the MP3 frame sync) *after* the generation had run and been
+  billed. Those models were unusable from this SDK.
+
 ### Changed
+
 - `submit` (and the new `list_jobs`) wait at least one second before retrying a 429, so a
   `Retry-After: 0` or a negative one no longer retries at once.
 - **Because those three buckets are now one class each, they descend from `RouterError` on the
@@ -194,11 +221,40 @@ the fuller account of each version, including verification notes.
   affected: `raise`, `except` and every attribute a caller reads inside the handler (`.message`,
   `.code`, `.http_status`, `.details`, `.request_id`, `.retry_after`) are unchanged.
 - `RouterError` is exported from the package root, alongside `CancelRefused` and
-  `AlreadyCompleted`. The eighteen per-bucket classes still live in
+  `AlreadyCompleted`. The nineteen per-bucket classes still live in
   `comfy_sdk.router_exceptions`.
+- `NotEnabled`'s documented meaning widened with the synced Router spec: on a queued `submit` it
+  can also refuse a *model* whose partner answers a generation directly as bytes (it cannot yet be
+  queued; nothing is queued or charged; `models.run` serves it). It is still terminal, but on a
+  submit it no longer proves the caller is not switched on — read `.detail`.
+- **Breaking, for direct `comfy_low` callers.** The body half of the `(body, headers)` tuple
+  that `ComfyLow.post_model_run` / `AsyncComfyLow.post_model_run` and
+  `get_model_request_result` return is now `dict[str, Any] | BinaryResult` (also importable
+  from `comfy_low`), so code that indexes it must narrow first: a binary 200 that raised
+  `invalid_response` in 0.4.0 now returns a `BinaryResult`. `comfy_sdk` users are covered by
+  the `BinaryResult` entry above.
 - `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
   body's `error_type`), or `None` when it named none — which is also how the SDK tells which
   surface answered.
+
+## [0.4.0] - 2026-09-18
+
+### Added
+
+- `model_provider`, `strict_mode` and `fallback_provider` on `models.run` / `AsyncModels.run` —
+  sent only when set, so a call that names none is byte-for-byte the request this route always
+  made. `fallback_provider` accepts a `bool`, sent as `true`/`false`.
+- `run_detailed()` (sync and async), returning a new `RouterRunResult`: the partner's native
+  `output` plus `serving_provider`, `dropped_params`, `replayed` and `request_id`. `run()` is
+  unchanged and still returns the native body. `RouterRunResult` is exported from `comfy_sdk`.
+- `Cancelled`, `QueueTimeout` and `RequestNotFound` in `comfy_sdk.router_exceptions`, for the
+  Router buckets `cancelled`, `queue_timeout` and `request_not_found`.
+
+### Changed
+
+- **Breaking, for direct `comfy_low` callers.** `ComfyLow.post_model_run` now returns
+  `(body, headers)`, matching the four `*_model_request*` queue methods beside it. `comfy_sdk`
+  users are unaffected.
 
 ## [0.3.0] - 2026-09-14
 
@@ -380,7 +436,9 @@ First public release of the Comfy API v2 Python SDK (`comfy-sdk`).
   upload/dedup inputs, submit, follow (poll or SSE), download outputs.
 - Sync and async clients. Python 3.10+.
 
-[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.3.0...HEAD
+[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.1.8...v0.1.9
