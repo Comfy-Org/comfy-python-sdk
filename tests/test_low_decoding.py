@@ -8,6 +8,9 @@ passes an explicit `file_size`, so the size-probe fallback never ran.
 from __future__ import annotations
 
 import io
+import os
+
+import pytest
 
 from comfy_low._multipart import file_size_of
 from comfy_low.sse import RawEvent, SSEDecoder
@@ -53,6 +56,38 @@ def test_file_size_of_seekable_stream_without_fileno():
     assert file_size_of(buf) == 10
     buf.read(4)  # partial consume -> size is the REMAINING bytes from the cursor
     assert file_size_of(buf) == 6
+
+
+@pytest.mark.parametrize("buffering", [-1, 0], ids=["buffered", "raw"])
+@pytest.mark.parametrize("offset", [0, 4, 10, 14])
+def test_file_size_of_disk_file_reports_remaining_bytes(tmp_path, buffering, offset):
+    path = tmp_path / "source.bin"
+    path.write_bytes(b"abcdefghij")
+    with open(path, "rb", buffering=buffering) as stream:
+        # A buffered read can advance the OS fd past the logical cursor.
+        stream.read(min(offset, 10))
+        if offset > 10:
+            stream.seek(offset)
+        assert stream.tell() == offset
+        assert file_size_of(stream) == max(0, 10 - offset)
+        assert stream.tell() == offset
+        assert stream.read() == b"abcdefghij"[offset:]
+
+
+def test_file_size_of_memory_stream_beyond_eof():
+    with io.BytesIO(b"abcdefghij") as stream:
+        stream.seek(14)
+        assert file_size_of(stream) == 0
+        assert stream.tell() == 14
+
+
+def test_file_size_of_pipe_is_unknown_and_does_not_consume_bytes():
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "rb") as stream, os.fdopen(write_fd, "wb") as writer:
+        writer.write(b"pipe-bytes")
+        writer.flush()
+        assert file_size_of(stream) is None
+        assert stream.read(10) == b"pipe-bytes"
 
 
 def test_file_size_of_unsized_source_returns_none():

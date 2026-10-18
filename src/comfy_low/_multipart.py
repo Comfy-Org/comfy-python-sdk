@@ -79,21 +79,21 @@ def build_multipart(
 
 
 def file_size_of(file_obj: BinaryIO) -> int | None:
-    """Best-effort size of a seekable file object, else ``None``."""
+    """Best-effort remaining bytes of a seekable file object, else ``None``."""
     try:
         fd = file_obj.fileno()
     except (OSError, AttributeError):
         fd = None
     if fd is not None:
         try:
-            return os.fstat(fd).st_size
-        except OSError:
+            return max(0, os.fstat(fd).st_size - file_obj.tell())
+        except (OSError, AttributeError):
             pass
     try:
         cur = file_obj.tell()
         file_obj.seek(0, os.SEEK_END)
         end = file_obj.tell()
         file_obj.seek(cur, os.SEEK_SET)
-        return end - cur
+        return max(0, end - cur)
     except (OSError, AttributeError):
         return None

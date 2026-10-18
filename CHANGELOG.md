@@ -10,6 +10,11 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Multipart uploads through `ComfyLow` and `AsyncComfyLow` now infer the remaining
+  bytes of a partially read file, so its `Content-Length` matches the bytes sent.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
