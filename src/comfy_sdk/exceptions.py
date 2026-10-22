@@ -140,6 +140,10 @@ _BY_CODE: dict[str, type[ComfyError]] = {
     "job_not_found": NotFound,
     "asset_not_found": NotFound,
     "unauthorized": Unauthorized,
+    # The events stream's terminal `error` frame spells an expired credential
+    # this way; the caller's remedy is the `unauthorized` one, so it is the same
+    # class, with `.code` left as the wire said it.
+    "credential_expired": Unauthorized,
     "forbidden": Forbidden,
 }
 
@@ -225,15 +229,24 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
         # response carried the array. `_detail_from` is a plain module-level
         # import now that `ComfyError` lives in `comfy_sdk._errors` — the cycle
         # that forced the lazy one is what this change removed.
-        return cls(
+        #
+        # A `_BY_CODE` alias that is not itself a Router bucket
+        # (`credential_expired` -> `Unauthorized`) keeps the class's bucket as
+        # `error_type`, so that attribute only ever names a value of the closed
+        # Router set; the wire spelling survives on `.code`.
+        alias = exc.code in _BY_CODE and bool(cls.error_type) and exc.code != cls.error_type
+        err = cls(
             str(exc),
-            error_type=exc.code,
+            error_type=cls.error_type if alias else exc.code,
             http_status=exc.http_status,
             details=exc.details,
             request_id=exc.request_id,
             retry_after=exc.retry_after,
             errors=tuple(_detail_from(entry) for entry in exc.validation_errors),
         )
+        if alias:
+            err.code = exc.code
+        return err
     # No `errors=` below, deliberately: `.errors` is a `RouterError` attribute
     # and none of the remaining classes takes the argument. A validation body
     # that reaches this branch — a `detail[]` under a v2 `error.code`, or under
