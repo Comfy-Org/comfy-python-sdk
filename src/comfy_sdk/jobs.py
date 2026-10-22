@@ -21,11 +21,12 @@ from pydantic import TypeAdapter, ValidationError
 
 from comfy_low.errors import ApiError
 from comfy_low.models import Job as LowJob
+from comfy_low.models import JobUrls
 from comfy_low.models import Output as LowOutput
 from comfy_low.transport import AsyncComfyLow, ComfyLow, job_labels
 
 from . import _core
-from .events import Event, StatusChange, event_from_raw
+from .events import Event, Progress, StatusChange, event_from_raw, progress_from_model
 from .exceptions import ComfyError, JobFailed, to_sdk_error, translating
 from .outputs import AsyncOutput, Output
 
@@ -55,6 +56,12 @@ def _metadata_of(model: LowJob) -> dict[str, str]:
     # spec sync lands; the transport validates into a subclass that does.
     # `job_labels` returns a new dict, so the caller gets a copy.
     return job_labels(getattr(model, "metadata", None))
+
+
+def _metrics_of(model: LowJob) -> dict[str, int | None] | None:
+    # A copy, like `_metadata_of`: `refresh()` and `events()` read the handle's
+    # own model, so a caller editing the dict must not edit what they read.
+    return None if model.metrics is None else dict(model.metrics)
 
 
 _TIME = TypeAdapter(datetime)
@@ -180,6 +187,80 @@ class Job:
         ``{}``, and a non-string value is dropped, rather than raising.
         """
         return _metadata_of(self._model)
+
+    # -- lifecycle --------------------------------------------------------
+    #
+    # Views onto whatever state this handle currently holds — reading one
+    # never re-fetches, exactly like the properties above. Call
+    # :meth:`refresh` (or :meth:`wait` / :meth:`result`) first if you need
+    # the server's latest.
+
+    @property
+    def created_at(self) -> datetime:
+        """When the server accepted the job. Timezone-aware; always set."""
+        return self._model.created_at
+
+    @property
+    def started_at(self) -> datetime | None:
+        """When execution began, or ``None`` while the job is still queued."""
+        return self._model.started_at
+
+    @property
+    def completed_at(self) -> datetime | None:
+        """When the job reached a terminal state, or ``None`` before then.
+
+        With :attr:`started_at`, this is how long a job took to run::
+
+            duration = job.completed_at - job.started_at
+        """
+        return self._model.completed_at
+
+    @property
+    def expires_at(self) -> datetime:
+        """Retention deadline — when the job and its outputs stop being
+        readable. A platform property, not an API constant, so read it rather
+        than assuming a window.
+        """
+        return self._model.expires_at
+
+    @property
+    def progress(self) -> Progress | None:
+        """The latest progress snapshot on this handle, or ``None``.
+
+        Same :class:`~comfy_sdk.events.Progress` shape the ``progress`` frames
+        of :meth:`events` carry. Not every surface fills this in on a poll, so
+        ``None`` means "no snapshot on this handle" and never "no progress" —
+        :meth:`events` is the live source, and the one to use for a UI.
+        """
+        model = self._model.progress
+        return None if model is None else progress_from_model(model)
+
+    @property
+    def queue_position(self) -> int | None:
+        """Place in the queue, or ``None`` when the surface does not report
+        one (and once the job is no longer queued).
+        """
+        return self._model.queue_position
+
+    @property
+    def metrics(self) -> dict[str, int | None] | None:
+        """Server-reported timings in milliseconds (e.g. ``queue_ms``,
+        ``execution_ms``), or ``None``. Individual values are nullable too: a
+        metric that is not available yet is ``None`` rather than absent. A
+        copy, so editing it does not change this handle.
+        """
+        return _metrics_of(self._model)
+
+    @property
+    def urls(self) -> JobUrls:
+        """The server's follow-up links (``self`` / ``events`` / ``cancel``).
+
+        Follow these rather than building URLs. A link may be host-relative,
+        and one pointing off the deployment's own origin is never sent the
+        API key. A copy, so editing it does not change the links this handle
+        follows.
+        """
+        return self._model.urls.model_copy()
 
     def get_outputs(self, node_id: str) -> list[Output]:
         """The outputs produced by one node, in server order.
@@ -318,6 +399,49 @@ class AsyncJob:
     def metadata(self) -> dict[str, str]:
         """:attr:`Job.metadata` — the labels given at submit, ``{}`` when none."""
         return _metadata_of(self._model)
+
+    # -- lifecycle (mirrors :class:`Job`; reads the handle, never re-fetches)
+
+    @property
+    def created_at(self) -> datetime:
+        """:attr:`Job.created_at`."""
+        return self._model.created_at
+
+    @property
+    def started_at(self) -> datetime | None:
+        """:attr:`Job.started_at`."""
+        return self._model.started_at
+
+    @property
+    def completed_at(self) -> datetime | None:
+        """:attr:`Job.completed_at`."""
+        return self._model.completed_at
+
+    @property
+    def expires_at(self) -> datetime:
+        """:attr:`Job.expires_at`."""
+        return self._model.expires_at
+
+    @property
+    def progress(self) -> Progress | None:
+        """:attr:`Job.progress`."""
+        model = self._model.progress
+        return None if model is None else progress_from_model(model)
+
+    @property
+    def queue_position(self) -> int | None:
+        """:attr:`Job.queue_position`."""
+        return self._model.queue_position
+
+    @property
+    def metrics(self) -> dict[str, int | None] | None:
+        """:attr:`Job.metrics`."""
+        return _metrics_of(self._model)
+
+    @property
+    def urls(self) -> JobUrls:
+        """:attr:`Job.urls`."""
+        return self._model.urls.model_copy()
 
     def get_outputs(self, node_id: str) -> list[AsyncOutput]:
         """:meth:`Job.get_outputs`, bound to async outputs. Not a coroutine —

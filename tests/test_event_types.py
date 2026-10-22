@@ -7,7 +7,19 @@ data; the `log` event type and the preview base64-decode guard had no coverage.
 from __future__ import annotations
 
 from comfy_low.sse import RawEvent
-from comfy_sdk.events import Log, Preview, event_from_raw
+from comfy_sdk.events import Log, Preview, Progress, event_from_raw, progress_from_model
+
+#: A progress payload with every optional field of the schema present.
+_PROGRESS_WIRE = {
+    "value": 0.42,
+    "nodes_done": 11,
+    "nodes_total": 31,
+    "current_node": "12",
+    "current_node_class": "KSampler",
+    "step": 21,
+    "steps": 50,
+    "message": "KSampler 21/50",
+}
 
 
 def _binder(model):  # only OutputReady needs a real binder; unused here
@@ -39,3 +51,32 @@ def test_preview_survives_undecodable_base64():
 
 def test_unknown_event_name_is_skipped():
     assert event_from_raw(RawEvent(event="mystery", data={}), _binder) is None
+
+
+def test_progress_event_carries_every_field_of_the_schema():
+    # `current_node_class` was the one field of the progress schema the
+    # decoder dropped. The stub server's frames do not send it, so this is
+    # where it is pinned.
+    ev = event_from_raw(RawEvent(event="progress", data=dict(_PROGRESS_WIRE)), _binder)
+    assert ev == Progress(
+        value=0.42,
+        message="KSampler 21/50",
+        nodes_done=11,
+        nodes_total=31,
+        current_node="12",
+        step=21,
+        steps=50,
+        current_node_class="KSampler",
+    )
+
+
+def test_progress_from_model_matches_the_stream_decoder():
+    # `job.progress` lifts the generated model; `job.events()` decodes the SSE
+    # frame. Both produce the SDK's `Progress`, and the contract serves the
+    # same schema down both paths — so for the same payload they must agree,
+    # field for field. A field added to one lift and not the other fails here.
+    from comfy_low.models import Progress as LowProgress
+
+    from_stream = event_from_raw(RawEvent(event="progress", data=dict(_PROGRESS_WIRE)), _binder)
+    from_model = progress_from_model(LowProgress.model_validate(dict(_PROGRESS_WIRE)))
+    assert from_model == from_stream
