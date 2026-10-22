@@ -10,6 +10,17 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A model run that hit Router's deadline could surface as a bare client timeout.** `run`'s
+  default read timeout was 600 seconds, the same ten minutes as Router's own deadline, so the
+  client could give up at the instant Router was writing its `504 deadline_exceeded` and lose the
+  request id and `Retry-After` that answer carries. `MODEL_RUN_TIMEOUT.read` is now
+  `comfy_low.transport.ROUTER_DEADLINE` (600 seconds, new) plus a minute; `write` is 120 seconds
+  instead of following the generation wait, `pool` stays generation-scale, and `connect` stays
+  10 seconds. `run_detailed` also reads its response headers case-insensitively, so a plain
+  lowercased mapping no longer reads as every header being absent.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added

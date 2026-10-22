@@ -167,10 +167,12 @@ failure, a paced ``429`` — which resolve in seconds or not at all; a blackhole
 host has no business pinning a caller (a whole thread, on the sync client) for
 longer than that. ``collect_max_elapsed`` is twenty minutes and governs class 3
 alone, because it is the one class whose budget has to outlast a *server-side*
-bound: a ``deadline_exceeded`` ``504`` arrives at Comfy's own deadline, the same
-ten minutes as :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT`, so a budget of one
-deadline window is already spent when the ``504`` lands and the collect attempt
-it exists for never starts. Two windows is one to reach the ``504`` and one to
+bound: a ``deadline_exceeded`` ``504`` arrives at Comfy's own deadline, the ten
+minutes of :data:`~comfy_low.transport.ROUTER_DEADLINE` — not the client's own
+``MODEL_RUN_TIMEOUT``, which is deliberately sized a minute *above* it so the
+``504`` is received rather than raced — so a budget of one deadline window is
+already spent when the ``504`` lands and the collect attempt it exists for never
+starts. Two windows is one to reach the ``504`` and one to
 collect what it left running — and nothing else pays for it. Both are measured
 from the same origin, the construction of the :class:`Retrier`; which one applies
 is decided per failure, by :func:`is_collectable`.
@@ -484,10 +486,11 @@ class RetryPolicy:
     #:
     #: It is separate, and twenty minutes, because the collect loop is the one
     #: class whose budget has to outlast a server-side bound. A
-    #: ``deadline_exceeded`` ``504`` arrives *at* Comfy's own deadline — the same
-    #: ten minutes as :data:`~comfy_low.transport.MODEL_RUN_TIMEOUT` — so a
-    #: budget of one deadline window is already spent by the time the ``504``
-    #: lands and the collect attempt it was sized for never starts. Two windows
+    #: ``deadline_exceeded`` ``504`` arrives *at* Comfy's own deadline — the ten
+    #: minutes of :data:`~comfy_low.transport.ROUTER_DEADLINE`, not the client's
+    #: own ``MODEL_RUN_TIMEOUT``, which sits a minute above it — so a budget of
+    #: one deadline window is already spent by the time the ``504`` lands and
+    #: the collect attempt it was sized for never starts. Two windows
     #: is one to reach the ``504`` and one to collect what it left running. The
     #: cost is not charged to anything else: a refused connection still gives up
     #: at :attr:`max_elapsed`. Ignored entirely when ``max_elapsed`` is zero, so
