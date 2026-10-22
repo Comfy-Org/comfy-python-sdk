@@ -198,6 +198,13 @@ def test_no_estimate_on_the_201_is_none(server, fast_poll) -> None:
         {key: value for key, value in EXACT_ESTIMATE.items() if key != "amount"},
         {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "0.02"},
         {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "0.08", "max_amount": "0.02"},
+        # A bound that is negative or not a finite figure is as unreadable as
+        # a missing one, so the range goes with it.
+        {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "-0.02", "max_amount": "0.08"},
+        {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "0.02", "max_amount": "-0.08"},
+        {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "NaN", "max_amount": "0.08"},
+        {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "0.02", "max_amount": "Infinity"},
+        {**EXACT_ESTIMATE, "source": "estimated", "min_amount": 0.02, "max_amount": 0.08},
     ],
 )
 def test_a_malformed_estimate_is_no_quote_and_never_fails_the_submit(
