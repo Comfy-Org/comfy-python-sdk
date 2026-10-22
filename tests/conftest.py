@@ -101,8 +101,15 @@ class ServerState:
     terminal_status: str = "succeeded"
     # SSE behavior: "reconnect" drops the first stream before terminal;
     # "stall" sends a couple frames then holds the connection open, silent
-    # (a "zombie": no terminal, no close) for `stall_seconds`.
+    # (a "zombie": no terminal, no close) for `stall_seconds`; "drop" answers
+    # every connection 200 and closes it without a terminal — with no frames,
+    # or with the on-connect status/progress snapshot if `sse_drop_snapshot` —
+    # and the connection numbered `sse_hold_on_connect` (if set) holds open for
+    # `sse_hold_seconds` before closing.
     sse_mode: str = "normal"
+    sse_drop_snapshot: bool = False
+    sse_hold_on_connect: int | None = None
+    sse_hold_seconds: float = 0.0
     stall_seconds: float = 2.0
     # GET /jobs/{id}/events answers 501 not_implemented — a surface without SSE.
     events_not_implemented: bool = False
@@ -770,6 +777,14 @@ def _make_handler(state: ServerState):
                 self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
                 self.wfile.flush()
 
+            if state.sse_mode == "drop":
+                if state.sse_drop_snapshot:
+                    frame("status", {"status": "running"})
+                    frame("progress", {"value": 0.4, "nodes_done": 4, "nodes_total": 10})
+                if state.events_connect_count == state.sse_hold_on_connect:
+                    # Event.wait, not time.sleep: tests fake out time.sleep.
+                    threading.Event().wait(state.sse_hold_seconds)
+                return
             if state.sse_mode == "reconnect" and state.events_connect_count == 1:
                 # First connection: a progress frame, then drop without terminal.
                 frame("progress", {"value": 0.4, "nodes_done": 4, "nodes_total": 10})
