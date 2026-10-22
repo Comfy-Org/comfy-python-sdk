@@ -53,10 +53,10 @@ catchable exception carrying its raw ``error_type`` -- treat one like
 ``internal_error``. A client that rejected the unknown value would fail hardest
 exactly when something has already gone wrong.
 
-Three of these names -- ``Unauthorized``, ``Forbidden``, ``InsufficientCredits``
--- also exist in :mod:`comfy_sdk.exceptions`, which is where the workflow
-surface's error codes are mapped. **They are the same class object, defined
-here and re-exported there**, so ``comfy_sdk.exceptions.Unauthorized is
+Four of these names -- ``Unauthorized``, ``Forbidden``, ``InsufficientCredits``,
+``RateLimited`` -- also exist in :mod:`comfy_sdk.exceptions`, which is where the
+workflow surface's error codes are mapped. **They are the same class object,
+defined here and re-exported there**, so ``comfy_sdk.exceptions.Unauthorized is
 comfy_sdk.router_exceptions.Unauthorized`` and either import catches whatever
 the other one does. ``tests/test_exception_modules.py`` asserts that of every
 name the two modules share.
@@ -71,8 +71,10 @@ broad catch honest. The consequence to know is the other direction: a *workflow*
 call that fails ``401``/``403``/``402`` now raises a :class:`RouterError`
 subclass too, because one class cannot be a ``RouterError`` on one surface and
 not on the other. ``except Unauthorized`` (from either module) is unchanged;
-``except RouterError`` is wider than the name suggests for exactly those three
-buckets.
+``except RouterError`` is wider than the name suggests for exactly those
+buckets. :class:`RateLimited` joined them later, for the same reason: the v2
+job routes answer ``429`` with the identically spelled ``rate_limited``, and
+the wire code alone cannot say which surface answered.
 
 This module is still deliberately *not* star-re-exported from the package root:
 lifting :class:`NotEnabled` there while ``comfy_sdk.InvalidInput`` stayed a name
@@ -82,8 +84,9 @@ and ``from comfy_sdk.router_exceptions import NotEnabled`` is it.
 :class:`RouterError` itself *is* lifted to the root, because it is the one name
 a caller writing a broad handler reaches for first -- and so are
 :class:`CancelRefused` and :class:`AlreadyCompleted`, which a caller handles at
-the ``cancel()`` call site rather than through this module. Those three are the
-whole of the package root's share; everything else is ``from
+the ``cancel()`` call site rather than through this module. Those three, plus
+the four buckets shared with :mod:`comfy_sdk.exceptions` above, are the whole
+of the package root's share; everything else is ``from
 comfy_sdk.router_exceptions import ...``.
 
 The coarse bucket is not the whole story. A per-field model-validation failure
