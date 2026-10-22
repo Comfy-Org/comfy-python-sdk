@@ -90,10 +90,22 @@ class JobSummary:
     """When the job last changed; ``None`` when the item has no readable time."""
 
     deployment_id: str | None
-    """The id of the deployment copy that ran the job, or ``None`` when the item has none.
+    """The deployment the job was sent to, or ``None`` for a job outside a deployment.
 
-    A deployment update makes a new copy, so for a job that ran before the
-    update this can differ from the deployment's current id.
+    This is the id in the address the job was posted at, which stays the same
+    when the deployment moves to another release. The serverless platform sends
+    it on every list item today, but the v2 ``JobListItem`` contract does not
+    declare it, so another host may leave it out (it then reads as ``None``).
+    A value that is present but is not a string still raises ``ComfyError``
+    with code ``invalid_response``.
+    """
+
+    release_version: int | None
+    """The version of the release that ran the job, as the deployment's build cut it.
+
+    ``None`` where the serving surface does not report it or could not look it
+    up in time. After a deployment moves to a new release, this is how to tell
+    which release produced a job.
     """
 
     metadata: dict[str, str]
@@ -128,12 +140,20 @@ class JobSummary:
                 f"job list item is missing {' and '.join(missing)}", code="invalid_response"
             )
         deployment_id = item.get("deployment_id")
-        wrong = [name for name in ("id", "status") if not isinstance(item[name], str)]
+        release_version = item.get("release_version")
+        wrong = [
+            f"non-string {name}" for name in ("id", "status") if not isinstance(item[name], str)
+        ]
         if deployment_id is not None and not isinstance(deployment_id, str):
-            wrong.append("deployment_id")
+            wrong.append("non-string deployment_id")
+        # bool is an int subclass, so it is ruled out by name.
+        if release_version is not None and (
+            not isinstance(release_version, int) or isinstance(release_version, bool)
+        ):
+            wrong.append("non-integer release_version")
         if wrong:
             raise ComfyError(
-                f"job list item has a non-string {' and '.join(wrong)}", code="invalid_response"
+                f"job list item has a {' and a '.join(wrong)}", code="invalid_response"
             )
         return cls(
             id=item["id"],
@@ -141,6 +161,7 @@ class JobSummary:
             create_time=_parse_time(item.get("create_time")),
             update_time=_parse_time(item.get("update_time")),
             deployment_id=deployment_id,
+            release_version=release_version,
             metadata=job_labels(item.get("metadata")),
             data=item,
         )
