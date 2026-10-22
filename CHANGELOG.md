@@ -10,6 +10,11 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Ignore one leading UTF-8 byte order mark in each SSE connection so the first
+  event or data field is decoded correctly, including after reconnecting.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
