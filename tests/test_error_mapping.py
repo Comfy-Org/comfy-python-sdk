@@ -278,7 +278,6 @@ def test_a_body_that_names_no_bucket_still_falls_back_to_the_status(body: object
         ("invalid_input", 422, "InvalidInput"),
         ("model_not_found", 404, "ModelNotFound"),
         ("concurrency_limit_exceeded", 409, "ConcurrencyLimitExceeded"),
-        ("rate_limited", 429, "RateLimited"),
         ("provider_error", 500, "ProviderError"),
         ("deadline_exceeded", 504, "DeadlineExceeded"),
     ],
@@ -295,9 +294,11 @@ def test_a_router_only_bucket_raises_its_typed_class(
     assert err.retry_after == 7
 
 
-@pytest.mark.parametrize("code", ["unauthorized", "forbidden", "insufficient_credits"])
+@pytest.mark.parametrize(
+    "code", ["unauthorized", "forbidden", "insufficient_credits", "rate_limited"]
+)
 def test_a_bucket_both_surfaces_spell_keeps_its_v2_class(code: str) -> None:
-    # These three codes are spelled identically by the v2 envelope and by
+    # These four codes are spelled identically by the v2 envelope and by
     # Router, and the code string alone cannot say which surface answered.
     # Retyping them to the RouterError twins would break every jobs-surface
     # handler to fix none -- the v2 classes fire on the router surface too.
@@ -305,6 +306,24 @@ def test_a_bucket_both_surfaces_spell_keeps_its_v2_class(code: str) -> None:
 
     err = to_sdk_error(ApiError("no", code=code, http_status=403))
     assert type(err) is getattr(sdk, "".join(p.title() for p in code.split("_")))
+
+
+def test_a_v2_envelope_rate_limited_is_the_shared_router_class() -> None:
+    # Deliberate sharing, not a mis-mapping: the v2 jobs/assets throttle and
+    # Router's `rate_limited` bucket are the same windowed allowance spelled the
+    # same way, so a v2 envelope with no Router header still raises the Router
+    # class -- exactly as `unauthorized`, `forbidden` and `insufficient_credits`
+    # do. `error_type` is left unset to prove the class comes from the code alone.
+    from comfy_sdk.router_exceptions import RateLimited, RouterError
+
+    exc = ApiError("slow down", code="rate_limited", http_status=429, retry_after=7)
+    assert exc.error_type is None
+    err = to_sdk_error(exc)
+    assert type(err) is RateLimited
+    assert isinstance(err, RouterError)
+    assert err.code == "rate_limited"
+    assert err.error_type == "rate_limited"
+    assert err.retry_after == 7
 
 
 # --- a response nothing in the stack recognised ---
