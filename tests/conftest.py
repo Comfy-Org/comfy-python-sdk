@@ -293,6 +293,10 @@ class ServerState:
     # Answer the submit with a body carrying no `request_id` at all — accepted
     # work the caller has no way to reach.
     queue_submit_omits_request_id: bool = False
+    # The 201's `estimate` object, sent verbatim (so a test can send a malformed
+    # one). None omits the field, as Router does on an idempotent replay or
+    # with the cost estimate off for the caller.
+    queue_submit_estimate: Any = None
     # The id the queue hands back, and the one every later route answers for.
     queue_request_id: str = "req_stub_01"
     # Status polls that report a non-terminal state before the request reaches
@@ -878,6 +882,8 @@ def _make_handler(state: ServerState):
             body: dict[str, Any] = {"status": state.queue_pending_status}
             if not state.queue_submit_omits_request_id:
                 body["request_id"] = state.queue_request_id
+            if state.queue_submit_estimate is not None:
+                body["estimate"] = state.queue_submit_estimate
             self._json(state.queue_submit_status, body)
 
         def _serve_queue_status(self, request_id: str) -> None:
