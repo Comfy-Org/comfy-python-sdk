@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Iterator
+from contextlib import aclosing, closing
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
@@ -262,15 +263,16 @@ class Job:
         while True:
             terminal_seen = False
             try:
-                for raw in self._low.get_job_events(events_url):
-                    ev = event_from_raw(raw, self._bind_output)
-                    if ev is None:
-                        continue
-                    if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
-                        terminal_seen = True
+                with closing(self._low.get_job_events(events_url)) as raw_events:
+                    for raw in raw_events:
+                        ev = event_from_raw(raw, self._bind_output)
+                        if ev is None:
+                            continue
+                        if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
+                            terminal_seen = True
+                            yield ev
+                            return
                         yield ev
-                        return
-                    yield ev
             except ApiError as exc:
                 if exc.http_status == 501:
                     return  # surface has no SSE — poll paths remain authoritative
@@ -379,15 +381,16 @@ class AsyncJob:
         while True:
             terminal_seen = False
             try:
-                async for raw in self._low.get_job_events(events_url):
-                    ev = event_from_raw(raw, self._bind_output)
-                    if ev is None:
-                        continue
-                    if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
-                        terminal_seen = True
+                async with aclosing(self._low.get_job_events(events_url)) as raw_events:
+                    async for raw in raw_events:
+                        ev = event_from_raw(raw, self._bind_output)
+                        if ev is None:
+                            continue
+                        if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
+                            terminal_seen = True
+                            yield ev
+                            return
                         yield ev
-                        return
-                    yield ev
             except ApiError as exc:
                 if exc.http_status == 501:
                     return  # surface has no SSE — poll paths remain authoritative

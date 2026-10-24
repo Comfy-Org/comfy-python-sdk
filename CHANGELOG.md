@@ -10,6 +10,11 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Job event iterators close their underlying HTTP stream when iteration completes or the
+  iterator is explicitly closed, for both synchronous and asynchronous clients.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added

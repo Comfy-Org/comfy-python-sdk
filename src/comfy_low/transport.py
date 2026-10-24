@@ -53,7 +53,7 @@ import asyncio
 import platform
 import secrets
 import sys
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Generator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1330,7 +1330,9 @@ class ComfyLow:
         resp = self.raw_request("GET", path, timeout=timeout)
         return _job(self._p.parse_or_raise(resp, (200,)))
 
-    def get_job_events(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> Iterator[RawEvent]:
+    def get_job_events(
+        self, job_id_or_url: str, *, timeout: Any = _UNSET
+    ) -> Generator[RawEvent, None, None]:
         """GET /api/v2/jobs/{id}/events — raw live SSE iterator (escape hatch).
 
         No reconnection here; a single connection's frames. ``comfy_sdk`` adds the
@@ -1851,7 +1853,7 @@ class AsyncComfyLow:
 
     async def get_job_events(
         self, job_id_or_url: str, *, timeout: Any = _UNSET
-    ) -> AsyncIterator[RawEvent]:
+    ) -> AsyncGenerator[RawEvent, None]:
         # Read-idle timeout by default (see the sync get_job_events); a stalled
         # connection raises so comfy_sdk falls back to poll/reconnect.
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/events"
