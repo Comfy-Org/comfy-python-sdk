@@ -10,6 +10,14 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Added
+
+- `ResultExpired` in `comfy_sdk.router_exceptions`, for the Router bucket `result_expired`
+  from the synced Router spec: a queued request that finished but whose result is no longer
+  stored, refused `410`. It is permanent for that request id, so do not retry the collect; it is
+  deliberately not `RequestNotFound`, which would say the id was never valid. Running the model
+  again means submitting a new request. Before this, the bucket arrived as a bare `RouterError`.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
