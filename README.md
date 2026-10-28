@@ -862,7 +862,7 @@ The default policy:
 | Retried, at the server's pace | the answers that pace a resend of the *same* key for work already running: a `deadline_exceeded` `504` carrying `Retry-After` (Comfy stopped holding the connection at its own bound; the contract says to retry with the same key, which collects that generation rather than dispatching another), and an in-flight-key `concurrency_limit_exceeded` `409` carrying `Retry-After` (another call is already running under the same key; the resend collects it — the same bucket on a `429` is plain throttling and takes the ordinary retry path). One `run()` rides that loop to the finished result |
 | Not retried | every other 4xx — `400`/`content_policy_violation`, `404`, any `409` that is not the paced in-flight `concurrency_limit_exceeded` one above (`hash_mismatch` carries a `Retry-After` and is still deterministic, and the router's `invalid_input` key cases are answered by a NEW key), `422`, `401`, `402` — because asking again cannot change a deterministic refusal. A `429` with no `Retry-After` is not asking to be asked again either |
 | Not retried by default | anything whose outcome is unknown: any **other 5xx response** — including the router's `service_unavailable` `503` (which asks a caller to retry with backoff but says nothing about the key), a `504` carrying no `Retry-After` (the router sends it only when it holds a generation to collect), and a `504` that is `provider_timeout` rather than `deadline_exceeded` — and a client-side timeout where the server may still be generating. The key stays claimed for these, so a same-key retry only comes back `422 idempotency_key_reuse` (that refusal no longer hides the real error — see below — but it is still a wasted request) — while a fresh-key retry is the second billed generation the one-key rule exists to prevent |
-| Budget | 60 seconds of **total elapsed time** from the first attempt, not a number of attempts. The collect loop gets its own, longer budget: 1200 seconds, two server deadline windows, so it can outlast the deadline that started it |
+| Budget | 60 seconds of **total elapsed time** from the first attempt, not a number of attempts. The collect loop gets its own, longer budget: 1860 seconds, two server deadline windows plus the run's 660-second wait for a pooled connection, so it can outlast the deadline that started it even for a run that queued first |
 | Backoff | 0.5s doubling to a 15s ceiling, with full jitter (each wait is drawn from `[0, ceiling]`), clamped to whatever is left of the budget. A `Retry-After` the server named is used as given instead |
 
 The budget bounds when the *last* attempt may **start**; an attempt already
@@ -887,11 +887,13 @@ There are two budgets because the classes have two shapes. `max_elapsed` governs
 the fast ones — a connect failure, a paced `429` — which resolve in seconds or
 not at all, so an unreachable host gives up in a minute rather than pinning a
 caller (a whole thread, on the sync client) for longer. `collect_max_elapsed`
-governs the collect loop alone, and is twenty minutes because that is the one
-class that has to outlast a *server-side* bound: a `deadline_exceeded` `504`
+governs the collect loop alone, and is thirty-one minutes because that is the
+one class that has to outlast a *server-side* bound: a `deadline_exceeded` `504`
 arrives at Comfy's own ten-minute deadline, so a single-window budget would
 already be spent when it lands and the collect attempt it exists for would never
-start. Nothing else pays for that room.
+start. Two windows cover that; the extra eleven minutes cover a run that first
+waited for a free pooled connection, which happens before the server's deadline
+starts counting. Nothing else pays for that room.
 
 A note on what the default trades: the collect rule is
 `spec/router-openapi.yaml`'s, so it binds Comfy Router — but

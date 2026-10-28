@@ -28,6 +28,12 @@ the fuller account of each version, including verification notes.
   instead of following the generation wait, `pool` stays generation-scale, and `connect` stays
   10 seconds. `run_detailed` also reads its response headers case-insensitively, so a plain
   lowercased mapping no longer reads as every header being absent.
+- **A run that queued for a pooled connection could lose its collect retry.** The collect budget
+  is measured from before the run waits for a connection, but Router's deadline only starts once
+  the request is sent, so a long pool wait followed by a `504 deadline_exceeded` landed after the
+  twenty-minute budget had closed and was raised rather than collected. The default
+  `RetryPolicy.collect_max_elapsed` is now 1860 seconds: two Router deadline windows plus the run's
+  pool-acquisition bound. An explicitly set value is unchanged.
 
 ## [0.5.0] - 2026-10-10
 

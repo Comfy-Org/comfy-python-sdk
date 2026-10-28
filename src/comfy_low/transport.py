@@ -127,6 +127,11 @@ _MODEL_RUN_WRITE_TIMEOUT = 120.0
 #: That is the accepted trade: a slow failure in the pathological case, rather
 #: than a fast failure in the ordinary one. Raising ``max_connections`` is the
 #: real lever for a caller who needs the fan-out not to queue at all.
+#:
+#: Because the wait happens before Router's deadline starts, ``comfy_sdk.retry``
+#: reserves this bound on top of the collect budget's two deadline windows: a
+#: run queued here for most of it and then held to Router's full deadline still
+#: has its ``504 deadline_exceeded`` collected rather than raised.
 _MODEL_RUN_POOL_TIMEOUT = ROUTER_DEADLINE + _MODEL_RUN_TIMEOUT_HEADROOM
 
 #: Default timeout for a model run. A run is *awaited server-side*: the server

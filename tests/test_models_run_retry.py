@@ -947,6 +947,9 @@ def test_the_collect_budget_outlasts_a_server_deadline_window() -> None:
     deadline_window = ROUTER_DEADLINE
     assert deadline_window == 600.0
     assert DEFAULT_RETRY.collect_max_elapsed >= 2 * deadline_window
+    # Plus the pool wait, which precedes the deadline but not the budget's origin.
+    assert MODEL_RUN_TIMEOUT.pool is not None
+    assert DEFAULT_RETRY.collect_max_elapsed >= MODEL_RUN_TIMEOUT.pool + 2 * deadline_window
 
     # And the client's own read timeout for one attempt is sized ABOVE Router's
     # deadline, never equal to it: at equality the client can abort at the same
@@ -956,7 +959,7 @@ def test_the_collect_budget_outlasts_a_server_deadline_window() -> None:
     assert MODEL_RUN_TIMEOUT.read > ROUTER_DEADLINE
 
     # And the fast classes do not pay for it: a refused connection still gives
-    # up in a minute rather than sitting on a caller's thread for twenty.
+    # up in a minute rather than sitting on a caller's thread for thirty-one.
     assert DEFAULT_RETRY.max_elapsed == 60.0
 
 
@@ -1012,6 +1015,23 @@ def test_a_deadline_504_at_the_server_bound_still_gets_a_collect_attempt() -> No
     clock = _FakeClock()
     retrier = Retrier(DEFAULT_RETRY, now=clock, rng=lambda: 1.0)
     clock.advance(600.0)  # one full server deadline window; see the test above
+    failure = DeadlineExceeded("still generating", http_status=504, retry_after=2)
+    assert retrier.delay_before_retry(failure) == 2.0
+
+
+def test_a_deadline_504_after_a_long_pool_wait_still_gets_a_collect_attempt() -> None:
+    # The budget's clock starts before the run waits for a pooled connection,
+    # and Router's deadline only starts once the request is sent. A run queued
+    # for nearly the whole pool bound and then held to Router's full deadline
+    # receives its 504 more than two deadline windows in -- the pool wait has
+    # to be reserved on top of them, or this collect attempt never starts.
+    assert MODEL_RUN_TIMEOUT.pool is not None
+    clock = _FakeClock()
+    retrier = Retrier(DEFAULT_RETRY, now=clock, rng=lambda: 1.0)
+    started = clock()
+    clock.advance(MODEL_RUN_TIMEOUT.pool - 1.0)  # queued behind a saturated pool
+    clock.advance(ROUTER_DEADLINE)  # then Router's full deadline
+    assert clock() - started > 2 * ROUTER_DEADLINE
     failure = DeadlineExceeded("still generating", http_status=504, retry_after=2)
     assert retrier.delay_before_retry(failure) == 2.0
 
@@ -1460,7 +1480,7 @@ async def test_the_async_loop_applies_the_same_claim_rules() -> None:
 def test_the_body_is_snapshotted_deeply_before_the_first_attempt(server) -> None:
     # Same key, same body is what makes the resend a collection. A shallow copy
     # leaves nested values shared with the caller, so a mutation during the
-    # retry window -- up to twenty minutes on the collect path -- would send a
+    # retry window -- up to thirty-one minutes on the collect path -- would send a
     # different body under the one key and earn the 422 the snapshot exists to
     # prevent.
     server.state.model_run_collects_after_deadline = True

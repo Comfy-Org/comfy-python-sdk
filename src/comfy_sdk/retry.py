@@ -165,7 +165,7 @@ number of attempts falls out of the backoff schedule.
 ``max_elapsed`` stays at one minute and governs the fast classes — a connect
 failure, a paced ``429`` — which resolve in seconds or not at all; a blackholed
 host has no business pinning a caller (a whole thread, on the sync client) for
-longer than that. ``collect_max_elapsed`` is twenty minutes and governs class 3
+longer than that. ``collect_max_elapsed`` is thirty-one minutes and governs class 3
 alone, because it is the one class whose budget has to outlast a *server-side*
 bound: a ``deadline_exceeded`` ``504`` arrives at Comfy's own deadline, the ten
 minutes of :data:`~comfy_low.transport.ROUTER_DEADLINE` — not the client's own
@@ -173,7 +173,11 @@ minutes of :data:`~comfy_low.transport.ROUTER_DEADLINE` — not the client's own
 ``504`` is received rather than raced — so a budget of one deadline window is
 already spent when the ``504`` lands and the collect attempt it exists for never
 starts. Two windows is one to reach the ``504`` and one to
-collect what it left running — and nothing else pays for it. Both are measured
+collect what it left running — and nothing else pays for it. On top of those
+two windows it reserves the run's pool-acquisition bound: the budget is measured
+from before the request waits for a pooled connection, and Router's deadline
+only starts once it is sent, so a run queued behind a saturated pool would
+otherwise land its ``504`` after the budget had closed. Both budgets are measured
 from the same origin, the construction of the :class:`Retrier`; which one applies
 is decided per failure, by :func:`is_collectable`.
 
@@ -196,6 +200,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
+
+from comfy_low.transport import _MODEL_RUN_POOL_TIMEOUT, ROUTER_DEADLINE
+
+#: Default :attr:`RetryPolicy.collect_max_elapsed`: two Router deadline windows
+#: — one to reach the ``deadline_exceeded`` ``504``, one to collect what it left
+#: running — plus the run's pool-acquisition bound. The pool wait is reserved
+#: OUTSIDE the two windows because the budget's origin precedes it while
+#: Router's deadline does not: a run that waited out most of the pool bound and
+#: then the whole deadline would otherwise receive its ``504`` with the budget
+#: already spent, and the collect attempt it exists for would never start.
+#: Derived rather than written as a literal so that moving either bound moves it.
+_DEFAULT_COLLECT_MAX_ELAPSED = _MODEL_RUN_POOL_TIMEOUT + 2 * ROUTER_DEADLINE
 
 #: Transport failures where the request was never delivered, so the server
 #: cannot be working on it and cannot have claimed the ``Idempotency-Key``:
@@ -484,19 +500,22 @@ class RetryPolicy:
     #: as :attr:`max_elapsed` and used in its place once the server has said the
     #: work is still running.
     #:
-    #: It is separate, and twenty minutes, because the collect loop is the one
+    #: It is separate, and thirty-one minutes, because the collect loop is the one
     #: class whose budget has to outlast a server-side bound. A
     #: ``deadline_exceeded`` ``504`` arrives *at* Comfy's own deadline — the ten
     #: minutes of :data:`~comfy_low.transport.ROUTER_DEADLINE`, not the client's
     #: own ``MODEL_RUN_TIMEOUT``, which sits a minute above it — so a budget of
     #: one deadline window is already spent by the time the ``504`` lands and
     #: the collect attempt it was sized for never starts. Two windows
-    #: is one to reach the ``504`` and one to collect what it left running. The
+    #: is one to reach the ``504`` and one to collect what it left running, and
+    #: the run's pool-acquisition bound is reserved on top of them because this
+    #: budget's clock starts before a queued run gets its connection — see
+    #: :data:`_DEFAULT_COLLECT_MAX_ELAPSED`. The
     #: cost is not charged to anything else: a refused connection still gives up
     #: at :attr:`max_elapsed`. Ignored entirely when ``max_elapsed`` is zero, so
     #: :data:`NO_RETRY` is still exactly one attempt. Declared last for the same
     #: positional-compatibility reason as :attr:`retry_collectable`.
-    collect_max_elapsed: float = 1200.0
+    collect_max_elapsed: float = _DEFAULT_COLLECT_MAX_ELAPSED
 
     def __post_init__(self) -> None:
         for name in _NUMERIC_FIELDS:
