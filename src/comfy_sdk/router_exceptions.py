@@ -541,7 +541,7 @@ class RequestNotFound(RouterError):
     right-id / wrong-model URL the path shape refuses, and it is deliberately
     indistinguishable from a request in another workspace, so a probe with a
     guessed id learns nothing. A request that merely aged out of its retention
-    window is ``410``, not this.
+    window is ``410`` :class:`ResultExpired`, not this.
     """
 
     error_type = "request_not_found"
@@ -563,6 +563,21 @@ class QueueBacklogFull(RouterError):
 
     error_type = "queue_backlog_full"
     _spec_meaning_digest: str = "50745ff63044"
+
+
+class ResultExpired(RouterError):
+    """The request existed and finished, but its result is no longer stored, so
+    the collect has nothing to return.
+
+    Returned under ``410`` and permanent for that ``request_id``: re-reading
+    answers the same way, so do not retry it. It is deliberately not
+    :class:`RequestNotFound`, which would say the id was never valid and invite
+    re-submitting a generation that has already run. Running the model again
+    means submitting a new request.
+    """
+
+    error_type = "result_expired"
+    _spec_meaning_digest: str = "986459c36e1d"
 
 
 # -- cancel refusals ---------------------------------------------------------
@@ -657,6 +672,7 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     QueueTimeout,
     RequestNotFound,
     QueueBacklogFull,
+    ResultExpired,
 )
 
 _BY_ERROR_TYPE: dict[str, type[RouterError]] = {cls.error_type: cls for cls in ROUTER_EXCEPTIONS}
@@ -943,6 +959,7 @@ __all__ = [
     "QueueTimeout",
     "RateLimited",
     "RequestNotFound",
+    "ResultExpired",
     "RouterError",
     "ServiceUnavailable",
     "Unauthorized",
