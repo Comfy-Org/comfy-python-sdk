@@ -322,16 +322,23 @@ class InsufficientCredits(RouterError):
 
 
 class ModelNotFound(RouterError):
-    """No such model. An unknown provider lands here too: both are "that id
-    names nothing".
+    """No such model. An unknown provider, an unenrolled id, an id the catalog
+    has retired past its sunset date, and a catalogued id the provider does not
+    currently serve for Comfy all land here: each is "that id runs nothing".
 
-    ``detail`` carries up to three suggestions drawn from the models the caller
-    is entitled to see. A catalogued id the provider does not currently serve
-    for Comfy also lands here, and the response then carries no suggestions.
+    For a retired id, ``detail`` reads ``<id> was retired on <YYYY-MM-DD>; use
+    <successor>`` when a successor is recorded and visible to the caller, or
+    just ``<id> was retired on <YYYY-MM-DD>`` when it is not. A named successor
+    is always a live catalog id the call can be re-pointed at. A model whose
+    sunset is still in the future is not retired: it stays listed and runnable
+    until that date. Otherwise ``detail`` carries up to three suggestions drawn
+    from the models the caller is entitled to see, except for a catalogued id
+    the provider does not currently serve, whose response carries none.
+    ``detail`` is display text, not a parse target.
     """
 
     error_type = "model_not_found"
-    _spec_meaning_digest: str = "33ffb0dd68a1"
+    _spec_meaning_digest: str = "6c0e0e327e4d"
 
 
 # -- transport-level buckets -------------------------------------------------
@@ -426,10 +433,18 @@ class NotEnabled(RouterError):
     is *not* the same thing, because ``forbidden`` is an entitlement decision
     about the caller while this is a state of the rollout. It is **terminal**:
     do not retry, and do not treat it as an outage.
+
+    The one exception to "about the caller" is the queued submit
+    (:meth:`~comfy_sdk.models.Models.submit`), which also answers
+    ``not_enabled`` for a *model* whose partner answers a generation directly
+    as bytes: that model cannot yet be queued, so it is the model and not the
+    caller that is refused, nothing is queued or charged, and the synchronous
+    route (:meth:`~comfy_sdk.models.Models.run`) runs it instead. On a submit,
+    read ``detail`` before concluding the account is not switched on.
     """
 
     error_type = "not_enabled"
-    _spec_meaning_digest: str = "c4a48688282c"
+    _spec_meaning_digest: str = "571a30cc6ba0"
 
 
 class ServiceUnavailable(RouterError):
@@ -534,11 +549,43 @@ class RequestNotFound(RouterError):
     right-id / wrong-model URL the path shape refuses, and it is deliberately
     indistinguishable from a request in another workspace, so a probe with a
     guessed id learns nothing. A request that merely aged out of its retention
-    window is ``410``, not this.
+    window is ``410`` :class:`ResultExpired`, not this.
     """
 
     error_type = "request_not_found"
     _spec_meaning_digest: str = "385112b3cdcf"
+
+
+class QueueBacklogFull(RouterError):
+    """The caller already has too many queued requests waiting to run, so this
+    submit was refused.
+
+    It shares ``429`` with :class:`ConcurrencyLimitExceeded` and is not the same
+    thing: that one is the synchronous route's answer for too many calls in
+    flight at once, whereas the queue accepts a submit at that limit and parks
+    it, and this bucket is the separate bound on how many a caller may leave
+    waiting -- so that parking cannot mean enqueuing without end. It clears as
+    the caller's own queued requests finish, so retry once some of them
+    complete.
+    """
+
+    error_type = "queue_backlog_full"
+    _spec_meaning_digest: str = "50745ff63044"
+
+
+class ResultExpired(RouterError):
+    """The request existed and finished, but its result is no longer stored, so
+    the collect has nothing to return.
+
+    Returned under ``410`` and permanent for that ``request_id``: re-reading
+    answers the same way, so do not retry it. It is deliberately not
+    :class:`RequestNotFound`, which would say the id was never valid and invite
+    re-submitting a generation that has already run. Running the model again
+    means submitting a new request.
+    """
+
+    error_type = "result_expired"
+    _spec_meaning_digest: str = "986459c36e1d"
 
 
 # -- cancel refusals ---------------------------------------------------------
@@ -632,6 +679,8 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     Cancelled,
     QueueTimeout,
     RequestNotFound,
+    QueueBacklogFull,
+    ResultExpired,
 )
 
 _BY_ERROR_TYPE: dict[str, type[RouterError]] = {cls.error_type: cls for cls in ROUTER_EXCEPTIONS}
@@ -914,9 +963,11 @@ __all__ = [
     "NotEnabled",
     "ProviderError",
     "ProviderTimeout",
+    "QueueBacklogFull",
     "QueueTimeout",
     "RateLimited",
     "RequestNotFound",
+    "ResultExpired",
     "RouterError",
     "ServiceUnavailable",
     "Unauthorized",

@@ -765,6 +765,14 @@ class Models(_ModelsBase):
         for is answered ``403`` ``not_enabled``, which arrives here as
         :class:`~comfy_sdk.router_exceptions.NotEnabled`. Nothing about the
         request is wrong in that case, and it is terminal — do not retry it.
+        The same ``not_enabled`` also refuses a *model* whose partner answers a
+        generation directly as bytes: such a model cannot yet be queued, nothing
+        is queued or charged, and :meth:`run` serves it instead — so read
+        ``detail`` before concluding the caller is not switched on. A caller
+        with too many requests already waiting is refused ``429``
+        ``queue_backlog_full``
+        (:class:`~comfy_sdk.router_exceptions.QueueBacklogFull`), which clears
+        as its own queued requests finish.
         """
         low = cast(ComfyLow, self._low)
         key = (
