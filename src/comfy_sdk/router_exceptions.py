@@ -571,10 +571,16 @@ class ResultExpired(RouterError):
     :class:`RequestNotFound`, which would say the id was never valid and invite
     re-submitting a generation that has already run. Running the model again
     means submitting a new request.
+
+    For a workspace under a zero-data-retention agreement a queued request's
+    result is not kept once delivered: it is removed shortly after the first
+    collect, and an uncollected one is removed after a grace period once the
+    request finishes. There a second collect can raise this, so store the
+    result on your side the first time you collect it.
     """
 
     error_type = "result_expired"
-    _spec_meaning_digest: str = "986459c36e1d"
+    _spec_meaning_digest: str = "000c6cc0df02"
 
 
 # -- cancel refusals ---------------------------------------------------------

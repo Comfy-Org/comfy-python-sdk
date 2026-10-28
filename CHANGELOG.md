@@ -17,6 +17,8 @@ the fuller account of each version, including verification notes.
   stored, refused `410`. It is permanent for that request id, so do not retry the collect; it is
   deliberately not `RequestNotFound`, which would say the id was never valid. Running the model
   again means submitting a new request. Before this, the bucket arrived as a bare `RouterError`.
+  Under a zero-data-retention workspace a result is removed shortly after its first collect (and
+  an uncollected one after a grace period), so a second collect can raise `ResultExpired` there.
 
 ## [0.5.0] - 2026-10-10
 
