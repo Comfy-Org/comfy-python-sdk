@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Iterator
-from contextlib import aclosing, closing
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
@@ -263,7 +262,8 @@ class Job:
         while True:
             terminal_seen = False
             try:
-                with closing(self._low.get_job_events(events_url)) as raw_events:
+                raw_events = self._low.get_job_events(events_url)
+                try:
                     for raw in raw_events:
                         ev = event_from_raw(raw, self._bind_output)
                         if ev is None:
@@ -273,6 +273,10 @@ class Job:
                             yield ev
                             return
                         yield ev
+                finally:
+                    close = getattr(raw_events, "close", None)
+                    if callable(close):
+                        close()
             except ApiError as exc:
                 if exc.http_status == 501:
                     return  # surface has no SSE — poll paths remain authoritative
@@ -381,7 +385,8 @@ class AsyncJob:
         while True:
             terminal_seen = False
             try:
-                async with aclosing(self._low.get_job_events(events_url)) as raw_events:
+                raw_events = self._low.get_job_events(events_url)
+                try:
                     async for raw in raw_events:
                         ev = event_from_raw(raw, self._bind_output)
                         if ev is None:
@@ -391,6 +396,10 @@ class AsyncJob:
                             yield ev
                             return
                         yield ev
+                finally:
+                    aclose = getattr(raw_events, "aclose", None)
+                    if callable(aclose):
+                        await aclose()
             except ApiError as exc:
                 if exc.http_status == 501:
                     return  # surface has no SSE — poll paths remain authoritative
