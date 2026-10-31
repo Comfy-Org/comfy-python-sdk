@@ -12,6 +12,11 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `RateLimited` is exported from `comfy_sdk` and `comfy_sdk.exceptions` as a fourth bucket shared
+  with the Router surface, beside `Unauthorized`, `Forbidden` and `InsufficientCredits`. It is the
+  same class as `comfy_sdk.router_exceptions.RateLimited`, and a v2 job route's `rate_limited`
+  envelope now maps to it explicitly; it carries `.retry_after`. The low layer gains
+  `comfy_low.errors.RateLimited` (also on `comfy_low`) for the same code.
 - `ResultExpired` in `comfy_sdk.router_exceptions`, for the Router bucket `result_expired`
   from the synced Router spec: a queued request that finished but whose result is no longer
   stored, refused `410`. It is permanent for that request id, so do not retry the collect; it is
