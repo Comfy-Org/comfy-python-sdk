@@ -14,7 +14,9 @@ restated here:
   :data:`comfy_low.transport._MODEL_RUN_PATH_TEMPLATE` and
   :data:`comfy_sdk.COMFY_ROUTER_BASE_URL` -- and, the same way, the two
   discovery routes ``models.list()`` / ``models.schema()`` read, by their
-  ``get.operationId`` (``listRouterModels``, ``getRouterModelInputSchema``).
+  ``get.operationId`` (``listRouterModels``, ``getRouterModelInputSchema``);
+* the **response header names** a run result is read from, compared against
+  :data:`comfy_sdk.models._RUN_RESULT_HEADERS`.
 
 Neither is generated, so a Router spec sync is the moment they can drift. The
 failures guarded against are a sync landing a new bucket that then reaches
@@ -47,7 +49,7 @@ from comfy_low.transport import (
     model_catalog_path,
 )
 from comfy_sdk import COMFY_ROUTER_BASE_URL
-from comfy_sdk.models import RouterRunResult, _run_result
+from comfy_sdk.models import _RUN_RESULT_HEADERS, RouterRunResult, _run_result
 from comfy_sdk.router_exceptions import (
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
@@ -599,3 +601,56 @@ def test_an_exempt_field_is_really_unmoved_by_the_headers_it_skips() -> None:
             f"the contract's 200 headers were supplied. It IS a lift: move it into "
             f"_CONTRACT_HEADER_LIFTS with the header it reads, so both pins apply to it."
         )
+
+
+# --- the source-side header table, pinned against the contract ----------
+#
+# The block above pins each *field* to the header it is lifted from.
+# `_RUN_RESULT_HEADERS` is the SDK's own list of the names `_run_result` reads;
+# these tests pin that list too, so it cannot drift from what the lifts read or
+# from what the contract declares.
+
+
+@pytest.mark.parametrize("name", _RUN_RESULT_HEADERS)
+def test_the_headers_a_run_result_reads_are_the_spec_s(name: str) -> None:
+    """Every name ``_run_result`` looks up is one ``runRouterModel`` declares.
+
+    This is the check that was missing when ``Idempotent-Replayed`` was read as
+    ``X-Comfy-Idempotent-Replayed``. A wrong header name cannot fail at runtime
+    -- the lookup misses, the field takes its "absent" value, and a genuine
+    replay reports ``replayed=False`` -- so nothing but a comparison against the
+    contract can catch it. Parametrized per name so a failure says which one.
+
+    Declared-but-unread headers are deliberately NOT an error: the 200 also
+    carries ``X-Content-Type-Options`` and the committed-spend trio, which
+    :class:`~comfy_sdk.models.RouterRunResult` does not surface. The invariant
+    is one-way -- everything read is declared -- not set equality.
+    """
+    declared = _declared_run_response_headers()
+    assert name in declared, (
+        f"src/comfy_sdk/models.py reads the response header {name!r}, which "
+        f"spec/router-openapi.yaml does not declare on runRouterModel's 200 "
+        f"({sorted(declared)}) -- the SDK is reading a header Router does not send, so the "
+        "field it feeds is silently taking its 'absent' value on every run"
+    )
+
+
+def test_the_replayed_header_carries_no_x_comfy_prefix() -> None:
+    # Named separately from the parametrized case above because this is the
+    # specific regression: `Idempotent-Replayed` is the ONE Router response
+    # header in this set without the `X-Comfy-` prefix its siblings carry, which
+    # is exactly why a prefix got added to it by hand and went unnoticed.
+    from comfy_sdk.models import _HEADER_REPLAYED
+
+    assert _HEADER_REPLAYED == "Idempotent-Replayed"
+    assert not _HEADER_REPLAYED.lower().startswith("x-comfy-")
+
+
+def test_the_source_header_table_is_the_pinned_lift_set() -> None:
+    """``_RUN_RESULT_HEADERS`` names exactly the headers the lifts are pinned to.
+
+    Without this the table could gain a name no field reads, or lose one a
+    field still reads, and both pins above would keep passing.
+    """
+    lifted = sorted(header for header, _probe in _CONTRACT_HEADER_LIFTS.values())
+    assert sorted(_RUN_RESULT_HEADERS) == lifted
