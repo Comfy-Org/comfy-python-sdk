@@ -254,6 +254,11 @@ _BY_CODE: dict[str, type[ApiError]] = {
         Forbidden,
     )
 }
+# A second wire spelling for an existing class rather than a class of its own:
+# the events stream's terminal `error` frame says `credential_expired` where a
+# request would have been answered `401 unauthorized`, and the caller's action
+# is the same — re-authenticate. The code itself is kept on the instance.
+_BY_CODE["credential_expired"] = Unauthorized
 
 
 def _clean(value: Any) -> str | None:
@@ -608,6 +613,43 @@ def error_from_envelope(
         error_type=bucket,
         validation_errors=validation_errors,
     )
+
+
+#: The HTTP status each code the events stream's terminal ``error`` frame is
+#: documented to carry would have had as a response. A frame has no status of
+#: its own — it arrives inside a ``200`` stream — so this is what lets
+#: :attr:`ApiError.http_status` read the same on a frame as on a request.
+_SSE_ERROR_STATUS: dict[str, int] = {
+    "credential_expired": 401,
+    "forbidden": 403,
+    "job_not_found": 404,
+}
+
+
+def sse_error_from_frame(data: dict[str, Any]) -> ApiError | None:
+    """Build the typed exception for the events stream's terminal ``error`` frame.
+
+    The server ends a job's event stream with ``event: error`` and an error
+    envelope as its data when it stops streaming for a reason other than the
+    job finishing — the credential expired, access was withdrawn, or the job is
+    gone. No status frame follows, so this is the only account of why the
+    stream ended. The envelope is read exactly as a response body would be
+    (:func:`error_from_envelope`), with the status taken from
+    :data:`_SSE_ERROR_STATUS` and ``code`` kept verbatim.
+
+    Returns ``None`` for a frame whose code that table does not name, or that
+    carries no usable envelope at all. Such a frame is not known to mean the
+    job's stream is over for good — a later server may end a stream to drain or
+    to cap its lifetime — so the caller treats it as an ordinary end of stream
+    and falls back to its poll-and-reconnect path rather than raising a failure
+    it cannot type.
+    """
+    err = data.get("error")
+    code = _clean(err.get("code")) if isinstance(err, dict) else None
+    status = _SSE_ERROR_STATUS.get(code) if code is not None else None
+    if status is None:
+        return None
+    return error_from_envelope(status, data)
 
 
 #: The last resort: a code guessed from the status, consulted only when the
