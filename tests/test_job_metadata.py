@@ -345,8 +345,24 @@ def test_list_jobs_items_keep_the_server_fields(server) -> None:
     assert summary.create_time == datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
     assert summary.update_time == datetime(2026, 10, 5, 12, 1, tzinfo=timezone.utc)
     assert summary.deployment_id == "dep_01"
+    assert summary.release_version is None
     assert summary.metadata == {}
     assert summary.data == item
+
+
+def test_list_jobs_items_carry_the_release_version(server) -> None:
+    server.state.job_list_pages = [[{**_item("job_01"), "release_version": 3}]]
+    with Comfy() as client:
+        (summary,) = client.list_jobs()
+    assert summary.release_version == 3
+    assert summary.deployment_id == "dep_01"
+
+
+async def test_async_list_jobs_items_carry_the_release_version(server) -> None:
+    server.state.job_list_pages = [[{**_item("job_01"), "release_version": 3}]]
+    async with AsyncComfy() as client:
+        (summary,) = [j async for j in client.list_jobs()]
+    assert summary.release_version == 3
 
 
 def test_a_filtered_list_skips_items_whose_labels_do_not_match(server) -> None:
@@ -557,6 +573,7 @@ def test_list_jobs_items_without_optional_fields_read_as_none(server) -> None:
     assert summary.create_time is None
     assert summary.update_time is None
     assert summary.deployment_id is None
+    assert summary.release_version is None
     assert summary.metadata == {}
 
 
@@ -582,6 +599,26 @@ _BAD_LIST_ITEMS = [
     pytest.param({**_item("job_01"), "status": 1}, "status", id="status-not-a-string"),
     pytest.param(
         {**_item("job_01"), "deployment_id": 7}, "deployment_id", id="deployment-id-not-a-string"
+    ),
+    pytest.param(
+        {**_item("job_01"), "release_version": "3"},
+        "release_version",
+        id="release-version-a-string",
+    ),
+    pytest.param(
+        {**_item("job_01"), "release_version": True},
+        "release_version",
+        id="release-version-a-bool",
+    ),
+    pytest.param(
+        {**_item("job_01"), "release_version": 3.0},
+        "release_version",
+        id="release-version-a-float",
+    ),
+    pytest.param(
+        {**_item("job_01"), "id": 5, "release_version": "3"},
+        "non-string id and a non-integer release_version",
+        id="id-and-release-version-both-wrong",
     ),
     pytest.param("job_01", "not a JSON object", id="not-an-object"),
 ]
@@ -614,6 +651,14 @@ def test_a_null_or_absent_deployment_id_reads_as_none(server, item) -> None:
     with Comfy() as client:
         (summary,) = client.list_jobs()
     assert summary.deployment_id is None
+
+
+@pytest.mark.parametrize("item", [_item("job_01"), {**_item("job_01"), "release_version": None}])
+def test_a_null_or_absent_release_version_reads_as_none(server, item) -> None:
+    server.state.job_list_pages = [[item]]
+    with Comfy() as client:
+        (summary,) = client.list_jobs()
+    assert summary.release_version is None
 
 
 # A page body that is valid JSON but not an object.
