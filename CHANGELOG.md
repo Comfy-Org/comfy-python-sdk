@@ -20,6 +20,11 @@ the fuller account of each version, including verification notes.
   Under a zero-data-retention workspace a result is removed shortly after its first collect (and
   an uncollected one after a grace period), so a second collect can raise `ResultExpired` there.
 
+### Fixed
+
+- Job event iterators close their underlying HTTP stream when iteration completes or the
+  iterator is explicitly closed, for both synchronous and asynchronous clients.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
