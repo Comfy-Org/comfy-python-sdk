@@ -31,6 +31,7 @@ from .errors import (
     Unauthorized,
     WorkflowFormatUi,
     error_from_envelope,
+    sse_error_from_frame,
 )
 from .sse import RawEvent, SSEDecoder
 from .transport import AsyncComfyLow, BinaryResult, ComfyLow
@@ -88,6 +89,7 @@ __all__ = [
     "Unauthorized",
     "Forbidden",
     "error_from_envelope",
+    "sse_error_from_frame",
     "OPERATION_IDS",
     "OPERATION_METHODS",
 ]
