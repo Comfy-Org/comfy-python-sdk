@@ -311,18 +311,21 @@ class InsufficientCredits(RouterError):
 
 
 class ModelNotFound(RouterError):
-    """No such model. An unknown provider, an unenrolled id, an id the catalog
-    has retired past its sunset date, and a catalogued id the provider does not
-    currently serve for Comfy all land here: each is "that id runs nothing".
+    """No such model Router can run. An unknown provider, an unenrolled id, an
+    id the catalog has retired past its sunset date, and a catalogued id the
+    provider does not currently serve for Comfy all land here: each is "that
+    id names nothing runnable".
 
     For a retired id, ``detail`` reads ``<id> was retired on <YYYY-MM-DD>; use
     <successor>`` when a successor is recorded and visible to the caller, or
-    just ``<id> was retired on <YYYY-MM-DD>`` when it is not. A named successor
-    is always a live catalog id the call can be re-pointed at. A model whose
-    sunset is still in the future is not retired: it stays listed and runnable
-    until that date. Otherwise ``detail`` carries up to three suggestions drawn
-    from the models the caller is entitled to see, except for a catalogued id
-    the provider does not currently serve, whose response carries none.
+    just ``<id> was retired on <YYYY-MM-DD>`` when it is not, instead of a
+    suggestion list. A successor named there is always a live catalog id the
+    call can be re-pointed at. A model whose sunset date is still in the
+    future is not retired: it stays listed and runnable until that date.
+
+    Otherwise ``detail`` carries up to three suggestions drawn from the models
+    the caller is entitled to see, except for a catalogued id the provider does
+    not currently serve for Comfy, whose response carries no suggestions.
     ``detail`` is display text, not a parse target.
     """
 
