@@ -233,6 +233,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
             request_id=exc.request_id,
             retry_after=exc.retry_after,
             errors=tuple(_detail_from(entry) for entry in exc.validation_errors),
+            refusal_subject=exc.refusal_subject,
         )
     # No `errors=` below, deliberately: `.errors` is a `RouterError` attribute
     # and none of the remaining classes takes the argument. A validation body
