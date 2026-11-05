@@ -478,11 +478,12 @@ class RateLimited(RouterError):
     It shares ``429`` with :class:`ConcurrencyLimitExceeded` and is not the same
     thing: that one clears the moment one of the caller's own in-flight calls
     finishes, so retrying in seconds is right, whereas nothing the caller does
-    drains this one early. ``detail`` names the window.
+    drains this one early. ``detail`` names the window, and ``Retry-After`` the
+    seconds to wait, carried on ``retry_after``.
     """
 
     error_type = "rate_limited"
-    _spec_meaning_digest: str = "b4ae727df04d"
+    _spec_meaning_digest: str = "e94bd188240b"
 
 
 # -- queue buckets -----------------------------------------------------------
