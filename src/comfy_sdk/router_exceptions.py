@@ -312,16 +312,23 @@ class InsufficientCredits(RouterError):
 
 
 class ModelNotFound(RouterError):
-    """No such model. An unknown provider lands here too: both are "that id
-    names nothing".
+    """No such model. An unknown provider, an unenrolled id, an id the catalog
+    has retired past its sunset date, and a catalogued id the provider does not
+    currently serve for Comfy all land here: each is "that id runs nothing".
 
-    ``detail`` carries up to three suggestions drawn from the models the caller
-    is entitled to see. A catalogued id the provider does not currently serve
-    for Comfy also lands here, and the response then carries no suggestions.
+    For a retired id, ``detail`` reads ``<id> was retired on <YYYY-MM-DD>; use
+    <successor>`` when a successor is recorded and visible to the caller, or
+    just ``<id> was retired on <YYYY-MM-DD>`` when it is not. A named successor
+    is always a live catalog id the call can be re-pointed at. A model whose
+    sunset is still in the future is not retired: it stays listed and runnable
+    until that date. Otherwise ``detail`` carries up to three suggestions drawn
+    from the models the caller is entitled to see, except for a catalogued id
+    the provider does not currently serve, whose response carries none.
+    ``detail`` is display text, not a parse target.
     """
 
     error_type = "model_not_found"
-    _spec_meaning_digest: str = "33ffb0dd68a1"
+    _spec_meaning_digest: str = "6c0e0e327e4d"
 
 
 # -- transport-level buckets -------------------------------------------------
@@ -472,7 +479,8 @@ class RateLimited(RouterError):
     It shares ``429`` with :class:`ConcurrencyLimitExceeded` and is not the same
     thing: that one clears the moment one of the caller's own in-flight calls
     finishes, so retrying in seconds is right, whereas nothing the caller does
-    drains this one early. On the Router surface, ``detail`` names the window.
+    drains this one early. On the Router surface, ``detail`` names the window,
+    and ``Retry-After`` the seconds to wait, carried on ``retry_after``.
 
     The v2 jobs/assets gateway raises this same class for its per-account
     request rate limit (``code == "rate_limited"``), with ``retry_after`` read
@@ -481,7 +489,7 @@ class RateLimited(RouterError):
     """
 
     error_type = "rate_limited"
-    _spec_meaning_digest: str = "b4ae727df04d"
+    _spec_meaning_digest: str = "e94bd188240b"
 
 
 # -- queue buckets -----------------------------------------------------------
@@ -537,7 +545,7 @@ class RequestNotFound(RouterError):
     right-id / wrong-model URL the path shape refuses, and it is deliberately
     indistinguishable from a request in another workspace, so a probe with a
     guessed id learns nothing. A request that merely aged out of its retention
-    window is ``410``, not this.
+    window is ``410`` :class:`ResultExpired`, not this.
     """
 
     error_type = "request_not_found"
@@ -559,6 +567,27 @@ class QueueBacklogFull(RouterError):
 
     error_type = "queue_backlog_full"
     _spec_meaning_digest: str = "50745ff63044"
+
+
+class ResultExpired(RouterError):
+    """The request existed and finished, but its result is no longer stored, so
+    the collect has nothing to return.
+
+    Returned under ``410`` and permanent for that ``request_id``: re-reading
+    answers the same way, so do not retry it. It is deliberately not
+    :class:`RequestNotFound`, which would say the id was never valid and invite
+    re-submitting a generation that has already run. Running the model again
+    means submitting a new request.
+
+    For a workspace under a zero-data-retention agreement a queued request's
+    result is not kept once delivered: it is removed shortly after the first
+    collect, and an uncollected one is removed after a grace period once the
+    request finishes. There a second collect can raise this, so store the
+    result on your side the first time you collect it.
+    """
+
+    error_type = "result_expired"
+    _spec_meaning_digest: str = "000c6cc0df02"
 
 
 # -- cancel refusals ---------------------------------------------------------
@@ -653,6 +682,7 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     QueueTimeout,
     RequestNotFound,
     QueueBacklogFull,
+    ResultExpired,
 )
 
 _BY_ERROR_TYPE: dict[str, type[RouterError]] = {cls.error_type: cls for cls in ROUTER_EXCEPTIONS}
@@ -939,6 +969,7 @@ __all__ = [
     "QueueTimeout",
     "RateLimited",
     "RequestNotFound",
+    "ResultExpired",
     "RouterError",
     "ServiceUnavailable",
     "Unauthorized",

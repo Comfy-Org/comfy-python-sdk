@@ -310,12 +310,17 @@ def test_the_catalog_query_parameters_are_the_ones_the_spec_declares() -> None:
     # `model_catalog_path` sends `cursor` and `limit` by name; a sync renaming
     # either would otherwise be silently ignored by the server.
     doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
-    params = doc["paths"][_MODEL_CATALOG_PATH]["get"]["parameters"]
     shared = doc["components"]["parameters"]
-    names = {
-        shared[p["$ref"].rsplit("/", 1)[-1]]["name"] if "$ref" in p else p["name"] for p in params
-    }
-    assert names == {"cursor", "limit"}
+    params = [
+        shared[p["$ref"].rsplit("/", 1)[-1]] if "$ref" in p else p
+        for p in doc["paths"][_MODEL_CATALOG_PATH]["get"]["parameters"]
+    ]
+    assert {p["name"] for p in params if p["in"] == "query"} == {"cursor", "limit"}
+    # The catalog also accepts a conditional `If-None-Match` header, which
+    # `models.list()` never sends; that is only correct while every
+    # non-query parameter stays optional.
+    required = [p["name"] for p in params if p["in"] != "query" and p.get("required")]
+    assert required == [], f"the catalog now requires {required}, which the SDK never sends"
     assert model_catalog_path("c", 5) == f"{_MODEL_CATALOG_PATH}?cursor=c&limit=5"
 
 
