@@ -12,6 +12,10 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `sso_required` (403) now raises `Forbidden` (code preserved) and carries `organization_id`, the
+  organization to start SSO with. `organization_id` is a new attribute on `ComfyError` and on
+  `comfy_low.ApiError`, `None` on every other code and when the server does not name the
+  organization (or names it in a shape that is not an id). `error_type` stays `forbidden`.
 - `ResultExpired` in `comfy_sdk.router_exceptions`, for the Router bucket `result_expired`
   from the synced Router spec: a queued request that finished but whose result is no longer
   stored, refused `410`. It is permanent for that request id, so do not retry the collect; it is
