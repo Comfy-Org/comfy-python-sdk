@@ -22,8 +22,7 @@ from conftest import _job_json
 import comfy_sdk.client as _client_module
 from comfy_low.models import Job as LowJob
 from comfy_low.models import JobStatus
-from comfy_sdk import AsyncComfy, Comfy, ComfyError, InvalidWorkflow, JobSummary
-from comfy_sdk.router_exceptions import RateLimited
+from comfy_sdk import AsyncComfy, Comfy, ComfyError, InvalidWorkflow, JobSummary, RateLimited
 
 _GRAPH = {"3": {"class_type": "KSampler", "inputs": {}}}
 _LABELS = {"client": "acme", "run": "nightly-42"}
