@@ -51,11 +51,28 @@ The SDK works against a ComfyUI instance with **Comfy API v2**. Comfy Cloud and 
 
 ## Getting started
 
+Get an API key from [platform.comfy.org](https://platform.comfy.org), then:
+
+```bash
+pip install comfy-sdk
+export COMFY_API_KEY="comfyui-..."
+```
+
 ```python
 from comfy_sdk import Comfy
 
-client = Comfy(api_key="comfyui-...")   # Comfy Cloud
+client = Comfy()        # reads COMFY_API_KEY, targets Comfy Cloud
+client.check()          # confirms the key works; runs nothing, costs nothing
 
+wf = client.workflows.from_example("text-to-image", prompt="a lighthouse at dusk, oil painting")
+job = client.run(wf)    # submit, then wait for the result
+job.outputs[0].to_file("lighthouse.png")
+```
+
+That runs without a workflow file of your own. When you have one, export it from
+ComfyUI with **File → Export (API)** and swap in `from_file`:
+
+```python
 wf = client.workflows.from_file("workflow_api.json")
 
 # Input assets are hashed locally with blake3
@@ -70,6 +87,46 @@ job = client.run(wf)
 for output in job.get_outputs("9"):
     output.to_file(output.name)
 ```
+
+### Built-in examples
+
+`client.workflows.from_example(name, **inputs)` returns an ordinary `Workflow`
+built from one of these graphs. Inputs you don't pass keep their defaults, and
+`seed` is random per call unless you set it.
+
+| Example | Output | Inputs | Model | Time on Cloud |
+|---|---|---|---|---|
+| `text-to-image` | PNG | `prompt`, `seed`, `width`, `height` | Z-Image Turbo | ~7s |
+| `image-to-video` | MP4, 3s | `image` (required), `prompt`, `negative_prompt`, `seed`, `width`, `height`, `frames` | Wan 2.2 5B | ~55s |
+| `text-to-video` | MP4, 3s | `prompt`, `negative_prompt`, `seed`, `width`, `height`, `frames` | Wan 2.2 5B | ~55s |
+
+The examples chain: animate the image you just made.
+
+```python
+image = client.assets.from_file("lighthouse.png")
+wf = client.workflows.from_example("image-to-video", image=image, prompt="the camera slowly pushes in")
+job = client.run(wf)
+job.outputs[0].to_file("lighthouse.mp4")
+```
+
+`client.workflows.examples()` lists every example with its inputs and defaults,
+and `wf.json` shows the full API-format graph, which is a good way to see what a
+workflow you export yourself will look like. The examples use models from the
+Comfy Cloud library; a self-hosted ComfyUI runs them only if it has the same
+model files.
+
+### Checking a key
+
+`client.check()` makes one authenticated read that creates no job and spends
+no credits. It returns `CheckResult(base_url=..., authenticated=True)`, or raises:
+
+| Raises | Means |
+|---|---|
+| `Unauthorized` | the key was rejected; create a new one |
+| `ComfyError`, `code == "not_a_comfy_api"` | `COMFY_BASE_URL` points at something that is not a Comfy API v2 deployment |
+
+It confirms the key and the address, not your balance: a key that passes can
+still be refused at submit with `InsufficientCredits`.
 
 ### Constructing a workflow
 

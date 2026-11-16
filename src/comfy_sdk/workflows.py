@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import json as _json
 from os import PathLike
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .examples import Example
 
 
 def _is_link(obj: Any) -> bool:
@@ -121,3 +124,27 @@ class WorkflowFactory:
 
     def from_str(self, text: str) -> Workflow:
         return Workflow(_json.loads(text))
+
+    def from_example(self, name: str, **inputs: Any) -> Workflow:
+        """A built-in example workflow, ready to run.
+
+        For a first run before you have a workflow of your own::
+
+            wf = client.workflows.from_example("text-to-image", prompt="a red fox in snow")
+            job = client.run(wf)
+
+        ``inputs`` set the example's named inputs (``prompt``, ``seed``, ...);
+        anything not passed keeps its default, and ``seed`` defaults to a new
+        random value per call. An unknown name or input raises ``ValueError``
+        listing the valid ones. :meth:`examples` lists every example and its
+        inputs. The examples use models from the Comfy Cloud library.
+        """
+        from .examples import get_example
+
+        return get_example(name).build(**inputs)
+
+    def examples(self) -> list[Example]:
+        """Every built-in example, for :meth:`from_example`."""
+        from .examples import EXAMPLES
+
+        return list(EXAMPLES)

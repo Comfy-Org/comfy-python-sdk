@@ -93,6 +93,11 @@ class ServerState:
     job_list_queries: list[dict[str, list[str]]] = field(default_factory=list)
     # GET /jobs/{id} answers 404 job_not_found instead of the job.
     job_not_found: bool = False
+    # GET /jobs/{id} answers this raw (status, content_type, body) instead —
+    # for a host that is not a v2 deployment (a web page, a bare 404, a 500).
+    job_get_raw: tuple[int, str, bytes] | None = None
+    # The id of every GET /jobs/{id}, in arrival order.
+    job_get_ids: list[str] = field(default_factory=list)
     # GET /jobs/{id}/events answers this (status, code) instead of connecting.
     events_error: tuple[int, str] | None = None
     # Number of GET /jobs/{id} polls before the job reports succeeded.
@@ -696,6 +701,11 @@ def _make_handler(state: ServerState):
             self.wfile.write(data)
 
         def _serve_job(self, job_id: str) -> None:
+            state.job_get_ids.append(job_id)
+            if state.job_get_raw is not None:
+                status, content_type, body = state.job_get_raw
+                self._raw(status, body, content_type)
+                return
             if state.job_not_found:
                 self._err(404, "job_not_found", "no such job")
                 return
