@@ -12,6 +12,15 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `client.workflows.from_example(name, **inputs)`: a built-in workflow to run before you have
+  one of your own. Three examples, `text-to-image` (Z-Image Turbo), `image-to-video` and
+  `text-to-video` (Wan 2.2 5B), each with named inputs (`prompt`, `seed`, `image`, ...) so no
+  node ids are needed. `client.workflows.examples()` lists them. `seed` defaults to a new random
+  value per call. An unknown example or input raises `ValueError` naming the valid ones.
+- `client.check()` on `Comfy` and `AsyncComfy`: confirms the key and the address with one
+  authenticated read that runs nothing, and returns a `CheckResult`. A rejected key raises
+  `Unauthorized`; an address that is not a Comfy API v2 deployment raises `ComfyError` with
+  `code == "not_a_comfy_api"`.
 - `ResultExpired` in `comfy_sdk.router_exceptions`, for the Router bucket `result_expired`
   from the synced Router spec: a queued request that finished but whose result is no longer
   stored, refused `410`. It is permanent for that request id, so do not retry the collect; it is

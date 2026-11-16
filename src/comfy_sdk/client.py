@@ -41,6 +41,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import AsyncIterator, Iterator, Mapping
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -261,6 +262,44 @@ def _resolve_api_key(explicit: str | None, base_url: str) -> str | None:
     return None
 
 
+#: A job id no deployment ever issues. :meth:`Comfy.check` looks it up: the
+#: lookup is authenticated like every v2 route, runs nothing and costs nothing,
+#: and its only successful answer is ``404 job_not_found``.
+_CHECK_JOB_ID = "00000000-0000-0000-0000-000000000000"
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    """What :meth:`Comfy.check` confirmed: this address speaks the v2 API and took the key."""
+
+    #: The deployment that answered (userinfo redacted).
+    base_url: str
+    #: Whether a key was sent. ``False`` only for a keyless self-hosted proxy.
+    authenticated: bool
+
+
+def _check_answer(exc: ApiError, base_url: str) -> None:
+    """Raise unless ``exc`` is the ``404 job_not_found`` a healthy, authorized deployment gives.
+
+    Any other 404, or a 200 that is not JSON, means the address is not a Comfy
+    API v2 deployment: a wrong path on a web host serves its HTML page, and a
+    serverless wildcard host answers 404 for a deployment id that does not exist.
+    """
+    if exc.http_status == 404 and exc.code == "job_not_found":
+        return
+    # A web page (a 200 that is not JSON) or a bare 404: something answered,
+    # but not the v2 API, so the fix is the address rather than the key.
+    if exc.http_status == 404 or exc.code == "invalid_response":
+        raise ComfyError(
+            f"{base_url} does not look like a Comfy API v2 deployment "
+            f"(GET /api/v2/jobs/{{id}} answered HTTP {exc.http_status}, {exc.code}). "
+            f"Check {BASE_URL_ENV_VAR}.",
+            code="not_a_comfy_api",
+            http_status=exc.http_status,
+        ) from exc
+    raise to_sdk_error(exc) from exc
+
+
 def _guard_ui_format(workflow: Workflow) -> None:
     if _core.looks_like_ui_format(workflow.json):
         raise WorkflowFormatUi(
@@ -349,6 +388,29 @@ class Comfy:
             h.commit()
             refs[id(h)] = h.as_reference()
         return _core.substitute_asset_handles(workflow.json, refs)
+
+    def check(self) -> CheckResult:
+        """Confirm the key and the address work, without running anything.
+
+        Makes one authenticated read that creates no job and spends no
+        credits, then returns a :class:`CheckResult`. A rejected key raises
+        :class:`~comfy_sdk.exceptions.Unauthorized`; an address that is not a
+        Comfy API v2 deployment raises :class:`~comfy_sdk.exceptions.ComfyError`
+        with ``code == "not_a_comfy_api"``. It does not check your balance or
+        subscription: a key that passes can still be refused at submit with
+        :class:`~comfy_sdk.exceptions.InsufficientCredits`.
+        """
+        with translating():
+            try:
+                self._low.get_job(_CHECK_JOB_ID)
+            except ApiError as exc:
+                _check_answer(exc, self._low.safe_base_url)
+            else:
+                raise ComfyError(
+                    f"{self._low.safe_base_url} returned a job for an id no deployment issues",
+                    code="invalid_response",
+                )
+        return CheckResult(self._low.safe_base_url, self._low.authenticated)
 
     def submit(
         self,
@@ -582,6 +644,20 @@ class AsyncComfy:
             await h.commit()
             refs[id(h)] = await h.as_reference()
         return _core.substitute_asset_handles(workflow.json, refs)
+
+    async def check(self) -> CheckResult:
+        """Async :meth:`Comfy.check`: confirm the key and address without running anything."""
+        with translating():
+            try:
+                await self._low.get_job(_CHECK_JOB_ID)
+            except ApiError as exc:
+                _check_answer(exc, self._low.safe_base_url)
+            else:
+                raise ComfyError(
+                    f"{self._low.safe_base_url} returned a job for an id no deployment issues",
+                    code="invalid_response",
+                )
+        return CheckResult(self._low.safe_base_url, self._low.authenticated)
 
     async def submit(
         self,

@@ -18,11 +18,18 @@ Quickstart::
     # client = Comfy()                                 # explicit key wins over it
     # export COMFY_BASE_URL=http://127.0.0.1:8189      # self-hosted, no key needed
 
+    client.check()                                     # key + address, runs nothing
+
+    # A built-in example, for a first run:
+    wf = client.workflows.from_example("text-to-image", prompt="a red fox in snow")
+    job = client.run(wf)                               # submit + poll-to-done
+    job.outputs[0].to_file(job.outputs[0].name)
+
+    # Your own workflow, exported with File > Export (API):
     wf = client.workflows.from_file("workflow_api.json")
     asset = client.assets.from_file("photo.png")       # lazy; uploaded on use
     wf.set_input("10", "image", asset)
-
-    result = client.run(wf)                            # submit + poll-to-done
+    result = client.run(wf)
     result.get_outputs("13")[0].to_file("out.png")
 """
 
@@ -39,6 +46,7 @@ from .client import (
     COMFY_ROUTER_BASE_URL,
     ROUTER_BASE_URL_ENV_VAR,
     AsyncComfy,
+    CheckResult,
     Comfy,
 )
 from .events import (
@@ -49,6 +57,7 @@ from .events import (
     Progress,
     StatusChange,
 )
+from .examples import Example, ExampleInput
 from .exceptions import (
     AlreadyCompleted,
     BlobNotFound,
@@ -95,6 +104,7 @@ __all__ = [
     "ROUTER_BASE_URL_ENV_VAR",
     "API_KEY_ENV_VAR",
     "AsyncComfy",
+    "CheckResult",
     # model runs
     "RouterRunResult",
     # model discovery
@@ -110,6 +120,8 @@ __all__ = [
     "AsyncAssetFactory",
     "Workflow",
     "WorkflowFactory",
+    "Example",
+    "ExampleInput",
     "Job",
     "AsyncJob",
     "JobSummary",
