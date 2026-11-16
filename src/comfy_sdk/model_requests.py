@@ -513,6 +513,13 @@ class RequestHandle(_RequestHandleBase):
         Calling it on a request that has already completed is one status poll
         and one fetch, so collecting a result twice — or from a second process
         — costs no more than the first time.
+        That holds only while the server still stores the result: once it has
+        aged out, the fetch raises
+        :class:`~comfy_sdk.router_exceptions.ResultExpired`, which is permanent
+        for that request — submit a new one to run the model again. Under a
+        zero-data-retention workspace the result is removed shortly after the
+        first collect, so a second collect is not safe to rely on there: keep
+        the result you got the first time.
         """
         deadline = None if timeout is None else _now() + timeout
         completion = _last(self.iter_events(timeout=timeout))

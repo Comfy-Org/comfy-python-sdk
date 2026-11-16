@@ -35,6 +35,7 @@ from comfy_sdk.router_exceptions import (
     QueueTimeout,
     RateLimited,
     RequestNotFound,
+    ResultExpired,
     RouterError,
     ServiceUnavailable,
     Unauthorized,
@@ -74,6 +75,7 @@ CASES: list[tuple[str, int, type[RouterError]]] = [
     ("queue_timeout", 504, QueueTimeout),
     ("request_not_found", 404, RequestNotFound),
     ("queue_backlog_full", 429, QueueBacklogFull),
+    ("result_expired", 410, ResultExpired),
 ]
 
 # Deliberately not in the set this SDK version knows: a later milestone adds it,
