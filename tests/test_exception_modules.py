@@ -70,6 +70,7 @@ REFUSALS: list[tuple[int, str]] = [
     (504, "queue_timeout"),
     (404, "request_not_found"),
     (429, "queue_backlog_full"),
+    (410, "result_expired"),
     (418, "something_invented_later"),
 ]
 
