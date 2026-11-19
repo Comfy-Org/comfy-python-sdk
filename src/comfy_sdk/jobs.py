@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Literal
 
@@ -26,7 +26,14 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow, job_labels
 
 from . import _core
 from .events import Event, StatusChange, event_from_raw
-from .exceptions import ComfyError, JobFailed, to_sdk_error, translating
+from .exceptions import (
+    ComfyError,
+    FailureCategory,
+    JobFailed,
+    category_of,
+    to_sdk_error,
+    translating,
+)
 from .outputs import AsyncOutput, Output
 
 _RECONNECT_PAUSE = 0.1
@@ -51,10 +58,8 @@ class JobWorkflow:
 
 
 def _metadata_of(model: LowJob) -> dict[str, str]:
-    # `getattr` because the generated `Job` does not declare the field until the
-    # spec sync lands; the transport validates into a subclass that does.
     # `job_labels` returns a new dict, so the caller gets a copy.
-    return job_labels(getattr(model, "metadata", None))
+    return job_labels(model.metadata)
 
 
 _TIME = TypeAdapter(datetime)
@@ -171,6 +176,15 @@ class Job:
         return self._model.error
 
     @property
+    def failure_category(self) -> FailureCategory | None:
+        """Why the job failed, or ``None`` when its error names no category.
+
+        A category outside the six values this SDK knows reads as
+        :attr:`FailureCategory.OTHER`; ``error.category`` keeps the raw string.
+        """
+        return category_of(self._model.error)
+
+    @property
     def metadata(self) -> dict[str, str]:
         """The string labels given at submit, or an empty dict when there are none.
 
@@ -268,7 +282,7 @@ class Job:
                         continue
                     if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
                         terminal_seen = True
-                        yield ev
+                        yield self._terminal_with_error(ev)
                         return
                     yield ev
             except ApiError as exc:
@@ -283,9 +297,21 @@ class Job:
             # stop if already terminal, else reconnect for fresh live frames.
             self.refresh()
             if _core.is_terminal(self.status):
-                yield StatusChange(status=self.status)
+                yield StatusChange(status=self.status, error=self._model.error)
                 return
             time.sleep(_RECONNECT_PAUSE)
+
+    def _terminal_with_error(self, ev: StatusChange) -> StatusChange:
+        # The stream frame declares only the status and the queue position, so
+        # the error of a job that did not succeed comes from one authoritative
+        # read. A failed read leaves the frame as the stream sent it.
+        if ev.status == _core.SUCCESS:
+            return ev
+        try:
+            self.refresh()
+        except (ComfyError, httpx.HTTPError):
+            return ev
+        return replace(ev, error=self._model.error)
 
     def __repr__(self) -> str:
         return f"Job(id={self.id!r}, status={self.status!r})"
@@ -313,6 +339,11 @@ class AsyncJob:
     @property
     def error(self) -> Any:
         return self._model.error
+
+    @property
+    def failure_category(self) -> FailureCategory | None:
+        """:attr:`Job.failure_category` — ``None`` when the error names no category."""
+        return category_of(self._model.error)
 
     @property
     def metadata(self) -> dict[str, str]:
@@ -385,7 +416,7 @@ class AsyncJob:
                         continue
                     if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
                         terminal_seen = True
-                        yield ev
+                        yield await self._terminal_with_error(ev)
                         return
                     yield ev
             except ApiError as exc:
@@ -398,9 +429,19 @@ class AsyncJob:
                 return
             await self.refresh()
             if _core.is_terminal(self.status):
-                yield StatusChange(status=self.status)
+                yield StatusChange(status=self.status, error=self._model.error)
                 return
             await asyncio.sleep(_RECONNECT_PAUSE)
+
+    async def _terminal_with_error(self, ev: StatusChange) -> StatusChange:
+        """:meth:`Job._terminal_with_error`, awaiting the read."""
+        if ev.status == _core.SUCCESS:
+            return ev
+        try:
+            await self.refresh()
+        except (ComfyError, httpx.HTTPError):
+            return ev
+        return replace(ev, error=self._model.error)
 
     def __repr__(self) -> str:
         return f"AsyncJob(id={self.id!r}, status={self.status!r})"
