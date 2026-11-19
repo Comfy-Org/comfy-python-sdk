@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import importlib
 import json
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from typing import Any
 
 import pytest
@@ -27,6 +29,7 @@ from comfy_sdk.realtime import (
     REALTIME_SUBPROTOCOL,
     AsyncRealtimeSession,
     RealtimeSession,
+    _plan,
     _realtime_path,
 )
 from comfy_sdk.router_exceptions import (
@@ -389,3 +392,196 @@ async def test_unsupported_model_async() -> None:
         with pytest.raises(ComfyError) as info:
             await client.realtime.connect("fish/live-3")
     assert info.value.code == "realtime_unsupported_model"
+
+
+# -- credential containment ---------------------------------------------------
+
+_HOP = "/v2/realtime/fal/redir/hop"
+_LANDED = "/v2/realtime/fal/redir/landed"
+#: Whether this websockets release follows redirects in its sync client (17+).
+_SYNC_FOLLOWS = hasattr(importlib.import_module("websockets.sync.client"), "reconnect")
+
+
+@dataclass
+class _Pair:
+    """A Router origin that redirects ``_HOP``, and a second origin beside it."""
+
+    router: _Seen
+    other: _Seen
+    other_port: int
+    location: str = _LANDED
+
+
+@pytest.fixture
+def redirect_pair(loop: _Loop, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Pair]:
+    def recorder(seen: _Seen) -> Any:
+        async def handler(ws: ServerConnection) -> None:
+            seen.path = ws.request.path
+            seen.paths.append(ws.request.path)
+            seen.headers = ws.request.headers
+            await ws.wait_closed()
+
+        return handler
+
+    router, other = _Seen(), _Seen()
+    pair: _Pair
+
+    def hop(ws: ServerConnection, request: Any) -> Any:
+        if request.path != _HOP:
+            return None
+        response = ws.respond(HTTPStatus.FOUND, "")
+        response.headers["Location"] = pair.location
+        return response
+
+    async def start(handler: Any, process_request: Any = None) -> Any:
+        return await serve(
+            handler,
+            "127.0.0.1",
+            0,
+            subprotocols=[REALTIME_SUBPROTOCOL],  # type: ignore[list-item]
+            process_request=process_request,
+        )
+
+    router_server = loop.run(start(recorder(router), hop))
+    other_server = loop.run(start(recorder(other)))
+    port = router_server.sockets[0].getsockname()[1]
+    other_port = other_server.sockets[0].getsockname()[1]
+    pair = _Pair(router=router, other=other, other_port=other_port)
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, f"http://127.0.0.1:{port}")
+    yield pair
+    for server in (router_server, other_server):
+        server.close()
+        loop.run(server.wait_closed())
+
+
+_AUTH_MODES = [pytest.param({}, id="api-key"), pytest.param({"id_token": "tok"}, id="id-token")]
+
+
+@pytest.mark.parametrize("auth", _AUTH_MODES)
+def test_cross_origin_redirect_is_refused_sync(redirect_pair: _Pair, auth: dict[str, str]) -> None:
+    redirect_pair.location = f"ws://127.0.0.1:{redirect_pair.other_port}{_LANDED}"
+    with Comfy(api_key=_KEY) as client, pytest.raises(RouterError) as info:
+        client.realtime.connect("redir/hop", **auth)
+    assert info.value.http_status == 302
+    assert redirect_pair.other.paths == []
+
+
+@pytest.mark.parametrize("auth", _AUTH_MODES)
+async def test_cross_origin_redirect_is_refused_async(
+    redirect_pair: _Pair, auth: dict[str, str]
+) -> None:
+    redirect_pair.location = f"ws://127.0.0.1:{redirect_pair.other_port}{_LANDED}"
+    async with AsyncComfy(api_key=_KEY) as client:
+        with pytest.raises(RouterError) as info:
+            await client.realtime.connect("redir/hop", **auth)
+    assert info.value.http_status == 302
+    assert redirect_pair.other.paths == []
+
+
+@pytest.mark.parametrize("auth", _AUTH_MODES)
+def test_same_origin_redirect_sync(redirect_pair: _Pair, auth: dict[str, str]) -> None:
+    with Comfy(api_key=_KEY) as client:
+        if not _SYNC_FOLLOWS:
+            # Before websockets 17 the sync client follows no redirect at all.
+            with pytest.raises(RouterError):
+                client.realtime.connect("redir/hop", **auth)
+            return
+        client.realtime.connect("redir/hop", **auth).close()
+    assert redirect_pair.router.path == _LANDED
+    assert redirect_pair.router.headers is not None
+    if auth:
+        assert _offer(redirect_pair.router) == [REALTIME_SUBPROTOCOL, "comfy-bearer.tok"]
+    else:
+        assert redirect_pair.router.headers["x-api-key"] == _KEY
+
+
+@pytest.mark.parametrize("auth", _AUTH_MODES)
+async def test_same_origin_redirect_async(redirect_pair: _Pair, auth: dict[str, str]) -> None:
+    async with AsyncComfy(api_key=_KEY) as client:
+        await (await client.realtime.connect("redir/hop", **auth)).aclose()
+    assert redirect_pair.router.path == _LANDED
+    assert redirect_pair.router.headers is not None
+    if auth:
+        assert _offer(redirect_pair.router) == [REALTIME_SUBPROTOCOL, "comfy-bearer.tok"]
+    else:
+        assert redirect_pair.router.headers["x-api-key"] == _KEY
+
+
+def test_plan_repr_carries_no_credential() -> None:
+    with Comfy(api_key=_KEY) as client:
+        keyed = _plan(client._low, "google/genie-4", None, None, ())
+        tokened = _plan(client._low, "google/genie-4", "secret-token", None, ())
+    assert _KEY not in repr(keyed)
+    assert "secret-token" not in repr(tokened)
+
+
+def test_userinfo_never_reaches_the_upgrade(
+    ws_server: _Seen, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    base = os.environ[ROUTER_BASE_URL_ENV_VAR].replace("http://", "http://user:pass@")
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, base)
+    with Comfy(api_key=_KEY) as client:
+        session = client.realtime.connect("google/genie-4", id_token="tok")
+        session.close()
+    assert ws_server.headers is not None
+    assert "authorization" not in ws_server.headers
+    assert "pass" not in session.url
+
+
+@pytest.mark.parametrize("entry", ["a, b", "a b", "", "comfy-bearer.other", b"x"])
+def test_protocols_entries_are_validated(ws_server: _Seen, entry: Any) -> None:
+    with Comfy(api_key=_KEY) as client, pytest.raises(ValueError):
+        client.realtime.connect("google/genie-4", protocols=[entry])
+    assert ws_server.paths == []
+
+
+def test_deeply_nested_refusal_body_stays_typed(refusing_server: _Script) -> None:
+    refusing_server.status, refusing_server.reason = 402, "Payment Required"
+    refusing_server.body = b"[" * 100_000
+    with Comfy(api_key=_KEY) as client, pytest.raises(RouterError) as info:
+        client.realtime.connect("google/genie-4")
+    assert info.value.http_status == 402
+
+
+def test_repeated_request_id_header_is_tolerated(
+    loop: _Loop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def handler(ws: ServerConnection) -> None:
+        await ws.wait_closed()
+
+    def stamp(ws: ServerConnection, request: Any, response: Any) -> Any:
+        response.headers["X-Comfy-Request-Id"] = "req-first"
+        response.headers["X-Comfy-Request-Id"] = "req-second"
+        return response
+
+    async def start() -> Any:
+        return await serve(
+            handler,
+            "127.0.0.1",
+            0,
+            subprotocols=[REALTIME_SUBPROTOCOL],  # type: ignore[list-item]
+            process_response=stamp,
+        )
+
+    server = loop.run(start())
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, f"http://127.0.0.1:{port}")
+    try:
+        with Comfy(api_key=_KEY) as client, client.realtime.connect("google/genie-4") as session:
+            assert session.request_id == "req-first"
+    finally:
+        server.close()
+        loop.run(server.wait_closed())
+
+
+def test_max_size_is_passed_through(ws_server: _Seen) -> None:
+    from websockets.exceptions import ConnectionClosedError
+
+    with Comfy(api_key=_KEY) as client:
+        session = client.realtime.connect("google/genie-4", max_size=8)
+        session.socket.send("x" * 64)
+        with pytest.raises(ConnectionClosedError) as info:
+            session.socket.recv()
+    assert info.value.sent is not None and info.value.sent.code == 1009

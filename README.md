@@ -1050,6 +1050,14 @@ locally with `ComfyError(code="realtime_unsupported_model")`, naming where to
 go instead. The `comfy_sdk.realtime` module docstring lists the refusal codes
 and the close codes the server uses.
 
+`id_token=` replaces the API key on the socket, not at construction: against
+Comfy Cloud, `Comfy()` and `AsyncComfy()` still raise `MissingApiKey` with no
+key, so a token-only caller passes a placeholder `api_key=` (it is not sent on
+a session opened with `id_token=`). A handshake redirect is followed only
+within the Router origin; one to another host is refused as a `RouterError`,
+so the credential never reaches it. `max_size=` (default 1 MiB, `None` for no
+limit) caps one inbound message.
+
 ## Sync and async
 
 `Comfy` and `AsyncComfy` expose the identical surface — swap the import and

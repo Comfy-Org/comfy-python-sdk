@@ -28,7 +28,11 @@ header. With one, the token rides in a ``comfy-bearer.<token>`` subprotocol
 entry beside ``comfy-realtime.v1`` and no credential header is sent: the server
 reads the subprotocol only when neither ``Authorization`` nor ``X-API-Key`` is
 present, and refuses a bearer entry offered without ``comfy-realtime.v1``. No
-credential is ever put in the URL.
+credential is ever put in the URL: userinfo on ``COMFY_ROUTER_BASE_URL`` is
+dropped from the upgrade, since ``websockets`` would turn it into an
+``Authorization`` header. A handshake redirect is followed only within the
+Router origin; one to another origin is refused as a ``RouterError`` for its
+``3xx`` instead, because the credential would ride along to the new host.
 
 **Billing.** A session is billed per second from the ``101`` that opens it, and
 a workspace may hold one live WebSocket session at a time.
@@ -75,11 +79,12 @@ import asyncio
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from comfy_low.errors import clean_request_id
-from comfy_low.transport import AsyncComfyLow, ComfyLow, redact_userinfo
+from comfy_low.transport import AsyncComfyLow, ComfyLow, origin, redact_userinfo
 
 from .exceptions import ComfyError, MissingApiKey
 from .router_exceptions import RouterError, error_from_response
@@ -181,15 +186,33 @@ def _ws_base(router_base_url: str) -> str:
     raise ValueError(f"router_base_url must be an http(s) URL; got {router_base_url!r}")
 
 
+def _strip_userinfo(url: str) -> str:
+    parts = urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    host = parts.netloc.rsplit("@", 1)[1]
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+
+def _ws_origin(url: str) -> tuple[str, str, int | None]:
+    # `origin` knows the http(s) default ports; ws(s) share them.
+    scheme, sep, rest = url.partition("://")
+    http = {"ws": "http", "wss": "https"}.get(scheme.lower(), scheme)
+    return origin(http + sep + rest)
+
+
 @dataclass(frozen=True)
 class _Plan:
-    url: str
+    # `url`, `subprotocols` and `headers` carry the credential (the bearer entry,
+    # `X-API-Key`), and a plan is a frame local whenever a refusal raises, so
+    # they stay out of the repr a locals-capturing error reporter would render.
+    url: str = field(repr=False)
     #: `url` with any userinfo redacted: what the session and errors display.
     safe_url: str
     provider: str
     model: str
-    subprotocols: list[str]
-    headers: dict[str, str]
+    subprotocols: list[str] = field(repr=False)
+    headers: dict[str, str] = field(repr=False)
     user_agent: str
 
 
@@ -207,7 +230,20 @@ def _plan(
     if isinstance(protocols, str):
         # A bare string would otherwise be offered one character at a time.
         raise TypeError("protocols must be a sequence of strings, not a str")
-    extra = [str(p) for p in protocols]
+    extra = list(protocols)
+    for entry in extra:
+        if not isinstance(entry, str) or not _TOKEN_RE.fullmatch(entry):
+            # Same rule as `id_token`: a comma or space would split one entry
+            # into several of the caller's offer.
+            raise ValueError(
+                f"protocols entries must be non-empty strings of HTTP token characters; "
+                f"got {entry!r}"
+            )
+        if entry.startswith(REALTIME_BEARER_SUBPROTOCOL_PREFIX):
+            raise ValueError(
+                f"protocols must not carry a {REALTIME_BEARER_SUBPROTOCOL_PREFIX!r} entry; "
+                "pass the token as id_token=..."
+            )
     headers: dict[str, str] = {}
     if id_token is not None:
         if not isinstance(id_token, str) or not _TOKEN_RE.fullmatch(id_token):
@@ -227,7 +263,10 @@ def _plan(
         subprotocols = [REALTIME_SUBPROTOCOL, *extra]
     url = _ws_base(prepared.router_base_url) + path
     return _Plan(
-        url=url,
+        # websockets sends URL userinfo as `Authorization: Basic`, which would
+        # both put a credential beside the one this module chose and make the
+        # server ignore a bearer subprotocol entry.
+        url=_strip_userinfo(url),
         safe_url=redact_userinfo(url),
         provider=serving,
         model=model,
@@ -246,7 +285,9 @@ def _refusal(exc: Any) -> RouterError:
     if raw:
         try:
             body = json.loads(raw)
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            # A deeply nested body exhausts the parser's recursion limit; it is
+            # as undecodable as malformed JSON, not a reason to escape untyped.
             body = None
     return error_from_response(response.status_code, headers, body)
 
@@ -262,8 +303,45 @@ def _request_id(socket: Any) -> str | None:
     response = getattr(socket, "response", None)
     if response is None:
         return None
-    # Bounded and filtered exactly as on a refusal: the header is server-controlled.
-    return clean_request_id(response.headers.get(_REQUEST_ID_HEADER))
+    # `Headers.get` raises on a repeated header (an intermediary adding its
+    # own); take the first. Bounded and filtered exactly as on a refusal: the
+    # header is server-controlled.
+    values = response.headers.get_all(_REQUEST_ID_HEADER)
+    return clean_request_id(values[0]) if values else None
+
+
+def _guard_redirects(connector: Any, url: str) -> None:
+    """Make ``connector`` refuse a handshake redirect that leaves ``url``'s origin.
+
+    The ``websockets`` releases that follow redirects resend the handshake's
+    headers and subprotocol offer to the target, stripping only
+    ``Authorization`` and cookies -- so ``X-API-Key`` and the bearer entry
+    would reach another host. Returning the ``3xx`` instead of the new URI
+    makes the library raise it, which surfaces as a ``RouterError``. A release
+    with no ``process_redirect`` does not follow redirects at all.
+    """
+    follow = getattr(connector, "process_redirect", None)
+    if follow is None:
+        return
+
+    def process_redirect(exc: Exception) -> Exception | str:
+        target = follow(exc)
+        if isinstance(target, str) and _ws_origin(target) != _ws_origin(url):
+            return exc
+        return target
+
+    connector.process_redirect = process_redirect
+
+
+def _check_selected(socket: Any) -> None:
+    # The server chooses among what was offered, which includes the bearer
+    # entry; selecting it would put the token on the session (and its repr).
+    selected = socket.subprotocol
+    if selected is not None and selected.startswith(REALTIME_BEARER_SUBPROTOCOL_PREFIX):
+        raise ComfyError(
+            "realtime server selected the credential subprotocol entry",
+            code="realtime_upgrade_failed",
+        )
 
 
 def _wire_format(provider: str) -> str:
@@ -347,13 +425,15 @@ class Realtime:
         provider: str | None = None,
         protocols: Sequence[str] = (),
         open_timeout: float | None = 10.0,
+        max_size: int | None = 2**20,
     ) -> RealtimeSession:
         """Open a realtime session on ``model`` (the full catalog id).
 
         ``id_token`` authenticates with a bearer token in the subprotocol offer
         instead of the client's API key. ``provider`` overrides the serving
         relay this SDK picks for ``model``. ``protocols`` are offered after the
-        SDK's own subprotocol entries.
+        SDK's own subprotocol entries. ``max_size`` caps one inbound message in
+        bytes (``None`` lifts it); a larger one closes the session with ``1009``.
 
         Raises a :class:`~comfy_sdk.router_exceptions.RouterError` subclass when
         Router refuses the upgrade, :class:`~comfy_sdk.exceptions.ComfyError`
@@ -363,36 +443,52 @@ class Realtime:
         """
         plan = _plan(self._low, model, id_token, provider, protocols)
         try:
-            from websockets.exceptions import InvalidHandshake, InvalidStatus
-            from websockets.sync.client import connect
+            from websockets.exceptions import InvalidStatus, WebSocketException
+            from websockets.sync import client as ws_client
             from websockets.typing import Subprotocol
         except ImportError as exc:
             raise ImportError(_MISSING_WEBSOCKETS) from exc
+        options: dict[str, Any] = {
+            "additional_headers": plan.headers,
+            "user_agent_header": plan.user_agent,
+            "subprotocols": [Subprotocol(p) for p in plan.subprotocols],
+            "open_timeout": open_timeout,
+            "max_size": max_size,
+        }
         try:
-            socket = connect(
-                plan.url,
-                additional_headers=plan.headers,
-                user_agent_header=plan.user_agent,
-                subprotocols=[Subprotocol(p) for p in plan.subprotocols],
-                open_timeout=open_timeout,
-            )
+            # websockets 17+ follows redirects in the sync client, through the
+            # `reconnect` object `connect()` builds; earlier releases have no
+            # such object and follow none.
+            reconnect = getattr(ws_client, "reconnect", None)
+            if reconnect is None:
+                socket = ws_client.connect(plan.url, **options)
+            else:
+                connector = reconnect(plan.url, **options)
+                _guard_redirects(connector, plan.url)
+                socket = connector.connect()
         except InvalidStatus as exc:
             raise _refusal(exc) from None
-        except (InvalidHandshake, OSError, TimeoutError, asyncio.TimeoutError) as exc:
+        except (WebSocketException, OSError, TimeoutError, asyncio.TimeoutError, ValueError) as exc:
             raise _upgrade_failed(plan.safe_url, exc) from exc
         # The session owns the socket and closes it, which is what the context
         # manager form promises; entering it says so. websockets 17.1+ otherwise
         # warns that a bare `connect()` result is used outside `with`.
         socket.__enter__()
-        return RealtimeSession(
-            socket=socket,
-            url=plan.safe_url,
-            provider=plan.provider,
-            model=plan.model,
-            wire_format=_wire_format(plan.provider),
-            subprotocol=socket.subprotocol,
-            request_id=_request_id(socket),
-        )
+        try:
+            _check_selected(socket)
+            return RealtimeSession(
+                socket=socket,
+                url=plan.safe_url,
+                provider=plan.provider,
+                model=plan.model,
+                wire_format=_wire_format(plan.provider),
+                subprotocol=socket.subprotocol,
+                request_id=_request_id(socket),
+            )
+        except BaseException:
+            # Nothing else holds the socket, and an open one is billed.
+            socket.close()
+            raise
 
 
 class AsyncRealtime:
@@ -409,33 +505,42 @@ class AsyncRealtime:
         provider: str | None = None,
         protocols: Sequence[str] = (),
         open_timeout: float | None = 10.0,
+        max_size: int | None = 2**20,
     ) -> AsyncRealtimeSession:
         """Mirrors :meth:`Realtime.connect` -- see there."""
         plan = _plan(self._low, model, id_token, provider, protocols)
         try:
             from websockets.asyncio.client import connect
-            from websockets.exceptions import InvalidHandshake, InvalidStatus
+            from websockets.exceptions import InvalidStatus, WebSocketException
             from websockets.typing import Subprotocol
         except ImportError as exc:
             raise ImportError(_MISSING_WEBSOCKETS) from exc
         try:
-            socket = await connect(
+            connector = connect(
                 plan.url,
                 additional_headers=plan.headers,
                 user_agent_header=plan.user_agent,
                 subprotocols=[Subprotocol(p) for p in plan.subprotocols],
                 open_timeout=open_timeout,
+                max_size=max_size,
             )
+            _guard_redirects(connector, plan.url)
+            socket = await connector
         except InvalidStatus as exc:
             raise _refusal(exc) from None
-        except (InvalidHandshake, OSError, TimeoutError, asyncio.TimeoutError) as exc:
+        except (WebSocketException, OSError, TimeoutError, asyncio.TimeoutError, ValueError) as exc:
             raise _upgrade_failed(plan.safe_url, exc) from exc
-        return AsyncRealtimeSession(
-            socket=socket,
-            url=plan.safe_url,
-            provider=plan.provider,
-            model=plan.model,
-            wire_format=_wire_format(plan.provider),
-            subprotocol=socket.subprotocol,
-            request_id=_request_id(socket),
-        )
+        try:
+            _check_selected(socket)
+            return AsyncRealtimeSession(
+                socket=socket,
+                url=plan.safe_url,
+                provider=plan.provider,
+                model=plan.model,
+                wire_format=_wire_format(plan.provider),
+                subprotocol=socket.subprotocol,
+                request_id=_request_id(socket),
+            )
+        except BaseException:
+            await socket.close()
+            raise
