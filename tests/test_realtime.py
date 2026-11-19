@@ -12,11 +12,13 @@ import asyncio
 import builtins
 import importlib
 import json
+import os
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from websockets.asyncio.server import ServerConnection, serve
@@ -400,6 +402,10 @@ _HOP = "/v2/realtime/fal/redir/hop"
 _LANDED = "/v2/realtime/fal/redir/landed"
 #: Whether this websockets release follows redirects in its sync client (17+).
 _SYNC_FOLLOWS = hasattr(importlib.import_module("websockets.sync.client"), "reconnect")
+#: Whether this websockets release follows redirects in its asyncio client (14+).
+_ASYNC_FOLLOWS = hasattr(
+    importlib.import_module("websockets.asyncio.client").connect, "process_redirect"
+)
 
 
 @dataclass
@@ -498,6 +504,12 @@ def test_same_origin_redirect_sync(redirect_pair: _Pair, auth: dict[str, str]) -
 @pytest.mark.parametrize("auth", _AUTH_MODES)
 async def test_same_origin_redirect_async(redirect_pair: _Pair, auth: dict[str, str]) -> None:
     async with AsyncComfy(api_key=_KEY) as client:
+        if not _ASYNC_FOLLOWS:
+            # websockets 13's asyncio client follows no redirect at all.
+            with pytest.raises(RouterError) as info:
+                await client.realtime.connect("redir/hop", **auth)
+            assert info.value.http_status == 302
+            return
         await (await client.realtime.connect("redir/hop", **auth)).aclose()
     assert redirect_pair.router.path == _LANDED
     assert redirect_pair.router.headers is not None
@@ -505,6 +517,36 @@ async def test_same_origin_redirect_async(redirect_pair: _Pair, auth: dict[str, 
         assert _offer(redirect_pair.router) == [REALTIME_SUBPROTOCOL, "comfy-bearer.tok"]
     else:
         assert redirect_pair.router.headers["x-api-key"] == _KEY
+
+
+@pytest.mark.parametrize("auth", _AUTH_MODES)
+async def test_same_origin_redirect_drops_userinfo_async(
+    redirect_pair: _Pair, auth: dict[str, str]
+) -> None:
+    if not _ASYNC_FOLLOWS:
+        pytest.skip("this websockets release follows no asyncio redirect")
+    port = urlsplit(os.environ[ROUTER_BASE_URL_ENV_VAR]).port
+    redirect_pair.location = f"ws://user:pw@127.0.0.1:{port}{_LANDED}"
+    async with AsyncComfy(api_key=_KEY) as client:
+        await (await client.realtime.connect("redir/hop", **auth)).aclose()
+    assert redirect_pair.router.path == _LANDED
+    assert redirect_pair.router.headers is not None
+    assert "authorization" not in redirect_pair.router.headers
+
+
+@pytest.mark.parametrize("auth", _AUTH_MODES)
+def test_same_origin_redirect_drops_userinfo_sync(
+    redirect_pair: _Pair, auth: dict[str, str]
+) -> None:
+    if not _SYNC_FOLLOWS:
+        pytest.skip("this websockets release follows no sync redirect")
+    port = urlsplit(os.environ[ROUTER_BASE_URL_ENV_VAR]).port
+    redirect_pair.location = f"ws://user:pw@127.0.0.1:{port}{_LANDED}"
+    with Comfy(api_key=_KEY) as client:
+        client.realtime.connect("redir/hop", **auth).close()
+    assert redirect_pair.router.path == _LANDED
+    assert redirect_pair.router.headers is not None
+    assert "authorization" not in redirect_pair.router.headers
 
 
 def test_plan_repr_carries_no_credential() -> None:

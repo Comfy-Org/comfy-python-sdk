@@ -28,8 +28,8 @@ header. With one, the token rides in a ``comfy-bearer.<token>`` subprotocol
 entry beside ``comfy-realtime.v1`` and no credential header is sent: the server
 reads the subprotocol only when neither ``Authorization`` nor ``X-API-Key`` is
 present, and refuses a bearer entry offered without ``comfy-realtime.v1``. No
-credential is ever put in the URL: userinfo on ``COMFY_ROUTER_BASE_URL`` is
-dropped from the upgrade, since ``websockets`` would turn it into an
+credential is ever put in the URL: userinfo on ``COMFY_ROUTER_BASE_URL``, or on
+a same-origin redirect target, is dropped from the upgrade, since ``websockets`` would turn it into an
 ``Authorization`` header. A handshake redirect is followed only within the
 Router origin; one to another origin is refused as a ``RouterError`` for its
 ``3xx`` instead, because the credential would ride along to the new host.
@@ -317,8 +317,9 @@ def _guard_redirects(connector: Any, url: str) -> None:
     headers and subprotocol offer to the target, stripping only
     ``Authorization`` and cookies -- so ``X-API-Key`` and the bearer entry
     would reach another host. Returning the ``3xx`` instead of the new URI
-    makes the library raise it, which surfaces as a ``RouterError``. A release
-    with no ``process_redirect`` does not follow redirects at all.
+    makes the library raise it, which surfaces as a ``RouterError``. A
+    same-origin target has its userinfo dropped, as the base URL does. A
+    release with no ``process_redirect`` does not follow redirects at all.
     """
     follow = getattr(connector, "process_redirect", None)
     if follow is None:
@@ -326,9 +327,13 @@ def _guard_redirects(connector: Any, url: str) -> None:
 
     def process_redirect(exc: Exception) -> Exception | str:
         target = follow(exc)
-        if isinstance(target, str) and _ws_origin(target) != _ws_origin(url):
+        if not isinstance(target, str):
+            return target
+        if _ws_origin(target) != _ws_origin(url):
             return exc
-        return target
+        # Userinfo on the target would become `Authorization: Basic` on the
+        # next upgrade, exactly as on the base URL.
+        return _strip_userinfo(target)
 
     connector.process_redirect = process_redirect
 
