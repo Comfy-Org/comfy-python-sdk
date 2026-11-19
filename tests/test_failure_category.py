@@ -190,6 +190,15 @@ def test_a_failed_reread_still_yields_the_terminal_status_without_an_error(serve
     assert job.failure_category is None
 
 
+def test_an_unreadable_reread_still_yields_the_terminal_status_without_an_error(server) -> None:
+    _fail(server, {"nope": 1})  # an error object the model cannot validate
+    with Comfy() as client:
+        job = client.submit(_wf(client))
+        seen = list(job.events())
+
+    assert seen[-1] == StatusChange(status="failed")
+
+
 def test_a_stream_that_ends_early_polls_to_the_terminal_status_with_the_error(server) -> None:
     _fail(server, _error("workflow_logic"))
     server.state.sse_mode = "reconnect"  # one progress frame, then a clean close
@@ -232,6 +241,17 @@ async def test_async_failed_reread_still_yields_the_terminal_status_without_an_e
 ) -> None:
     _fail(server, _error("invalid_input"))
     server.state.job_not_found = True
+    async with AsyncComfy() as client:
+        job = await client.submit(_wf(client))
+        seen = [e async for e in job.events()]
+
+    assert seen[-1] == StatusChange(status="failed")
+
+
+async def test_async_unreadable_reread_still_yields_the_terminal_status_without_an_error(
+    server,
+) -> None:
+    _fail(server, {"nope": 1})
     async with AsyncComfy() as client:
         job = await client.submit(_wf(client))
         seen = [e async for e in job.events()]

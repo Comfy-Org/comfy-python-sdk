@@ -294,9 +294,10 @@ for event in job.events():          # SSE; live, auto-reconnecting (no replay)
 result = job.result()               # raises JobFailed with node details on failure
 ```
 
-A terminal `StatusChange` other than `succeeded` carries the job's `error`:
-the stream frame itself holds only the status, so `events()` reads the job once
-and fills `error` from that read (left `None` if the read fails).
+A terminal `StatusChange` other than `succeeded` carries the job's `error` when
+the job has one: the stream frame itself holds only the status, so `events()`
+reads the job once and fills `error` from that read (left `None` if the read
+fails, or if the job has no error, as a canceled one usually has none).
 
 `job.events()` reconnects automatically if the stream drops, but never
 replays a frame you've already seen (the stream carries no cursor). That's

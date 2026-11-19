@@ -309,7 +309,7 @@ class Job:
             return ev
         try:
             self.refresh()
-        except (ComfyError, httpx.HTTPError):
+        except (ComfyError, httpx.HTTPError, ValidationError):
             return ev
         return replace(ev, error=self._model.error)
 
@@ -439,7 +439,7 @@ class AsyncJob:
             return ev
         try:
             await self.refresh()
-        except (ComfyError, httpx.HTTPError):
+        except (ComfyError, httpx.HTTPError, ValidationError):
             return ev
         return replace(ev, error=self._model.error)
 
