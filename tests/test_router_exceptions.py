@@ -212,6 +212,28 @@ def test_a_missing_request_id_is_none_rather_than_an_error() -> None:
     assert error_from_response(status, headers, body).request_id is None
 
 
+def test_a_body_without_code_has_no_refusal_code() -> None:
+    status, headers, body = stub_error_response("forbidden", 403)
+    assert "code" not in body
+    assert error_from_response(status, headers, body).refusal_code is None
+    assert error_from_response(503, {}, None).refusal_code is None
+
+
+def test_a_string_code_in_the_body_is_the_refusal_code() -> None:
+    status, headers, body = stub_error_response("concurrency_limit_exceeded", 429)
+    body = {**body, "code": "router.realtime.session_already_live"}
+    exc = error_from_response(status, headers, body)
+    assert isinstance(exc, ConcurrencyLimitExceeded)
+    assert exc.refusal_code == "router.realtime.session_already_live"
+    assert exc.error_type == "concurrency_limit_exceeded"
+
+
+@pytest.mark.parametrize("code", [7, None, "", "  ", ["x"]])
+def test_a_non_string_or_blank_code_is_no_refusal_code(code: Any) -> None:
+    status, headers, body = stub_error_response("forbidden", 403)
+    assert error_from_response(status, headers, {**body, "code": code}).refusal_code is None
+
+
 # -- the 422: structured detail[] entries ------------------------------------
 
 VALIDATION_BODY: dict[str, Any] = {

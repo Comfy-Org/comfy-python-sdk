@@ -106,6 +106,7 @@ def test_the_namespace_adds_no_new_top_level_import_path() -> None:
     # ``from comfy_sdk import Comfy`` stays the only path a caller needs:
     # the namespace is reached as ``client.models``, so neither class is
     # exported at the top level.
-    for name in ("Models", "AsyncModels"):
+    # The same holds for ``client.realtime``.
+    for name in ("Models", "AsyncModels", "Realtime", "AsyncRealtime"):
         assert name not in comfy_sdk.__all__
         assert not hasattr(comfy_sdk, name)
