@@ -8,9 +8,12 @@ is the contract's ``StatusEvent`` shape.
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
+from comfy_low import AsyncComfyLow, ComfyLow
 from comfy_sdk import AsyncComfy, Comfy, FailureCategory, JobFailed, StatusChange
+from comfy_sdk.jobs import AsyncJob, Job
 
 WIRE_VALUES = [
     "invalid_input",
@@ -197,6 +200,31 @@ def test_an_unreadable_reread_still_yields_the_terminal_status_without_an_error(
         seen = list(job.events())
 
     assert seen[-1] == StatusChange(status="failed")
+
+
+def test_the_reread_gets_a_connection_when_the_client_allows_only_one(server) -> None:
+    # The stream's connection is closed before the re-read, so a client limited
+    # to one connection reads the error instead of waiting on its own stream.
+    _fail(server, _error("invalid_input"))
+    limits = httpx.Limits(max_connections=1)
+    with ComfyLow(server.base_url, client=httpx.Client(limits=limits, timeout=3.0)) as low:
+        job = Job(low, low.post_jobs({"3": {"class_type": "KSampler", "inputs": {}}}))
+        seen = list(job.events())
+
+    assert seen[-1].error is not None
+    assert seen[-1].error.category == "invalid_input"
+
+
+async def test_async_reread_gets_a_connection_when_the_client_allows_only_one(server) -> None:
+    _fail(server, _error("invalid_input"))
+    limits = httpx.Limits(max_connections=1)
+    client = httpx.AsyncClient(limits=limits, timeout=3.0)
+    async with AsyncComfyLow(server.base_url, client=client) as low:
+        job = AsyncJob(low, await low.post_jobs({"3": {"class_type": "KSampler", "inputs": {}}}))
+        seen = [e async for e in job.events()]
+
+    assert seen[-1].error is not None
+    assert seen[-1].error.category == "invalid_input"
 
 
 def test_a_stream_that_ends_early_polls_to_the_terminal_status_with_the_error(server) -> None:

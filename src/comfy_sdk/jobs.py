@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Iterator
+from contextlib import aclosing, closing
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -274,24 +275,27 @@ class Job:
         """
         events_url = self._model.urls.events or self._model.id
         while True:
-            terminal_seen = False
+            terminal: StatusChange | None = None
             try:
-                for raw in self._low.get_job_events(events_url):
-                    ev = event_from_raw(raw, self._bind_output)
-                    if ev is None:
-                        continue
-                    if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
-                        terminal_seen = True
-                        yield self._terminal_with_error(ev)
-                        return
-                    yield ev
+                # Closed before the terminal status is enriched: the re-read needs
+                # a connection, and a client limited to one would wait on this one.
+                with closing(self._low.get_job_events(events_url)) as stream:
+                    for raw in stream:
+                        ev = event_from_raw(raw, self._bind_output)
+                        if ev is None:
+                            continue
+                        if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
+                            terminal = ev
+                            break
+                        yield ev
             except ApiError as exc:
                 if exc.http_status == 501:
                     return  # surface has no SSE — poll paths remain authoritative
                 raise to_sdk_error(exc) from exc
             except (httpx.HTTPError, httpx.StreamError):
                 pass  # connection dropped mid-stream — reconnect below
-            if terminal_seen:
+            if terminal is not None:
+                yield self._terminal_with_error(terminal)
                 return
             # Stream ended without a terminal frame. Poll the authoritative state:
             # stop if already terminal, else reconnect for fresh live frames.
@@ -408,24 +412,25 @@ class AsyncJob:
 
         events_url = self._model.urls.events or self._model.id
         while True:
-            terminal_seen = False
+            terminal: StatusChange | None = None
             try:
-                async for raw in self._low.get_job_events(events_url):
-                    ev = event_from_raw(raw, self._bind_output)
-                    if ev is None:
-                        continue
-                    if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
-                        terminal_seen = True
-                        yield await self._terminal_with_error(ev)
-                        return
-                    yield ev
+                async with aclosing(self._low.get_job_events(events_url)) as stream:
+                    async for raw in stream:
+                        ev = event_from_raw(raw, self._bind_output)
+                        if ev is None:
+                            continue
+                        if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
+                            terminal = ev
+                            break
+                        yield ev
             except ApiError as exc:
                 if exc.http_status == 501:
                     return  # surface has no SSE — poll paths remain authoritative
                 raise to_sdk_error(exc) from exc
             except (httpx.HTTPError, httpx.StreamError):
                 pass
-            if terminal_seen:
+            if terminal is not None:
+                yield await self._terminal_with_error(terminal)
                 return
             await self.refresh()
             if _core.is_terminal(self.status):
