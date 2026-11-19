@@ -29,10 +29,11 @@ entry beside ``comfy-realtime.v1`` and no credential header is sent: the server
 reads the subprotocol only when neither ``Authorization`` nor ``X-API-Key`` is
 present, and refuses a bearer entry offered without ``comfy-realtime.v1``. No
 credential is ever put in the URL: userinfo on ``COMFY_ROUTER_BASE_URL``, or on
-a same-origin redirect target, is dropped from the upgrade, since ``websockets`` would turn it into an
-``Authorization`` header. A handshake redirect is followed only within the
-Router origin; one to another origin is refused as a ``RouterError`` for its
-``3xx`` instead, because the credential would ride along to the new host.
+a same-origin redirect target, is dropped from the upgrade, since
+``websockets`` would turn it into an ``Authorization`` header. A handshake
+redirect is followed only within the Router origin; one to another origin is
+refused as a ``RouterError`` for its ``3xx`` instead, because the credential
+would ride along to the new host.
 
 **Billing.** A session is billed per second from the ``101`` that opens it, and
 a workspace may hold one live WebSocket session at a time.
