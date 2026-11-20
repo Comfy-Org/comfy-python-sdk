@@ -205,6 +205,13 @@ def test_no_estimate_on_the_201_is_none(server, fast_poll) -> None:
         {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "NaN", "max_amount": "0.08"},
         {**EXACT_ESTIMATE, "source": "estimated", "min_amount": "0.02", "max_amount": "Infinity"},
         {**EXACT_ESTIMATE, "source": "estimated", "min_amount": 0.02, "max_amount": 0.08},
+        # A `free` quote must name its zero, and a non-zero one contradicts itself.
+        {
+            key: value
+            for key, value in {**EXACT_ESTIMATE, "source": "free"}.items()
+            if key != "amount"
+        },
+        {**EXACT_ESTIMATE, "source": "free"},
     ],
 )
 def test_a_malformed_estimate_is_no_quote_and_never_fails_the_submit(
@@ -228,6 +235,46 @@ def test_an_estimated_range_may_be_a_single_point(server, fast_poll) -> None:
 
     assert estimate is not None
     assert (estimate.min_amount, estimate.max_amount) == ("0.04", "0.040")
+    # Built from an exact quote: the exact-only figures it arrived with are not
+    # an estimated quote's to carry, so they stay in `raw` alone.
+    assert (estimate.amount, estimate.amount_cents, estimate.credits) == (None, None, None)
+    assert estimate.raw["amount"] == "0.04"
+
+
+def test_an_exact_quote_carries_no_bounds(server, fast_poll) -> None:
+    server.state.queue_submit_estimate = {
+        **EXACT_ESTIMATE,
+        "min_amount": "0.02",
+        "max_amount": "0.08",
+        "min_amount_cents": 2.0,
+        "max_amount_cents": 8.0,
+        "reason": "not_quotable",
+    }
+    estimate = _submitted_estimate()
+
+    assert estimate is not None
+    assert estimate.is_exact and estimate.amount == "0.04"
+    assert (estimate.min_amount, estimate.max_amount) == (None, None)
+    assert (estimate.min_amount_cents, estimate.max_amount_cents) == (None, None)
+    assert estimate.reason is None
+
+
+@pytest.mark.parametrize("zero", ["0", "0.00"])
+def test_a_free_quote_is_a_known_zero_not_an_unknown(server, fast_poll, zero: str) -> None:
+    server.state.queue_submit_estimate = {
+        **EXACT_ESTIMATE,
+        "source": "free",
+        "amount": zero,
+        "amount_cents": 0,
+        "credits": 0,
+    }
+    estimate = _submitted_estimate()
+
+    assert estimate is not None
+    assert estimate.is_free
+    assert not (estimate.is_unknown or estimate.is_exact or estimate.is_estimated)
+    assert estimate.amount == zero
+    assert (estimate.amount_cents, estimate.credits) == (0.0, 0.0)
 
 
 def test_a_mistyped_optional_estimate_field_is_left_none(server, fast_poll) -> None:

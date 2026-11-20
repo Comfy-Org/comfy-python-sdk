@@ -142,10 +142,10 @@ class QueueUpdate:
         )
 
 
-#: The two ``source`` values that carry a figure. Anything else -- ``unknown``
-#: or a value added server side after this SDK version -- is read as no figure,
+#: The ``source`` values that carry a figure. Anything else -- ``unknown`` or a
+#: value added server side after this SDK version -- is read as no figure,
 #: which is the spec's own rule for the field.
-_QUOTED_SOURCES = ("exact", "estimated")
+_QUOTED_SOURCES = ("exact", "estimated", "free")
 
 #: A money string as the spec writes one: a plain non-negative decimal. Any
 #: other string -- blank, ``NaN``, ``-1``, ``1e9`` -- is no figure, so a caller
@@ -158,18 +158,26 @@ class CostEstimate:
     """Router's pre-flight cost quote for one queued request.
 
     Read from the ``estimate`` object on the queued submit's ``201`` body and
-    exposed as :attr:`RequestHandle.estimate`. It is priced before dispatch
-    from the same rate card the charge is billed against, in US dollars.
+    exposed as :attr:`RequestHandle.estimate`. It is priced before dispatch, in
+    US dollars, at Comfy's standard **list price** -- or, for a model billed
+    the cost its vendor reports, estimated from the vendor's published price
+    list. It does not reflect negotiated or customer-specific rates, and it is
+    not the final charge: the settled charge in the workspace's usage and
+    billing records is what is paid.
 
     ``source`` is an **open string** and says how much to trust the figure:
-    ``exact`` carries :attr:`amount`; ``estimated`` carries :attr:`min_amount`
-    and :attr:`max_amount` and no :attr:`amount`; ``unknown`` carries neither,
-    and a :attr:`reason`. Any other value is read as ``unknown``
-    (:attr:`is_unknown`), as the spec directs, and its figures are dropped
-    (they stay in :attr:`raw`). An absent :attr:`amount` is never "free".
-    The figure the ``source`` promises is always present: an ``exact`` quote
-    whose :attr:`amount`, or an ``estimated`` one whose bounds, cannot be read
-    is no quote at all.
+    ``exact`` carries :attr:`amount` (exact *at list price*, not the
+    workspace's charge); ``free`` carries an :attr:`amount` of ``"0"``, because
+    the rate card prices the request at zero; ``estimated`` carries
+    :attr:`min_amount` and :attr:`max_amount` and no :attr:`amount`;
+    ``unknown`` carries neither, and a :attr:`reason`. Any other value is read
+    as ``unknown`` (:attr:`is_unknown`), as the spec directs, and its figures
+    are dropped (they stay in :attr:`raw`). Only :attr:`is_free` means free --
+    an absent :attr:`amount` never does. Each ``source`` keeps only the figures
+    it promises -- an ``estimated`` quote never carries an :attr:`amount`, an
+    ``exact`` one never carries bounds -- and those are always present: an
+    ``exact`` or ``free`` quote whose :attr:`amount`, or an ``estimated`` one
+    whose bounds, cannot be read is no quote at all.
 
     Money is the server's decimal **string**, kept verbatim and never coerced
     to a float, so ``"0.04"`` stays exactly ``"0.04"``; the ``*_cents`` and
@@ -179,9 +187,10 @@ class CostEstimate:
     it is rated, not at :attr:`pricing_as_of`.
     """
 
-    #: ``exact`` | ``estimated`` | ``unknown``, verbatim — and possibly a value
-    #: this SDK version has never heard of. Branch on :attr:`is_exact`,
-    #: :attr:`is_estimated` and :attr:`is_unknown` rather than comparing.
+    #: ``exact`` | ``estimated`` | ``free`` | ``unknown``, verbatim — and
+    #: possibly a value this SDK version has never heard of. Branch on
+    #: :attr:`is_exact`, :attr:`is_estimated`, :attr:`is_free` and
+    #: :attr:`is_unknown` rather than comparing.
     source: str
     #: Always ``USD`` today.
     currency: str
@@ -192,7 +201,8 @@ class CostEstimate:
     #: When the rate card the quote was priced from was fetched (or, when no
     #: card was read, when the quote was answered), as the server's string.
     pricing_as_of: str
-    #: Dollars as a decimal string. Present only when ``source`` is ``exact``.
+    #: Dollars as a decimal string. Present only when ``source`` is ``exact``
+    #: or ``free`` (where it is ``"0"``).
     amount: str | None = None
     #: The lower bound in dollars as a decimal string; ``estimated`` only.
     min_amount: str | None = None
@@ -224,6 +234,12 @@ class CostEstimate:
     def is_estimated(self) -> bool:
         """Whether the quote is a range, in :attr:`min_amount` / :attr:`max_amount`."""
         return self.source == "estimated"
+
+    @property
+    def is_free(self) -> bool:
+        """Whether the rate card prices the request at zero — a known zero
+        :attr:`amount`, as opposed to :attr:`is_unknown`'s absent one."""
+        return self.source == "free"
 
     @property
     def is_unknown(self) -> bool:
@@ -405,43 +421,47 @@ def _estimate_of(payload: Any) -> CostEstimate | None:
         or pricing_as_of is None
     ):
         return None
-    if source not in _QUOTED_SOURCES:
-        # Read as `unknown`, which carries no figure whatever else arrived.
-        return CostEstimate(
-            source=source,
-            currency=currency,
-            provider=provider,
-            model=model,
-            pricing_as_of=pricing_as_of,
-            reason=text("reason"),
-            raw=dict(estimate),
-        )
-    quote = CostEstimate(
+    base = CostEstimate(
         source=source,
         currency=currency,
         provider=provider,
         model=model,
         pricing_as_of=pricing_as_of,
-        amount=money("amount"),
-        min_amount=money("min_amount"),
-        max_amount=money("max_amount"),
-        amount_cents=number("amount_cents"),
-        min_amount_cents=number("min_amount_cents"),
-        max_amount_cents=number("max_amount_cents"),
-        credits=number("credits"),
-        reason=text("reason"),
         raw=dict(estimate),
     )
-    if quote.is_exact and quote.amount is None:
-        return None
-    if quote.is_estimated:
-        if quote.min_amount is None or quote.max_amount is None:
+    if source not in _QUOTED_SOURCES:
+        # Read as `unknown`, which carries no figure whatever else arrived.
+        return replace(base, reason=text("reason"))
+    # Each source keeps only the figures it promises; anything else it arrived
+    # with stays in `raw`, so an `estimated` quote can never be read as exact.
+    if source == "estimated":
+        min_amount, max_amount = money("min_amount"), money("max_amount")
+        if min_amount is None or max_amount is None:
             return None
         # Both already match `_DECIMAL_AMOUNT`, so `Decimal` cannot raise; a
         # reversed range is a quote nobody can act on.
-        if Decimal(quote.min_amount) > Decimal(quote.max_amount):
+        if Decimal(min_amount) > Decimal(max_amount):
             return None
-    return quote
+        return replace(
+            base,
+            min_amount=min_amount,
+            max_amount=max_amount,
+            min_amount_cents=number("min_amount_cents"),
+            max_amount_cents=number("max_amount_cents"),
+        )
+    amount = money("amount")
+    if amount is None:
+        return None
+    # A `free` quote that names a non-zero price contradicts itself, and
+    # reading either half of it would be a guess.
+    if source == "free" and Decimal(amount) != 0:
+        return None
+    return replace(
+        base,
+        amount=amount,
+        amount_cents=number("amount_cents"),
+        credits=number("credits"),
+    )
 
 
 def _raise_for_completion(payload: Any, *, request_id: str, envelope_only: bool = False) -> None:
@@ -602,8 +622,10 @@ class _RequestHandleBase:
         replay; and always on a handle rebuilt with ``client.models.handle``.
 
         Branch on ``is not None``; when a quote is present,
-        :attr:`CostEstimate.source` says how much to trust the figure. It is
-        not a price lock: the run is charged at the rates in force when rated.
+        :attr:`CostEstimate.source` says how much to trust the figure. It is a
+        list-price quote, not the workspace's final charge (the settled usage
+        and billing records are), and not a price lock: the run is charged at
+        the rates in force when rated.
         """
         return self._estimate
 
