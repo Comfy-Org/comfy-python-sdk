@@ -278,7 +278,6 @@ def test_a_body_that_names_no_bucket_still_falls_back_to_the_status(body: object
         ("invalid_input", 422, "InvalidInput"),
         ("model_not_found", 404, "ModelNotFound"),
         ("concurrency_limit_exceeded", 409, "ConcurrencyLimitExceeded"),
-        ("rate_limited", 429, "RateLimited"),
         ("provider_error", 500, "ProviderError"),
         ("deadline_exceeded", 504, "DeadlineExceeded"),
     ],
@@ -295,9 +294,11 @@ def test_a_router_only_bucket_raises_its_typed_class(
     assert err.retry_after == 7
 
 
-@pytest.mark.parametrize("code", ["unauthorized", "forbidden", "insufficient_credits"])
+@pytest.mark.parametrize(
+    "code", ["unauthorized", "forbidden", "insufficient_credits", "rate_limited"]
+)
 def test_a_bucket_both_surfaces_spell_keeps_its_v2_class(code: str) -> None:
-    # These three codes are spelled identically by the v2 envelope and by
+    # These four codes are spelled identically by the v2 envelope and by
     # Router, and the code string alone cannot say which surface answered.
     # Retyping them to the RouterError twins would break every jobs-surface
     # handler to fix none -- the v2 classes fire on the router surface too.
@@ -305,6 +306,35 @@ def test_a_bucket_both_surfaces_spell_keeps_its_v2_class(code: str) -> None:
 
     err = to_sdk_error(ApiError("no", code=code, http_status=403))
     assert type(err) is getattr(sdk, "".join(p.title() for p in code.split("_")))
+
+
+def test_a_v2_rate_limited_raises_the_one_shared_rate_limited_class() -> None:
+    # The v2 job routes document `rate_limited` with the same spelling Router
+    # uses, so the class is reachable from the package root, `exceptions` and
+    # `router_exceptions` -- one object -- and keeps the server's pacing hint.
+    import comfy_sdk
+    import comfy_sdk.exceptions as sdk
+    import comfy_sdk.router_exceptions as rx
+
+    err = to_sdk_error(ApiError("slow down", code="rate_limited", http_status=429, retry_after=3))
+    assert comfy_sdk.RateLimited is sdk.RateLimited is rx.RateLimited
+    assert type(err) is comfy_sdk.RateLimited
+    assert err.retry_after == 3
+    assert err.http_status == 429
+
+
+def test_a_v2_rate_limited_envelope_is_typed_at_the_low_layer() -> None:
+    import comfy_low
+    import comfy_low.errors as low
+
+    err = error_from_envelope(
+        429, {"error": {"code": "rate_limited", "message": "slow down"}}, retry_after=3
+    )
+    assert type(err) is low.RateLimited is comfy_low.RateLimited
+    assert err.code == "rate_limited"
+    assert err.retry_after == 3
+    # A code-less 429 still decodes to the queue-depth reading.
+    assert type(error_from_envelope(429, None)) is QueueFull
 
 
 # --- a response nothing in the stack recognised ---

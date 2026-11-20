@@ -12,6 +12,11 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `RateLimited` is exported from `comfy_sdk` and `comfy_sdk.exceptions` as a fourth bucket shared
+  with the Router surface, beside `Unauthorized`, `Forbidden` and `InsufficientCredits`. It is the
+  same class as `comfy_sdk.router_exceptions.RateLimited`, and a v2 job route's `rate_limited`
+  envelope now maps to it explicitly; it carries `.retry_after`. The low layer gains
+  `comfy_low.errors.RateLimited` (also on `comfy_low`) for the same code.
 - `FailureCategory`, and `failure_category` on `Job`, `AsyncJob` and `JobFailed`: why a job
   failed, as one of `invalid_input`, `content_refused`, `out_of_gpu_memory`,
   `missing_model_or_node`, `workflow_logic` or `other`, read from the error's `category`. It is
