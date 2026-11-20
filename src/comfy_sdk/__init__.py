@@ -54,6 +54,7 @@ from .exceptions import (
     BlobNotFound,
     CancelRefused,
     ComfyError,
+    FailureCategory,
     Forbidden,
     HashMismatch,
     IdempotencyKeyReuse,
@@ -132,6 +133,7 @@ __all__ = [
     "Log",
     # exceptions
     "ComfyError",
+    "FailureCategory",
     "JobFailed",
     "QueueFull",
     "MissingAsset",
