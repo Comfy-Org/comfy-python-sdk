@@ -35,9 +35,10 @@ the fuller account of each version, including verification notes.
 
 ### Fixed
 
-- `job.events()` / async `events()` now raise a typed error (`Unauthorized` with code
-  `credential_expired`, `Forbidden`, or `NotFound`) when the server sends the terminal `error`
-  event, instead of silently reconnecting.
+- `job.events()` / async `events()` now raise a typed error when the server ends the stream
+  with a terminal `error` event naming `credential_expired` (`Unauthorized`), `forbidden`
+  (`Forbidden`) or `job_not_found` (`NotFound`), instead of silently reconnecting. An `error`
+  event with any other code, or no readable one, still falls back to polling and reconnecting.
 
 ## [0.5.0] - 2026-10-10
 
