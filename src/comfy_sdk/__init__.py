@@ -70,7 +70,13 @@ from .exceptions import (
     WorkflowFormatUi,
 )
 from .jobs import AsyncJob, Job, JobSummary, JobWorkflow
-from .model_requests import COMPLETED, AsyncRequestHandle, QueueUpdate, RequestHandle
+from .model_requests import (
+    COMPLETED,
+    AsyncRequestHandle,
+    CostEstimate,
+    QueueUpdate,
+    RequestHandle,
+)
 from .models import BinaryResult
 from .outputs import AsyncOutput, DownloadUrl, Output
 from .retry import DEFAULT_RETRY, NO_RETRY, RetryPolicy
@@ -119,6 +125,7 @@ __all__ = [
     "RequestHandle",
     "AsyncRequestHandle",
     "QueueUpdate",
+    "CostEstimate",
     "COMPLETED",
     "Output",
     "AsyncOutput",
