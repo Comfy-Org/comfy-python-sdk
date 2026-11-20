@@ -18,6 +18,7 @@ import base64
 from dataclasses import dataclass
 from typing import Any
 
+from comfy_low.models import JobError
 from comfy_low.models import Output as LowOutput
 from comfy_low.sse import RawEvent
 
@@ -59,6 +60,11 @@ class OutputReady:
 class StatusChange:
     status: str
     queue_position: int | None = None
+    error: JobError | None = None
+    """The job's error, on a terminal status other than ``succeeded`` when the
+    job has one; the same value as :attr:`Job.error`. The stream frame itself
+    carries no error, so the job handle fills this from one re-read of the job.
+    """
 
 
 @dataclass

@@ -294,6 +294,11 @@ for event in job.events():          # SSE; live, auto-reconnecting (no replay)
 result = job.result()               # raises JobFailed with node details on failure
 ```
 
+A terminal `StatusChange` other than `succeeded` carries the job's `error` when
+the job has one: the stream frame itself holds only the status, so `events()`
+reads the job once and fills `error` from that read (left `None` if the read
+fails, or if the job has no error, as a canceled one usually has none).
+
 `job.events()` reconnects automatically if the stream drops, but never
 replays a frame you've already seen (the stream carries no cursor). That's
 why polling stays authoritative: `job.wait()` / `job.result()` (and
@@ -827,7 +832,16 @@ async with AsyncComfy(api_key="comfyui-...") as client:
 This surface is **gated server side**. A caller the queue is not switched on
 for is answered `403 not_enabled`, which arrives as
 `comfy_sdk.router_exceptions.NotEnabled` — nothing about the request is wrong,
-and it is terminal: do not retry it.
+and it is terminal: do not retry it. The same `403 not_enabled` also refuses a
+*model* whose partner answers a generation directly as bytes: it cannot yet be
+queued, nothing is queued or charged, and `client.models.run` serves it instead —
+so read `.detail` before concluding the account is not switched on.
+
+A caller with too many queued requests already waiting is refused
+`429 queue_backlog_full`, raised as `comfy_sdk.router_exceptions.QueueBacklogFull`.
+It is not `ConcurrencyLimitExceeded` (the synchronous route's in-flight bound):
+the queue parks a submit at that limit, and this is the separate bound on how many
+may be left waiting. It clears as your own queued requests finish.
 
 ### Retrying a run without paying for it twice
 
@@ -1055,7 +1069,11 @@ asset, job, event, and output helpers translate protocol errors, so catches of
   retries 429 responses with `Retry-After` for a bounded budget (including
   deployment warm-up), then raises the translated error if backpressure remains.
 - `JobFailed` — a job reached a non-`succeeded` terminal state; `.error`
-  carries node-level detail when the platform provided one.
+  carries node-level detail when the platform provided one, and
+  `.failure_category` is why the job failed as a `FailureCategory`
+  (`invalid_input`, `content_refused`, `out_of_gpu_memory`,
+  `missing_model_or_node`, `workflow_logic` or `other`), or `None` when the
+  error names none. `job.failure_category` reads the same off the handle.
 - A plain `ComfyError` whose `.code` reads `http_<status>` (`http_503`,
   `http_500`) — the response was answered by something in front of Router
   rather than by the service itself, so no service verdict was reached: no
@@ -1104,12 +1122,13 @@ status on `.http_status`; keep an `except ComfyError` outside the clause above
 if you need to handle those in the same place.
 
 `RouterError` is exported from the package root because it is the handler most
-callers write first. The eighteen per-bucket classes stay in
+callers write first. The twenty per-bucket classes stay in
 `comfy_sdk.router_exceptions` — `InvalidInput`, `ContentPolicyViolation`,
 `ProviderError`, `ProviderTimeout`, `InsufficientCredits`, `ModelNotFound`,
 `Unauthorized`, `Forbidden`, `ConcurrencyLimitExceeded`, `ClientDisconnected`,
 `InternalError`, `DeadlineExceeded`, `NotEnabled`, `ServiceUnavailable`,
-`RateLimited`, `Cancelled`, `QueueTimeout`, `RequestNotFound` — one import path
+`RateLimited`, `Cancelled`, `QueueTimeout`, `RequestNotFound`,
+`QueueBacklogFull`, `ResultExpired` — one import path
 for the whole set rather than half of it here and half of it there. A bucket added to Router after your installed version
 arrives as `RouterError` itself, with the raw value readable on `.error_type`.
 
