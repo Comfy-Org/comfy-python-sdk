@@ -48,7 +48,7 @@ dev = [
     # otherwise silently changes what CI catches between PRs.
     "ruff~=0.15.22",
     "mypy>=2.3,<2.5",
-    "pytest~=9.1.1",
+    "pytest>=9.1.1,<9.3.0",
     "pytest-asyncio~=1.4.0",
     # A .coverage database was already being produced locally (and committed)
     # without the tool that makes it reproducible being declared anywhere.
