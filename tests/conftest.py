@@ -107,6 +107,20 @@ class ServerState:
     polls_to_succeed: int = 1
     # Terminal status the job reaches.
     terminal_status: str = "succeeded"
+    # The `error` object every job answer reports while its status is `failed`
+    # (the poll, the submit and cancel snapshots). The stream's own status frame
+    # never carries it: the contract's `StatusEvent` declares only `status` and
+    # `queue_position`. `None` is a failed job with no error detail.
+    job_failure: dict[str, Any] | None = None
+    # Status the POST /jobs and POST /jobs/{id}/cancel snapshots report.
+    submit_status: str = "queued"
+    cancel_status: str = "canceling"
+    # GET /jobs/{id}/logs answers 200 with this body, or 204 when `None`, with
+    # `No-Log-Reason` set to `job_logs_no_reason` when that is given.
+    job_logs: dict[str, Any] | None = None
+    job_logs_no_reason: str | None = None
+    # Every path GET /jobs/{id}/logs was asked for, in arrival order.
+    job_logs_paths: list[str] = field(default_factory=list)
     # SSE behavior: "reconnect" drops the first stream before terminal;
     # "stall" sends a couple frames then holds the connection open, silent
     # (a "zombie": no terminal, no close) for `stall_seconds`.
@@ -482,6 +496,7 @@ def _job_json(
     status: str,
     outputs: list[dict] | None = None,
     metadata: Any = None,
+    error: dict[str, Any] | None = None,
 ) -> dict:
     job = {
         "id": job_id,
@@ -493,7 +508,7 @@ def _job_json(
         "queue_position": 0,
         "progress": None,
         "outputs": outputs or [],
-        "error": None,
+        "error": error,
         "metrics": {"queue_ms": 9000, "execution_ms": None},
         "urls": {
             "self": f"/api/v2/jobs/{job_id}",
@@ -524,6 +539,9 @@ _OUTPUT = _output_json("13", "asset_out_01")
 
 
 def _make_handler(state: ServerState):
+    def _failure_of(status: str) -> dict[str, Any] | None:
+        return state.job_failure if status == "failed" else None
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a: Any) -> None:
             pass
@@ -688,6 +706,9 @@ def _make_handler(state: ServerState):
             if m:
                 self._serve_job_workflow(m.group(1))
                 return
+            if re.match(r"/api/v2/jobs/([^/]+)/logs$", self.path):
+                self._serve_job_logs()
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)$", self.path)
             if m:
                 self._serve_job(m.group(1))
@@ -737,7 +758,23 @@ def _make_handler(state: ServerState):
             else:
                 status = "running"
                 outputs = []
-            self._json(200, _job_json(job_id, status, outputs, state.job_metadata))
+            self._json(
+                200,
+                _job_json(job_id, status, outputs, state.job_metadata, _failure_of(status)),
+            )
+
+        def _serve_job_logs(self) -> None:
+            state.job_logs_paths.append(self.path)
+            if state.job_not_found:
+                self._err(404, "job_not_found", "no such job")
+                return
+            if state.job_logs is not None:
+                self._json(200, state.job_logs)
+                return
+            self.send_response(204)
+            if state.job_logs_no_reason is not None:
+                self.send_header("No-Log-Reason", state.job_logs_no_reason)
+            self.end_headers()
 
         def _serve_job_list(self) -> None:
             query = parse_qs(urlsplit(self.path).query)
@@ -868,7 +905,13 @@ def _make_handler(state: ServerState):
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
-                self._json(200, _job_json(m.group(1), "canceling", metadata=state.job_metadata))
+                status = state.cancel_status
+                self._json(
+                    200,
+                    _job_json(
+                        m.group(1), status, metadata=state.job_metadata, error=_failure_of(status)
+                    ),
+                )
                 return
             self._read_body()
             self._err(404, "not_found")
@@ -1307,7 +1350,8 @@ def _make_handler(state: ServerState):
             metadata = (
                 state.job_metadata if state.job_metadata is not None else body.get("metadata")
             )
-            self._json(201, _job_json(job_id, "queued", metadata=metadata))
+            status = state.submit_status
+            self._json(201, _job_json(job_id, status, metadata=metadata, error=_failure_of(status)))
 
     return Handler
 

@@ -53,7 +53,7 @@ import asyncio
 import platform
 import secrets
 import sys
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Generator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -67,7 +67,7 @@ from pydantic import BeforeValidator, create_model
 
 from . import _multipart
 from .errors import ApiError, clean_body_excerpt, clean_request_id, error_from_envelope
-from .models import Asset, Job, JobWorkflowResponse
+from .models import Asset, Job, JobLogs, JobWorkflowResponse
 from .sse import RawEvent, SSEDecoder
 
 _API = "/api/v2"
@@ -932,11 +932,10 @@ def job_labels(raw: Any) -> dict[str, str]:
 def _with_lenient_metadata(base: type[Job]) -> type[Job]:
     """``base`` with a ``metadata`` field that reads through :func:`job_labels`.
 
-    The v2 contract gained ``metadata`` on the job object, but the vendored spec
-    the models are generated from does not carry it yet. Declared here, in the
-    hand-written layer, rather than in the generated models, so the field is
-    read today. It overrides the field rather than adding one, so it keeps
-    reading leniently after a spec sync adds a strict ``metadata`` to ``Job``.
+    The generated ``Job`` types ``metadata`` strictly as a map of strings, but a
+    self-hosted proxy sends its own as a string. This overrides that field in
+    the hand-written layer, so such a job still validates and the labels read
+    leniently.
 
     The class is named ``_<base>WithMetadata``, so for ``Job`` its name is the
     module attribute it is bound to below, which is what pickle looks up.
@@ -994,9 +993,9 @@ def _jobs_list_path(
     """Sans-IO path (with query) for one page of ``GET /api/v2/jobs``.
 
     Each metadata filter is sent as ``metadata[<key>]=<value>``, the
-    ``deepObject`` style the v2 contract's ``listJobs`` declares (the vendored
-    spec does not carry that route yet). Nothing is checked here: the server
-    owns the filter rules and answers a bad filter with its own error.
+    ``deepObject`` style the v2 contract's ``listJobs`` declares. Nothing is
+    checked here: the server owns the filter rules and answers a bad filter
+    with its own error.
     """
     params = [(f"metadata[{k}]", v) for k, v in metadata_filter_pairs(metadata)]
     if limit is not None:
@@ -1330,7 +1329,22 @@ class ComfyLow:
         resp = self.raw_request("GET", path, timeout=timeout)
         return _job(self._p.parse_or_raise(resp, (200,)))
 
-    def get_job_events(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> Iterator[RawEvent]:
+    def get_job_logs(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> JobLogs | None:
+        """GET /api/v2/jobs/{id}/logs — what the run printed, or ``None``.
+
+        ``None`` (a ``204``) is the normal answer for a job with no log: the
+        surface captures none, the job has not finished, or the run was killed
+        before it reported one. The text is untrusted: render it as plain text.
+        """
+        path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/logs"
+        resp = self.raw_request("GET", path, timeout=timeout)
+        if resp.status_code == 204:
+            return None
+        return JobLogs.model_validate(self._p.parse_or_raise(resp, (200,)))
+
+    def get_job_events(
+        self, job_id_or_url: str, *, timeout: Any = _UNSET
+    ) -> Generator[RawEvent, None, None]:
         """GET /api/v2/jobs/{id}/events — raw live SSE iterator (escape hatch).
 
         No reconnection here; a single connection's frames. ``comfy_sdk`` adds the
@@ -1849,9 +1863,17 @@ class AsyncComfyLow:
         resp = await self.raw_request("GET", path, timeout=timeout)
         return _job(self._p.parse_or_raise(resp, (200,)))
 
+    async def get_job_logs(self, job_id_or_url: str, *, timeout: Any = _UNSET) -> JobLogs | None:
+        """Async :meth:`ComfyLow.get_job_logs`."""
+        path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/logs"
+        resp = await self.raw_request("GET", path, timeout=timeout)
+        if resp.status_code == 204:
+            return None
+        return JobLogs.model_validate(self._p.parse_or_raise(resp, (200,)))
+
     async def get_job_events(
         self, job_id_or_url: str, *, timeout: Any = _UNSET
-    ) -> AsyncIterator[RawEvent]:
+    ) -> AsyncGenerator[RawEvent, None]:
         # Read-idle timeout by default (see the sync get_job_events); a stalled
         # connection raises so comfy_sdk falls back to poll/reconnect.
         path = job_id_or_url if _looks_like_path(job_id_or_url) else f"/jobs/{job_id_or_url}/events"

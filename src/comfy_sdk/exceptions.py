@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
+from enum import Enum
 from typing import Any, TypeVar
 
 import httpx
@@ -99,6 +100,36 @@ class QueueFull(ComfyError):
         self.retry_after = retry_after
 
 
+class FailureCategory(str, Enum):
+    """Why a job failed, for a failure the platform attributed to the caller.
+
+    Branch on this instead of parsing the error ``message``, whose wording may
+    change. A value the server adds later reads as :attr:`OTHER`; the raw string
+    stays on ``error.category``.
+    """
+
+    INVALID_INPUT = "invalid_input"
+    CONTENT_REFUSED = "content_refused"
+    OUT_OF_GPU_MEMORY = "out_of_gpu_memory"
+    MISSING_MODEL_OR_NODE = "missing_model_or_node"
+    WORKFLOW_LOGIC = "workflow_logic"
+    OTHER = "other"
+
+
+def category_of(error: JobError | None) -> FailureCategory | None:
+    """The error's :class:`FailureCategory`, or ``None`` when it names none.
+
+    A job that did not fail, a platform failure and a job from before categories
+    existed carry no category.
+    """
+    if error is None or error.category is None:
+        return None
+    try:
+        return FailureCategory(error.category)
+    except ValueError:
+        return FailureCategory.OTHER
+
+
 class JobFailed(ComfyError):
     """A job reached a non-success terminal state.
 
@@ -109,6 +140,11 @@ class JobFailed(ComfyError):
     def __init__(self, message: str, *, error: JobError | None = None) -> None:
         super().__init__(message, code=(error.code if error else "job_failed"))
         self.error = error
+
+    @property
+    def failure_category(self) -> FailureCategory | None:
+        """Why the job failed, or ``None`` when the error names no category."""
+        return category_of(self.error)
 
 
 #: Wire ``code`` -> the class this SDK raises for it. Only the codes the v2
@@ -392,6 +428,7 @@ __all__ = [
     "BlobNotFound",
     "CancelRefused",
     "ComfyError",
+    "FailureCategory",
     "Forbidden",
     "HashMismatch",
     "IdempotencyKeyReuse",
