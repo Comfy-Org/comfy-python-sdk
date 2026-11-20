@@ -12,6 +12,10 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `sso_required` (403) now raises `Forbidden` (code preserved) and carries `organization_id`, the
+  organization to start SSO with. `organization_id` is a new attribute on `ComfyError` and on
+  `comfy_low.ApiError`, `None` on every other code and when the server does not name the
+  organization (or names it in a shape that is not an id). `error_type` stays `forbidden`.
 - `FailureCategory`, and `failure_category` on `Job`, `AsyncJob` and `JobFailed`: why a job
   failed, as one of `invalid_input`, `content_refused`, `out_of_gpu_memory`,
   `missing_model_or_node`, `workflow_logic` or `other`, read from the error's `category`. It is
