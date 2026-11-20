@@ -33,6 +33,11 @@ the fuller account of each version, including verification notes.
   Under a zero-data-retention workspace a result is removed shortly after its first collect (and
   an uncollected one after a grace period), so a second collect can raise `ResultExpired` there.
 
+### Fixed
+
+- Ignore one leading UTF-8 byte order mark in each SSE connection so the first
+  event or data field is decoded correctly, including after reconnecting.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
