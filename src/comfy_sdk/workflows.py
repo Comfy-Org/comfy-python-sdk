@@ -141,7 +141,8 @@ class Workflow:
             class_type: ComfyUI class type (e.g. ``"KSampler"``).
             before: If set, the new node is inserted before this node.
             after: If set, the new node is inserted after this node.
-            inputs: Input dict for the new node.
+            inputs: Input dict for the new node. Stored as a shallow copy, so
+                passing another node's ``inputs`` dict does not alias them.
             output_map: Maps input names in ``inputs`` to the new node's output
                 port that re-emits that input. Only mapped linked inputs drive
                 downstream redirection.
@@ -151,9 +152,10 @@ class Workflow:
 
         Raises:
             ValueError: If both ``before`` and ``after`` are given; if an
-                ``output_map`` key does not name a link in ``inputs``; or if
-                two mapped inputs point at the same source output with
-                different target ports.
+                ``output_map`` key does not name a link in ``inputs``; if two
+                mapped inputs point at the same source output with different
+                target ports; or if a redirected consumer is upstream of the
+                new node's own inputs (the rewrite would close a cycle).
         """
         if before and after:
             raise ValueError("Specify either 'before' or 'after', not both")
@@ -185,6 +187,31 @@ class Workflow:
                 )
             redirects[src] = port
 
+        # Reject redirections that would close a cycle before touching the
+        # graph: rewiring a consumer C to the new node is only sound if the
+        # new node does not (transitively) read C.
+        if redirects:
+            ancestors: set[str] = set()
+            stack = [v[0] for v in new_inputs.values() if _is_link(v)]
+            while stack:
+                nid = stack.pop()
+                if nid in ancestors or nid not in self.json:
+                    continue
+                ancestors.add(nid)
+                for value in (self.json[nid].get("inputs") or {}).values():
+                    if _is_link(value):
+                        stack.append(value[0])
+            for nid, node in self.json.items():
+                if nid not in ancestors:
+                    continue
+                for value in (node.get("inputs") or {}).values():
+                    if _is_link(value) and (value[0], int(value[1])) in redirects:
+                        raise ValueError(
+                            f"add_node would create a dependency cycle: node {nid!r} "
+                            "consumes a redirected source output but the new node "
+                            "reads that node (directly or transitively)"
+                        )
+
         # Auto-generate node_id: one greater than the highest existing ID
         if self.json:
             max_id = max(int(nid) for nid in self.json)
@@ -194,7 +221,10 @@ class Workflow:
 
         node_entry: dict[str, Any] = {"class_type": class_type}
         if inputs:
-            node_entry["inputs"] = inputs
+            # Shallow copy: redirection rewrites *entries* of input dicts, so
+            # sharing the caller's dict (e.g. another node's inputs) would let
+            # the rewrite mutate this node's links — or make them self-links.
+            node_entry["inputs"] = dict(inputs)
         self.json[node_id] = node_entry
 
         # Redirect downstream consumers of each mapped source output
