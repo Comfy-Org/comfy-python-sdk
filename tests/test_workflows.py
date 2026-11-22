@@ -7,6 +7,8 @@ plain dict value, never nested in a list (batch inputs).
 
 from __future__ import annotations
 
+import pytest
+
 from comfy_sdk._core import find_asset_handles, substitute_asset_handles
 from comfy_sdk.workflows import Workflow, WorkflowFactory
 
@@ -99,6 +101,7 @@ def test_add_node_redirects_downstream_single_consumer():
             "attention": "pytorch attention",
             "model": ["2", 0],
         },
+        output_map={"model": 0},
     )
     assert new_id == "5"
     assert wf.json[new_id]["class_type"] == "ModelAttentionBackend"
@@ -134,12 +137,55 @@ def test_add_node_redirects_multiple_downstream():
             "megapixels": 1,
             "image": ["1", 0],
         },
+        output_map={"image": 0},
     )
     assert new_id == "5"
     assert wf.json[new_id]["inputs"]["image"] == ["1", 0]
     assert wf.json["2"]["inputs"]["images"] == [new_id, 0]
     assert wf.json["3"]["inputs"]["images"] == [new_id, 0]
     assert wf.json["4"]["inputs"]["images"] == [new_id, 0]
+
+
+def test_add_node_maps_each_source_to_its_own_new_port():
+    # The LoraLoader case from review: two sources both at output 0 must be
+    # re-emitted on *different* ports of the new node (MODEL=0, CLIP=1), so a
+    # consumer of the CLIPLoader's output 0 is rewired to [new_id, 1].
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors"}},
+        "3": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0]}},
+    }
+    wf = Workflow(graph)
+    new_id = wf.add_node(
+        "LoraLoader",
+        inputs={
+            "lora_name": "lora.safetensors",
+            "strength_model": 1,
+            "strength_clip": 1,
+            "model": ["1", 0],
+            "clip": ["2", 0],
+        },
+        output_map={"model": 0, "clip": 1},
+    )
+    assert new_id == "5"
+    assert wf.json["3"]["inputs"]["model"] == [new_id, 0]
+    assert wf.json["4"]["inputs"]["clip"] == [new_id, 1]
+
+
+def test_add_node_unmapped_link_does_not_redirect():
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+        "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+    }
+    wf = Workflow(graph)
+    new_id = wf.add_node(
+        "LoraLoader",
+        inputs={"lora_name": "lora.safetensors", "model": ["1", 0]},
+    )
+    assert new_id == "3"
+    # No output_map: the node is inserted but nothing is rewired through it.
+    assert wf.json["2"]["inputs"]["model"] == ["1", 0]
 
 
 def test_add_node_no_redirect_when_upstream_not_in_graph():
@@ -153,6 +199,7 @@ def test_add_node_no_redirect_when_upstream_not_in_graph():
     new_id = wf.add_node(
         "KSampler",
         inputs={"model": ["999", 0]},
+        output_map={"model": 0},
     )
     assert new_id == "2"
     assert wf.json[new_id]["inputs"]["model"] == ["999", 0]
@@ -161,7 +208,7 @@ def test_add_node_no_redirect_when_upstream_not_in_graph():
 def test_add_node_no_redirect_when_no_downstream_consumers():
     graph = {
         "1": {
-            "class_type": "CheckpointLoader",
+            "class_type": "CheckpointLoaderSimple",
             "inputs": {"ckpt_name": "model.safetensors"},
         },
     }
@@ -169,6 +216,7 @@ def test_add_node_no_redirect_when_no_downstream_consumers():
     new_id = wf.add_node(
         "LoraLoader",
         inputs={"model": ["1", 0], "clip": ["1", 1]},
+        output_map={"model": 0, "clip": 1},
     )
     assert new_id == "2"
     assert wf.json[new_id]["inputs"]["model"] == ["1", 0]
@@ -177,12 +225,37 @@ def test_add_node_no_redirect_when_no_downstream_consumers():
 
 def test_add_node_both_before_and_after_raises():
     wf = Workflow({"1": {"class_type": "X", "inputs": {}}})
-    try:
+    with pytest.raises(ValueError, match="not both"):
         wf.add_node("Y", before="1", after="1", inputs={})
-    except ValueError as e:
-        assert "not both" in str(e)
-    else:
-        assert False, "Expected ValueError"
+
+
+def test_add_node_output_map_key_must_be_a_link():
+    wf = Workflow({"1": {"class_type": "X", "inputs": {}}})
+    # Key not present in inputs at all.
+    with pytest.raises(ValueError, match="must name a link input"):
+        wf.add_node("Y", inputs={"model": ["1", 0]}, output_map={"clip": 1})
+    # Key present but not a link.
+    with pytest.raises(ValueError, match="must name a link input"):
+        wf.add_node(
+            "Y",
+            inputs={"model": ["1", 0], "lora_name": "lora.safetensors"},
+            output_map={"lora_name": 1},
+        )
+
+
+def test_add_node_conflicting_output_map_raises():
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+    }
+    wf = Workflow(graph)
+    # Two mapped inputs pointing at the same source output but claiming
+    # different ports — ambiguous, so it must fail rather than pick one.
+    with pytest.raises(ValueError, match="conflicting ports"):
+        wf.add_node(
+            "Y",
+            inputs={"a": ["1", 0], "b": ["1", 0]},
+            output_map={"a": 0, "b": 1},
+        )
 
 
 def test_add_node_no_inputs_no_redirect():
