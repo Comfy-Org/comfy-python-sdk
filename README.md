@@ -1023,20 +1023,30 @@ pip install 'comfy-sdk[realtime]'
 ```
 
 ```python
+import json
+
 from comfy_sdk import Comfy
+
+# Your first message, in the model's own protocol. Encode it before opening the
+# session, so a serialization error doesn't leave an unused session open.
+payload = json.dumps({"type": "..."})  # Google sessions: JSON text frames
 
 client = Comfy()
 with client.realtime.connect("google/genie-4") as session:
-    session.socket.send(json.dumps({...}))       # Google sessions: JSON text frames
+    session.socket.send(payload)
     frame = session.socket.recv()
 ```
 
 ```python
+import msgpack
+
 from comfy_sdk import AsyncComfy
+
+payload = msgpack.packb({"type": "..."})  # fal sessions: MessagePack
 
 async with AsyncComfy() as client:
     async with await client.realtime.connect("xai/grok-voice/realtime") as session:
-        await session.socket.send(msgpack.packb({...}))  # fal sessions: MessagePack
+        await session.socket.send(payload)
         frame = await session.socket.recv()
 ```
 
