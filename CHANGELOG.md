@@ -36,17 +36,6 @@ the fuller account of each version, including verification notes.
   again means submitting a new request. Before this, the bucket arrived as a bare `RouterError`.
   Under a zero-data-retention workspace a result is removed shortly after its first collect (and
   an uncollected one after a grace period), so a second collect can raise `ResultExpired` there.
-- `client.realtime.connect` on `Comfy` and `AsyncComfy`: opens a Comfy Router realtime
-  session over `GET /v2/realtime/{serving}/{model}` on `COMFY_ROUTER_BASE_URL`, authenticated
-  by the client's API key (`X-API-Key`) or an `id_token=` sent in the subprotocol offer. A
-  refused upgrade raises the typed `RouterError` subclass for its bucket; models served on
-  another realtime surface are refused locally with `realtime_unsupported_model`. No message
-  codec is bundled. `id_token=` does not lift the constructor's `MissingApiKey` on Comfy Cloud:
-  a token-only caller passes a placeholder `api_key=`. A handshake redirect to another origin
-  is refused rather than followed with the credential.
-- `RouterError.refusal_code`: the body's `code` field when it is a string (realtime refusals
-  send one, such as `router.realtime.session_already_live`), `None` otherwise.
-- The `realtime` extra (`pip install 'comfy-sdk[realtime]'`), which adds `websockets>=13`.
 
 ### Fixed
 
