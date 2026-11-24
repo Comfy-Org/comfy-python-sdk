@@ -22,9 +22,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 
-from comfy_low.transport import RunHandoff, model_run_request
+from comfy_low import ApiError
+from comfy_low.transport import RunHandoff, _Prepared, model_run_request
 from comfy_sdk import AsyncComfy, BinaryResult, Comfy
 from comfy_sdk.exceptions import ComfyError
 from comfy_sdk.models import RouterRunResult, _preference_applied
@@ -151,12 +153,24 @@ def test_handoff_binary_result_is_binary(server, fast_poll):
 def test_run_detailed_follows_the_handoff(server, fast_poll):
     server.state.model_run_handoff = True
     server.state.model_run_request_id = "req_run_01"
+    # The result route stamps its own id; the run request's is the one kept.
+    server.state.queue_result_request_id = "req_result_02"
     with _client() as client:
         detailed = client.models.run_detailed(MODEL, ARGS, respond_async=True)
     assert isinstance(detailed, RouterRunResult)
     assert detailed.output == server.state.queue_result
     assert detailed.replayed is False
     assert detailed.request_id == "req_run_01"
+    # Accepted before dispatch: a missing fallback disclosure is "not disclosed".
+    assert detailed.handed_off is True
+    assert detailed.serving_provider is None
+
+
+def test_run_detailed_without_handoff_is_not_handed_off(server):
+    server.state.model_run_handoff = True
+    with _client() as client:
+        detailed = client.models.run_detailed(MODEL, ARGS)
+    assert detailed.handed_off is False
 
 
 async def test_async_run_detailed_follows_the_handoff(server, fast_poll):
@@ -187,6 +201,9 @@ def test_202_without_preference_applied_is_not_a_result(server, fast_poll):
     assert excinfo.value.code == "invalid_response"
     assert excinfo.value.idempotency_key == server.state.model_run_idempotency_keys[0]
     assert server.state.queue_status_count == 0
+    # The generation it may have started stays reachable through models.handle().
+    assert excinfo.value.details["handle"]["request_id"] == server.state.queue_request_id
+    assert server.state.queue_request_id in str(excinfo.value)
 
 
 async def test_async_202_without_preference_applied_is_not_a_result(server, fast_poll):
@@ -233,6 +250,40 @@ def test_mixed_resend_under_one_key_starts_one_generation(server, fast_poll):
     assert server.state.queue_submit_count == 0
 
 
+def test_replayed_handoff_without_preference_applied_is_followed(server, fast_poll):
+    # RFC 7240 does not require Preference-Applied on a reply to a request that
+    # sent no Prefer, so a replay of the handoff is recognised by being replayed.
+    server.state.model_run_handoff = True
+    server.state.model_run_handoff_preference_applied = False
+    key = "replayed-handoff-key-0001"
+    server.state.model_run_handoff_keys.add(key)
+    with _client() as client:
+        result = client.models.run(MODEL, ARGS, idempotency_key=key)
+    assert result == server.state.queue_result
+    assert server.state.model_run_generations == 0
+
+
+def test_followed_handoff_without_opt_in_keeps_the_timeout(server, fast_poll):
+    # A default, bounded run answered with a replayed handoff stays bounded.
+    server.state.model_run_handoff = True
+    server.state.queue_polls_to_complete = 10**9
+    key = "bounded-resend-key-0001"
+    server.state.model_run_handoff_keys.add(key)
+    with _client() as client, pytest.raises(TimeoutError):
+        client.models.run(MODEL, ARGS, idempotency_key=key, timeout=0.3)
+    assert server.state.queue_cancel_count == 0
+
+
+async def test_async_followed_handoff_without_opt_in_keeps_the_timeout(server, fast_poll):
+    server.state.model_run_handoff = True
+    server.state.queue_polls_to_complete = 10**9
+    key = "bounded-resend-key-0002"
+    server.state.model_run_handoff_keys.add(key)
+    async with _async_client() as client:
+        with pytest.raises(TimeoutError):
+            await client.models.run(MODEL, ARGS, idempotency_key=key, timeout=0.3)
+
+
 async def test_async_mixed_resend_under_one_key_starts_one_generation(server, fast_poll):
     server.state.model_run_handoff = True
     key = "mixed-resend-key-0002"
@@ -256,6 +307,8 @@ async def test_async_mixed_resend_under_one_key_starts_one_generation(server, fa
         ("respond-async; foo=bar", True),
         ("return=minimal", False),
         ("respond-asynchronously", False),
+        ('foo="x, respond-async; y"', False),
+        ('foo="a\\"b, respond-async", respond-async', True),
         ("", False),
     ],
 )
@@ -271,3 +324,12 @@ def test_preference_applied_absent():
 def test_run_handoff_is_not_a_dict():
     # A handle must never be mistakable for a partner's native dict output.
     assert not isinstance(RunHandoff(handle={"request_id": "r"}), dict)
+
+
+@pytest.mark.parametrize("body", [b"[]", b"null", b'"handle"', b"7"])
+def test_non_object_202_is_invalid_response(body: bytes):
+    prepared = _Prepared("http://example.invalid", None)
+    resp = httpx.Response(202, content=body, headers={"Content-Type": "application/json"})
+    with pytest.raises(ApiError) as excinfo:
+        prepared.parse_run_outcome(resp)
+    assert excinfo.value.code == "invalid_response"

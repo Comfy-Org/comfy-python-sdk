@@ -16,9 +16,12 @@ the fuller account of each version, including verification notes.
   sends `Prefer: respond-async`, so Router may hand a long run to its queue and answer `202` with
   a handle instead of holding the connection. A `202` carrying `Preference-Applied:
   respond-async` is polled through the queue's status and result reads to the same native result
-  `run` returns for a `200`; a `200` is returned as always; a `202` without `Preference-Applied`
-  raises `ComfyError` (`code="invalid_response"`) carrying the key. Off by default: the default
-  call sends no `Prefer` header. `comfy_low`'s `post_model_run` gains the same keyword and now
+  `run` returns for a `200`; a `200` is returned as always; a `202` with neither
+  `Preference-Applied` nor `Idempotent-Replayed` raises `ComfyError` (`code="invalid_response"`)
+  carrying the key and the `202` body. A handoff followed on a call that did not opt in stays
+  bounded by its `timeout`. `RouterRunResult` gains `handed_off`, under which a missing
+  provider disclosure means "not disclosed". Off by default: the default call sends no `Prefer`
+  header. `comfy_low`'s `post_model_run` gains the same keyword and now
   returns a `RunHandoff` (newly exported) for a `202`.
 - `sso_required` (403) now raises `Forbidden` (code preserved) and carries `organization_id`, the
   organization to start SSO with. `organization_id` is a new attribute on `ComfyError` and on

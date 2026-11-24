@@ -570,9 +570,16 @@ On the handed-off path `timeout` bounds the run request, not the wait, which
 lasts until the queue says the run is done — use `models.subscribe` if you want
 a client-side bound on the whole wait. The `Idempotency-Key` is sent either way,
 and a resend under the same key — with or without the flag — collects the
-generation the first request started rather than starting another. A `202`
-that does not carry `Preference-Applied` is never returned as output: it raises
-`ComfyError` (`code="invalid_response"`) carrying the key to resend under.
+generation the first request started rather than starting another; a resend
+*without* the flag that is answered with the handoff is still bounded by its
+`timeout`, raising `TimeoutError` without cancelling the run. A `202` that
+carries neither `Preference-Applied` nor `Idempotent-Replayed` is never returned
+as output: it raises `ComfyError` (`code="invalid_response"`) carrying the key,
+the response's request id and, on `details["handle"]`, the body — so a queue
+`request_id` it names can still be collected with `models.handle()`. On a
+handed-off `run_detailed`, `handed_off` is `True` and a missing
+`serving_provider` / `dropped_params` means "not disclosed", since the run was
+accepted before any provider was dispatched.
 
 ### Two result shapes — JSON, or the model's own bytes
 

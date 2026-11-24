@@ -478,7 +478,9 @@ _CONTRACT_HEADER_LIFTS = {
 #: Being listed here exempts a field from BOTH pins above, so the exemption is
 #: itself checked -- see
 #: ``test_an_exempt_field_is_really_unmoved_by_the_headers_it_skips``.
-_NON_HEADER_FIELDS = {"output"}
+#: ``handed_off`` is set by the call path (a ``202`` that was followed), never
+#: read from a header.
+_NON_HEADER_FIELDS = {"output", "handed_off"}
 
 
 def _declared_run_response_headers() -> set[str]:

@@ -341,6 +341,9 @@ class ServerState:
     queue_submit_estimate: Any = None
     # The id the queue hands back, and the one every later route answers for.
     queue_request_id: str = "req_stub_01"
+    # Sent as `X-Comfy-Request-Id` on the queue result route's 200 — a real
+    # Router stamps one on every response, distinct from the run request's.
+    queue_result_request_id: str | None = None
     # Status polls that report a non-terminal state before the request reaches
     # COMPLETED. 0 means the very first poll is already complete.
     queue_polls_to_complete: int = 2
@@ -1065,7 +1068,15 @@ def _make_handler(state: ServerState):
                     },
                 )
                 return
-            self._json(200, {**state.queue_result, **state.queue_result_extra})
+            self._json(
+                200,
+                {**state.queue_result, **state.queue_result_extra},
+                headers=(
+                    {"X-Comfy-Request-Id": state.queue_result_request_id}
+                    if state.queue_result_request_id
+                    else None
+                ),
+            )
 
         def _put_queue_cancel(self, request_id: str) -> None:
             state.queue_cancel_count += 1

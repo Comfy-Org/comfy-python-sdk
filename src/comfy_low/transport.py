@@ -742,7 +742,16 @@ class _Prepared:
         document; everything else is :meth:`parse_run_result`'s, unchanged.
         """
         if resp.status_code == 202:
-            return RunHandoff(handle=self.parse_or_raise(resp, (202,)))
+            handle: Any = self.parse_or_raise(resp, (202,))
+            if not isinstance(handle, dict):
+                raise ApiError(
+                    "The 202 model run handoff is not a JSON object",
+                    code="invalid_response",
+                    http_status=resp.status_code,
+                    request_id=_request_id(resp),
+                    body_excerpt=_body_excerpt(resp),
+                )
+            return RunHandoff(handle=handle)
         return self.parse_run_result(resp, (200, 201))
 
     def parse_run_result(
