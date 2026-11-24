@@ -9,11 +9,15 @@ status and Router error body, which is how Router refuses a session.
 from __future__ import annotations
 
 import asyncio
+import base64
 import builtins
+import hashlib
 import importlib
 import json
+import logging
 import os
 import threading
+import traceback
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -627,3 +631,106 @@ def test_max_size_is_passed_through(ws_server: _Seen) -> None:
         with pytest.raises(ConnectionClosedError) as info:
             session.socket.recv()
     assert info.value.sent is not None and info.value.sent.code == 1009
+
+
+# -- catalog ids, credential-safe logs and errors -----------------------------
+
+
+def test_catalog_id_resolves_to_its_endpoint_path(ws_server: _Seen) -> None:
+    # The catalog lists `xai/grok-voice`; the route serves it under `/realtime`.
+    assert _realtime_path("xai/grok-voice") == ("fal", "/v2/realtime/fal/xai/grok-voice/realtime")
+    with Comfy(api_key=_KEY) as client, client.realtime.connect("xai/grok-voice") as session:
+        assert session.model == "xai/grok-voice"
+    assert ws_server.path == "/v2/realtime/fal/xai/grok-voice/realtime"
+
+
+_SECRET_TOKEN = "tok.secret-bearer-1"
+_SECRET_MODES = [
+    pytest.param({}, _KEY, id="api-key"),
+    pytest.param({"id_token": _SECRET_TOKEN}, _SECRET_TOKEN, id="id-token"),
+]
+
+
+@pytest.mark.parametrize(("auth", "secret"), _SECRET_MODES)
+def test_debug_logging_masks_the_credential_sync(
+    ws_server: _Seen, caplog: pytest.LogCaptureFixture, auth: dict[str, str], secret: str
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="websockets.client"):
+        with Comfy(api_key=_KEY) as client, client.realtime.connect("google/genie-4", **auth):
+            pass
+    assert "> GET /v2/realtime/google/google/genie-4" in caplog.text
+    assert secret not in caplog.text
+    assert "***" in caplog.text
+
+
+@pytest.mark.parametrize(("auth", "secret"), _SECRET_MODES)
+async def test_debug_logging_masks_the_credential_async(
+    ws_server: _Seen, caplog: pytest.LogCaptureFixture, auth: dict[str, str], secret: str
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="websockets.client"):
+        async with AsyncComfy(api_key=_KEY) as client:
+            async with await client.realtime.connect("google/genie-4", **auth):
+                pass
+    assert "> GET /v2/realtime/google/google/genie-4" in caplog.text
+    assert secret not in caplog.text
+    assert "***" in caplog.text
+
+
+@pytest.fixture
+def echoing_server(loop: _Loop, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Answers ``101`` but echoes the whole subprotocol offer back."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        request = (await reader.readuntil(b"\r\n\r\n")).decode()
+        fields = dict(
+            (name.strip().lower(), value.strip())
+            for name, _, value in (line.partition(":") for line in request.split("\r\n")[1:])
+            if name
+        )
+        accept = base64.b64encode(
+            hashlib.sha1(
+                (fields["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()
+        ).decode()
+        head = [
+            "HTTP/1.1 101 Switching Protocols",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Accept: {accept}",
+            f"Sec-WebSocket-Protocol: {fields['sec-websocket-protocol']}",
+        ]
+        writer.write(("\r\n".join(head) + "\r\n\r\n").encode())
+        await writer.drain()
+        writer.close()
+
+    async def start() -> Any:
+        return await asyncio.start_server(handle, "127.0.0.1", 0)
+
+    server = loop.run(start())
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setenv(ROUTER_BASE_URL_ENV_VAR, f"http://127.0.0.1:{port}")
+    yield
+    server.close()
+    loop.run(server.wait_closed())
+
+
+def _assert_masked(exc: ComfyError) -> None:
+    assert exc.code == "realtime_upgrade_failed"
+    assert "comfy-bearer.***" in str(exc)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    assert _SECRET_TOKEN not in rendered
+
+
+def test_echoed_offer_does_not_leak_the_token_sync(echoing_server: None) -> None:
+    with Comfy(api_key=_KEY) as client, pytest.raises(ComfyError) as info:
+        client.realtime.connect("google/genie-4", id_token=_SECRET_TOKEN)
+    _assert_masked(info.value)
+
+
+async def test_echoed_offer_does_not_leak_the_token_async(echoing_server: None) -> None:
+    async with AsyncComfy(api_key=_KEY) as client:
+        with pytest.raises(ComfyError) as info:
+            await client.realtime.connect("google/genie-4", id_token=_SECRET_TOKEN)
+    _assert_masked(info.value)

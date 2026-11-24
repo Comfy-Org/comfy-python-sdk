@@ -11,7 +11,7 @@ model's own protocol, and no codec or event model is layered over it::
     from comfy_sdk import Comfy
 
     client = Comfy()
-    with client.realtime.connect("xai/grok-voice/realtime") as session:
+    with client.realtime.connect("xai/grok-voice") as session:
         session.socket.send(msgpack.packb({...}))      # fal sessions: MessagePack
         frame = session.socket.recv()
 
@@ -33,10 +33,16 @@ a same-origin redirect target, is dropped from the upgrade, since
 ``websockets`` would turn it into an ``Authorization`` header. A handshake
 redirect is followed only within the Router origin; one to another origin is
 refused as a ``RouterError`` for its ``3xx`` instead, because the credential
-would ride along to the new host.
+would ride along to the new host. The handshake is logged through a
+``websockets.client`` logger that masks the credential, so turning on
+``DEBUG`` logging does not write the key or token into application logs, and
+a failed handshake whose error would echo the credential has it masked in
+the message and is not chained to the raw exception.
 
-**Billing.** A session is billed per second from the ``101`` that opens it, and
-a workspace may hold one live WebSocket session at a time.
+**Billing.** A session is billed per second while it is open, and a workspace
+may hold one live WebSocket session at a time. A Google-served session has a
+grace period before its first media, so a short one that exchanges no media
+may not be billed at all.
 
 **Refusals.** A refused upgrade answers with an ordinary HTTP status and the
 Router error envelope (``detail``, ``error_type``) plus a ``code`` naming the
@@ -69,15 +75,17 @@ is prefixed ``router.realtime.`` on the wire):
 * ``1012`` (:data:`REALTIME_CLOSE_SERVICE_RESTART`) -- the server is
   restarting; open a new session.
 
-Any other observed code, notably ``1006``, is a bare close with no close frame
-(the fal session cap, credits exhausted, a blocked account) and carries no
-reason.
+``1006`` means the connection dropped with no close frame (the fal session
+cap, credits exhausted, a blocked account) and carries no reason. Other codes
+(``1001``, ``1009``, ...) arrive in a real close frame, possibly relayed from
+the upstream model, and may carry a reason.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -108,6 +116,12 @@ _REALTIME_SERVING_PROVIDERS: Mapping[str, str] = {
     "google/genie-4": "google",
 }
 _DEFAULT_SERVING_PROVIDER = "fal"
+
+#: Catalog ids whose WebSocket endpoint path differs from the id itself. The
+#: endpoint form is accepted too, since it is what the route actually serves.
+_REALTIME_ENDPOINTS: Mapping[str, str] = {
+    "xai/grok-voice": "xai/grok-voice/realtime",
+}
 
 #: Realtime models Router serves on a different surface than this WebSocket
 #: route, with where to go instead. Refused before any socket opens so the
@@ -149,9 +163,9 @@ def _segments(value: str, what: str) -> list[str]:
 def _realtime_path(model: str, provider: str | None = None) -> tuple[str, str]:
     """``(serving provider, path)`` for ``model``, or a local refusal.
 
-    ``model`` is the full catalog id and is interpolated whole after the
-    serving segment, so ``xai/grok-voice/realtime`` becomes
-    ``/v2/realtime/fal/xai/grok-voice/realtime``.
+    ``model`` is the full catalog id. It is mapped to its endpoint path where
+    the two differ and interpolated after the serving segment, so
+    ``xai/grok-voice`` becomes ``/v2/realtime/fal/xai/grok-voice/realtime``.
     """
     if len(_segments(model, "realtime model id")) < 2:
         raise ValueError(
@@ -175,7 +189,8 @@ def _realtime_path(model: str, provider: str | None = None) -> tuple[str, str]:
         if len(_segments(provider, "realtime provider")) != 1:
             raise ValueError(f"realtime provider must be a single path segment; got {provider!r}")
         serving = provider
-    return serving, REALTIME_ROUTE_TEMPLATE.format(provider=serving, model=model)
+    endpoint = _REALTIME_ENDPOINTS.get(model, model)
+    return serving, REALTIME_ROUTE_TEMPLATE.format(provider=serving, model=endpoint)
 
 
 def _ws_base(router_base_url: str) -> str:
@@ -215,6 +230,8 @@ class _Plan:
     subprotocols: list[str] = field(repr=False)
     headers: dict[str, str] = field(repr=False)
     user_agent: str
+    #: The credential this plan sends, masked in logs and handshake errors.
+    secrets: tuple[str, ...] = field(repr=False)
 
 
 def _plan(
@@ -253,6 +270,7 @@ def _plan(
                 "(it rides in the Sec-WebSocket-Protocol header)"
             )
         subprotocols = [REALTIME_SUBPROTOCOL, REALTIME_BEARER_SUBPROTOCOL_PREFIX + id_token, *extra]
+        secret = id_token
     else:
         if not prepared.api_key:
             raise MissingApiKey(
@@ -262,6 +280,7 @@ def _plan(
             )
         headers["X-API-Key"] = prepared.api_key
         subprotocols = [REALTIME_SUBPROTOCOL, *extra]
+        secret = prepared.api_key
     url = _ws_base(prepared.router_base_url) + path
     return _Plan(
         # websockets sends URL userinfo as `Authorization: Basic`, which would
@@ -274,7 +293,58 @@ def _plan(
         subprotocols=subprotocols,
         headers=headers,
         user_agent=prepared._user_agent,
+        secrets=(secret,),
     )
+
+
+_MASK = "***"
+
+
+def _mask(text: str, secrets: Sequence[str]) -> str:
+    for secret in secrets:
+        text = text.replace(secret, _MASK)
+    return text
+
+
+def _leaks(exc: BaseException, secrets: Sequence[str]) -> bool:
+    """Whether ``exc`` or anything chained to it renders a credential."""
+    seen: set[int] = set()
+    todo: list[BaseException | None] = [exc]
+    while todo:
+        e = todo.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        rendered = f"{e} {e.args!r}"
+        if any(secret in rendered for secret in secrets):
+            return True
+        todo += [e.__cause__, e.__context__]
+    return False
+
+
+class _MaskingLogger(logging.LoggerAdapter):
+    """``websockets.client``, with the credential masked out of every record.
+
+    At ``DEBUG`` websockets logs each handshake header it sends and receives,
+    which includes ``X-API-Key`` and the ``comfy-bearer.<token>`` entry.
+    """
+
+    def __init__(self, secrets: Sequence[str]) -> None:
+        super().__init__(logging.getLogger("websockets.client"), {})
+        self._secrets = tuple(secrets)
+
+    def log(self, level: int, msg: object, *args: object, **kwargs: Any) -> None:
+        if not self.isEnabledFor(level):
+            return
+        if isinstance(msg, str):
+            msg = _mask(msg, self._secrets)
+        masked = tuple(
+            _mask(text, self._secrets)
+            if any(secret in (text := str(arg)) for secret in self._secrets)
+            else arg
+            for arg in args
+        )
+        super().log(level, msg, *masked, **kwargs)
 
 
 def _refusal(exc: Any) -> RouterError:
@@ -293,9 +363,12 @@ def _refusal(exc: Any) -> RouterError:
     return error_from_response(response.status_code, headers, body)
 
 
-def _upgrade_failed(url: str, exc: BaseException) -> ComfyError:
+def _upgrade_failed(plan: _Plan, exc: BaseException) -> ComfyError:
     return ComfyError(
-        f"realtime upgrade to {url} failed: {type(exc).__name__}: {exc}",
+        _mask(
+            f"realtime upgrade to {plan.safe_url} failed: {type(exc).__name__}: {exc}",
+            plan.secrets,
+        ),
         code="realtime_upgrade_failed",
     )
 
@@ -460,7 +533,9 @@ class Realtime:
             "subprotocols": [Subprotocol(p) for p in plan.subprotocols],
             "open_timeout": open_timeout,
             "max_size": max_size,
+            "logger": _MaskingLogger(plan.secrets),
         }
+        leaked: ComfyError | None = None
         try:
             # websockets 17+ follows redirects in the sync client, through the
             # `reconnect` object `connect()` builds; earlier releases have no
@@ -475,7 +550,15 @@ class Realtime:
         except InvalidStatus as exc:
             raise _refusal(exc) from None
         except (WebSocketException, OSError, TimeoutError, asyncio.TimeoutError, ValueError) as exc:
-            raise _upgrade_failed(plan.safe_url, exc) from exc
+            failure = _upgrade_failed(plan, exc)
+            if not _leaks(exc, plan.secrets):
+                raise failure from exc
+            # A malformed `101` can echo the subprotocol offer, bearer entry
+            # included, into the library's error: raised outside this block,
+            # so that error is neither the cause nor the context.
+            leaked = failure
+        if leaked is not None:
+            raise leaked
         # The session owns the socket and closes it, which is what the context
         # manager form promises; entering it says so. websockets 17.1+ otherwise
         # warns that a bare `connect()` result is used outside `with`.
@@ -521,6 +604,7 @@ class AsyncRealtime:
             from websockets.typing import Subprotocol
         except ImportError as exc:
             raise ImportError(_MISSING_WEBSOCKETS) from exc
+        leaked: ComfyError | None = None
         try:
             connector = connect(
                 plan.url,
@@ -529,13 +613,22 @@ class AsyncRealtime:
                 subprotocols=[Subprotocol(p) for p in plan.subprotocols],
                 open_timeout=open_timeout,
                 max_size=max_size,
+                logger=_MaskingLogger(plan.secrets),
             )
             _guard_redirects(connector, plan.url)
             socket = await connector
         except InvalidStatus as exc:
             raise _refusal(exc) from None
         except (WebSocketException, OSError, TimeoutError, asyncio.TimeoutError, ValueError) as exc:
-            raise _upgrade_failed(plan.safe_url, exc) from exc
+            failure = _upgrade_failed(plan, exc)
+            if not _leaks(exc, plan.secrets):
+                raise failure from exc
+            # A malformed `101` can echo the subprotocol offer, bearer entry
+            # included, into the library's error: raised outside this block,
+            # so that error is neither the cause nor the context.
+            leaked = failure
+        if leaked is not None:
+            raise leaked
         try:
             _check_selected(socket)
             return AsyncRealtimeSession(

@@ -1012,7 +1012,7 @@ fresh one" and starts a second billed generation.
 ## Realtime sessions
 
 Comfy Router serves realtime models (today `google/genie-4` and
-`xai/grok-voice/realtime`) over a WebSocket. `client.realtime.connect` builds
+`xai/grok-voice`) over a WebSocket. `client.realtime.connect` builds
 the URL on the client's `COMFY_ROUTER_BASE_URL`, authenticates with the
 client's API key (an `X-API-Key` header; or pass `id_token=` to send a bearer
 token in the subprotocol offer instead) and hands back the open socket. It
@@ -1045,16 +1045,17 @@ from comfy_sdk import AsyncComfy
 payload = msgpack.packb({"type": "..."})  # fal sessions: MessagePack
 
 async with AsyncComfy() as client:
-    async with await client.realtime.connect("xai/grok-voice/realtime") as session:
+    async with await client.realtime.connect("xai/grok-voice") as session:
         await session.socket.send(payload)
         frame = await session.socket.recv()
 ```
 
 No codec is bundled: `session.wire_format` is `"json"` or `"msgpack"`, and
 fal-served sessions need a MessagePack encoder such as the `msgpack` package.
-A session is **billed per second from the moment the upgrade succeeds**, and a
-workspace may hold **one live WebSocket session at a time**, so close sessions
-you are done with. A refused upgrade raises the same typed `RouterError`
+A session is **billed per second while it is open** (a Google-served session
+has a grace period before its first media, so a short one that exchanges no
+media may not be billed at all), and a workspace may hold **one live WebSocket
+session at a time**, so close sessions you are done with. A refused upgrade raises the same typed `RouterError`
 subclasses as `client.models` (`InsufficientCredits`,
 `ConcurrencyLimitExceeded`, ...), with the specific realtime reason on
 `exc.refusal_code` (for example `router.realtime.session_already_live`). Unlike
@@ -1070,7 +1071,9 @@ Comfy Cloud, `Comfy()` and `AsyncComfy()` still raise `MissingApiKey` with no
 key, so a token-only caller passes a placeholder `api_key=` (it is not sent on
 a session opened with `id_token=`). A handshake redirect is followed only
 within the Router origin; one to another host is refused as a `RouterError`,
-so the credential never reaches it. `max_size=` (default 1 MiB, `None` for no
+so the credential never reaches it. The handshake is logged with the
+credential masked, so `DEBUG` logging on `websockets` does not write the key or
+token into your logs. `max_size=` (default 1 MiB, `None` for no
 limit) caps one inbound message.
 
 ## Sync and async
