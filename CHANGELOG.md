@@ -18,8 +18,9 @@ the fuller account of each version, including verification notes.
   respond-async` is polled through the queue's status and result reads to the same native result
   `run` returns for a `200`; a `200` is returned as always; a `202` with neither
   `Preference-Applied` nor `Idempotent-Replayed` raises `ComfyError` (`code="invalid_response"`)
-  carrying the key and the `202` body. A handoff followed on a call that did not opt in stays
-  bounded by its `timeout`, and its `TimeoutError` carries `idempotency_key` / `request_id` /
+  carrying the key and the `202` body. A handoff followed on a call that did not opt in is
+  polled only for what is left of a numeric `timeout` counted from the start of the call
+  (retries before the `202` keep the retry policy's own budget), and its `TimeoutError` carries `idempotency_key` / `request_id` /
   `retry_after`; each poll and result read keeps the run's `timeout` (an `httpx.Timeout`, or
   `None` for no limit, included) as its HTTP timeout. `RouterRunResult` gains `handed_off`, under which a missing
   provider disclosure means "not disclosed". Off by default: the default call sends no `Prefer`

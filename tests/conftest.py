@@ -1184,7 +1184,7 @@ def _make_handler(state: ServerState):
             prefer = self.headers.get("Prefer")
             state.model_run_prefer_headers.append(prefer)
 
-            if key and key in state.model_run_handoff_keys:
+            if key and key in state.model_run_handoff_keys and not state.model_run_fail_times:
                 # A resend under a handed-off key collects that handoff: the
                 # same handle again, marked replayed, and nothing re-run —
                 # whether or not this resend asked for the handoff.

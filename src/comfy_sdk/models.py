@@ -288,8 +288,16 @@ def _handoff_wait(
     A caller that opted in asked for the long wait, so it is unbounded, as
     documented on :meth:`Models._run`. A caller that did not -- following a
     replayed handoff under a reused key -- asked for an ordinary bounded run,
-    so a numeric ``timeout`` keeps bounding the whole call, polls included,
-    and running out raises ``TimeoutError`` without cancelling the run.
+    so it is followed only for what is left of a numeric ``timeout`` counted
+    from the start of the call, and running out raises ``TimeoutError`` without
+    cancelling the run.
+
+    That window bounds the *following*, not the retries before the ``202``:
+    they keep the retry policy's own budget, which outlasts ``timeout`` on
+    purpose (a collect attempt exists for the answer that arrives once a full
+    ``timeout`` is spent). When they have used the window up the answer is
+    zero, which is one look at the queue: a run that is already done is still
+    returned.
     """
     if respond_async or not isinstance(timeout, (int, float)):
         return None
@@ -635,8 +643,11 @@ class Models(_ModelsBase):
         ``202`` that carries ``Preference-Applied: respond-async`` or
         ``Idempotent-Replayed`` is therefore followed even on a call that did
         not ask, because it is the answer to a request under this key that
-        did; on such a call a numeric ``timeout`` still bounds the whole call,
-        polls included, raising ``TimeoutError`` without cancelling. On either
+        did; on such a call it is followed only for what is left of a numeric
+        ``timeout`` counted from the start of the call, then raises
+        ``TimeoutError`` without cancelling. Retries before the ``202`` keep
+        the retry policy's own budget; if they have used that window up, the
+        queue is looked at once, and a run already done is returned. On either
         path each status and result read keeps the ``timeout`` the run was
         called with as its HTTP timeout, so an ``httpx.Timeout`` passed here
         bounds every request rather than only the first and ``None`` limits

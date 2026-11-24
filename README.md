@@ -573,9 +573,12 @@ which lasts until the queue says the run is done — use `models.subscribe` if
 you want a client-side bound on the whole wait. The `Idempotency-Key` is sent either way,
 and a resend under the same key — with or without the flag — collects the
 generation the first request started rather than starting another; a resend
-*without* the flag that is answered with the handoff is still bounded by its
-`timeout`, raising `TimeoutError` without cancelling the run — stamped with
-the `idempotency_key`, `request_id` and `retry_after` a resend reads. A `202` that
+*without* the flag that is answered with the handoff is followed only for what
+is left of a numeric `timeout` counted from the start of the call, then raises
+`TimeoutError` without cancelling the run — stamped with the `idempotency_key`,
+`request_id` and `retry_after` a resend reads. Retries before the `202` keep the
+retry policy's own budget; if they have used that window up, the queue is looked
+at once and a run already done is returned. A `202` that
 carries neither `Preference-Applied` nor `Idempotent-Replayed` is never returned
 as output: it raises `ComfyError` (`code="invalid_response"`) carrying the key,
 the response's request id and, on `details["handle"]`, the body — so a queue

@@ -316,6 +316,59 @@ async def test_async_followed_handoff_without_opt_in_keeps_the_timeout(server, f
             await client.models.run(MODEL, ARGS, idempotency_key=key, timeout=0.3)
 
 
+def _spend_the_window_on_a_retry(state: Any, key: str) -> None:
+    """One paced ``429`` longer than the test's ``timeout``, then the replayed ``202``."""
+    state.model_run_handoff = True
+    state.model_run_handoff_keys.add(key)
+    state.model_run_transient_error = (429, "rate_limited")
+    state.model_run_retry_after = "1"
+    state.model_run_fail_times = 1
+
+
+# `timeout` bounds following a handoff, not the retries before it: those keep
+# the retry policy's budget (and the server's named pace) as on any other run.
+def test_a_retry_past_the_timeout_still_collects_a_finished_handoff(server, fast_poll):
+    key = "spent-window-key-0001"
+    _spend_the_window_on_a_retry(server.state, key)
+    server.state.queue_polls_to_complete = 0
+    with _client() as client:
+        out = client.models.run(MODEL, ARGS, idempotency_key=key, timeout=0.5)
+    assert out == server.state.queue_result
+    assert server.state.model_run_prefer_headers == [None, None]
+
+
+async def test_async_a_retry_past_the_timeout_still_collects_a_finished_handoff(server, fast_poll):
+    key = "spent-window-key-0002"
+    _spend_the_window_on_a_retry(server.state, key)
+    server.state.queue_polls_to_complete = 0
+    async with _async_client() as client:
+        out = await client.models.run(MODEL, ARGS, idempotency_key=key, timeout=0.5)
+    assert out == server.state.queue_result
+
+
+def test_a_retry_past_the_timeout_looks_once_at_a_pending_handoff(server, fast_poll):
+    key = "spent-window-key-0003"
+    _spend_the_window_on_a_retry(server.state, key)
+    server.state.queue_polls_to_complete = 10**9
+    with _client() as client, pytest.raises(TimeoutError) as caught:
+        client.models.run(MODEL, ARGS, idempotency_key=key, timeout=0.5)
+    assert caught.value.idempotency_key == key  # type: ignore[attr-defined]
+    assert server.state.queue_status_count == 1
+    assert server.state.queue_cancel_count == 0
+
+
+async def test_async_a_retry_past_the_timeout_looks_once_at_a_pending_handoff(server, fast_poll):
+    key = "spent-window-key-0004"
+    _spend_the_window_on_a_retry(server.state, key)
+    server.state.queue_polls_to_complete = 10**9
+    async with _async_client() as client:
+        with pytest.raises(TimeoutError) as caught:
+            await client.models.run(MODEL, ARGS, idempotency_key=key, timeout=0.5)
+    assert caught.value.idempotency_key == key  # type: ignore[attr-defined]
+    assert server.state.queue_status_count == 1
+    assert server.state.queue_cancel_count == 0
+
+
 def test_followed_handoff_timeout_carries_the_resend_contract(server, fast_poll):
     # The poll's TimeoutError answers the same recovery attributes every other
     # failure of the call does, so a caller can resend under the key.
