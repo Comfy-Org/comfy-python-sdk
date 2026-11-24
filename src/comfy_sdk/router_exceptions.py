@@ -503,8 +503,15 @@ class RateLimited(RouterError):
     It shares ``429`` with :class:`ConcurrencyLimitExceeded` and is not the same
     thing: that one clears the moment one of the caller's own in-flight calls
     finishes, so retrying in seconds is right, whereas nothing the caller does
-    drains this one early. ``detail`` names the window, and ``Retry-After`` the
-    seconds to wait, carried on ``retry_after``.
+    drains this one early. On the Router surface, ``detail`` names the window,
+    and ``Retry-After`` the seconds to wait, carried on ``retry_after``.
+
+    The window guarantee above is Router's. The v2 jobs/assets gateway raises
+    this same class for ``code == "rate_limited"``, and there it has two causes:
+    usually the account is past its request rate limit, but a v2 route also
+    answers it while a service it depends on is briefly unavailable, so it is
+    not proof the allowance is spent. ``retry_after`` is read from
+    ``Retry-After`` when the response sent one.
     """
 
     error_type = "rate_limited"

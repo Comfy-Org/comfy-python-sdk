@@ -148,10 +148,11 @@ class JobFailed(ComfyError):
         return category_of(self.error)
 
 
-#: Wire ``code`` -> the class this SDK raises for it. Only the codes the v2
-#: envelope owns are listed here; the Router buckets are looked up in
-#: :data:`comfy_sdk.router_exceptions._BY_ERROR_TYPE` instead, so that table
-#: stays the single copy of the contract's closed set.
+#: Wire ``code`` -> the class this SDK raises for it. The codes listed here are
+#: the ones the v2 envelope can send; every other Router bucket is looked up in
+#: :data:`comfy_sdk.router_exceptions._BY_ERROR_TYPE` instead, which stays the
+#: single copy of the contract's closed set -- the four shared codes below are
+#: the only Router buckets that appear in both tables.
 #:
 #: Four entries -- ``insufficient_credits``, ``rate_limited``, ``unauthorized``,
 #: ``forbidden`` -- name classes that live in
@@ -161,7 +162,12 @@ class JobFailed(ComfyError):
 #: alone cannot say which surface answered, and raising a class that is *not* a
 #: ``RouterError`` for a Router refusal is what made ``except RouterError`` a
 #: dead handler. One class per bucket, reachable from both modules, is the only
-#: shape where neither ``except`` clause is wrong.
+#: shape where neither ``except`` clause is wrong. The v2 contract's account rate
+#: limit (``components/responses/RateLimited`` in ``spec/openapi.yaml``) and
+#: Router's ``rate_limited`` bucket share a spelling, so one class serves both
+#: and ``.error_type == "rate_limited"`` is set on it from either surface. Only
+#: Router's is always a spent window; a v2 route also answers it while a service
+#: it depends on is briefly unavailable.
 _BY_CODE: dict[str, type[ComfyError]] = {
     "invalid_workflow": InvalidWorkflow,
     "workflow_format_ui": WorkflowFormatUi,
