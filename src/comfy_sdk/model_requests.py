@@ -177,7 +177,8 @@ class CostEstimate:
     it promises -- an ``estimated`` quote never carries an :attr:`amount`, an
     ``exact`` one never carries bounds -- and those are always present: an
     ``exact`` or ``free`` quote whose :attr:`amount`, or an ``estimated`` one
-    whose bounds, cannot be read is no quote at all.
+    whose bounds, cannot be read is no quote at all, and so is a ``free`` quote
+    any of whose figures is non-zero.
 
     Money is the server's decimal **string**, kept verbatim and never coerced
     to a float, so ``"0.04"`` stays exactly ``"0.04"``; the ``*_cents`` and
@@ -452,16 +453,21 @@ def _estimate_of(payload: Any) -> CostEstimate | None:
     amount = money("amount")
     if amount is None:
         return None
-    # A `free` quote that names a non-zero price contradicts itself, and
-    # reading either half of it would be a guess.
-    if source == "free" and Decimal(amount) != 0:
+    # A `free` quote that names a non-zero price in any of its three figures
+    # contradicts itself, and reading any one of them would be a guess. The
+    # cents and credits are checked as they arrived: `number` reads a negative,
+    # non-finite or wrong-typed figure as absent, and an absent figure must not
+    # pass for a zero one.
+    amount_cents, credits = number("amount_cents"), number("credits")
+    if source == "free" and (
+        Decimal(amount) != 0
+        or any(
+            estimate.get(name) is not None and figure != 0
+            for name, figure in (("amount_cents", amount_cents), ("credits", credits))
+        )
+    ):
         return None
-    return replace(
-        base,
-        amount=amount,
-        amount_cents=number("amount_cents"),
-        credits=number("credits"),
-    )
+    return replace(base, amount=amount, amount_cents=amount_cents, credits=credits)
 
 
 def _raise_for_completion(payload: Any, *, request_id: str, envelope_only: bool = False) -> None:
@@ -642,7 +648,9 @@ class RequestHandle(_RequestHandleBase):
 
     Built by ``client.models.submit`` and by ``client.models.handle``; there is
     nothing to construct by hand, and nothing in it that a second process
-    cannot rebuild from :attr:`model` and :attr:`request_id`.
+    cannot rebuild from :attr:`model` and :attr:`request_id` -- except
+    :attr:`estimate`, which only the submitting process ever holds. Keep the
+    quote alongside the two ids if a later process needs it.
     """
 
     def __init__(

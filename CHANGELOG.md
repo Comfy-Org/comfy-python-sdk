@@ -36,6 +36,31 @@ the fuller account of each version, including verification notes.
   again means submitting a new request. Before this, the bucket arrived as a bare `RouterError`.
   Under a zero-data-retention workspace a result is removed shortly after its first collect (and
   an uncollected one after a grace period), so a second collect can raise `ResultExpired` there.
+- `RateLimited` is exported from `comfy_sdk` and `comfy_sdk.exceptions` as a fourth bucket shared
+  with the Router surface, beside `Unauthorized`, `Forbidden` and `InsufficientCredits`. It is the
+  same class as `comfy_sdk.router_exceptions.RateLimited`, and a v2 job route's `rate_limited`
+  envelope now maps to it explicitly; it carries `.retry_after`. The low layer gains
+  `comfy_low.errors.RateLimited` (also on `comfy_low`) for the same code.
+- The queued submit's cost quote. `RequestHandle.estimate` / `AsyncRequestHandle.estimate`
+  carry Router's pre-flight quote as a `CostEstimate` (`source`, `currency`, `amount` /
+  `min_amount` / `max_amount` as decimal strings, their `*_cents`, `credits`, `provider`,
+  `model`, `pricing_as_of`, `reason`, `raw`, and `is_exact` / `is_estimated` / `is_free` /
+  `is_unknown`) when the submit's `201` included one. It is a list-price quote, not the
+  workspace's final charge. `None` means no quote is available, never no charge:
+  the estimate is off for the caller, the submit was answered by an idempotent replay, or the
+  handle was rebuilt with `client.models.handle`. A malformed quote reads as `None` and never
+  fails the submit.
+- `client.realtime.connect` on `Comfy` and `AsyncComfy`: opens a Comfy Router realtime
+  session over `GET /v2/realtime/{serving}/{model}` on `COMFY_ROUTER_BASE_URL`, authenticated
+  by the client's API key (`X-API-Key`) or an `id_token=` sent in the subprotocol offer. A
+  refused upgrade raises the typed `RouterError` subclass for its bucket; models served on
+  another realtime surface are refused locally with `realtime_unsupported_model`. No message
+  codec is bundled. `id_token=` does not lift the constructor's `MissingApiKey` on Comfy Cloud:
+  a token-only caller passes a placeholder `api_key=`. A handshake redirect to another origin
+  is refused rather than followed with the credential.
+- `RouterError.refusal_code`: the body's `code` field when it is a string (realtime refusals
+  send one, such as `router.realtime.session_already_live`), `None` otherwise.
+- The `realtime` extra (`pip install 'comfy-sdk[realtime]'`), which adds `websockets>=13`.
 
 ### Fixed
 
@@ -49,6 +74,10 @@ the fuller account of each version, including verification notes.
   that stayed open for at least 5 s, so a healthy stream that drops now and then still reconnects
   quickly. The first pause is still 0.1 s. The 429 and 501 handling on the events path is
   unchanged.
+- `job.events()` / async `events()` now raise a typed error when the server ends the stream
+  with a terminal `error` event naming `credential_expired` (`Unauthorized`), `forbidden`
+  (`Forbidden`) or `job_not_found` (`NotFound`), instead of silently reconnecting. An `error`
+  event with any other code, or no readable one, still falls back to polling and reconnecting.
 
 ## [0.5.0] - 2026-10-10
 
