@@ -216,6 +216,31 @@ class BinaryResult:
         )
 
 
+@dataclass(frozen=True)
+class RunHandoff:
+    """A model run Router answered ``202``: handed to its queue, not finished.
+
+    What ``post_model_run`` returns in place of a result when Comfy Router
+    accepts the run but answers before the generation is done. Router does
+    that only for a caller that asked for it with ``Prefer: respond-async``
+    (RFC 7240) on a model it is configured to hand off; every other run keeps
+    the ``200`` that carries the finished output. The answer to the ``Prefer``
+    is ``Preference-Applied: respond-async`` on the response, which this
+    carrier does not read -- the response headers travel beside it, as they do
+    for every run, so the layer above decides what a ``202`` without it means.
+
+    The body is the queue handle -- the same ``request_id`` / ``status_url`` /
+    ``response_url`` the queued submit answers with -- kept as the decoded
+    JSON object rather than modelled, so a field the server adds reaches the
+    caller untouched. It is a separate type rather than a ``dict`` so a handle
+    can never be mistaken for a partner's native output, which is also a
+    ``dict``.
+    """
+
+    #: The ``202`` body verbatim: the queue handle for the handed-off run.
+    handle: dict[str, Any]
+
+
 def media_type(content_type: str | None) -> str:
     """The bare, lowercased media type of a ``Content-Type`` header value.
 
@@ -349,6 +374,7 @@ def model_run_request(
     model_provider: str | None = None,
     strict_mode: bool | None = None,
     fallback_provider: bool | str | None = None,
+    respond_async: bool = False,
 ) -> tuple[str, dict[str, Any], dict[str, str]]:
     """Sans-IO ``(path, json_body, headers)`` for one model run.
 
@@ -366,6 +392,11 @@ def model_run_request(
 
     ``arguments`` is copied into a plain dict so any ``Mapping`` is accepted and
     the caller's object is never handed to the JSON encoder directly.
+
+    ``respond_async`` adds ``Prefer: respond-async`` (RFC 7240), the opt-in
+    under which Router may answer ``202`` with a queue handle instead of
+    holding the connection for the result. Off, no ``Prefer`` is sent at all,
+    so the request is byte-for-byte the one this route has always made.
     """
     provider, name = parse_model_id(model)
     path = _MODEL_RUN_PATH_TEMPLATE.format(
@@ -376,6 +407,8 @@ def model_run_request(
         path = f"{path}?{query}"
     body: dict[str, Any] = dict(arguments)
     headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
+    if respond_async:
+        headers["Prefer"] = "respond-async"
     return path, body, headers
 
 
@@ -700,6 +733,17 @@ class _Prepared:
         if resp.status_code in ok:
             return self._decode_json(resp)
         self._raise_for_response(resp)
+
+    def parse_run_outcome(self, resp: httpx.Response) -> dict[str, Any] | BinaryResult | RunHandoff:
+        """A model run's answer: its finished result, or the ``202`` handoff.
+
+        The ``202`` body is the queue handle, which is JSON whatever the model
+        produces, so it is decoded as :meth:`parse_or_raise` decodes any
+        document; everything else is :meth:`parse_run_result`'s, unchanged.
+        """
+        if resp.status_code == 202:
+            return RunHandoff(handle=self.parse_or_raise(resp, (202,)))
+        return self.parse_run_result(resp, (200, 201))
 
     def parse_run_result(
         self, resp: httpx.Response, ok: tuple[int, ...]
@@ -1387,8 +1431,9 @@ class ComfyLow:
         model_provider: str | None = None,
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
+        respond_async: bool = False,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> tuple[dict[str, Any] | BinaryResult, Mapping[str, str]]:
+    ) -> tuple[dict[str, Any] | BinaryResult | RunHandoff, Mapping[str, str]]:
         """POST ``{router_base_url}/v2/models/{provider}/{model}`` — awaited server-side.
 
         Addressed to Comfy Router, not to the ``/api/v2`` deployment
@@ -1396,8 +1441,9 @@ class ComfyLow:
         :attr:`router_base_url` precisely so it does not pick up the ``/api/v2``
         prefix ``_Prepared.url`` adds to a relative path.
 
-        One request, one response: the server does not answer until the
-        generation is complete, so the decoded body *is* the finished result.
+        One request, one response: unless ``respond_async`` asks otherwise (see
+        below), the server does not answer until the generation is complete, so
+        the decoded body *is* the finished result.
         That holds for a submit/poll provider too — the polling happens server
         side, inside this call, which is why the default ``timeout`` is
         :data:`MODEL_RUN_TIMEOUT` rather than the client's own.
@@ -1431,6 +1477,15 @@ class ComfyLow:
         schema could not carry every field. Returning the body alone discarded
         both, so a caller could not tell an alt-provider run from a native one.
 
+        ``respond_async`` sends ``Prefer: respond-async``. A ``202`` -- which
+        Router sends only to a caller that asked, on a model it hands off --
+        comes back as a :class:`RunHandoff` holding the queue handle rather
+        than as a result; following it is the caller's. A ``202`` is accepted
+        whether or not this call asked, because a resend under an
+        ``Idempotency-Key`` whose first request was handed off can be answered
+        with that handoff again, and raising on it would leave the caller no
+        way back to a generation it already started.
+
         Raises ``TypeError``/``ValueError`` from :func:`parse_model_id` before
         any request when ``model`` is not a ``{provider}/{model}`` id.
         """
@@ -1441,10 +1496,11 @@ class ComfyLow:
             model_provider=model_provider,
             strict_mode=strict_mode,
             fallback_provider=fallback_provider,
+            respond_async=respond_async,
         )
         url = self._p.router_base_url + path
         resp = self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_run_result(resp, (200, 201)), resp.headers
+        return self._p.parse_run_outcome(resp), resp.headers
 
     # -- models: the queued form ------------------------------------------
     #
@@ -1913,8 +1969,9 @@ class AsyncComfyLow:
         model_provider: str | None = None,
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
+        respond_async: bool = False,
         timeout: Any = MODEL_RUN_TIMEOUT,
-    ) -> tuple[dict[str, Any] | BinaryResult, Mapping[str, str]]:
+    ) -> tuple[dict[str, Any] | BinaryResult | RunHandoff, Mapping[str, str]]:
         """Async :meth:`ComfyLow.post_model_run` — same ``dict | BinaryResult`` body."""
         path, body, headers = model_run_request(
             model,
@@ -1923,10 +1980,11 @@ class AsyncComfyLow:
             model_provider=model_provider,
             strict_mode=strict_mode,
             fallback_provider=fallback_provider,
+            respond_async=respond_async,
         )
         url = self._p.router_base_url + path
         resp = await self.raw_request("POST", url, headers=headers, json=body, timeout=timeout)
-        return self._p.parse_run_result(resp, (200, 201)), resp.headers
+        return self._p.parse_run_outcome(resp), resp.headers
 
     # -- models: the queued form ------------------------------------------
     async def post_model_submit(
@@ -2004,4 +2062,4 @@ def _looks_like_path(s: str) -> bool:
     return s.startswith("http") or s.startswith("/")
 
 
-__all__ = ["ComfyLow", "AsyncComfyLow", "ApiError", "BinaryResult"]
+__all__ = ["ComfyLow", "AsyncComfyLow", "ApiError", "BinaryResult", "RunHandoff"]

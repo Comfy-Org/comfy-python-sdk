@@ -34,7 +34,7 @@ from .errors import (
     sse_error_from_frame,
 )
 from .sse import RawEvent, SSEDecoder
-from .transport import AsyncComfyLow, BinaryResult, ComfyLow
+from .transport import AsyncComfyLow, BinaryResult, ComfyLow, RunHandoff
 
 # The exact set of operationIds the transport must cover; the spec-coverage test
 # asserts this equals the set of operationIds in spec/openapi.yaml.
@@ -78,6 +78,7 @@ __all__ = [
     "ComfyLow",
     "AsyncComfyLow",
     "BinaryResult",
+    "RunHandoff",
     "RawEvent",
     "SSEDecoder",
     "ApiError",

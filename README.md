@@ -529,7 +529,8 @@ Three things follow from that, and they are the whole contract of this method:
 
 `run` returns when the generation is **complete**. There is no submit step and
 nothing to poll: where the platform has to submit-and-poll an upstream
-provider, that happens server side inside this one call. The value you get back
+provider, that happens server side inside this one call (or, if you opt in with
+`respond_async=True` below, client side inside it — still one call). The value you get back
 is the provider's own payload, handed over as-is. For a model that answers
 JSON — most of them — that is a `dict` with no wrapper class between you and
 what the provider produced. For a model whose partner answers a generation
@@ -546,6 +547,32 @@ async with AsyncComfy(api_key="comfyui-...") as client:
 
 There is no `run_async()`, and there will not be one — one operation, one name,
 and `await` is what makes it asynchronous.
+
+#### Long runs without a held connection: `respond_async=True`
+
+```python
+result = client.models.run("bfl/flux-2-pro", {"prompt": "a cat"}, respond_async=True)
+```
+
+Same call, same result — but it sends `Prefer: respond-async`, which lets Router
+hand a slow run to its queue and answer `202` with a handle instead of holding
+the HTTP connection open until the model finishes. When Router does that (it
+answers with `Preference-Applied: respond-async`), `run` polls the handle — the
+same status and result reads `models.submit`'s handle makes, which are not
+billed — and returns exactly what it would have returned for a `200`. When it
+does not (the model is not one Router hands off, or the deployment has the
+handoff switched off) the answer is the ordinary `200`, returned as always, so
+the flag is safe to pass for any model. `run_detailed` and the async client
+take the same keyword.
+
+It is off by default: without it no `Prefer` header is sent and nothing changes.
+On the handed-off path `timeout` bounds the run request, not the wait, which
+lasts until the queue says the run is done — use `models.subscribe` if you want
+a client-side bound on the whole wait. The `Idempotency-Key` is sent either way,
+and a resend under the same key — with or without the flag — collects the
+generation the first request started rather than starting another. A `202`
+that does not carry `Preference-Applied` is never returned as output: it raises
+`ComfyError` (`code="invalid_response"`) carrying the key to resend under.
 
 ### Two result shapes — JSON, or the model's own bytes
 

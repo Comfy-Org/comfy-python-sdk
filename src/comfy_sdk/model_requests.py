@@ -786,9 +786,20 @@ class RequestHandle(_RequestHandleBase):
         ``budget`` is what is left of the caller's deadline, and bounds the
         fetch the way :meth:`_status` bounds a poll.
         """
+        return self._collect_with_headers(completion, budget=budget)[0]
+
+    def _collect_with_headers(
+        self, completion: QueueUpdate, *, budget: float | None = None
+    ) -> tuple[dict[str, Any] | BinaryResult, httpx.Headers]:
+        """:meth:`_collect`, plus the result fetch's response headers.
+
+        For ``models.run_detailed`` following a ``202`` handoff, whose
+        :class:`~comfy_sdk.models.RouterRunResult` is read off the headers of
+        the response that carried the output.
+        """
         _raise_for_completion(completion.raw, request_id=self._request_id)
         with translating():
-            payload, _headers = self._call(
+            payload, headers = self._call(
                 lambda: self._low.get_model_request_result(
                     self._model, self._request_id, **_http_timeout(budget)
                 ),
@@ -799,7 +810,7 @@ class RequestHandle(_RequestHandleBase):
         # is how a failure gets returned as a result. A `BinaryResult` is not a
         # `Mapping` and so never carries one -- it is bytes, not an envelope.
         _raise_for_completion(payload, request_id=self._request_id, envelope_only=True)
-        return payload
+        return payload, headers
 
     def cancel(self) -> QueueUpdate:
         """Ask the server to cancel this request.
@@ -930,16 +941,22 @@ class AsyncRequestHandle(_RequestHandleBase):
         self, completion: QueueUpdate, *, budget: float | None = None
     ) -> dict[str, Any] | BinaryResult:
         """Async :meth:`RequestHandle._collect`."""
+        return (await self._collect_with_headers(completion, budget=budget))[0]
+
+    async def _collect_with_headers(
+        self, completion: QueueUpdate, *, budget: float | None = None
+    ) -> tuple[dict[str, Any] | BinaryResult, httpx.Headers]:
+        """Async :meth:`RequestHandle._collect_with_headers`."""
         _raise_for_completion(completion.raw, request_id=self._request_id)
         with translating():
-            payload, _headers = await self._call(
+            payload, headers = await self._call(
                 lambda: self._low.get_model_request_result(
                     self._model, self._request_id, **_http_timeout(budget)
                 ),
                 budget=budget,
             )
         _raise_for_completion(payload, request_id=self._request_id, envelope_only=True)
-        return payload
+        return payload, headers
 
     async def cancel(self) -> QueueUpdate:
         """Async :meth:`RequestHandle.cancel` — a request, not a guarantee."""
