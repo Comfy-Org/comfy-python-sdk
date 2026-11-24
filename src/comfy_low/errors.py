@@ -40,6 +40,27 @@ def clean_request_id(raw: Any) -> str | None:
     return match.group(0) if match else None
 
 
+#: The whole of an organization id, bounded in the pattern itself. The value is
+#: server-controlled and documented as the ``organization`` query parameter of
+#: Comfy Cloud's SSO start, so it is checked against the shape of an id — no
+#: URL delimiter, whitespace or control character, and a bounded length —
+#: before a caller pastes it into a URL or a log line.
+_ORGANIZATION_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,200}")
+
+
+def clean_organization_id(raw: Any) -> str | None:
+    """``raw`` if it is a bounded, id-shaped token (surrounding whitespace aside), else ``None``.
+
+    Unlike :func:`clean_request_id` this does not keep a leading run: a
+    truncated organization id would start SSO for the wrong organization, so a
+    value that does not match whole reads as absent.
+    """
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.strip()
+    return stripped if _ORGANIZATION_ID_RE.fullmatch(stripped) else None
+
+
 #: Longest body excerpt kept on an exception. Long enough for the one-line
 #: reason an intermediary states (``no healthy upstream``, ``upstream connect
 #: error or disconnect/reset before headers``), short enough that an HTML error
@@ -109,6 +130,7 @@ class ApiError(Exception):
         body_excerpt: str | None = None,
         error_type: str | None = None,
         validation_errors: Sequence[Mapping[str, Any]] = (),
+        organization_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -176,6 +198,16 @@ class ApiError(Exception):
         #: :func:`error_from_envelope` enforces that, so a set excerpt always
         #: means ``message`` is one this SDK synthesised.
         self.body_excerpt = body_excerpt
+        #: On ``sso_required``: the organization whose single sign-on governs
+        #: this key — the ``organization`` query parameter of Comfy Cloud's SSO
+        #: start. ``None`` on every other code and when the server does not
+        #: know it. Read off the envelope's ``error.organization_id``, a
+        #: sibling of ``code`` and ``message``, by :func:`error_from_envelope`,
+        #: which drops a value that is not a bounded id-shaped token
+        #: (:func:`clean_organization_id`). A ``HEAD`` probe has no body to
+        #: read, so an ``sso_required`` refusal of one surfaces as a plain
+        #: ``forbidden`` with this left ``None``.
+        self.organization_id = organization_id
 
     def __str__(self) -> str:
         """``message``, plus the body excerpt whenever there is one.
@@ -254,6 +286,11 @@ _BY_CODE: dict[str, type[ApiError]] = {
         Forbidden,
     )
 }
+# The key is valid but the account must sign in through its organization's
+# SSO. A `Forbidden` so an auth `except` sees it; `code` stays `sso_required`
+# and `organization_id` names the org. Deliberately no class of its own: the
+# Router exception surface is one class per bucket, and this is not a bucket.
+_BY_CODE["sso_required"] = Forbidden
 
 
 def _clean(value: Any) -> str | None:
@@ -533,6 +570,7 @@ def error_from_envelope(
     # capped, instead of verbatim at whatever length it was sent.
     message = clean_body_excerpt((err or {}).get("message") if isinstance(err, dict) else None)
     details = (err or {}).get("details") if isinstance(err, dict) else None
+    raw_organization_id = (err or {}).get("organization_id") if isinstance(err, dict) else None
 
     # Read whether or not `code` already won: the bucket is how a caller tells
     # a Router response from a v2 one, and on the three buckets both surfaces
@@ -596,6 +634,12 @@ def error_from_envelope(
     else:
         message = f"HTTP {http_status}"
 
+    # Gated on the code so the documented contract holds: `organization_id` is
+    # set only on an `sso_required` refusal. A caller that starts SSO whenever
+    # it is set must not be steered by the same field on an unrelated 404 or
+    # 429. Reduced to an id-shaped token, so a non-string, empty or malformed
+    # value reads as absent rather than reaching a URL.
+    organization_id = clean_organization_id(raw_organization_id) if code == "sso_required" else None
     cls = _BY_CODE.get(code, ApiError)
     return cls(
         message,
@@ -607,6 +651,7 @@ def error_from_envelope(
         body_excerpt=body_excerpt,
         error_type=bucket,
         validation_errors=validation_errors,
+        organization_id=organization_id,
     )
 
 
