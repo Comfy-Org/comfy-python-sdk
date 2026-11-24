@@ -454,9 +454,18 @@ def _estimate_of(payload: Any) -> CostEstimate | None:
     if amount is None:
         return None
     # A `free` quote that names a non-zero price in any of its three figures
-    # contradicts itself, and reading any one of them would be a guess.
+    # contradicts itself, and reading any one of them would be a guess. The
+    # cents and credits are checked as they arrived: `number` reads a negative,
+    # non-finite or wrong-typed figure as absent, and an absent figure must not
+    # pass for a zero one.
     amount_cents, credits = number("amount_cents"), number("credits")
-    if source == "free" and (Decimal(amount) != 0 or amount_cents or credits):
+    if source == "free" and (
+        Decimal(amount) != 0
+        or any(
+            estimate.get(name) is not None and figure != 0
+            for name, figure in (("amount_cents", amount_cents), ("credits", credits))
+        )
+    ):
         return None
     return replace(base, amount=amount, amount_cents=amount_cents, credits=credits)
 
