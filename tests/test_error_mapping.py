@@ -312,9 +312,9 @@ def test_a_bucket_both_surfaces_spell_keeps_its_v2_class(code: str) -> None:
 
 def test_a_v2_envelope_rate_limited_is_the_shared_router_class() -> None:
     # Deliberate sharing, not a mis-mapping: the v2 jobs/assets throttle and
-    # Router's `rate_limited` bucket are the same windowed allowance spelled the
-    # same way, so a v2 envelope with no Router header still raises the Router
-    # class -- exactly as `unauthorized`, `forbidden` and `insufficient_credits`
+    # Router's `rate_limited` bucket are spelled the same way and the code alone
+    # cannot say which answered, so a v2 envelope with no Router header still
+    # raises the Router class -- exactly as `unauthorized`, `forbidden` and `insufficient_credits`
     # do. `error_type` is left unset to prove the class comes from the code alone.
     from comfy_sdk.router_exceptions import RateLimited, RouterError
 

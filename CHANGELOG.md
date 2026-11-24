@@ -294,11 +294,6 @@ the fuller account of each version, including verification notes.
 - `ApiError.error_type` records the Router bucket a response named (`X-Comfy-Error-Type`, or the
   body's `error_type`), or `None` when it named none — which is also how the SDK tells which
   surface answered.
-- `rate_limited` is the fourth code both surfaces share: `RateLimited` is now exported from
-  `comfy_sdk` and `comfy_sdk.exceptions` (the same class as
-  `comfy_sdk.router_exceptions.RateLimited`), and `comfy_low.errors.RateLimited` types it at the
-  low layer. A v2 jobs/assets throttle raised that class before and still does, so
-  `except RouterError` catches it too. A code-less `429` still decodes to `queue_full`.
 
 ## [0.4.0] - 2026-09-18
 

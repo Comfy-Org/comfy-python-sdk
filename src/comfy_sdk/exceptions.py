@@ -164,9 +164,10 @@ class JobFailed(ComfyError):
 #: dead handler. One class per bucket, reachable from both modules, is the only
 #: shape where neither ``except`` clause is wrong. The v2 contract's account rate
 #: limit (``components/responses/RateLimited`` in ``spec/openapi.yaml``) and
-#: Router's ``rate_limited`` bucket are the same windowed allowance spelled the
-#: same way, so one class serves both, and ``.error_type == "rate_limited"`` is
-#: set on it from either surface.
+#: Router's ``rate_limited`` bucket share a spelling, so one class serves both
+#: and ``.error_type == "rate_limited"`` is set on it from either surface. Only
+#: Router's is always a spent window; a v2 route also answers it while a service
+#: it depends on is briefly unavailable.
 _BY_CODE: dict[str, type[ComfyError]] = {
     "invalid_workflow": InvalidWorkflow,
     "workflow_format_ui": WorkflowFormatUi,

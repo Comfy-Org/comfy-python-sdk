@@ -498,10 +498,12 @@ class RateLimited(RouterError):
     drains this one early. On the Router surface, ``detail`` names the window,
     and ``Retry-After`` the seconds to wait, carried on ``retry_after``.
 
-    The v2 jobs/assets gateway raises this same class for its per-account
-    request rate limit (``code == "rate_limited"``), with ``retry_after`` read
-    from ``Retry-After`` when the response sent one: both surfaces spell the
-    windowed allowance identically, so one class serves both.
+    The window guarantee above is Router's. The v2 jobs/assets gateway raises
+    this same class for ``code == "rate_limited"``, and there it has two causes:
+    usually the account is past its request rate limit, but a v2 route also
+    answers it while a service it depends on is briefly unavailable, so it is
+    not proof the allowance is spent. ``retry_after`` is read from
+    ``Retry-After`` when the response sent one.
     """
 
     error_type = "rate_limited"
