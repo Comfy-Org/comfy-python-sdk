@@ -254,8 +254,10 @@ class QueueFull(ApiError):
 
 
 class RateLimited(ApiError):
-    """The caller's request allowance over a time window is spent; unlike
-    ``queue_full`` (a bounded queue at depth), only the window rolling clears it."""
+    """The service is throttling the caller: usually a request allowance over a
+    time window is spent, but a v2 route also answers this while a service it
+    depends on is briefly unavailable. Unlike ``queue_full`` (a bounded queue
+    at depth) it is not about queue depth; wait out ``Retry-After`` and retry."""
 
     code = "rate_limited"
 

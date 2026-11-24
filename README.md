@@ -1060,13 +1060,16 @@ asset, job, event, and output helpers translate protocol errors, so catches of
 - `QueueFull` — backpressure; carries `.retry_after` seconds. `client.submit`
   retries 429 responses with `Retry-After` for a bounded budget (including
   deployment warm-up), then raises the translated error if backpressure remains.
-- `RateLimited` — the account's request allowance for a time window is spent
-  (`rate_limited`, HTTP 429). `.retry_after` is the seconds to wait when the
-  response sent a delta-seconds `Retry-After`, and `None` otherwise (no header,
-  or an HTTP-date); it is not defaulted to `0` the way `QueueFull`'s is, so
-  check it before sleeping on it. Unlike `QueueFull` it clears only when the
-  window rolls. Shared with the Router surface, as
-  `InsufficientCredits` is.
+- `RateLimited` — the service is throttling the caller (`rate_limited`, HTTP
+  429): usually the account's request allowance for a time window is spent,
+  but the v2 job routes also answer it while a service they depend on is
+  briefly unavailable, so do not read it as proof the allowance is used up.
+  `.retry_after` is the seconds to wait when the response sent a delta-seconds
+  `Retry-After`, and `None` otherwise (no header, or an HTTP-date); it is not
+  defaulted to `0` the way `QueueFull`'s is, so check it before sleeping on it.
+  Unlike `QueueFull` it is not about queue depth, and nothing the caller does
+  clears it early: wait out `Retry-After` and retry. Shared with the Router
+  surface, as `InsufficientCredits` is.
 - `JobFailed` — a job reached a non-`succeeded` terminal state; `.error`
   carries node-level detail when the platform provided one, and
   `.failure_category` is why the job failed as a `FailureCategory`
