@@ -55,7 +55,7 @@ from typing import Any, cast
 
 import httpx
 
-from comfy_low.errors import ApiError
+from comfy_low.errors import ApiError, clean_request_id
 from comfy_low.errors import IdempotencyKeyReuse as ProtocolIdempotencyKeyReuse
 from comfy_low.transport import (
     MODEL_RUN_TIMEOUT,
@@ -252,7 +252,7 @@ def _handoff_request_id(handoff: RunHandoff, headers: Mapping[str, str]) -> str:
             f"follow; {hint}",
             code="invalid_response",
             http_status=202,
-            request_id=headers.get("X-Comfy-Request-Id"),
+            request_id=clean_request_id(headers.get("X-Comfy-Request-Id")),
             details={"handle": handoff.handle},
         )
     return _request_id_of(handoff.handle)
@@ -303,10 +303,12 @@ def _handoff_timed_out(exc: TimeoutError, key: str, accepted: Mapping[str, str])
     :func:`~comfy_sdk.exceptions.translating` stamps; without this a caller
     following the documented recovery -- read ``exc.idempotency_key`` and
     resend -- would hit ``AttributeError`` instead. ``request_id`` is the
-    ``202``'s, the run request that started (and was billed for) the generation.
+    ``202``'s, the run request that started (and was billed for) the
+    generation, reduced to a displayable id as on every other failure.
     """
     if not hasattr(exc, "request_id"):
-        exc.request_id = accepted.get("X-Comfy-Request-Id")  # type: ignore[attr-defined]
+        request_id = clean_request_id(accepted.get("X-Comfy-Request-Id"))
+        exc.request_id = request_id  # type: ignore[attr-defined]
     return _stamp(exc, key)
 
 

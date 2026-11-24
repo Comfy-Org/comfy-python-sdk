@@ -29,7 +29,12 @@ from comfy_low import ApiError
 from comfy_low.transport import RunHandoff, _Prepared, model_run_request
 from comfy_sdk import AsyncComfy, BinaryResult, Comfy
 from comfy_sdk.exceptions import ComfyError
-from comfy_sdk.models import RouterRunResult, _preference_applied
+from comfy_sdk.models import (
+    RouterRunResult,
+    _handoff_request_id,
+    _handoff_timed_out,
+    _preference_applied,
+)
 from comfy_sdk.retry import NO_RETRY
 from comfy_sdk.router_exceptions import ContentPolicyViolation
 
@@ -203,6 +208,21 @@ def test_handoff_completion_with_error_type_raises_typed(server, fast_poll):
 
 
 # --- 202 without Preference-Applied ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "cleaned"),
+    [("req_a, req_b", "req_a"), ("r" * 300, "r" * 200), ("\x01bad", None)],
+)
+def test_handoff_failures_carry_a_displayable_request_id(raw: str, cleaned: str | None):
+    # Duplicate headers reach `get` joined with ", "; the id is server text
+    # headed for a log line, so it is cleaned as every other failure's is.
+    headers = httpx.Headers({"X-Comfy-Request-Id": raw})
+    timed_out = _handoff_timed_out(TimeoutError("late"), "key-1", headers)
+    assert timed_out.request_id == cleaned  # type: ignore[attr-defined]
+    with pytest.raises(ComfyError) as excinfo:
+        _handoff_request_id(RunHandoff({"request_id": "req_stub_01"}), headers)
+    assert excinfo.value.request_id == cleaned
 
 
 def test_202_without_preference_applied_is_not_a_result(server, fast_poll):
