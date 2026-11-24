@@ -58,6 +58,7 @@ from .assets import AssetFactory, AsyncAssetFactory
 from .exceptions import ComfyError, MissingApiKey, WorkflowFormatUi, to_sdk_error, translating
 from .jobs import AsyncJob, AsyncJobFactory, Job, JobFactory, JobSummary
 from .models import AsyncModels, Models
+from .realtime import AsyncRealtime, Realtime
 from .retry import DEFAULT_RETRY, RetryPolicy
 from .workflows import Workflow, WorkflowFactory
 
@@ -312,6 +313,10 @@ class Comfy:
         #: transport (credentials, base URL, connection pool, timeout) and its
         #: retry policy.
         self.models = Models(self._low, retry)
+        #: ``client.realtime`` — Router realtime WebSocket sessions, on this
+        #: client's credential and ``router_base_url``. Needs the ``realtime``
+        #: extra.
+        self.realtime = Realtime(self._low)
 
     def close(self) -> None:
         """Release the underlying HTTP connection pool.
@@ -557,6 +562,8 @@ class AsyncComfy:
         self.jobs = AsyncJobFactory(self._low)
         #: Async counterpart of :attr:`Comfy.models`, on this client's transport.
         self.models = AsyncModels(self._low, retry)
+        #: Async counterpart of :attr:`Comfy.realtime`.
+        self.realtime = AsyncRealtime(self._low)
 
     async def aclose(self) -> None:
         """Async :meth:`Comfy.close`. Prefer ``async with AsyncComfy(...)``."""

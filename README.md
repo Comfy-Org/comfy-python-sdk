@@ -45,6 +45,8 @@ pip install -e ".[dev]"
 
 Install the optional `pil` extra with `pip install -e ".[pil]"` to use `Preview.to_pil()` for decoding an in-progress output preview to a `PIL.Image`.
 
+Install the optional `realtime` extra with `pip install 'comfy-sdk[realtime]'` to use `client.realtime.connect` (it adds `websockets`; see [Realtime sessions](#realtime-sessions)).
+
 ### For local
 
 The SDK works against a ComfyUI instance with **Comfy API v2**. Comfy Cloud and serverless instances deployed from our developer platform already use Comfy API v2. For local or self-hosted instances, **Comfy API v2** can be setup using the [comfy-api-proxy](https://github.com/Comfy-Org/comfy-api-proxy).
@@ -1039,6 +1041,73 @@ surfaces reads it with `getattr(exc, "idempotency_key", None)`. Either way
 resend freely": check for it before replaying, as the snippet above does, rather
 than passing it straight back into `idempotency_key=` where `None` means "mint a
 fresh one" and starts a second billed generation.
+
+## Realtime sessions
+
+Comfy Router serves realtime models (today `google/genie-4` and
+`xai/grok-voice`) over a WebSocket. `client.realtime.connect` builds
+the URL on the client's `COMFY_ROUTER_BASE_URL`, authenticates with the
+client's API key (an `X-API-Key` header; or pass `id_token=` to send a bearer
+token in the subprotocol offer instead) and hands back the open socket. It
+needs the `realtime` extra:
+
+```bash
+pip install 'comfy-sdk[realtime]'
+```
+
+```python
+import json
+
+from comfy_sdk import Comfy
+
+# Your first message, in the model's own protocol. Encode it before opening the
+# session, so a serialization error doesn't leave an unused session open.
+payload = json.dumps({"type": "..."})  # Google sessions: JSON text frames
+
+client = Comfy()
+with client.realtime.connect("google/genie-4") as session:
+    session.socket.send(payload)
+    frame = session.socket.recv()
+```
+
+```python
+import msgpack
+
+from comfy_sdk import AsyncComfy
+
+payload = msgpack.packb({"type": "..."})  # fal sessions: MessagePack
+
+async with AsyncComfy() as client:
+    async with await client.realtime.connect("xai/grok-voice") as session:
+        await session.socket.send(payload)
+        frame = await session.socket.recv()
+```
+
+No codec is bundled: `session.wire_format` is `"json"` or `"msgpack"`, and
+fal-served sessions need a MessagePack encoder such as the `msgpack` package.
+A session is **billed per second while it is open** (a Google-served session
+has a grace period before its first media, so a short one that exchanges no
+media may not be billed at all), and a workspace may hold **one live WebSocket
+session at a time**, so close sessions you are done with. A refused upgrade raises the same typed `RouterError`
+subclasses as `client.models` (`InsufficientCredits`,
+`ConcurrencyLimitExceeded`, ...), with the specific realtime reason on
+`exc.refusal_code` (for example `router.realtime.session_already_live`). Unlike
+`client.models`, a refusal that carries no bucket (an intermediary's bare `503`)
+arrives as `RouterError` itself, with the status on `.http_status`. Models
+Router serves on a different realtime surface (WebRTC or LiveKit) are refused
+locally with `ComfyError(code="realtime_unsupported_model")`, naming where to
+go instead. The `comfy_sdk.realtime` module docstring lists the refusal codes
+and the close codes the server uses.
+
+`id_token=` replaces the API key on the socket, not at construction: against
+Comfy Cloud, `Comfy()` and `AsyncComfy()` still raise `MissingApiKey` with no
+key, so a token-only caller passes a placeholder `api_key=` (it is not sent on
+a session opened with `id_token=`). A handshake redirect is followed only
+within the Router origin; one to another host is refused as a `RouterError`,
+so the credential never reaches it. The handshake is logged with the
+credential masked, so `DEBUG` logging on `websockets` does not write the key or
+token into your logs. `max_size=` (default 1 MiB, `None` for no
+limit) caps one inbound message.
 
 ## Sync and async
 

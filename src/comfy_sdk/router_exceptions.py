@@ -214,6 +214,7 @@ class RouterError(ComfyError):
         request_id: str | None = None,
         retry_after: int | None = None,
         errors: Sequence[ValidationErrorDetail] = (),
+        refusal_code: str | None = None,
         organization_id: str | None = None,
         code: str | None = None,
     ) -> None:
@@ -257,6 +258,13 @@ class RouterError(ComfyError):
         #: carries is read off the header, so the entries have to survive
         #: whichever bucket that turns out to be.
         self.errors: tuple[ValidationErrorDetail, ...] = tuple(errors)
+        #: The body's ``code`` field when it is a string, else ``None``. Only
+        #: a refused realtime WebSocket upgrade (``client.realtime.connect``)
+        #: sends one today -- a dotted reason such as
+        #: ``router.realtime.session_already_live`` that is finer than the
+        #: ``error_type`` bucket -- so it is ``None`` on every other response.
+        #: Branch on the class first; read this for the specific reason.
+        self.refusal_code = refusal_code
 
 
 # Each class below carries two lines of contract under its docstring:
@@ -787,7 +795,9 @@ def error_from_response(
 
     detail: str | None = None
     errors: tuple[ValidationErrorDetail, ...] = ()
+    refusal_code: str | None = None
     if isinstance(body, Mapping):
+        refusal_code = _clean(body.get("code"))
         raw_detail = body.get("detail")
         if isinstance(raw_detail, str):
             # Reduced by the same function the array summary and every body
@@ -820,6 +830,7 @@ def error_from_response(
         request_id=request_id,
         retry_after=retry_after,
         errors=errors,
+        refusal_code=refusal_code,
     )
 
 

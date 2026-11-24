@@ -38,6 +38,9 @@ Issues = "https://github.com/Comfy-Org/comfy-python-sdk/issues"
 [project.optional-dependencies]
 # Preview.to_pil() decodes in-progress preview frames to PIL images.
 pil = ["Pillow>=10"]
+# client.realtime.connect opens a Router realtime session over a WebSocket;
+# httpx has no WebSocket support, so the upgrade needs a second library.
+realtime = ["websockets>=13"]
 # Regenerating comfy_low models from the vendored spec (codegen / CI drift check).
 # Pinned: the drift gate compares byte-for-byte, so the generator version is
 # load-bearing — an unpinned bump could reformat and flag false drift.
@@ -56,6 +59,8 @@ dev = [
     "datamodel-code-generator~=0.68.1",
     "Pillow>=10",
     "PyYAML>=6",
+    # tests/test_realtime.py drives client.realtime against a loopback server.
+    "websockets>=13",
 ]
 
 [build-system]
