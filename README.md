@@ -795,8 +795,8 @@ enabled for every caller, it is omitted when the submit was answered by an
 idempotent replay (the original quote is not stored), and a rehydrated handle
 never has one. When present, `source` (`exact` / `estimated` / `free` /
 `unknown`, and any other value read as `unknown`) says how much to trust the
-figure; a `free` quote's `amount` is `"0"`, and an `unknown` quote carries a
-`reason` instead. The quote is priced at Comfy's standard list price (or, for a
+figure; a `free` quote's `amount` is `"0"` (and its cents and credits figures,
+when present, are `0`), and an `unknown` quote carries a `reason` instead. The quote is priced at Comfy's standard list price (or, for a
 model billed what its vendor reports, from the vendor's published price list),
 so `exact` means exact at list price — it does not reflect negotiated rates,
 and the settled charge in your workspace's usage and billing records is what you
@@ -804,7 +804,8 @@ pay. It is not a price lock either: the run is charged at the rates in force
 when it is rated.
 
 Rehydrate a handle in another process from the two ids that address the
-request, with no call made:
+request, with no call made (the cost quote does not come back with it, so keep
+`handle.estimate` alongside the ids if a later process needs it):
 
 ```python
 handle = client.models.handle("fal-ai/flux-pro", request_id)

@@ -212,6 +212,9 @@ def test_no_estimate_on_the_201_is_none(server, fast_poll) -> None:
             if key != "amount"
         },
         {**EXACT_ESTIMATE, "source": "free"},
+        # ...including a zero amount beside a non-zero cents or credits figure.
+        {**EXACT_ESTIMATE, "source": "free", "amount": "0", "amount_cents": 4, "credits": 0},
+        {**EXACT_ESTIMATE, "source": "free", "amount": "0", "amount_cents": 0, "credits": 8.44},
     ],
 )
 def test_a_malformed_estimate_is_no_quote_and_never_fails_the_submit(

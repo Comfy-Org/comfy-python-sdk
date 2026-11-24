@@ -893,7 +893,11 @@ class Models(_ModelsBase):
         process that never made the submit — a worker draining a queue of ids,
         a retry after a restart — reaches the same
         :class:`~comfy_sdk.model_requests.RequestHandle` the submitting process
-        held. Makes no request of its own: an id that names nothing surfaces on
+        held, save for its
+        :attr:`~comfy_sdk.model_requests.RequestHandle.estimate`: the cost quote
+        arrives only on the submit's response, so a rebuilt handle's is always
+        ``None``, and a process that needs it must keep it with the ids. Makes
+        no request of its own: an id that names nothing surfaces on
         the first :meth:`~comfy_sdk.model_requests.RequestHandle.status` or
         :meth:`~comfy_sdk.model_requests.RequestHandle.get`, as the server's
         own answer rather than as a guess made here.
