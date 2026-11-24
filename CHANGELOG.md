@@ -17,6 +17,10 @@ the fuller account of each version, including verification notes.
   same class as `comfy_sdk.router_exceptions.RateLimited`, and a v2 job route's `rate_limited`
   envelope now maps to it explicitly; it carries `.retry_after`. The low layer gains
   `comfy_low.errors.RateLimited` (also on `comfy_low`) for the same code.
+- `sso_required` (403) now raises `Forbidden` (code preserved) and carries `organization_id`, the
+  organization to start SSO with. `organization_id` is a new attribute on `ComfyError` and on
+  `comfy_low.ApiError`, `None` on every other code and when the server does not name the
+  organization (or names it in a shape that is not an id). `error_type` stays `forbidden`.
 - `FailureCategory`, and `failure_category` on `Job`, `AsyncJob` and `JobFailed`: why a job
   failed, as one of `invalid_input`, `content_refused`, `out_of_gpu_memory`,
   `missing_model_or_node`, `workflow_logic` or `other`, read from the error's `category`. It is
@@ -37,6 +41,19 @@ the fuller account of each version, including verification notes.
   again means submitting a new request. Before this, the bucket arrived as a bare `RouterError`.
   Under a zero-data-retention workspace a result is removed shortly after its first collect (and
   an uncollected one after a grace period), so a second collect can raise `ResultExpired` there.
+
+### Fixed
+
+- **`Job.events()` / `AsyncJob.events()` no longer reconnect every 0.1 s against a stream that
+  keeps dropping.** When a connection ended with no terminal frame (a clean close or a dropped
+  connection) and the job was still running, the loop paused a flat 0.1 s before polling and
+  reconnecting again. A server or proxy that answered 200 and closed straight away therefore got
+  about 10 connects and 10 job polls a second for the whole life of the job — and so did one that
+  sent the on-connect status snapshot first and then closed. The pause now doubles from 0.1 s up
+  to a 5 s cap while connections keep ending early, and goes back to 0.1 s after any connection
+  that stayed open for at least 5 s, so a healthy stream that drops now and then still reconnects
+  quickly. The first pause is still 0.1 s. The 429 and 501 handling on the events path is
+  unchanged.
 
 ## [0.5.0] - 2026-10-10
 

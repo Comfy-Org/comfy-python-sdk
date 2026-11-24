@@ -43,6 +43,14 @@ class ServerState:
     content_bytes: bytes = b"\x89PNG-stub-output-bytes-0123456789"
     # Require an Authorization header (Cloud/serverless).
     require_auth: bool = False
+    # When set, every authenticated GET/POST/PUT/DELETE answers 403
+    # `sso_required` (HEAD is unaffected: it has no body to carry it) — the
+    # gateway's refusal of a personal key whose account an SSO organization
+    # holds. `{"organization_id": "org_..."}` sends the org beside `code`
+    # inside `error`; `{"organization_id": None}` omits it, as the gateway does
+    # when it does not know the org. (Named after the TypeScript stub's
+    # `ssoRequired` knob so the two stubs stay scenario-for-scenario.)
+    sso_required: dict | None = None
     # POST /jobs returns 429 queue_full this many times before succeeding.
     queue_full_times: int = 0
     # Like `queue_full_times`, but the 429 carries no Retry-After header at
@@ -115,8 +123,15 @@ class ServerState:
     job_logs_paths: list[str] = field(default_factory=list)
     # SSE behavior: "reconnect" drops the first stream before terminal;
     # "stall" sends a couple frames then holds the connection open, silent
-    # (a "zombie": no terminal, no close) for `stall_seconds`.
+    # (a "zombie": no terminal, no close) for `stall_seconds`; "drop" answers
+    # every connection 200 and closes it without a terminal — with no frames,
+    # or with the on-connect status/progress snapshot if `sse_drop_snapshot` —
+    # and the connection numbered `sse_hold_on_connect` (if set) holds open for
+    # `sse_hold_seconds` before closing.
     sse_mode: str = "normal"
+    sse_drop_snapshot: bool = False
+    sse_hold_on_connect: int | None = None
+    sse_hold_seconds: float = 0.0
     stall_seconds: float = 2.0
     # GET /jobs/{id}/events answers 501 not_implemented — a surface without SSE.
     events_not_implemented: bool = False
@@ -595,6 +610,20 @@ def _make_handler(state: ServerState):
                 return True
             return bool(state.last_auth_header)
 
+        def _sso_refused(self) -> bool:
+            """Answer 403 ``sso_required`` if the knob is set; ``True`` if it did."""
+            if state.sso_required is None:
+                return False
+            error = {
+                "code": "sso_required",
+                "message": "This account signs in with your organization's single sign-on",
+            }
+            organization_id = state.sso_required.get("organization_id")
+            if organization_id is not None:
+                error["organization_id"] = organization_id
+            self._json(403, {"error": error})
+            return True
+
         def _read_body(self) -> bytes:
             n = int(self.headers.get("Content-Length", 0))
             return self.rfile.read(n) if n else b""
@@ -616,6 +645,8 @@ def _make_handler(state: ServerState):
             if not self._auth_ok():
                 self._err(401, "unauthorized", "no key")
                 return
+            if self._sso_refused():
+                return
             m = re.match(r"/api/v2/assets/([^/]+)$", self.path)
             if m:
                 state.delete_count += 1
@@ -629,6 +660,8 @@ def _make_handler(state: ServerState):
         def do_GET(self) -> None:
             if not self._auth_ok():
                 self._err(401, "unauthorized", "no key")
+                return
+            if self._sso_refused():
                 return
 
             m = re.match(r"/api/v2/assets/([^/]+)/content$", self.path)
@@ -807,6 +840,14 @@ def _make_handler(state: ServerState):
                 self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
                 self.wfile.flush()
 
+            if state.sse_mode == "drop":
+                if state.sse_drop_snapshot:
+                    frame("status", {"status": "running"})
+                    frame("progress", {"value": 0.4, "nodes_done": 4, "nodes_total": 10})
+                if state.events_connect_count == state.sse_hold_on_connect:
+                    # Event.wait, not time.sleep: tests fake out time.sleep.
+                    threading.Event().wait(state.sse_hold_seconds)
+                return
             if state.sse_mode == "reconnect" and state.events_connect_count == 1:
                 # First connection: a progress frame, then drop without terminal.
                 frame("progress", {"value": 0.4, "nodes_done": 4, "nodes_total": 10})
@@ -831,6 +872,9 @@ def _make_handler(state: ServerState):
                 self._read_body()
                 self._err(401, "unauthorized", "no key")
                 return
+            if self._sso_refused():
+                self._read_body()
+                return
             # Comfy Router's queue cancel is a PUT (the contract's
             # `cancelRouterModelRequest`), so it is served here and nowhere
             # else: a POST to the same path is the wrong verb and gets a 404
@@ -847,6 +891,9 @@ def _make_handler(state: ServerState):
             if not self._auth_ok():
                 self._read_body()
                 self._err(401, "unauthorized", "no key")
+                return
+            if self._sso_refused():
+                self._read_body()
                 return
 
             if self.path == "/api/v2/assets":

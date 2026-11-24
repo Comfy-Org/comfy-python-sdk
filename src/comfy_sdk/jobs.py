@@ -38,6 +38,17 @@ from .exceptions import (
 from .outputs import AsyncOutput, Output
 
 _RECONNECT_PAUSE = 0.1
+# Cap for the reconnect pause, which doubles from ``_RECONNECT_PAUSE`` while
+# connections keep ending early. ``events()`` has no deadline of its own, so a
+# dropped healthy stream must still notice a terminal status within seconds;
+# the cap matches ``_core.backoff_schedule``'s default.
+_MAX_RECONNECT_PAUSE = 5.0
+# How long a connection must stay open before its end resets the pause to
+# ``_RECONNECT_PAUSE``. Delivered frames are no signal of health: every connect
+# opens with a status/progress snapshot, so a server or proxy that sends it and
+# closes would otherwise reset the backoff each time. A connection that lasted
+# at least the cap already spaces reconnects no tighter than a capped pause.
+_HEALTHY_STREAM_SECONDS = _MAX_RECONNECT_PAUSE
 
 
 @dataclass(frozen=True)
@@ -274,8 +285,10 @@ class Job:
         poll-authoritative ``wait``/``result``, never a requirement.
         """
         events_url = self._model.urls.events or self._model.id
+        backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
         while True:
             terminal: StatusChange | None = None
+            opened = time.monotonic()
             try:
                 # Closed before the terminal status is enriched: the re-read needs
                 # a connection, and a client limited to one would wait on this one.
@@ -294,6 +307,7 @@ class Job:
                 raise to_sdk_error(exc) from exc
             except (httpx.HTTPError, httpx.StreamError):
                 pass  # connection dropped mid-stream — reconnect below
+            lived = time.monotonic() - opened
             if terminal is not None:
                 yield self._terminal_with_error(terminal)
                 return
@@ -303,7 +317,11 @@ class Job:
             if _core.is_terminal(self.status):
                 yield StatusChange(status=self.status, error=self._model.error)
                 return
-            time.sleep(_RECONNECT_PAUSE)
+            if lived >= _HEALTHY_STREAM_SECONDS:
+                # A stream that stayed open was healthy: start over at the short
+                # pause rather than inheriting earlier short connects' backoff.
+                backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
+            time.sleep(next(backoff))
 
     def _terminal_with_error(self, ev: StatusChange) -> StatusChange:
         # The stream frame declares only the status and the queue position, so
@@ -411,8 +429,10 @@ class AsyncJob:
         import asyncio
 
         events_url = self._model.urls.events or self._model.id
+        backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
         while True:
             terminal: StatusChange | None = None
+            opened = time.monotonic()
             try:
                 async with aclosing(self._low.get_job_events(events_url)) as stream:
                     async for raw in stream:
@@ -429,6 +449,7 @@ class AsyncJob:
                 raise to_sdk_error(exc) from exc
             except (httpx.HTTPError, httpx.StreamError):
                 pass
+            lived = time.monotonic() - opened
             if terminal is not None:
                 yield await self._terminal_with_error(terminal)
                 return
@@ -436,7 +457,11 @@ class AsyncJob:
             if _core.is_terminal(self.status):
                 yield StatusChange(status=self.status, error=self._model.error)
                 return
-            await asyncio.sleep(_RECONNECT_PAUSE)
+            if lived >= _HEALTHY_STREAM_SECONDS:
+                # A stream that stayed open was healthy: start over at the short
+                # pause rather than inheriting earlier short connects' backoff.
+                backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
+            await asyncio.sleep(next(backoff))
 
     async def _terminal_with_error(self, ev: StatusChange) -> StatusChange:
         """:meth:`Job._terminal_with_error`, awaiting the read."""
