@@ -40,6 +40,27 @@ def clean_request_id(raw: Any) -> str | None:
     return match.group(0) if match else None
 
 
+#: The whole of an organization id, bounded in the pattern itself. The value is
+#: server-controlled and documented as the ``organization`` query parameter of
+#: Comfy Cloud's SSO start, so it is checked against the shape of an id — no
+#: URL delimiter, whitespace or control character, and a bounded length —
+#: before a caller pastes it into a URL or a log line.
+_ORGANIZATION_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,200}")
+
+
+def clean_organization_id(raw: Any) -> str | None:
+    """``raw`` if it is a bounded, id-shaped token (surrounding whitespace aside), else ``None``.
+
+    Unlike :func:`clean_request_id` this does not keep a leading run: a
+    truncated organization id would start SSO for the wrong organization, so a
+    value that does not match whole reads as absent.
+    """
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.strip()
+    return stripped if _ORGANIZATION_ID_RE.fullmatch(stripped) else None
+
+
 #: Longest body excerpt kept on an exception. Long enough for the one-line
 #: reason an intermediary states (``no healthy upstream``, ``upstream connect
 #: error or disconnect/reset before headers``), short enough that an HTML error
@@ -109,6 +130,7 @@ class ApiError(Exception):
         body_excerpt: str | None = None,
         error_type: str | None = None,
         validation_errors: Sequence[Mapping[str, Any]] = (),
+        organization_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -140,10 +162,10 @@ class ApiError(Exception):
         #: neither.
         #:
         #: Kept even when it is the same string as :attr:`code`, because
-        #: ``code`` cannot be read backwards: the three buckets both surfaces
+        #: ``code`` cannot be read backwards: the four buckets both surfaces
         #: spell identically (``unauthorized``, ``forbidden``,
-        #: ``insufficient_credits``) leave ``code`` saying nothing about who
-        #: answered. What it buys is at the ``comfy_sdk`` boundary — a bucket
+        #: ``insufficient_credits``, ``rate_limited``) leave ``code`` saying
+        #: nothing about who answered. What it buys is at the ``comfy_sdk`` boundary — a bucket
         #: Router adds after this SDK version was built has no class to map to,
         #: and this is what lets ``to_sdk_error`` still raise a ``RouterError``
         #: for it rather than a bare ``ComfyError`` that no Router handler
@@ -176,6 +198,16 @@ class ApiError(Exception):
         #: :func:`error_from_envelope` enforces that, so a set excerpt always
         #: means ``message`` is one this SDK synthesised.
         self.body_excerpt = body_excerpt
+        #: On ``sso_required``: the organization whose single sign-on governs
+        #: this key — the ``organization`` query parameter of Comfy Cloud's SSO
+        #: start. ``None`` on every other code and when the server does not
+        #: know it. Read off the envelope's ``error.organization_id``, a
+        #: sibling of ``code`` and ``message``, by :func:`error_from_envelope`,
+        #: which drops a value that is not a bounded id-shaped token
+        #: (:func:`clean_organization_id`). A ``HEAD`` probe has no body to
+        #: read, so an ``sso_required`` refusal of one surfaces as a plain
+        #: ``forbidden`` with this left ``None``.
+        self.organization_id = organization_id
 
     def __str__(self) -> str:
         """``message``, plus the body excerpt whenever there is one.
@@ -221,6 +253,15 @@ class QueueFull(ApiError):
     code = "queue_full"
 
 
+class RateLimited(ApiError):
+    """The service is throttling the caller: usually a request allowance over a
+    time window is spent, but a v2 route also answers this while a service it
+    depends on is briefly unavailable. Unlike ``queue_full`` (a bounded queue
+    at depth) it is not about queue depth; wait out ``Retry-After`` and retry."""
+
+    code = "rate_limited"
+
+
 class InsufficientCredits(ApiError):
     code = "insufficient_credits"
 
@@ -248,12 +289,23 @@ _BY_CODE: dict[str, type[ApiError]] = {
         BlobNotFound,
         IdempotencyKeyReuse,
         QueueFull,
+        RateLimited,
         InsufficientCredits,
         NotFound,
         Unauthorized,
         Forbidden,
     )
 }
+# A second wire spelling for an existing class rather than a class of its own:
+# the events stream's terminal `error` frame says `credential_expired` where a
+# request would have been answered `401 unauthorized`, and the caller's action
+# is the same — re-authenticate. The code itself is kept on the instance.
+_BY_CODE["credential_expired"] = Unauthorized
+# The key is valid but the account must sign in through its organization's
+# SSO. A `Forbidden` so an auth `except` sees it; `code` stays `sso_required`
+# and `organization_id` names the org. Deliberately no class of its own: the
+# Router exception surface is one class per bucket, and this is not a bucket.
+_BY_CODE["sso_required"] = Forbidden
 
 
 def _clean(value: Any) -> str | None:
@@ -533,9 +585,10 @@ def error_from_envelope(
     # capped, instead of verbatim at whatever length it was sent.
     message = clean_body_excerpt((err or {}).get("message") if isinstance(err, dict) else None)
     details = (err or {}).get("details") if isinstance(err, dict) else None
+    raw_organization_id = (err or {}).get("organization_id") if isinstance(err, dict) else None
 
     # Read whether or not `code` already won: the bucket is how a caller tells
-    # a Router response from a v2 one, and on the three buckets both surfaces
+    # a Router response from a v2 one, and on the four buckets both surfaces
     # spell identically the code string cannot answer that. See
     # `ApiError.error_type`.
     bucket = _clean(error_type) or _clean(
@@ -596,6 +649,12 @@ def error_from_envelope(
     else:
         message = f"HTTP {http_status}"
 
+    # Gated on the code so the documented contract holds: `organization_id` is
+    # set only on an `sso_required` refusal. A caller that starts SSO whenever
+    # it is set must not be steered by the same field on an unrelated 404 or
+    # 429. Reduced to an id-shaped token, so a non-string, empty or malformed
+    # value reads as absent rather than reaching a URL.
+    organization_id = clean_organization_id(raw_organization_id) if code == "sso_required" else None
     cls = _BY_CODE.get(code, ApiError)
     return cls(
         message,
@@ -607,7 +666,45 @@ def error_from_envelope(
         body_excerpt=body_excerpt,
         error_type=bucket,
         validation_errors=validation_errors,
+        organization_id=organization_id,
     )
+
+
+#: The HTTP status each code the events stream's terminal ``error`` frame is
+#: documented to carry would have had as a response. A frame has no status of
+#: its own — it arrives inside a ``200`` stream — so this is what lets
+#: :attr:`ApiError.http_status` read the same on a frame as on a request.
+_SSE_ERROR_STATUS: dict[str, int] = {
+    "credential_expired": 401,
+    "forbidden": 403,
+    "job_not_found": 404,
+}
+
+
+def sse_error_from_frame(data: dict[str, Any]) -> ApiError | None:
+    """Build the typed exception for the events stream's terminal ``error`` frame.
+
+    The server ends a job's event stream with ``event: error`` and an error
+    envelope as its data when it stops streaming for a reason other than the
+    job finishing — the credential expired, access was withdrawn, or the job is
+    gone. No status frame follows, so this is the only account of why the
+    stream ended. The envelope is read exactly as a response body would be
+    (:func:`error_from_envelope`), with the status taken from
+    :data:`_SSE_ERROR_STATUS` and ``code`` kept verbatim.
+
+    Returns ``None`` for a frame whose code that table does not name, or that
+    carries no usable envelope at all. Such a frame is not known to mean the
+    job's stream is over for good — a later server may end a stream to drain or
+    to cap its lifetime — so the caller treats it as an ordinary end of stream
+    and falls back to its poll-and-reconnect path rather than raising a failure
+    it cannot type.
+    """
+    err = data.get("error")
+    code = _clean(err.get("code")) if isinstance(err, dict) else None
+    status = _SSE_ERROR_STATUS.get(code) if code is not None else None
+    if status is None:
+        return None
+    return error_from_envelope(status, data)
 
 
 #: The last resort: a code guessed from the status, consulted only when the

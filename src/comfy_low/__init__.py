@@ -6,9 +6,8 @@ Two parts:
   (do not hand-edit; regenerate with ``scripts/gen_models.sh``).
 * ``comfy_low.transport`` — a hand-written thin ``httpx`` transport (sync +
   async) with one function per ``operationId`` in ``spec/openapi.yaml``, plus
-  ``list_jobs`` for the v2 ``GET /jobs`` route that the vendored spec does not
-  carry yet, and the mandatory escape hatches (raw response, streaming bodies,
-  all headers, per-request timeout/abort).
+  the mandatory escape hatches (raw response, streaming bodies, all headers,
+  per-request timeout/abort).
 
 This layer is deliberately boring: no orchestration, retries, hashing, or SSE
 reconnection. Those live in ``comfy_sdk``.
@@ -28,9 +27,11 @@ from .errors import (
     MissingAsset,
     NotFound,
     QueueFull,
+    RateLimited,
     Unauthorized,
     WorkflowFormatUi,
     error_from_envelope,
+    sse_error_from_frame,
 )
 from .sse import RawEvent, SSEDecoder
 from .transport import AsyncComfyLow, BinaryResult, ComfyLow
@@ -46,8 +47,10 @@ OPERATION_IDS: frozenset[str] = frozenset(
         "deleteAsset",
         "getAssetContent",
         "postJobs",
+        "listJobs",
         "getJob",
         "getJobWorkflow",
+        "getJobLogs",
         "getJobEvents",
         "cancelJob",
     }
@@ -62,8 +65,10 @@ OPERATION_METHODS: dict[str, str] = {
     "deleteAsset": "delete_asset",
     "getAssetContent": "get_asset_content",
     "postJobs": "post_jobs",
+    "listJobs": "list_jobs",
     "getJob": "get_job",
     "getJobWorkflow": "get_job_workflow",
+    "getJobLogs": "get_job_logs",
     "getJobEvents": "get_job_events",
     "cancelJob": "cancel_job",
 }
@@ -83,11 +88,13 @@ __all__ = [
     "BlobNotFound",
     "IdempotencyKeyReuse",
     "QueueFull",
+    "RateLimited",
     "InsufficientCredits",
     "NotFound",
     "Unauthorized",
     "Forbidden",
     "error_from_envelope",
+    "sse_error_from_frame",
     "OPERATION_IDS",
     "OPERATION_METHODS",
 ]

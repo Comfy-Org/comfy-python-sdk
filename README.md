@@ -294,6 +294,11 @@ for event in job.events():          # SSE; live, auto-reconnecting (no replay)
 result = job.result()               # raises JobFailed with node details on failure
 ```
 
+A terminal `StatusChange` other than `succeeded` carries the job's `error` when
+the job has one: the stream frame itself holds only the status, so `events()`
+reads the job once and fills `error` from that read (left `None` if the read
+fails, or if the job has no error, as a canceled one usually has none).
+
 `job.events()` reconnects automatically if the stream drops, but never
 replays a frame you've already seen (the stream carries no cursor). That's
 why polling stays authoritative: `job.wait()` / `job.result()` (and
@@ -303,6 +308,14 @@ live UI feedback, and `wait()`/`result()`/`run()` for the definitive answer.
 `job.status` is the current status string; `job.outputs` is the full list of
 output handles regardless of which node produced them (`job.get_outputs(node_id)`
 filters to one node, as in the quickstart above).
+
+A stream the server *ends* is different from one that drops: when the server
+stops streaming for a reason other than the job finishing, it sends a terminal
+`error` event, and `events()` raises it rather than reconnecting —
+`Unauthorized` (with `code == "credential_expired"`) when the credential
+expired mid-stream, `Forbidden` when access was withdrawn, `NotFound` when the
+job is gone. An `error` event carrying any other code is treated like a dropped
+stream: `events()` polls the job and reconnects.
 
 ## Getting a job's workflow back
 
@@ -766,6 +779,30 @@ failed *and* a cancelled request as `COMPLETED` carrying an `error_type`, so
 back as a result. `iter_events` deliberately does not raise — it is a view of
 the queue's progress, and `get()` is the one that collects.
 
+When Router quotes the request's cost up front, the handle carries it as
+`handle.estimate`, a `CostEstimate`:
+
+```python
+if handle.estimate is not None:
+    if handle.estimate.is_exact or handle.estimate.is_free:
+        print(handle.estimate.amount)  # dollars as a decimal string, e.g. "0.04"; "0" if free
+    elif handle.estimate.is_estimated:
+        print(handle.estimate.min_amount, handle.estimate.max_amount)
+```
+
+`None` means **no quote is available, never "no charge"**: the estimate is not
+enabled for every caller, it is omitted when the submit was answered by an
+idempotent replay (the original quote is not stored), and a rehydrated handle
+never has one. When present, `source` (`exact` / `estimated` / `free` /
+`unknown`, and any other value read as `unknown`) says how much to trust the
+figure; a `free` quote's `amount` is `"0"`, and an `unknown` quote carries a
+`reason` instead. The quote is priced at Comfy's standard list price (or, for a
+model billed what its vendor reports, from the vendor's published price list),
+so `exact` means exact at list price — it does not reflect negotiated rates,
+and the settled charge in your workspace's usage and billing records is what you
+pay. It is not a price lock either: the run is charged at the rates in force
+when it is rated.
+
 Rehydrate a handle in another process from the two ids that address the
 request, with no call made:
 
@@ -1055,8 +1092,22 @@ asset, job, event, and output helpers translate protocol errors, so catches of
 - `QueueFull` — backpressure; carries `.retry_after` seconds. `client.submit`
   retries 429 responses with `Retry-After` for a bounded budget (including
   deployment warm-up), then raises the translated error if backpressure remains.
+- `RateLimited` — the service is throttling the caller (`rate_limited`, HTTP
+  429): usually the account's request allowance for a time window is spent,
+  but the v2 job routes also answer it while a service they depend on is
+  briefly unavailable, so do not read it as proof the allowance is used up.
+  `.retry_after` is the seconds to wait when the response sent a delta-seconds
+  `Retry-After`, and `None` otherwise (no header, or an HTTP-date); it is not
+  defaulted to `0` the way `QueueFull`'s is, so check it before sleeping on it.
+  Unlike `QueueFull` it is not about queue depth, and nothing the caller does
+  clears it early: wait out `Retry-After` and retry. Shared with the Router
+  surface, as `InsufficientCredits` is.
 - `JobFailed` — a job reached a non-`succeeded` terminal state; `.error`
-  carries node-level detail when the platform provided one.
+  carries node-level detail when the platform provided one, and
+  `.failure_category` is why the job failed as a `FailureCategory`
+  (`invalid_input`, `content_refused`, `out_of_gpu_memory`,
+  `missing_model_or_node`, `workflow_logic` or `other`), or `None` when the
+  error names none. `job.failure_category` reads the same off the handle.
 - A plain `ComfyError` whose `.code` reads `http_<status>` (`http_503`,
   `http_500`) — the response was answered by something in front of Router
   rather than by the service itself, so no service verdict was reached: no
@@ -1120,16 +1171,14 @@ for the whole set rather than half of it here and half of it there. A bucket add
 arrives as `RouterError` itself, with the raw value readable on `.error_type`.
 
 Four of those names — `Unauthorized`, `Forbidden`, `InsufficientCredits`,
-`RateLimited` — are also exported by `comfy_sdk.exceptions` (and the first three
-by `comfy_sdk` too). **They are the same
+`RateLimited` — are also exported by `comfy_sdk` and `comfy_sdk.exceptions`. **They are the same
 class**, re-exported, not a second one wearing the same name, so
 `except InsufficientCredits` catches the refusal whichever import you wrote. The
 consequence worth knowing is the other direction: because one class cannot
 descend from `RouterError` on one surface and not on the other, a *workflow*
-call that fails `401`/`403`/`402` raises a `RouterError` subclass too, and so
-does a jobs/assets call throttled with `429 rate_limited`, which raises
-`RateLimited` — so `except RouterError` is slightly wider than its name for
-exactly those four.
+call that fails `401`/`403`/`402`, or `429` with `rate_limited`, raises a
+`RouterError` subclass too, so `except RouterError` is slightly wider than its
+name for exactly those four.
 
 A `cancel()` the server declines raises `AlreadyCompleted` when the request had
 already finished — there was nothing left to stop, and the result is still

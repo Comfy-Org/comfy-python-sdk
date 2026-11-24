@@ -54,6 +54,7 @@ from .exceptions import (
     BlobNotFound,
     CancelRefused,
     ComfyError,
+    FailureCategory,
     Forbidden,
     HashMismatch,
     IdempotencyKeyReuse,
@@ -64,12 +65,19 @@ from .exceptions import (
     MissingAsset,
     NotFound,
     QueueFull,
+    RateLimited,
     RouterError,
     Unauthorized,
     WorkflowFormatUi,
 )
 from .jobs import AsyncJob, Job, JobSummary, JobWorkflow
-from .model_requests import COMPLETED, AsyncRequestHandle, QueueUpdate, RequestHandle
+from .model_requests import (
+    COMPLETED,
+    AsyncRequestHandle,
+    CostEstimate,
+    QueueUpdate,
+    RequestHandle,
+)
 from .models import BinaryResult
 from .outputs import AsyncOutput, DownloadUrl, Output
 from .retry import DEFAULT_RETRY, NO_RETRY, RetryPolicy
@@ -118,6 +126,7 @@ __all__ = [
     "RequestHandle",
     "AsyncRequestHandle",
     "QueueUpdate",
+    "CostEstimate",
     "COMPLETED",
     "Output",
     "AsyncOutput",
@@ -132,6 +141,7 @@ __all__ = [
     "Log",
     # exceptions
     "ComfyError",
+    "FailureCategory",
     "JobFailed",
     "QueueFull",
     "MissingAsset",
@@ -145,9 +155,13 @@ __all__ = [
     "MissingApiKey",
     "Unauthorized",
     "Forbidden",
+    "RateLimited",
     # Comfy Router failures. `RouterError` is the base of every one of them and
-    # is lifted here because it is the broad catch a caller writes first; the
-    # per-bucket classes stay in `comfy_sdk.router_exceptions`, which is one
+    # is lifted here because it is the broad catch a caller writes first. The
+    # four buckets both surfaces spell alike (`InsufficientCredits`,
+    # `Unauthorized`, `Forbidden`, `RateLimited`) are lifted above as workflow
+    # errors that are also `RouterError`s; the Router-only per-bucket classes
+    # stay in `comfy_sdk.router_exceptions`, which is one
     # import path for the whole closed set rather than half of it here and half
     # of it there. `AlreadyCompleted` / `CancelRefused` are the cancel route's
     # refusals, which that closed set does not name.

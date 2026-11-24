@@ -83,6 +83,7 @@ from .model_requests import (
     QueueUpdate,
     RequestHandle,
     _completed,
+    _estimate_of,
     _remaining,
     _request_id_of,
 )
@@ -773,6 +774,12 @@ class Models(_ModelsBase):
         ``queue_backlog_full``
         (:class:`~comfy_sdk.router_exceptions.QueueBacklogFull`), which clears
         as its own queued requests finish.
+
+        When Router quotes the request's cost up front it arrives on the
+        handle as :attr:`~comfy_sdk.model_requests.RequestHandle.estimate`, a
+        :class:`~comfy_sdk.model_requests.CostEstimate`. ``None`` there means
+        no quote is available — the estimate is off for the caller, or the
+        submit was answered by an idempotent replay — and never "no charge".
         """
         low = cast(ComfyLow, self._low)
         key = (
@@ -797,7 +804,8 @@ class Models(_ModelsBase):
                         raise
                     time.sleep(delay)
             request_id = _request_id_of(body)
-        return RequestHandle(low, model, request_id, self._retry)
+            estimate = _estimate_of(body)
+        return RequestHandle(low, model, request_id, self._retry, estimate=estimate)
 
     def subscribe(
         self,
@@ -1111,7 +1119,8 @@ class AsyncModels(_ModelsBase):
                         raise
                     await asyncio.sleep(delay)
             request_id = _request_id_of(body)
-        return AsyncRequestHandle(low, model, request_id, self._retry)
+            estimate = _estimate_of(body)
+        return AsyncRequestHandle(low, model, request_id, self._retry, estimate=estimate)
 
     async def subscribe(
         self,
