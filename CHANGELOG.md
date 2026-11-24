@@ -12,11 +12,6 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
-- `RateLimited` is exported from `comfy_sdk` and `comfy_sdk.exceptions` as a fourth bucket shared
-  with the Router surface, beside `Unauthorized`, `Forbidden` and `InsufficientCredits`. It is the
-  same class as `comfy_sdk.router_exceptions.RateLimited`, and a v2 job route's `rate_limited`
-  envelope now maps to it explicitly; it carries `.retry_after`. The low layer gains
-  `comfy_low.errors.RateLimited` (also on `comfy_low`) for the same code.
 - `sso_required` (403) now raises `Forbidden` (code preserved) and carries `organization_id`, the
   organization to start SSO with. `organization_id` is a new attribute on `ComfyError` and on
   `comfy_low.ApiError`, `None` on every other code and when the server does not name the
