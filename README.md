@@ -779,6 +779,30 @@ failed *and* a cancelled request as `COMPLETED` carrying an `error_type`, so
 back as a result. `iter_events` deliberately does not raise — it is a view of
 the queue's progress, and `get()` is the one that collects.
 
+When Router quotes the request's cost up front, the handle carries it as
+`handle.estimate`, a `CostEstimate`:
+
+```python
+if handle.estimate is not None:
+    if handle.estimate.is_exact or handle.estimate.is_free:
+        print(handle.estimate.amount)  # dollars as a decimal string, e.g. "0.04"; "0" if free
+    elif handle.estimate.is_estimated:
+        print(handle.estimate.min_amount, handle.estimate.max_amount)
+```
+
+`None` means **no quote is available, never "no charge"**: the estimate is not
+enabled for every caller, it is omitted when the submit was answered by an
+idempotent replay (the original quote is not stored), and a rehydrated handle
+never has one. When present, `source` (`exact` / `estimated` / `free` /
+`unknown`, and any other value read as `unknown`) says how much to trust the
+figure; a `free` quote's `amount` is `"0"`, and an `unknown` quote carries a
+`reason` instead. The quote is priced at Comfy's standard list price (or, for a
+model billed what its vendor reports, from the vendor's published price list),
+so `exact` means exact at list price — it does not reflect negotiated rates,
+and the settled charge in your workspace's usage and billing records is what you
+pay. It is not a price lock either: the run is charged at the rates in force
+when it is rated.
+
 Rehydrate a handle in another process from the two ids that address the
 request, with no call made:
 
