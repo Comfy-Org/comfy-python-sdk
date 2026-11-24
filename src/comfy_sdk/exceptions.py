@@ -176,6 +176,10 @@ _BY_CODE: dict[str, type[ComfyError]] = {
     "job_not_found": NotFound,
     "asset_not_found": NotFound,
     "unauthorized": Unauthorized,
+    # The events stream's terminal `error` frame spells an expired credential
+    # this way; the caller's remedy is the `unauthorized` one, so it is the same
+    # class, with `.code` left as the wire said it.
+    "credential_expired": Unauthorized,
     "forbidden": Forbidden,
     # The key is valid but the account must sign in through its organization's
     # SSO. A `Forbidden` so an auth `except` sees it; `code` stays

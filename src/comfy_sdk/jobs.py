@@ -20,7 +20,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import TypeAdapter, ValidationError
 
-from comfy_low.errors import ApiError
+from comfy_low.errors import ApiError, sse_error_from_frame
 from comfy_low.models import Job as LowJob
 from comfy_low.models import Output as LowOutput
 from comfy_low.transport import AsyncComfyLow, ComfyLow, job_labels
@@ -283,6 +283,15 @@ class Job:
         A surface without SSE (501 from the events endpoint — contract-legal)
         ends the iteration silently: streaming is an enhancement over the
         poll-authoritative ``wait``/``result``, never a requirement.
+
+        A terminal ``error`` frame — the server ending the stream because the
+        credential expired, access was withdrawn, or the job is gone — raises
+        the matching SDK exception (:class:`~comfy_sdk.exceptions.Unauthorized`
+        with ``code == "credential_expired"``,
+        :class:`~comfy_sdk.exceptions.Forbidden`, or
+        :class:`~comfy_sdk.exceptions.NotFound`) instead of reconnecting. An
+        ``error`` frame with any other code, or no readable one, is treated as
+        the stream ending early: the polling fallback above takes over.
         """
         events_url = self._model.urls.events or self._model.id
         backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
@@ -294,6 +303,15 @@ class Job:
                 # a connection, and a client limited to one would wait on this one.
                 with closing(self._low.get_job_events(events_url)) as stream:
                     for raw in stream:
+                        if raw.event == "error":
+                            # Terminal frame: the server is ending the stream for a
+                            # reason other than the job finishing. No status follows
+                            # it — surface it, never reconnect. A code it does not
+                            # know is left to the poll-and-reconnect path below.
+                            frame_error = sse_error_from_frame(raw.data)
+                            if frame_error is not None:
+                                raise frame_error
+                            continue
                         ev = event_from_raw(raw, self._bind_output)
                         if ev is None:
                             continue
@@ -424,7 +442,10 @@ class AsyncJob:
 
     async def events(self) -> AsyncIterator[Event]:
         """Async :meth:`Job.events` — typed live stream, auto-reconnecting with
-        no replay and the poll path as its backstop.
+        no replay and the poll path as its backstop. A 501 ends it silently; a
+        terminal ``error`` frame with a known code raises the matching SDK
+        exception instead of reconnecting, and any other one falls back to the
+        poll path.
         """
         import asyncio
 
@@ -436,6 +457,15 @@ class AsyncJob:
             try:
                 async with aclosing(self._low.get_job_events(events_url)) as stream:
                     async for raw in stream:
+                        if raw.event == "error":
+                            # Terminal frame: the server is ending the stream for a
+                            # reason other than the job finishing. No status follows
+                            # it — surface it, never reconnect. A code it does not
+                            # know is left to the poll-and-reconnect path below.
+                            frame_error = sse_error_from_frame(raw.data)
+                            if frame_error is not None:
+                                raise frame_error
+                            continue
                         ev = event_from_raw(raw, self._bind_output)
                         if ev is None:
                             continue
