@@ -89,6 +89,10 @@ _MAX_PACE = 60
 #: transport failure rather than an answer.
 _MIN_HTTP_TIMEOUT = 1.0
 
+#: "No HTTP timeout of its own: use the client's." Distinct from ``None``, which
+#: is a caller's explicit "no limit" and has to reach the request as that.
+_INHERIT_TIMEOUT: Any = object()
+
 #: HTTP timeout, in seconds, for the best-effort cleanup cancel ``subscribe``
 #: issues after its own timeout -- see ``RequestHandle._cancel_best_effort``.
 _CANCEL_TIMEOUT = 10.0
@@ -582,17 +586,16 @@ def _bounded(policy: RetryPolicy, budget: float | None) -> RetryPolicy:
     )
 
 
-def _http_timeout(
-    budget: float | None, fallback: float | httpx.Timeout | None = None
-) -> dict[str, Any]:
+def _http_timeout(budget: float | None, fallback: Any = _INHERIT_TIMEOUT) -> dict[str, Any]:
     """Keyword arguments bounding one low-level call's HTTP timeout by ``budget``.
 
-    With no budget, ``fallback`` applies when there is one and the client's own
-    timeout otherwise. Floored at :data:`_MIN_HTTP_TIMEOUT` for the reason
-    given there.
+    With no budget, ``fallback`` applies -- ``None`` included, which is an
+    explicit "no limit" -- unless it is :data:`_INHERIT_TIMEOUT`, when the
+    client's own timeout does. A budget is floored at
+    :data:`_MIN_HTTP_TIMEOUT` for the reason given there.
     """
     if budget is None:
-        return {} if fallback is None else {"timeout": fallback}
+        return {} if fallback is _INHERIT_TIMEOUT else {"timeout": fallback}
     return {"timeout": max(budget, _MIN_HTTP_TIMEOUT)}
 
 
@@ -604,11 +607,12 @@ class _RequestHandleBase:
     _retry: RetryPolicy
     _estimate: CostEstimate | None
     #: The per-request HTTP timeout a poll or result fetch uses when it has no
-    #: budget of its own. ``None`` -- every handle a caller builds -- is the
-    #: client's timeout; ``models.run`` following a ``202`` handoff sets the
-    #: run's own ``timeout`` here, so the limits it was called with keep
-    #: bounding each read rather than falling back to an unlimited client.
-    _request_timeout: float | httpx.Timeout | None = None
+    #: budget of its own. :data:`_INHERIT_TIMEOUT` -- every handle a caller
+    #: builds -- is the client's timeout; ``models.run`` following a ``202``
+    #: handoff sets the run's own ``timeout`` here (``None``, no limit,
+    #: included), so each read keeps the limits the run was called with rather
+    #: than falling back to the client's.
+    _request_timeout: Any = _INHERIT_TIMEOUT
 
     @property
     def model(self) -> str:

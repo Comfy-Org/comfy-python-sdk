@@ -364,6 +364,7 @@ class ServerState:
     # Seconds a status poll holds the connection before answering — a stalled
     # read, so a test can tell whether the poll carried an HTTP timeout.
     queue_status_delay: float = 0.0
+    queue_result_delay: float = 0.0
     queue_status_transient_error: tuple[int, str] = (429, "rate_limited")
     # Retry-After sent alongside a transient status failure.
     queue_status_transient_retry_after: str | None = "1"
@@ -1054,6 +1055,8 @@ def _make_handler(state: ServerState):
 
         def _serve_queue_result(self, request_id: str) -> None:
             state.queue_result_count += 1
+            if state.queue_result_delay:
+                threading.Event().wait(state.queue_result_delay)
             state.queue_paths.append(self.path)
             if state.queue_result_binary_body is not None:
                 self._raw(

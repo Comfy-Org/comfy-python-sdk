@@ -567,7 +567,8 @@ take the same keyword.
 
 It is off by default: without it no `Prefer` header is sent and nothing changes.
 On the handed-off path `timeout` bounds the run request and each status and
-result read (an `httpx.Timeout` keeps its limits on every one), not the wait,
+result read (an `httpx.Timeout` keeps its limits on every one, and `None` means
+no limit on any of them, whatever the client's own timeout is), not the wait,
 which lasts until the queue says the run is done — use `models.subscribe` if
 you want a client-side bound on the whole wait. The `Idempotency-Key` is sent either way,
 and a resend under the same key — with or without the flag — collects the

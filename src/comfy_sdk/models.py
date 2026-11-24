@@ -637,7 +637,8 @@ class Models(_ModelsBase):
         polls included, raising ``TimeoutError`` without cancelling. On either
         path each status and result read keeps the ``timeout`` the run was
         called with as its HTTP timeout, so an ``httpx.Timeout`` passed here
-        bounds every request rather than only the first, and that
+        bounds every request rather than only the first and ``None`` limits
+        none of them, whatever the client's own timeout is, and that
         ``TimeoutError`` carries ``idempotency_key``, ``request_id`` and
         ``retry_after`` like every other failure of the call. A ``202``
         with neither is not a contract this SDK knows and raises
@@ -853,8 +854,8 @@ class Models(_ModelsBase):
             # still raises carrying the key, and resending under it collects
             # this same handed-off generation.
             handle = RequestHandle(low, model, _handoff_request_id(body, headers), self._retry)
-            # Each read keeps the HTTP limits the run was called with; the
-            # client's own may be unlimited.
+            # Each read keeps the HTTP limits the run was called with (`None`
+            # is no limit); the client's own may be looser or tighter.
             handle._request_timeout = timeout
             wait = _handoff_wait(respond_async, timeout, started)
             deadline = None if wait is None else _now() + wait

@@ -30,6 +30,7 @@ from comfy_low.transport import RunHandoff, _Prepared, model_run_request
 from comfy_sdk import AsyncComfy, BinaryResult, Comfy
 from comfy_sdk.exceptions import ComfyError
 from comfy_sdk.models import RouterRunResult, _preference_applied
+from comfy_sdk.retry import NO_RETRY
 from comfy_sdk.router_exceptions import ContentPolicyViolation
 
 MODEL = "acme/flux-dev"
@@ -344,6 +345,62 @@ async def test_async_followed_handoff_polls_keep_an_explicit_httpx_timeout(serve
     async with AsyncComfy(api_key="comfyui-test-key", timeout=None) as client:
         with pytest.raises(httpx.TimeoutException):
             await client.models.run(MODEL, ARGS, idempotency_key=key, timeout=httpx.Timeout(0.3))
+
+
+@pytest.mark.parametrize("slow_read", ["queue_status_delay", "queue_result_delay"])
+@pytest.mark.parametrize("opted_in", [True, False])
+def test_followed_handoff_reads_keep_an_explicit_none_timeout(
+    server, fast_poll, slow_read, opted_in
+):
+    # `timeout=None` on the run is "no limit", not "unset": a read slower than
+    # the client's own timeout must still be waited for.
+    server.state.model_run_handoff = True
+    setattr(server.state, slow_read, 0.8)
+    key = "none-timeout-resend-key-0001"
+    if not opted_in:
+        server.state.model_run_handoff_keys.add(key)
+    with Comfy(api_key="comfyui-test-key", timeout=0.3, retry=NO_RETRY) as client:
+        result = client.models.run(
+            MODEL, ARGS, idempotency_key=key, respond_async=opted_in, timeout=None
+        )
+    assert result == server.state.queue_result
+
+
+@pytest.mark.parametrize("slow_read", ["queue_status_delay", "queue_result_delay"])
+@pytest.mark.parametrize("opted_in", [True, False])
+async def test_async_followed_handoff_reads_keep_an_explicit_none_timeout(
+    server, fast_poll, slow_read, opted_in
+):
+    server.state.model_run_handoff = True
+    setattr(server.state, slow_read, 0.8)
+    key = "none-timeout-resend-key-0002"
+    if not opted_in:
+        server.state.model_run_handoff_keys.add(key)
+    async with AsyncComfy(api_key="comfyui-test-key", timeout=0.3, retry=NO_RETRY) as client:
+        result = await client.models.run(
+            MODEL, ARGS, idempotency_key=key, respond_async=opted_in, timeout=None
+        )
+    assert result == server.state.queue_result
+
+
+@pytest.mark.parametrize("slow_read", ["queue_status_delay", "queue_result_delay"])
+def test_ordinary_handle_reads_still_inherit_the_client_timeout(server, fast_poll, slow_read):
+    setattr(server.state, slow_read, 0.8)
+    with Comfy(api_key="comfyui-test-key", timeout=0.3, retry=NO_RETRY) as client:
+        handle = client.models.handle(MODEL, server.state.queue_request_id)
+        with pytest.raises(httpx.TimeoutException):
+            handle.get()
+
+
+@pytest.mark.parametrize("slow_read", ["queue_status_delay", "queue_result_delay"])
+async def test_async_ordinary_handle_reads_still_inherit_the_client_timeout(
+    server, fast_poll, slow_read
+):
+    setattr(server.state, slow_read, 0.8)
+    async with AsyncComfy(api_key="comfyui-test-key", timeout=0.3, retry=NO_RETRY) as client:
+        handle = await client.models.handle(MODEL, server.state.queue_request_id)
+        with pytest.raises(httpx.TimeoutException):
+            await handle.get()
 
 
 async def test_async_mixed_resend_under_one_key_starts_one_generation(server, fast_poll):
