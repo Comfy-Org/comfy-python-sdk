@@ -39,10 +39,6 @@ the fuller account of each version, including verification notes.
 
 ### Fixed
 
-- `job.events()` / async `events()` now raise a typed error when the server ends the stream
-  with a terminal `error` event naming `credential_expired` (`Unauthorized`), `forbidden`
-  (`Forbidden`) or `job_not_found` (`NotFound`), instead of silently reconnecting. An `error`
-  event with any other code, or no readable one, still falls back to polling and reconnecting.
 - **`Job.events()` / `AsyncJob.events()` no longer reconnect every 0.1 s against a stream that
   keeps dropping.** When a connection ended with no terminal frame (a clean close or a dropped
   connection) and the job was still running, the loop paused a flat 0.1 s before polling and
