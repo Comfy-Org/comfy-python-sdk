@@ -296,6 +296,20 @@ def _handoff_wait(
     return max(0.0, started + timeout - _now())
 
 
+def _handoff_timed_out(exc: TimeoutError, key: str, accepted: Mapping[str, str]) -> TimeoutError:
+    """``exc``, stamped with what resending under ``key`` needs, as every run failure is.
+
+    The poll's ``TimeoutError`` is a builtin and so outside what
+    :func:`~comfy_sdk.exceptions.translating` stamps; without this a caller
+    following the documented recovery -- read ``exc.idempotency_key`` and
+    resend -- would hit ``AttributeError`` instead. ``request_id`` is the
+    ``202``'s, the run request that started (and was billed for) the generation.
+    """
+    if not hasattr(exc, "request_id"):
+        exc.request_id = accepted.get("X-Comfy-Request-Id")  # type: ignore[attr-defined]
+    return _stamp(exc, key)
+
+
 class _ModelsBase:
     """Read-only view of the configuration inherited from the host client."""
 
@@ -620,7 +634,12 @@ class Models(_ModelsBase):
         ``Idempotent-Replayed`` is therefore followed even on a call that did
         not ask, because it is the answer to a request under this key that
         did; on such a call a numeric ``timeout`` still bounds the whole call,
-        polls included, raising ``TimeoutError`` without cancelling. A ``202``
+        polls included, raising ``TimeoutError`` without cancelling. On either
+        path each status and result read keeps the ``timeout`` the run was
+        called with as its HTTP timeout, so an ``httpx.Timeout`` passed here
+        bounds every request rather than only the first, and that
+        ``TimeoutError`` carries ``idempotency_key``, ``request_id`` and
+        ``retry_after`` like every other failure of the call. A ``202``
         with neither is not a contract this SDK knows and raises
         :class:`~comfy_sdk.ComfyError` (``code="invalid_response"``) carrying
         the key and the body on ``details["handle"]``, rather than being
@@ -834,12 +853,19 @@ class Models(_ModelsBase):
             # still raises carrying the key, and resending under it collects
             # this same handed-off generation.
             handle = RequestHandle(low, model, _handoff_request_id(body, headers), self._retry)
+            # Each read keeps the HTTP limits the run was called with; the
+            # client's own may be unlimited.
+            handle._request_timeout = timeout
             wait = _handoff_wait(respond_async, timeout, started)
             deadline = None if wait is None else _now() + wait
-            completion = _last(handle.iter_events(timeout=wait))
-            output, collected = handle._collect_with_headers(
-                completion, budget=_remaining(deadline)
-            )
+            try:
+                completion = _last(handle.iter_events(timeout=wait))
+                output, collected = handle._collect_with_headers(
+                    completion, budget=_remaining(deadline)
+                )
+            except TimeoutError as exc:
+                _handoff_timed_out(exc, key, headers)
+                raise
             return output, _handoff_headers(headers, collected), True
 
     # -- the queued form: submit, hold a handle, collect ------------------
@@ -1252,14 +1278,19 @@ class AsyncModels(_ModelsBase):
                 return body, headers, False
             # Followed inside `translating` — see :meth:`Models._run`.
             handle = AsyncRequestHandle(low, model, _handoff_request_id(body, headers), self._retry)
+            handle._request_timeout = timeout
             wait = _handoff_wait(respond_async, timeout, started)
             deadline = None if wait is None else _now() + wait
             completion: QueueUpdate | None = None
-            async for update in handle.iter_events(timeout=wait):
-                completion = update
-            output, collected = await handle._collect_with_headers(
-                _completed(completion), budget=_remaining(deadline)
-            )
+            try:
+                async for update in handle.iter_events(timeout=wait):
+                    completion = update
+                output, collected = await handle._collect_with_headers(
+                    _completed(completion), budget=_remaining(deadline)
+                )
+            except TimeoutError as exc:
+                _handoff_timed_out(exc, key, headers)
+                raise
             return output, _handoff_headers(headers, collected), True
 
     # -- the queued form: submit, hold a handle, collect ------------------

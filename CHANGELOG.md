@@ -19,7 +19,9 @@ the fuller account of each version, including verification notes.
   `run` returns for a `200`; a `200` is returned as always; a `202` with neither
   `Preference-Applied` nor `Idempotent-Replayed` raises `ComfyError` (`code="invalid_response"`)
   carrying the key and the `202` body. A handoff followed on a call that did not opt in stays
-  bounded by its `timeout`. `RouterRunResult` gains `handed_off`, under which a missing
+  bounded by its `timeout`, and its `TimeoutError` carries `idempotency_key` / `request_id` /
+  `retry_after`; each poll and result read keeps the run's `timeout` (an `httpx.Timeout`
+  included) as its HTTP timeout. `RouterRunResult` gains `handed_off`, under which a missing
   provider disclosure means "not disclosed". Off by default: the default call sends no `Prefer`
   header. `comfy_low`'s `post_model_run` gains the same keyword and now
   returns a `RunHandoff` (newly exported) for a `202`.

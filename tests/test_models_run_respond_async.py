@@ -295,6 +295,57 @@ async def test_async_followed_handoff_without_opt_in_keeps_the_timeout(server, f
             await client.models.run(MODEL, ARGS, idempotency_key=key, timeout=0.3)
 
 
+def test_followed_handoff_timeout_carries_the_resend_contract(server, fast_poll):
+    # The poll's TimeoutError answers the same recovery attributes every other
+    # failure of the call does, so a caller can resend under the key.
+    server.state.model_run_handoff = True
+    server.state.model_run_request_id = "req_run_timeout_01"
+    server.state.queue_polls_to_complete = 10**9
+    key = "bounded-resend-key-0003"
+    server.state.model_run_handoff_keys.add(key)
+    with _client() as client, pytest.raises(TimeoutError) as caught:
+        client.models.run(MODEL, ARGS, idempotency_key=key, timeout=0.3)
+    assert caught.value.idempotency_key == key  # type: ignore[attr-defined]
+    assert caught.value.request_id == "req_run_timeout_01"  # type: ignore[attr-defined]
+    assert caught.value.retry_after is None  # type: ignore[attr-defined]
+
+
+async def test_async_followed_handoff_timeout_carries_the_resend_contract(server, fast_poll):
+    server.state.model_run_handoff = True
+    server.state.queue_polls_to_complete = 10**9
+    key = "bounded-resend-key-0004"
+    server.state.model_run_handoff_keys.add(key)
+    async with _async_client() as client:
+        with pytest.raises(TimeoutError) as caught:
+            await client.models.run(MODEL, ARGS, idempotency_key=key, timeout=0.3)
+    assert caught.value.idempotency_key == key  # type: ignore[attr-defined]
+    assert hasattr(caught.value, "request_id")
+    assert caught.value.retry_after is None  # type: ignore[attr-defined]
+
+
+def test_followed_handoff_polls_keep_an_explicit_httpx_timeout(server, fast_poll):
+    # An unlimited client and a run given httpx.Timeout limits: a stalled
+    # status read must be cut off by those limits, not wait forever.
+    server.state.model_run_handoff = True
+    server.state.queue_status_delay = 2.0
+    key = "httpx-timeout-resend-key-0001"
+    server.state.model_run_handoff_keys.add(key)
+    with Comfy(api_key="comfyui-test-key", timeout=None) as client:
+        with pytest.raises(httpx.TimeoutException) as caught:
+            client.models.run(MODEL, ARGS, idempotency_key=key, timeout=httpx.Timeout(0.3))
+    assert caught.value.idempotency_key == key  # type: ignore[attr-defined]
+
+
+async def test_async_followed_handoff_polls_keep_an_explicit_httpx_timeout(server, fast_poll):
+    server.state.model_run_handoff = True
+    server.state.queue_status_delay = 2.0
+    key = "httpx-timeout-resend-key-0002"
+    server.state.model_run_handoff_keys.add(key)
+    async with AsyncComfy(api_key="comfyui-test-key", timeout=None) as client:
+        with pytest.raises(httpx.TimeoutException):
+            await client.models.run(MODEL, ARGS, idempotency_key=key, timeout=httpx.Timeout(0.3))
+
+
 async def test_async_mixed_resend_under_one_key_starts_one_generation(server, fast_poll):
     server.state.model_run_handoff = True
     key = "mixed-resend-key-0002"

@@ -582,14 +582,17 @@ def _bounded(policy: RetryPolicy, budget: float | None) -> RetryPolicy:
     )
 
 
-def _http_timeout(budget: float | None) -> dict[str, Any]:
+def _http_timeout(
+    budget: float | None, fallback: float | httpx.Timeout | None = None
+) -> dict[str, Any]:
     """Keyword arguments bounding one low-level call's HTTP timeout by ``budget``.
 
-    Empty when there is no budget, so the client's own timeout applies. Floored
-    at :data:`_MIN_HTTP_TIMEOUT` for the reason given there.
+    With no budget, ``fallback`` applies when there is one and the client's own
+    timeout otherwise. Floored at :data:`_MIN_HTTP_TIMEOUT` for the reason
+    given there.
     """
     if budget is None:
-        return {}
+        return {} if fallback is None else {"timeout": fallback}
     return {"timeout": max(budget, _MIN_HTTP_TIMEOUT)}
 
 
@@ -600,6 +603,12 @@ class _RequestHandleBase:
     _request_id: str
     _retry: RetryPolicy
     _estimate: CostEstimate | None
+    #: The per-request HTTP timeout a poll or result fetch uses when it has no
+    #: budget of its own. ``None`` -- every handle a caller builds -- is the
+    #: client's timeout; ``models.run`` following a ``202`` handoff sets the
+    #: run's own ``timeout`` here, so the limits it was called with keep
+    #: bounding each read rather than falling back to an unlimited client.
+    _request_timeout: float | httpx.Timeout | None = None
 
     @property
     def model(self) -> str:
@@ -690,7 +699,7 @@ class RequestHandle(_RequestHandleBase):
         with translating():
             payload, headers = self._call(
                 lambda: self._low.get_model_request_status(
-                    self._model, self._request_id, **_http_timeout(budget)
+                    self._model, self._request_id, **_http_timeout(budget, self._request_timeout)
                 ),
                 budget=budget,
             )
@@ -801,7 +810,7 @@ class RequestHandle(_RequestHandleBase):
         with translating():
             payload, headers = self._call(
                 lambda: self._low.get_model_request_result(
-                    self._model, self._request_id, **_http_timeout(budget)
+                    self._model, self._request_id, **_http_timeout(budget, self._request_timeout)
                 ),
                 budget=budget,
             )
@@ -902,7 +911,7 @@ class AsyncRequestHandle(_RequestHandleBase):
         with translating():
             payload, headers = await self._call(
                 lambda: self._low.get_model_request_status(
-                    self._model, self._request_id, **_http_timeout(budget)
+                    self._model, self._request_id, **_http_timeout(budget, self._request_timeout)
                 ),
                 budget=budget,
             )
@@ -951,7 +960,7 @@ class AsyncRequestHandle(_RequestHandleBase):
         with translating():
             payload, headers = await self._call(
                 lambda: self._low.get_model_request_result(
-                    self._model, self._request_id, **_http_timeout(budget)
+                    self._model, self._request_id, **_http_timeout(budget, self._request_timeout)
                 ),
                 budget=budget,
             )

@@ -566,13 +566,15 @@ the flag is safe to pass for any model. `run_detailed` and the async client
 take the same keyword.
 
 It is off by default: without it no `Prefer` header is sent and nothing changes.
-On the handed-off path `timeout` bounds the run request, not the wait, which
-lasts until the queue says the run is done — use `models.subscribe` if you want
-a client-side bound on the whole wait. The `Idempotency-Key` is sent either way,
+On the handed-off path `timeout` bounds the run request and each status and
+result read (an `httpx.Timeout` keeps its limits on every one), not the wait,
+which lasts until the queue says the run is done — use `models.subscribe` if
+you want a client-side bound on the whole wait. The `Idempotency-Key` is sent either way,
 and a resend under the same key — with or without the flag — collects the
 generation the first request started rather than starting another; a resend
 *without* the flag that is answered with the handoff is still bounded by its
-`timeout`, raising `TimeoutError` without cancelling the run. A `202` that
+`timeout`, raising `TimeoutError` without cancelling the run — stamped with
+the `idempotency_key`, `request_id` and `retry_after` a resend reads. A `202` that
 carries neither `Preference-Applied` nor `Idempotent-Replayed` is never returned
 as output: it raises `ComfyError` (`code="invalid_response"`) carrying the key,
 the response's request id and, on `details["handle"]`, the body — so a queue

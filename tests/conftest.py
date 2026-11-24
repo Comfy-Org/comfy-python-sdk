@@ -361,6 +361,9 @@ class ServerState:
     # (status, code) each of those answers with. Checked *before*
     # `queue_status_error`, exactly as `model_run_fail_times` is.
     queue_status_fail_times: int = 0
+    # Seconds a status poll holds the connection before answering — a stalled
+    # read, so a test can tell whether the poll carried an HTTP timeout.
+    queue_status_delay: float = 0.0
     queue_status_transient_error: tuple[int, str] = (429, "rate_limited")
     # Retry-After sent alongside a transient status failure.
     queue_status_transient_retry_after: str | None = "1"
@@ -1008,6 +1011,9 @@ def _make_handler(state: ServerState):
         def _serve_queue_status(self, request_id: str) -> None:
             state.queue_status_count += 1
             state.queue_paths.append(self.path)
+            if state.queue_status_delay:
+                # Event.wait, not time.sleep: tests fake out time.sleep.
+                threading.Event().wait(state.queue_status_delay)
             if state.queue_status_fail_times > 0:
                 state.queue_status_fail_times -= 1
                 status, code = state.queue_status_transient_error
