@@ -166,6 +166,17 @@ def test_run_detailed_follows_the_handoff(server, fast_poll):
     assert detailed.serving_provider is None
 
 
+def test_run_detailed_handoff_without_run_request_id_reports_none(server, fast_poll):
+    server.state.model_run_handoff = True
+    # The 202 names no id; the result fetch's must not stand in for the run's.
+    server.state.model_run_request_id = None
+    server.state.queue_result_request_id = "req_result_02"
+    with _client() as client:
+        detailed = client.models.run_detailed(MODEL, ARGS, respond_async=True)
+    assert detailed.handed_off is True
+    assert detailed.request_id is None
+
+
 def test_run_detailed_without_handoff_is_not_handed_off(server):
     server.state.model_run_handoff = True
     with _client() as client:

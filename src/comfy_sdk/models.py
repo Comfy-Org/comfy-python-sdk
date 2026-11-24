@@ -266,13 +266,17 @@ def _handoff_headers(accepted: Mapping[str, str], collected: Mapping[str, str]) 
     request's own and are kept from the ``202``: ``Idempotent-Replayed`` --
     it is the run request that was replayed -- and ``X-Comfy-Request-Id``,
     the id of the request that started (and was billed for) the generation,
-    which is the one to quote in a support request.
+    which is the one to quote in a support request. Their absence is kept
+    too: a ``202`` that named no request id reports none, rather than the
+    result fetch's id passed off as the run's.
     """
     merged = httpx.Headers(accepted)
     merged.update(collected)
     for name in ("Idempotent-Replayed", "X-Comfy-Request-Id"):
         if name in accepted:
             merged[name] = accepted[name]
+        elif name in merged:
+            del merged[name]
     return merged
 
 
