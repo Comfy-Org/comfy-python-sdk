@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
+from enum import Enum
 from typing import Any, TypeVar
 
 import httpx
@@ -99,6 +100,36 @@ class QueueFull(ComfyError):
         self.retry_after = retry_after
 
 
+class FailureCategory(str, Enum):
+    """Why a job failed, for a failure the platform attributed to the caller.
+
+    Branch on this instead of parsing the error ``message``, whose wording may
+    change. A value the server adds later reads as :attr:`OTHER`; the raw string
+    stays on ``error.category``.
+    """
+
+    INVALID_INPUT = "invalid_input"
+    CONTENT_REFUSED = "content_refused"
+    OUT_OF_GPU_MEMORY = "out_of_gpu_memory"
+    MISSING_MODEL_OR_NODE = "missing_model_or_node"
+    WORKFLOW_LOGIC = "workflow_logic"
+    OTHER = "other"
+
+
+def category_of(error: JobError | None) -> FailureCategory | None:
+    """The error's :class:`FailureCategory`, or ``None`` when it names none.
+
+    A job that did not fail, a platform failure and a job from before categories
+    existed carry no category.
+    """
+    if error is None or error.category is None:
+        return None
+    try:
+        return FailureCategory(error.category)
+    except ValueError:
+        return FailureCategory.OTHER
+
+
 class JobFailed(ComfyError):
     """A job reached a non-success terminal state.
 
@@ -109,6 +140,11 @@ class JobFailed(ComfyError):
     def __init__(self, message: str, *, error: JobError | None = None) -> None:
         super().__init__(message, code=(error.code if error else "job_failed"))
         self.error = error
+
+    @property
+    def failure_category(self) -> FailureCategory | None:
+        """Why the job failed, or ``None`` when the error names no category."""
+        return category_of(self.error)
 
 
 #: Wire ``code`` -> the class this SDK raises for it. Only the codes the v2
@@ -141,6 +177,12 @@ _BY_CODE: dict[str, type[ComfyError]] = {
     "asset_not_found": NotFound,
     "unauthorized": Unauthorized,
     "forbidden": Forbidden,
+    # The key is valid but the account must sign in through its organization's
+    # SSO. A `Forbidden` so an auth `except` sees it; `code` stays
+    # `sso_required` and `organization_id` names the org. No class of its own:
+    # `Forbidden` is a Router bucket class and that surface is one class per
+    # bucket, which `sso_required` is not.
+    "sso_required": Forbidden,
 }
 
 
@@ -208,6 +250,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
             http_status=exc.http_status,
             details=exc.details,
             request_id=exc.request_id,
+            organization_id=exc.organization_id,
         )
     cls = _class_for(exc)
     if issubclass(cls, RouterError):
@@ -225,14 +268,23 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
         # response carried the array. `_detail_from` is a plain module-level
         # import now that `ComfyError` lives in `comfy_sdk._errors` — the cycle
         # that forced the lazy one is what this change removed.
+        #
+        # `error_type` is the class's own bucket when it has one. Every table
+        # keys a bucket class by that bucket, so for those this IS `exc.code`;
+        # the exception is a non-bucket code mapped onto a bucket class
+        # (``sso_required`` -> `Forbidden`), which keeps its wire value on
+        # `code` while `error_type` stays inside the closed set. The base
+        # `RouterError` has no bucket and carries the unknown one it was sent.
         return cls(
             str(exc),
-            error_type=exc.code,
+            error_type=cls.error_type or exc.code,
+            code=exc.code,
             http_status=exc.http_status,
             details=exc.details,
             request_id=exc.request_id,
             retry_after=exc.retry_after,
             errors=tuple(_detail_from(entry) for entry in exc.validation_errors),
+            organization_id=exc.organization_id,
         )
     # No `errors=` below, deliberately: `.errors` is a `RouterError` attribute
     # and none of the remaining classes takes the argument. A validation body
@@ -262,6 +314,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
         # collects an already-billed generation, and dropping it here left the
         # caller told to wait with nothing to wait on.
         retry_after=exc.retry_after,
+        organization_id=exc.organization_id,
     )
 
 
@@ -289,7 +342,7 @@ _STAMPABLE: tuple[type[BaseException], ...] = (
 #: :data:`_STAMPABLE` so an attribute added to :class:`ComfyError` for the
 #: caller to read inside an ``except`` block is added here too —
 #: ``tests/test_error_contract.py`` pins the pairing.
-_STAMPED_ATTRIBUTES = ("request_id", "retry_after")
+_STAMPED_ATTRIBUTES = ("request_id", "retry_after", "organization_id")
 
 #: Stamped like :data:`_STAMPED_ATTRIBUTES`, but defaulted to ``False``
 #: rather than ``None``: these are booleans a caller tests directly, and a
@@ -375,6 +428,7 @@ __all__ = [
     "BlobNotFound",
     "CancelRefused",
     "ComfyError",
+    "FailureCategory",
     "Forbidden",
     "HashMismatch",
     "IdempotencyKeyReuse",

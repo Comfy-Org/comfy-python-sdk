@@ -43,6 +43,14 @@ class ServerState:
     content_bytes: bytes = b"\x89PNG-stub-output-bytes-0123456789"
     # Require an Authorization header (Cloud/serverless).
     require_auth: bool = False
+    # When set, every authenticated GET/POST/PUT/DELETE answers 403
+    # `sso_required` (HEAD is unaffected: it has no body to carry it) — the
+    # gateway's refusal of a personal key whose account an SSO organization
+    # holds. `{"organization_id": "org_..."}` sends the org beside `code`
+    # inside `error`; `{"organization_id": None}` omits it, as the gateway does
+    # when it does not know the org. (Named after the TypeScript stub's
+    # `ssoRequired` knob so the two stubs stay scenario-for-scenario.)
+    sso_required: dict | None = None
     # POST /jobs returns 429 queue_full this many times before succeeding.
     queue_full_times: int = 0
     # Like `queue_full_times`, but the 429 carries no Retry-After header at
@@ -99,10 +107,31 @@ class ServerState:
     polls_to_succeed: int = 1
     # Terminal status the job reaches.
     terminal_status: str = "succeeded"
+    # The `error` object every job answer reports while its status is `failed`
+    # (the poll, the submit and cancel snapshots). The stream's own status frame
+    # never carries it: the contract's `StatusEvent` declares only `status` and
+    # `queue_position`. `None` is a failed job with no error detail.
+    job_failure: dict[str, Any] | None = None
+    # Status the POST /jobs and POST /jobs/{id}/cancel snapshots report.
+    submit_status: str = "queued"
+    cancel_status: str = "canceling"
+    # GET /jobs/{id}/logs answers 200 with this body, or 204 when `None`, with
+    # `No-Log-Reason` set to `job_logs_no_reason` when that is given.
+    job_logs: dict[str, Any] | None = None
+    job_logs_no_reason: str | None = None
+    # Every path GET /jobs/{id}/logs was asked for, in arrival order.
+    job_logs_paths: list[str] = field(default_factory=list)
     # SSE behavior: "reconnect" drops the first stream before terminal;
     # "stall" sends a couple frames then holds the connection open, silent
-    # (a "zombie": no terminal, no close) for `stall_seconds`.
+    # (a "zombie": no terminal, no close) for `stall_seconds`; "drop" answers
+    # every connection 200 and closes it without a terminal — with no frames,
+    # or with the on-connect status/progress snapshot if `sse_drop_snapshot` —
+    # and the connection numbered `sse_hold_on_connect` (if set) holds open for
+    # `sse_hold_seconds` before closing.
     sse_mode: str = "normal"
+    sse_drop_snapshot: bool = False
+    sse_hold_on_connect: int | None = None
+    sse_hold_seconds: float = 0.0
     stall_seconds: float = 2.0
     # GET /jobs/{id}/events answers 501 not_implemented — a surface without SSE.
     events_not_implemented: bool = False
@@ -474,6 +503,7 @@ def _job_json(
     status: str,
     outputs: list[dict] | None = None,
     metadata: Any = None,
+    error: dict[str, Any] | None = None,
 ) -> dict:
     job = {
         "id": job_id,
@@ -485,7 +515,7 @@ def _job_json(
         "queue_position": 0,
         "progress": None,
         "outputs": outputs or [],
-        "error": None,
+        "error": error,
         "metrics": {"queue_ms": 9000, "execution_ms": None},
         "urls": {
             "self": f"/api/v2/jobs/{job_id}",
@@ -516,6 +546,9 @@ _OUTPUT = _output_json("13", "asset_out_01")
 
 
 def _make_handler(state: ServerState):
+    def _failure_of(status: str) -> dict[str, Any] | None:
+        return state.job_failure if status == "failed" else None
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a: Any) -> None:
             pass
@@ -577,6 +610,20 @@ def _make_handler(state: ServerState):
                 return True
             return bool(state.last_auth_header)
 
+        def _sso_refused(self) -> bool:
+            """Answer 403 ``sso_required`` if the knob is set; ``True`` if it did."""
+            if state.sso_required is None:
+                return False
+            error = {
+                "code": "sso_required",
+                "message": "This account signs in with your organization's single sign-on",
+            }
+            organization_id = state.sso_required.get("organization_id")
+            if organization_id is not None:
+                error["organization_id"] = organization_id
+            self._json(403, {"error": error})
+            return True
+
         def _read_body(self) -> bytes:
             n = int(self.headers.get("Content-Length", 0))
             return self.rfile.read(n) if n else b""
@@ -598,6 +645,8 @@ def _make_handler(state: ServerState):
             if not self._auth_ok():
                 self._err(401, "unauthorized", "no key")
                 return
+            if self._sso_refused():
+                return
             m = re.match(r"/api/v2/assets/([^/]+)$", self.path)
             if m:
                 state.delete_count += 1
@@ -611,6 +660,8 @@ def _make_handler(state: ServerState):
         def do_GET(self) -> None:
             if not self._auth_ok():
                 self._err(401, "unauthorized", "no key")
+                return
+            if self._sso_refused():
                 return
 
             m = re.match(r"/api/v2/assets/([^/]+)/content$", self.path)
@@ -662,6 +713,9 @@ def _make_handler(state: ServerState):
             if m:
                 self._serve_job_workflow(m.group(1))
                 return
+            if re.match(r"/api/v2/jobs/([^/]+)/logs$", self.path):
+                self._serve_job_logs()
+                return
             m = re.match(r"/api/v2/jobs/([^/]+)$", self.path)
             if m:
                 self._serve_job(m.group(1))
@@ -711,7 +765,23 @@ def _make_handler(state: ServerState):
             else:
                 status = "running"
                 outputs = []
-            self._json(200, _job_json(job_id, status, outputs, state.job_metadata))
+            self._json(
+                200,
+                _job_json(job_id, status, outputs, state.job_metadata, _failure_of(status)),
+            )
+
+        def _serve_job_logs(self) -> None:
+            state.job_logs_paths.append(self.path)
+            if state.job_not_found:
+                self._err(404, "job_not_found", "no such job")
+                return
+            if state.job_logs is not None:
+                self._json(200, state.job_logs)
+                return
+            self.send_response(204)
+            if state.job_logs_no_reason is not None:
+                self.send_header("No-Log-Reason", state.job_logs_no_reason)
+            self.end_headers()
 
         def _serve_job_list(self) -> None:
             query = parse_qs(urlsplit(self.path).query)
@@ -770,6 +840,14 @@ def _make_handler(state: ServerState):
                 self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
                 self.wfile.flush()
 
+            if state.sse_mode == "drop":
+                if state.sse_drop_snapshot:
+                    frame("status", {"status": "running"})
+                    frame("progress", {"value": 0.4, "nodes_done": 4, "nodes_total": 10})
+                if state.events_connect_count == state.sse_hold_on_connect:
+                    # Event.wait, not time.sleep: tests fake out time.sleep.
+                    threading.Event().wait(state.sse_hold_seconds)
+                return
             if state.sse_mode == "reconnect" and state.events_connect_count == 1:
                 # First connection: a progress frame, then drop without terminal.
                 frame("progress", {"value": 0.4, "nodes_done": 4, "nodes_total": 10})
@@ -794,6 +872,9 @@ def _make_handler(state: ServerState):
                 self._read_body()
                 self._err(401, "unauthorized", "no key")
                 return
+            if self._sso_refused():
+                self._read_body()
+                return
             # Comfy Router's queue cancel is a PUT (the contract's
             # `cancelRouterModelRequest`), so it is served here and nowhere
             # else: a POST to the same path is the wrong verb and gets a 404
@@ -810,6 +891,9 @@ def _make_handler(state: ServerState):
             if not self._auth_ok():
                 self._read_body()
                 self._err(401, "unauthorized", "no key")
+                return
+            if self._sso_refused():
+                self._read_body()
                 return
 
             if self.path == "/api/v2/assets":
@@ -836,7 +920,13 @@ def _make_handler(state: ServerState):
                 return
             m = re.match(r"/api/v2/jobs/([^/]+)/cancel$", self.path)
             if m:
-                self._json(200, _job_json(m.group(1), "canceling", metadata=state.job_metadata))
+                status = state.cancel_status
+                self._json(
+                    200,
+                    _job_json(
+                        m.group(1), status, metadata=state.job_metadata, error=_failure_of(status)
+                    ),
+                )
                 return
             self._read_body()
             self._err(404, "not_found")
@@ -1275,7 +1365,8 @@ def _make_handler(state: ServerState):
             metadata = (
                 state.job_metadata if state.job_metadata is not None else body.get("metadata")
             )
-            self._json(201, _job_json(job_id, "queued", metadata=metadata))
+            status = state.submit_status
+            self._json(201, _job_json(job_id, status, metadata=metadata, error=_failure_of(status)))
 
     return Handler
 

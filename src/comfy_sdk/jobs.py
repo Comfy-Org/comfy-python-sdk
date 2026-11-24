@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass, field
+from contextlib import aclosing, closing
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Literal
 
@@ -26,10 +27,28 @@ from comfy_low.transport import AsyncComfyLow, ComfyLow, job_labels
 
 from . import _core
 from .events import Event, StatusChange, event_from_raw
-from .exceptions import ComfyError, JobFailed, to_sdk_error, translating
+from .exceptions import (
+    ComfyError,
+    FailureCategory,
+    JobFailed,
+    category_of,
+    to_sdk_error,
+    translating,
+)
 from .outputs import AsyncOutput, Output
 
 _RECONNECT_PAUSE = 0.1
+# Cap for the reconnect pause, which doubles from ``_RECONNECT_PAUSE`` while
+# connections keep ending early. ``events()`` has no deadline of its own, so a
+# dropped healthy stream must still notice a terminal status within seconds;
+# the cap matches ``_core.backoff_schedule``'s default.
+_MAX_RECONNECT_PAUSE = 5.0
+# How long a connection must stay open before its end resets the pause to
+# ``_RECONNECT_PAUSE``. Delivered frames are no signal of health: every connect
+# opens with a status/progress snapshot, so a server or proxy that sends it and
+# closes would otherwise reset the backoff each time. A connection that lasted
+# at least the cap already spaces reconnects no tighter than a capped pause.
+_HEALTHY_STREAM_SECONDS = _MAX_RECONNECT_PAUSE
 
 
 @dataclass(frozen=True)
@@ -51,10 +70,8 @@ class JobWorkflow:
 
 
 def _metadata_of(model: LowJob) -> dict[str, str]:
-    # `getattr` because the generated `Job` does not declare the field until the
-    # spec sync lands; the transport validates into a subclass that does.
     # `job_labels` returns a new dict, so the caller gets a copy.
-    return job_labels(getattr(model, "metadata", None))
+    return job_labels(model.metadata)
 
 
 _TIME = TypeAdapter(datetime)
@@ -171,6 +188,15 @@ class Job:
         return self._model.error
 
     @property
+    def failure_category(self) -> FailureCategory | None:
+        """Why the job failed, or ``None`` when its error names no category.
+
+        A category outside the six values this SDK knows reads as
+        :attr:`FailureCategory.OTHER`; ``error.category`` keeps the raw string.
+        """
+        return category_of(self._model.error)
+
+    @property
     def metadata(self) -> dict[str, str]:
         """The string labels given at submit, or an empty dict when there are none.
 
@@ -259,33 +285,55 @@ class Job:
         poll-authoritative ``wait``/``result``, never a requirement.
         """
         events_url = self._model.urls.events or self._model.id
+        backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
         while True:
-            terminal_seen = False
+            terminal: StatusChange | None = None
+            opened = time.monotonic()
             try:
-                for raw in self._low.get_job_events(events_url):
-                    ev = event_from_raw(raw, self._bind_output)
-                    if ev is None:
-                        continue
-                    if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
-                        terminal_seen = True
+                # Closed before the terminal status is enriched: the re-read needs
+                # a connection, and a client limited to one would wait on this one.
+                with closing(self._low.get_job_events(events_url)) as stream:
+                    for raw in stream:
+                        ev = event_from_raw(raw, self._bind_output)
+                        if ev is None:
+                            continue
+                        if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
+                            terminal = ev
+                            break
                         yield ev
-                        return
-                    yield ev
             except ApiError as exc:
                 if exc.http_status == 501:
                     return  # surface has no SSE — poll paths remain authoritative
                 raise to_sdk_error(exc) from exc
             except (httpx.HTTPError, httpx.StreamError):
                 pass  # connection dropped mid-stream — reconnect below
-            if terminal_seen:
+            lived = time.monotonic() - opened
+            if terminal is not None:
+                yield self._terminal_with_error(terminal)
                 return
             # Stream ended without a terminal frame. Poll the authoritative state:
             # stop if already terminal, else reconnect for fresh live frames.
             self.refresh()
             if _core.is_terminal(self.status):
-                yield StatusChange(status=self.status)
+                yield StatusChange(status=self.status, error=self._model.error)
                 return
-            time.sleep(_RECONNECT_PAUSE)
+            if lived >= _HEALTHY_STREAM_SECONDS:
+                # A stream that stayed open was healthy: start over at the short
+                # pause rather than inheriting earlier short connects' backoff.
+                backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
+            time.sleep(next(backoff))
+
+    def _terminal_with_error(self, ev: StatusChange) -> StatusChange:
+        # The stream frame declares only the status and the queue position, so
+        # the error of a job that did not succeed comes from one authoritative
+        # read. A failed read leaves the frame as the stream sent it.
+        if ev.status == _core.SUCCESS:
+            return ev
+        try:
+            self.refresh()
+        except (ComfyError, httpx.HTTPError, ValidationError):
+            return ev
+        return replace(ev, error=self._model.error)
 
     def __repr__(self) -> str:
         return f"Job(id={self.id!r}, status={self.status!r})"
@@ -313,6 +361,11 @@ class AsyncJob:
     @property
     def error(self) -> Any:
         return self._model.error
+
+    @property
+    def failure_category(self) -> FailureCategory | None:
+        """:attr:`Job.failure_category` — ``None`` when the error names no category."""
+        return category_of(self._model.error)
 
     @property
     def metadata(self) -> dict[str, str]:
@@ -376,31 +429,49 @@ class AsyncJob:
         import asyncio
 
         events_url = self._model.urls.events or self._model.id
+        backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
         while True:
-            terminal_seen = False
+            terminal: StatusChange | None = None
+            opened = time.monotonic()
             try:
-                async for raw in self._low.get_job_events(events_url):
-                    ev = event_from_raw(raw, self._bind_output)
-                    if ev is None:
-                        continue
-                    if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
-                        terminal_seen = True
+                async with aclosing(self._low.get_job_events(events_url)) as stream:
+                    async for raw in stream:
+                        ev = event_from_raw(raw, self._bind_output)
+                        if ev is None:
+                            continue
+                        if isinstance(ev, StatusChange) and _core.is_terminal(ev.status):
+                            terminal = ev
+                            break
                         yield ev
-                        return
-                    yield ev
             except ApiError as exc:
                 if exc.http_status == 501:
                     return  # surface has no SSE — poll paths remain authoritative
                 raise to_sdk_error(exc) from exc
             except (httpx.HTTPError, httpx.StreamError):
                 pass
-            if terminal_seen:
+            lived = time.monotonic() - opened
+            if terminal is not None:
+                yield await self._terminal_with_error(terminal)
                 return
             await self.refresh()
             if _core.is_terminal(self.status):
-                yield StatusChange(status=self.status)
+                yield StatusChange(status=self.status, error=self._model.error)
                 return
-            await asyncio.sleep(_RECONNECT_PAUSE)
+            if lived >= _HEALTHY_STREAM_SECONDS:
+                # A stream that stayed open was healthy: start over at the short
+                # pause rather than inheriting earlier short connects' backoff.
+                backoff = _core.backoff_schedule(_RECONNECT_PAUSE, 2.0, _MAX_RECONNECT_PAUSE)
+            await asyncio.sleep(next(backoff))
+
+    async def _terminal_with_error(self, ev: StatusChange) -> StatusChange:
+        """:meth:`Job._terminal_with_error`, awaiting the read."""
+        if ev.status == _core.SUCCESS:
+            return ev
+        try:
+            await self.refresh()
+        except (ComfyError, httpx.HTTPError, ValidationError):
+            return ev
+        return replace(ev, error=self._model.error)
 
     def __repr__(self) -> str:
         return f"AsyncJob(id={self.id!r}, status={self.status!r})"
