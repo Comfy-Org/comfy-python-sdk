@@ -1,4 +1,23 @@
-# Default owners for everything in the repo. A pull request that touches any
-# file requires an approving review from at least one member of these teams
-# (enforced by the "Requirements to Merge to Main" ruleset).
+# Enforced by the "Requirements to Merge to Main" ruleset. The last matching
+# pattern wins, and one approval from any owner on the matching line is enough.
+
+# Default: the two teams own everything, including any file added later.
 * @Comfy-Org/comfy-cloud-team @Comfy-Org/core-engine-team
+
+# Existing files outside the Router surface need @guill's approval. The Router
+# surface is the direct partner-model calls (`client.models`), as opposed to running
+# ComfyUI workflows. Router files stay with the default above. A new file is
+# owned by the teams until it's added to this list.
+/spec/openapi.yaml @guill
+# /src/comfy_sdk/__init__.py @guill
+/src/comfy_sdk/_core.py @guill
+# /src/comfy_sdk/_errors.py @guill
+/src/comfy_sdk/_hashing.py @guill
+/src/comfy_sdk/assets.py @guill
+/src/comfy_sdk/client.py @guill
+/src/comfy_sdk/events.py @guill
+/src/comfy_sdk/exceptions.py @guill
+/src/comfy_sdk/jobs.py @guill
+/src/comfy_sdk/outputs.py @guill
+/src/comfy_sdk/py.typed @guill
+/src/comfy_sdk/workflows.py @guill
