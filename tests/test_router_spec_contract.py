@@ -35,7 +35,7 @@ from __future__ import annotations
 import inspect
 from dataclasses import MISSING, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args, get_type_hints
 
 import httpx
 import pytest
@@ -376,6 +376,15 @@ def test_the_budget_detail_models_exactly_the_spec_s_properties() -> None:
     assert set(schemas["RouterSpendBudgetDetail"]["properties"]) == {
         f.name for f in fields(SpendBudgetDetail)
     }
+    # And field by field: a retyped amount would otherwise read as "not
+    # disclosed" for Owners too, since `_budget_from` drops a non-`int` amount.
+    detail = schemas["RouterSpendBudgetDetail"]
+    spec_types = {"string": str, "integer": int}
+    hints = get_type_hints(SpendBudgetDetail)
+    for name, prop in detail["properties"].items():
+        members = set(get_args(hints[name])) or {hints[name]}
+        assert members - {type(None)} == {spec_types.get(prop.get("type"))}, name
+        assert (type(None) not in members) == (name in detail.get("required", [])), name
 
 
 def test_a_queued_submit_declares_the_dropped_params_header() -> None:

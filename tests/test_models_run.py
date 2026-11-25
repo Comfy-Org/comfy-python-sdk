@@ -1096,6 +1096,10 @@ def test_run_detailed_parses_dropped_params_as_json_not_as_a_comma_split() -> No
     # A value that is not JSON at all is kept whole rather than guessed at: one
     # intact entry a human can read beats two confident fragments.
     assert _detailed({"X-Comfy-Router-Dropped-Params": "not json"}).dropped_params == ("not json",)
+    # Nesting deep enough to exhaust the parser's recursion limit fits in a
+    # header and takes the same fallback rather than escaping as RecursionError.
+    deep = "[" * 100_000
+    assert _detailed({"X-Comfy-Router-Dropped-Params": deep}).dropped_params == (deep,)
 
 
 def test_run_detailed_reports_a_replay_from_the_headers_presence() -> None:

@@ -453,6 +453,7 @@ def _check_router_budget_detail() -> int:
         return 1
     sys.path.insert(0, str(ROOT / "src"))
     from dataclasses import fields
+    from typing import get_args, get_type_hints
 
     import yaml
 
@@ -471,6 +472,29 @@ def _check_router_budget_detail() -> int:
             file=sys.stderr,
         )
         return 1
+    # Names alone are not enough: `_budget_from` reads a non-`int` amount as
+    # "not disclosed", so a sync that retyped an amount would blank it for
+    # Owners too. Each property's type, and whether it is required, must match
+    # the dataclass annotation -- required fields are the non-optional ones.
+    spec_types = {"string": str, "integer": int}
+    required = set(schemas["RouterSpendBudgetDetail"].get("required", []))
+    hints = get_type_hints(SpendBudgetDetail)
+    mismatched = []
+    for name, prop in schemas["RouterSpendBudgetDetail"]["properties"].items():
+        members = set(get_args(hints[name])) or {hints[name]}
+        optional = type(None) in members
+        if members - {type(None)} != {spec_types.get(prop.get("type"))} or optional == (
+            name in required
+        ):
+            mismatched.append(name)
+    if mismatched:
+        print(
+            "DRIFT: comfy_sdk.router_exceptions.SpendBudgetDetail types or "
+            "requiredness differ from RouterSpendBudgetDetail in "
+            f"spec/router-openapi.yaml for: {sorted(mismatched)}",
+            file=sys.stderr,
+        )
+        return 1
     ref = "#/components/schemas/RouterSpendBudgetDetail"
     body = schemas["RouterErrorResponse"]["properties"]
     if body["budget"] != {"$ref": ref} or body["blocking_budgets"].get("items") != {"$ref": ref}:
@@ -480,7 +504,10 @@ def _check_router_budget_detail() -> int:
             file=sys.stderr,
         )
         return 1
-    print("OK: SpendBudgetDetail models every field of RouterSpendBudgetDetail")
+    print(
+        "OK: SpendBudgetDetail models every field of RouterSpendBudgetDetail, "
+        "with matching types and requiredness"
+    )
     return 0
 
 

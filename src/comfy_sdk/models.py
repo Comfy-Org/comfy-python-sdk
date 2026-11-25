@@ -497,13 +497,16 @@ def _dropped_params(raw: str | None) -> tuple[str, ...] | None:
     So: parse as JSON, and fall back to the raw value as a single entry rather
     than guessing at delimiters. The fallback is deliberately not a comma split
     -- on a malformed value, one intact entry a human can read beats two
-    confident fragments. (The spec bug is filed separately against the server's
+    confident fragments. A value nested deeply enough to exhaust the parser's
+    recursion limit takes the same fallback: on a submit the request is already
+    queued when this runs, so a bad disclosure must never cost the caller the
+    handle. (The spec bug is filed separately against the server's
     own openapi.yml, which this vendored copy is synced from; correcting it
     here would be reverted by the next sync.)
     """
     if raw is None:
         return None
-    with contextlib.suppress(ValueError, TypeError):
+    with contextlib.suppress(ValueError, TypeError, RecursionError):
         parsed = json.loads(raw)
         if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
             return tuple(parsed)
