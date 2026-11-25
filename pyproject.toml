@@ -52,7 +52,7 @@ dev = [
     "ruff~=0.15.22",
     "mypy>=2.3,<2.5",
     "pytest~=9.1.1",
-    "pytest-asyncio~=1.4.0",
+    "pytest-asyncio>=1.4,<1.6",
     # A .coverage database was already being produced locally (and committed)
     # without the tool that makes it reproducible being declared anywhere.
     "pytest-cov~=7.0",
