@@ -7,6 +7,8 @@ plain dict value, never nested in a list (batch inputs).
 
 from __future__ import annotations
 
+import pytest
+
 from comfy_sdk._core import find_asset_handles, substitute_asset_handles
 from comfy_sdk.workflows import Workflow, WorkflowFactory
 
@@ -67,6 +69,265 @@ def test_plain_graph_passes_through_the_walk_unchanged():
     graph = {"1": {"inputs": {"seed": 42, "model": "x.safetensors"}}}
     assert find_asset_handles(graph) == []
     assert substitute_asset_handles(graph, {}) == graph
+
+
+def test_add_node_redirects_downstream_single_consumer():
+    graph = {
+        "1": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": "model.safetensors"},
+        },
+        "2": {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "lora_name": "lora.safetensors",
+                "strength_model": 1,
+                "model": ["1", 0],
+            },
+        },
+        "4": {
+            "class_type": "KSampler",
+            "inputs": {
+                "seed": 0,
+                "model": ["2", 0],
+            },
+        },
+    }
+    wf = Workflow(graph)
+    new_id = wf.add_node(
+        "ModelAttentionBackend",
+        before="4",
+        inputs={
+            "attention": "pytorch attention",
+            "model": ["2", 0],
+        },
+        output_map={"model": 0},
+    )
+    assert new_id == "5"
+    assert wf.json[new_id]["class_type"] == "ModelAttentionBackend"
+    assert wf.json[new_id]["inputs"]["model"] == ["2", 0]
+    assert wf.json["4"]["inputs"]["model"] == [new_id, 0]
+
+
+def test_add_node_redirects_multiple_downstream():
+    graph = {
+        "1": {
+            "class_type": "LoadImage",
+            "inputs": {"image": "example.png"},
+        },
+        "2": {
+            "class_type": "PreviewImage",
+            "inputs": {"images": ["1", 0]},
+        },
+        "3": {
+            "class_type": "PreviewImage",
+            "inputs": {"images": ["1", 0]},
+        },
+        "4": {
+            "class_type": "PreviewImage",
+            "inputs": {"images": ["1", 0]},
+        },
+    }
+    wf = Workflow(graph)
+    new_id = wf.add_node(
+        "ImageScaleToTotalPixels",
+        after="1",
+        inputs={
+            "upscale_method": "nearest-exact",
+            "megapixels": 1,
+            "image": ["1", 0],
+        },
+        output_map={"image": 0},
+    )
+    assert new_id == "5"
+    assert wf.json[new_id]["inputs"]["image"] == ["1", 0]
+    assert wf.json["2"]["inputs"]["images"] == [new_id, 0]
+    assert wf.json["3"]["inputs"]["images"] == [new_id, 0]
+    assert wf.json["4"]["inputs"]["images"] == [new_id, 0]
+
+
+def test_add_node_maps_each_source_to_its_own_new_port():
+    # The LoraLoader case from review: two sources both at output 0 must be
+    # re-emitted on *different* ports of the new node (MODEL=0, CLIP=1), so a
+    # consumer of the CLIPLoader's output 0 is rewired to [new_id, 1].
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors"}},
+        "3": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0]}},
+    }
+    wf = Workflow(graph)
+    new_id = wf.add_node(
+        "LoraLoader",
+        inputs={
+            "lora_name": "lora.safetensors",
+            "strength_model": 1,
+            "strength_clip": 1,
+            "model": ["1", 0],
+            "clip": ["2", 0],
+        },
+        output_map={"model": 0, "clip": 1},
+    )
+    assert new_id == "5"
+    assert wf.json["3"]["inputs"]["model"] == [new_id, 0]
+    assert wf.json["4"]["inputs"]["clip"] == [new_id, 1]
+
+
+def test_add_node_unmapped_link_does_not_redirect():
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+        "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+    }
+    wf = Workflow(graph)
+    new_id = wf.add_node(
+        "LoraLoader",
+        inputs={"lora_name": "lora.safetensors", "model": ["1", 0]},
+    )
+    assert new_id == "3"
+    # No output_map: the node is inserted but nothing is rewired through it.
+    assert wf.json["2"]["inputs"]["model"] == ["1", 0]
+
+
+def test_add_node_no_redirect_when_upstream_not_in_graph():
+    graph = {
+        "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"text": "hello"},
+        },
+    }
+    wf = Workflow(graph)
+    new_id = wf.add_node(
+        "KSampler",
+        inputs={"model": ["999", 0]},
+        output_map={"model": 0},
+    )
+    assert new_id == "2"
+    assert wf.json[new_id]["inputs"]["model"] == ["999", 0]
+
+
+def test_add_node_no_redirect_when_no_downstream_consumers():
+    graph = {
+        "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": "model.safetensors"},
+        },
+    }
+    wf = Workflow(graph)
+    new_id = wf.add_node(
+        "LoraLoader",
+        inputs={"model": ["1", 0], "clip": ["1", 1]},
+        output_map={"model": 0, "clip": 1},
+    )
+    assert new_id == "2"
+    assert wf.json[new_id]["inputs"]["model"] == ["1", 0]
+    assert wf.json[new_id]["inputs"]["clip"] == ["1", 1]
+
+
+def test_add_node_both_before_and_after_raises():
+    wf = Workflow({"1": {"class_type": "X", "inputs": {}}})
+    with pytest.raises(ValueError, match="not both"):
+        wf.add_node("Y", before="1", after="1", inputs={})
+
+
+def test_add_node_output_map_key_must_be_a_link():
+    wf = Workflow({"1": {"class_type": "X", "inputs": {}}})
+    # Key not present in inputs at all.
+    with pytest.raises(ValueError, match="must name a link input"):
+        wf.add_node("Y", inputs={"model": ["1", 0]}, output_map={"clip": 1})
+    # Key present but not a link.
+    with pytest.raises(ValueError, match="must name a link input"):
+        wf.add_node(
+            "Y",
+            inputs={"model": ["1", 0], "lora_name": "lora.safetensors"},
+            output_map={"lora_name": 1},
+        )
+
+
+def test_add_node_conflicting_output_map_raises():
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+    }
+    wf = Workflow(graph)
+    # Two mapped inputs pointing at the same source output but claiming
+    # different ports — ambiguous, so it must fail rather than pick one.
+    with pytest.raises(ValueError, match="conflicting ports"):
+        wf.add_node(
+            "Y",
+            inputs={"a": ["1", 0], "b": ["1", 0]},
+            output_map={"a": 0, "b": 1},
+        )
+
+
+def test_add_node_does_not_alias_caller_inputs():
+    # Passing another node's inputs dict must not share it: the redirection
+    # rewrites node 2's entry, and a shared dict would turn the new node's
+    # own link into a self-link.
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+        "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+    }
+    wf = Workflow(graph)
+    aliased = wf.json["2"]["inputs"]
+    new_id = wf.add_node("LoraLoaderModelOnly", inputs=aliased, output_map={"model": 0})
+    assert new_id == "3"
+    assert wf.json[new_id]["inputs"] is not aliased
+    assert wf.json[new_id]["inputs"]["model"] == ["1", 0]
+    assert wf.json["2"]["inputs"]["model"] == [new_id, 0]
+
+
+def test_add_node_rejects_cycle_creating_insertion():
+    # Node 2 consumes node 1's output 0; the new node reads node 2. Redirecting
+    # consumers of ["1", 0] would rewire node 2 to read the new node — closing a
+    # cycle the executor cannot resolve.
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+        "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+    }
+    wf = Workflow(graph)
+    with pytest.raises(ValueError, match="dependency cycle"):
+        wf.add_node(
+            "Y",
+            inputs={"a": ["1", 0], "b": ["2", 0]},
+            output_map={"a": 0},
+        )
+    # Graph untouched: no node added, no links rewritten.
+    assert set(wf.json) == {"1", "2"}
+    assert wf.json["2"]["inputs"]["model"] == ["1", 0]
+
+
+def test_add_node_allows_insertion_before_unrelated_ancestor_chain():
+    # The ordinary case must keep working: the new node reads a source that is
+    # upstream of the consumers being redirected, but no consumer feeds back
+    # into the new node.
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+        "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+        "3": {"class_type": "VAEDecode", "inputs": {"samples": ["2", 0]}},
+    }
+    wf = Workflow(graph)
+    new_id = wf.add_node(
+        "LoraLoaderModelOnly",
+        inputs={"lora_name": "lora.safetensors", "model": ["1", 0]},
+        output_map={"model": 0},
+    )
+    assert new_id == "4"
+    # Node 2 is an ancestor of the new node only via node 1, which it shares as
+    # a source; it consumes the redirected output legitimately.
+    assert wf.json["2"]["inputs"]["model"] == [new_id, 0]
+
+
+def test_add_node_no_inputs_no_redirect():
+    wf = Workflow({"1": {"class_type": "X", "inputs": {}}})
+    new_id = wf.add_node("Y")
+    assert new_id == "2"
+    assert wf.json[new_id]["class_type"] == "Y"
+    assert "inputs" not in wf.json[new_id]
+
+
+def test_add_node_auto_id_on_empty_graph():
+    wf = Workflow({})
+    new_id = wf.add_node("X")
+    assert new_id == "1"
 
 
 def test_remove_node_model_attention_backend():

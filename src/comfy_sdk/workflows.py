@@ -100,6 +100,149 @@ class Workflow:
                 for key in to_delete:
                     del inputs[key]
 
+    def add_node(
+        self,
+        class_type: str,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        inputs: dict[str, Any] | None = None,
+        output_map: dict[str, int] | None = None,
+    ) -> str:
+        """Insert a new node, optionally redirecting downstream connections
+        through it.
+
+        The new node is assigned an auto-incremented ID (one greater than the
+        highest existing node ID).  ``class_type`` and optional ``inputs`` are
+        stored on the node.
+
+        Redirection is opt-in via ``output_map``, which maps each *input name*
+        of the new node to the output port on which the new node re-emits that
+        input: ``{input_name: new_output_index}``.  For every mapped input whose
+        value is a link ``[src_node, src_output]``, all downstream consumers of
+        that source output are redirected to ``[new_id, new_output_index]``.
+
+        The source's output index is deliberately *not* reused for the new
+        node: output ports belong to the node's ``class_type``, and the SDK has
+        no metadata mapping one class's ports onto another's.  For example a
+        ``LoraLoader`` fed ``model=["1", 0]`` (UNETLoader) and ``clip=["2", 0]``
+        (CLIPLoader) re-emits MODEL on port 0 and CLIP on port 1, so it needs
+        ``output_map={"model": 0, "clip": 1}`` — a consumer of the CLIPLoader's
+        output ``0`` must be rewired to ``[new_id, 1]``, not ``[new_id, 0]``.
+
+        Linked inputs without an ``output_map`` entry do not redirect anything:
+        the new node does not claim to re-emit those inputs.
+
+        ``before`` / ``after`` are informational — they document which existing
+        node the new node is placed relative to, but do not affect the
+        redirection logic (which is driven entirely by ``output_map``).
+
+        Args:
+            class_type: ComfyUI class type (e.g. ``"KSampler"``).
+            before: If set, the new node is inserted before this node.
+            after: If set, the new node is inserted after this node.
+            inputs: Input dict for the new node. Stored as a shallow copy, so
+                passing another node's ``inputs`` dict does not alias them.
+            output_map: Maps input names in ``inputs`` to the new node's output
+                port that re-emits that input. Only mapped linked inputs drive
+                downstream redirection.
+
+        Returns:
+            The auto-generated node ID.
+
+        Raises:
+            ValueError: If both ``before`` and ``after`` are given; if an
+                ``output_map`` key does not name a link in ``inputs``; if two
+                mapped inputs point at the same source output with different
+                target ports; or if a redirected consumer is upstream of the
+                new node's own inputs (the rewrite would close a cycle).
+        """
+        if before and after:
+            raise ValueError("Specify either 'before' or 'after', not both")
+
+        new_inputs = inputs or {}
+        output_map = output_map or {}
+
+        # Resolve each mapping entry to its source link. The map is keyed by
+        # input name rather than by source output index because two different
+        # sources can sit at the same output index (e.g. LoraLoader's model and
+        # clip inputs, both linked to output 0 of their own loaders) yet need
+        # to re-emit on different ports of the new node.
+        redirects: dict[tuple[str, int], int] = {}
+        for name, port in output_map.items():
+            value = new_inputs.get(name)
+            if not _is_link(value):
+                raise ValueError(
+                    f"output_map key {name!r} must name a link input "
+                    "(a [node_id, output_index] pair) in inputs"
+                )
+            if port < 0:
+                raise ValueError(f"output_map port for {name!r} must be non-negative")
+            src = (new_inputs[name][0], int(new_inputs[name][1]))
+            existing = redirects.get(src)
+            if existing is not None and existing != port:
+                raise ValueError(
+                    f"output_map maps source link {list(src)!r} to conflicting ports "
+                    f"{existing} and {port}"
+                )
+            redirects[src] = port
+
+        # Reject redirections that would close a cycle before touching the
+        # graph: rewiring a consumer C to the new node is only sound if the
+        # new node does not (transitively) read C.
+        if redirects:
+            ancestors: set[str] = set()
+            stack = [v[0] for v in new_inputs.values() if _is_link(v)]
+            while stack:
+                nid = stack.pop()
+                if nid in ancestors or nid not in self.json:
+                    continue
+                ancestors.add(nid)
+                for value in (self.json[nid].get("inputs") or {}).values():
+                    if _is_link(value):
+                        stack.append(value[0])
+            for nid, node in self.json.items():
+                if nid not in ancestors:
+                    continue
+                for value in (node.get("inputs") or {}).values():
+                    if _is_link(value) and (value[0], int(value[1])) in redirects:
+                        raise ValueError(
+                            f"add_node would create a dependency cycle: node {nid!r} "
+                            "consumes a redirected source output but the new node "
+                            "reads that node (directly or transitively)"
+                        )
+
+        # Auto-generate node_id: one greater than the highest existing ID
+        if self.json:
+            max_id = max(int(nid) for nid in self.json)
+            node_id = str(max_id + 1)
+        else:
+            node_id = "1"
+
+        node_entry: dict[str, Any] = {"class_type": class_type}
+        if inputs:
+            # Shallow copy: redirection rewrites *entries* of input dicts, so
+            # sharing the caller's dict (e.g. another node's inputs) would let
+            # the rewrite mutate this node's links — or make them self-links.
+            node_entry["inputs"] = dict(inputs)
+        self.json[node_id] = node_entry
+
+        # Redirect downstream consumers of each mapped source output
+        for (src_node, src_output), port in redirects.items():
+            if src_node not in self.json or src_node == node_id:
+                continue
+            for nid, node in self.json.items():
+                if nid == node_id:
+                    continue
+                node_inputs = node.get("inputs")
+                if not node_inputs:
+                    continue
+                for key, value in list(node_inputs.items()):
+                    if _is_link(value) and value[0] == src_node and int(value[1]) == src_output:
+                        node_inputs[key] = [node_id, port]
+
+        return node_id
+
     def __repr__(self) -> str:
         return f"Workflow(nodes={len(self.json)})"
 
