@@ -89,6 +89,10 @@ _MAX_PACE = 60
 #: transport failure rather than an answer.
 _MIN_HTTP_TIMEOUT = 1.0
 
+#: "No HTTP timeout of its own: use the client's." Distinct from ``None``, which
+#: is a caller's explicit "no limit" and has to reach the request as that.
+_INHERIT_TIMEOUT: Any = object()
+
 #: HTTP timeout, in seconds, for the best-effort cleanup cancel ``subscribe``
 #: issues after its own timeout -- see ``RequestHandle._cancel_best_effort``.
 _CANCEL_TIMEOUT = 10.0
@@ -582,14 +586,16 @@ def _bounded(policy: RetryPolicy, budget: float | None) -> RetryPolicy:
     )
 
 
-def _http_timeout(budget: float | None) -> dict[str, Any]:
+def _http_timeout(budget: float | None, fallback: Any = _INHERIT_TIMEOUT) -> dict[str, Any]:
     """Keyword arguments bounding one low-level call's HTTP timeout by ``budget``.
 
-    Empty when there is no budget, so the client's own timeout applies. Floored
-    at :data:`_MIN_HTTP_TIMEOUT` for the reason given there.
+    With no budget, ``fallback`` applies -- ``None`` included, which is an
+    explicit "no limit" -- unless it is :data:`_INHERIT_TIMEOUT`, when the
+    client's own timeout does. A budget is floored at
+    :data:`_MIN_HTTP_TIMEOUT` for the reason given there.
     """
     if budget is None:
-        return {}
+        return {} if fallback is _INHERIT_TIMEOUT else {"timeout": fallback}
     return {"timeout": max(budget, _MIN_HTTP_TIMEOUT)}
 
 
@@ -600,6 +606,13 @@ class _RequestHandleBase:
     _request_id: str
     _retry: RetryPolicy
     _estimate: CostEstimate | None
+    #: The per-request HTTP timeout a poll or result fetch uses when it has no
+    #: budget of its own. :data:`_INHERIT_TIMEOUT` -- every handle a caller
+    #: builds -- is the client's timeout; ``models.run`` following a ``202``
+    #: handoff sets the run's own ``timeout`` here (``None``, no limit,
+    #: included), so each read keeps the limits the run was called with rather
+    #: than falling back to the client's.
+    _request_timeout: Any = _INHERIT_TIMEOUT
 
     @property
     def model(self) -> str:
@@ -690,7 +703,7 @@ class RequestHandle(_RequestHandleBase):
         with translating():
             payload, headers = self._call(
                 lambda: self._low.get_model_request_status(
-                    self._model, self._request_id, **_http_timeout(budget)
+                    self._model, self._request_id, **_http_timeout(budget, self._request_timeout)
                 ),
                 budget=budget,
             )
@@ -786,11 +799,22 @@ class RequestHandle(_RequestHandleBase):
         ``budget`` is what is left of the caller's deadline, and bounds the
         fetch the way :meth:`_status` bounds a poll.
         """
+        return self._collect_with_headers(completion, budget=budget)[0]
+
+    def _collect_with_headers(
+        self, completion: QueueUpdate, *, budget: float | None = None
+    ) -> tuple[dict[str, Any] | BinaryResult, httpx.Headers]:
+        """:meth:`_collect`, plus the result fetch's response headers.
+
+        For ``models.run_detailed`` following a ``202`` handoff, whose
+        :class:`~comfy_sdk.models.RouterRunResult` is read off the headers of
+        the response that carried the output.
+        """
         _raise_for_completion(completion.raw, request_id=self._request_id)
         with translating():
-            payload, _headers = self._call(
+            payload, headers = self._call(
                 lambda: self._low.get_model_request_result(
-                    self._model, self._request_id, **_http_timeout(budget)
+                    self._model, self._request_id, **_http_timeout(budget, self._request_timeout)
                 ),
                 budget=budget,
             )
@@ -799,7 +823,7 @@ class RequestHandle(_RequestHandleBase):
         # is how a failure gets returned as a result. A `BinaryResult` is not a
         # `Mapping` and so never carries one -- it is bytes, not an envelope.
         _raise_for_completion(payload, request_id=self._request_id, envelope_only=True)
-        return payload
+        return payload, headers
 
     def cancel(self) -> QueueUpdate:
         """Ask the server to cancel this request.
@@ -891,7 +915,7 @@ class AsyncRequestHandle(_RequestHandleBase):
         with translating():
             payload, headers = await self._call(
                 lambda: self._low.get_model_request_status(
-                    self._model, self._request_id, **_http_timeout(budget)
+                    self._model, self._request_id, **_http_timeout(budget, self._request_timeout)
                 ),
                 budget=budget,
             )
@@ -930,16 +954,22 @@ class AsyncRequestHandle(_RequestHandleBase):
         self, completion: QueueUpdate, *, budget: float | None = None
     ) -> dict[str, Any] | BinaryResult:
         """Async :meth:`RequestHandle._collect`."""
+        return (await self._collect_with_headers(completion, budget=budget))[0]
+
+    async def _collect_with_headers(
+        self, completion: QueueUpdate, *, budget: float | None = None
+    ) -> tuple[dict[str, Any] | BinaryResult, httpx.Headers]:
+        """Async :meth:`RequestHandle._collect_with_headers`."""
         _raise_for_completion(completion.raw, request_id=self._request_id)
         with translating():
-            payload, _headers = await self._call(
+            payload, headers = await self._call(
                 lambda: self._low.get_model_request_result(
-                    self._model, self._request_id, **_http_timeout(budget)
+                    self._model, self._request_id, **_http_timeout(budget, self._request_timeout)
                 ),
                 budget=budget,
             )
         _raise_for_completion(payload, request_id=self._request_id, envelope_only=True)
-        return payload
+        return payload, headers
 
     async def cancel(self) -> QueueUpdate:
         """Async :meth:`RequestHandle.cancel` — a request, not a guarantee."""

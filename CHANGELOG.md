@@ -12,6 +12,20 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `respond_async=True` on `models.run` and `models.run_detailed` (and the `AsyncModels` twins):
+  sends `Prefer: respond-async`, so Router may hand a long run to its queue and answer `202` with
+  a handle instead of holding the connection. A `202` carrying `Preference-Applied:
+  respond-async` is polled through the queue's status and result reads to the same native result
+  `run` returns for a `200`; a `200` is returned as always; a `202` with neither
+  `Preference-Applied` nor `Idempotent-Replayed` raises `ComfyError` (`code="invalid_response"`)
+  carrying the key and the `202` body. A handoff followed on a call that did not opt in is
+  polled only for what is left of a numeric `timeout` counted from the start of the call
+  (retries before the `202` keep the retry policy's own budget), and its `TimeoutError` carries `idempotency_key` / `request_id` /
+  `retry_after`; each poll and result read keeps the run's `timeout` (an `httpx.Timeout`, or
+  `None` for no limit, included) as its HTTP timeout. `RouterRunResult` gains `handed_off`, under which a missing
+  provider disclosure means "not disclosed". Off by default: the default call sends no `Prefer`
+  header. `comfy_low`'s `post_model_run` gains the same keyword and now
+  returns a `RunHandoff` (newly exported) for a `202`.
 - `sso_required` (403) now raises `Forbidden` (code preserved) and carries `organization_id`, the
   organization to start SSO with. `organization_id` is a new attribute on `ComfyError` and on
   `comfy_low.ApiError`, `None` on every other code and when the server does not name the

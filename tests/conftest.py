@@ -268,6 +268,15 @@ class ServerState:
     model_run_validation_detail: list[Any] | None = None
     # The bucket sent on `X-Comfy-Error-Type` alongside it.
     model_run_validation_error_type: str = "invalid_input"
+    # The queue handoff: a run that sends `Prefer: respond-async` is answered
+    # 202 with a queue handle (addressing `queue_request_id`, so the queued
+    # status/result knobs below drive the poll) instead of the finished 200.
+    # Off models a deployment with the handoff flag off, or a model not on its
+    # allowlist: the preference is ignored and the run answers 200 as always.
+    model_run_handoff: bool = False
+    # Whether that 202 echoes `Preference-Applied: respond-async`. False is a
+    # 202 that does not say it is the handoff the caller asked for.
+    model_run_handoff_preference_applied: bool = True
 
     # --- model discovery: GET /v2/models and .../openapi.json ---
     # Catalog pages keyed by the `cursor` that fetches them (`None` is the first
@@ -332,6 +341,9 @@ class ServerState:
     queue_submit_estimate: Any = None
     # The id the queue hands back, and the one every later route answers for.
     queue_request_id: str = "req_stub_01"
+    # Sent as `X-Comfy-Request-Id` on the queue result route's 200 — a real
+    # Router stamps one on every response, distinct from the run request's.
+    queue_result_request_id: str | None = None
     # Status polls that report a non-terminal state before the request reaches
     # COMPLETED. 0 means the very first poll is already complete.
     queue_polls_to_complete: int = 2
@@ -349,6 +361,10 @@ class ServerState:
     # (status, code) each of those answers with. Checked *before*
     # `queue_status_error`, exactly as `model_run_fail_times` is.
     queue_status_fail_times: int = 0
+    # Seconds a status poll holds the connection before answering — a stalled
+    # read, so a test can tell whether the poll carried an HTTP timeout.
+    queue_status_delay: float = 0.0
+    queue_result_delay: float = 0.0
     queue_status_transient_error: tuple[int, str] = (429, "rate_limited")
     # Retry-After sent alongside a transient status failure.
     queue_status_transient_retry_after: str | None = "1"
@@ -467,6 +483,12 @@ class ServerState:
     # and does not increment this, which is what lets a test tell a real replay
     # apart from a second generation that merely returns an equal payload.
     model_run_generations: int = 0
+    # The `Prefer` header of every model run, in arrival order (`None` records
+    # a run that sent none) — the header the default path must never send.
+    model_run_prefer_headers: list[str | None] = field(default_factory=list)
+    # Keys whose run was handed off, so a resend under one — with or without
+    # `Prefer` — replays that 202 rather than starting a second generation.
+    model_run_handoff_keys: set[str] = field(default_factory=set)
     queue_submit_count: int = 0
     queue_status_count: int = 0
     # Status polls that were actually *answered with a queue state*, as
@@ -990,6 +1012,9 @@ def _make_handler(state: ServerState):
         def _serve_queue_status(self, request_id: str) -> None:
             state.queue_status_count += 1
             state.queue_paths.append(self.path)
+            if state.queue_status_delay:
+                # Event.wait, not time.sleep: tests fake out time.sleep.
+                threading.Event().wait(state.queue_status_delay)
             if state.queue_status_fail_times > 0:
                 state.queue_status_fail_times -= 1
                 status, code = state.queue_status_transient_error
@@ -1030,6 +1055,8 @@ def _make_handler(state: ServerState):
 
         def _serve_queue_result(self, request_id: str) -> None:
             state.queue_result_count += 1
+            if state.queue_result_delay:
+                threading.Event().wait(state.queue_result_delay)
             state.queue_paths.append(self.path)
             if state.queue_result_binary_body is not None:
                 self._raw(
@@ -1050,7 +1077,15 @@ def _make_handler(state: ServerState):
                     },
                 )
                 return
-            self._json(200, {**state.queue_result, **state.queue_result_extra})
+            self._json(
+                200,
+                {**state.queue_result, **state.queue_result_extra},
+                headers=(
+                    {"X-Comfy-Request-Id": state.queue_result_request_id}
+                    if state.queue_result_request_id
+                    else None
+                ),
+            )
 
         def _put_queue_cancel(self, request_id: str) -> None:
             state.queue_cancel_count += 1
@@ -1146,6 +1181,15 @@ def _make_handler(state: ServerState):
             state.last_model_run_body = json.loads(self._read_body() or b"{}")
             key = self.headers.get("Idempotency-Key")
             state.model_run_idempotency_keys.append(key)
+            prefer = self.headers.get("Prefer")
+            state.model_run_prefer_headers.append(prefer)
+
+            if key and key in state.model_run_handoff_keys and not state.model_run_fail_times:
+                # A resend under a handed-off key collects that handoff: the
+                # same handle again, marked replayed, and nothing re-run —
+                # whether or not this resend asked for the handoff.
+                self._serve_run_handoff(provider, model, replayed=True)
+                return
 
             # Checked before the reject-on-duplicate rule below: a deployment
             # that replays a claimed key answers with the recorded result
@@ -1278,6 +1322,11 @@ def _make_handler(state: ServerState):
             if key:
                 state.model_run_idempotency[key] = "done"
             state.model_run_generations += 1
+            if state.model_run_handoff and "respond-async" in (prefer or "").lower():
+                if key:
+                    state.model_run_handoff_keys.add(key)
+                self._serve_run_handoff(provider, model, replayed=False)
+                return
             if state.model_run_undecodable_body:
                 self._raw(
                     state.model_run_status,
@@ -1289,6 +1338,30 @@ def _make_handler(state: ServerState):
                 state.model_run_status,
                 state.model_run_result,
                 headers=state.model_run_response_headers or None,
+            )
+
+        def _serve_run_handoff(self, provider: str, model: str, *, replayed: bool) -> None:
+            """The run route's 202: the queue handle for a handed-off run."""
+            base = f"http://{self.headers.get('Host')}/v2/models/{provider}/{model}/requests/"
+            request_url = base + state.queue_request_id
+            headers: dict[str, str] = {}
+            if state.model_run_handoff_preference_applied:
+                headers["Preference-Applied"] = "respond-async"
+            if replayed:
+                headers["Idempotent-Replayed"] = "true"
+            if state.model_run_request_id is not None:
+                headers["X-Comfy-Request-Id"] = state.model_run_request_id
+            self._json(
+                202,
+                {
+                    "request_id": state.queue_request_id,
+                    "status": "IN_QUEUE",
+                    "queue_position": state.queue_start_position,
+                    "status_url": request_url + "/status",
+                    "response_url": request_url,
+                    "cancel_url": request_url + "/cancel",
+                },
+                headers=headers,
             )
 
         def _serve_run_result(

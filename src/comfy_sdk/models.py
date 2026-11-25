@@ -55,19 +55,20 @@ from typing import Any, cast
 
 import httpx
 
-from comfy_low.errors import ApiError
+from comfy_low.errors import ApiError, clean_request_id
 from comfy_low.errors import IdempotencyKeyReuse as ProtocolIdempotencyKeyReuse
 from comfy_low.transport import (
     MODEL_RUN_TIMEOUT,
     AsyncComfyLow,
     BinaryResult,
     ComfyLow,
+    RunHandoff,
     parse_model_id,
     parse_request_id,
 )
 
 from ._core import new_idempotency_key, validate_idempotency_key
-from .exceptions import IdempotencyKeyReuse, _stamp, to_sdk_error, translating
+from .exceptions import ComfyError, IdempotencyKeyReuse, _stamp, to_sdk_error, translating
 from .model_catalog import (
     DISCOVERY_TIMEOUT,
     AsyncModelList,
@@ -84,6 +85,7 @@ from .model_requests import (
     RequestHandle,
     _completed,
     _estimate_of,
+    _last,
     _remaining,
     _request_id_of,
 )
@@ -176,6 +178,148 @@ def _resend_refused(exc: BaseException) -> BaseException:
     return exc
 
 
+#: The RFC 7240 preference ``respond_async=True`` sends, and the token Router
+#: echoes on ``Preference-Applied`` when it honoured it.
+_RESPOND_ASYNC = "respond-async"
+
+
+def _preference_applied(headers: Mapping[str, str]) -> bool:
+    """Whether ``Preference-Applied`` names ``respond-async``.
+
+    Read as RFC 7240 writes it -- a comma-separated list of preferences, each
+    of which may carry a value or parameters -- and compared case-insensitively,
+    so ``respond-async`` beside another applied preference still counts. A
+    value may be a quoted-string, so separators are only honoured outside
+    quotes: ``foo="x, respond-async"`` applies ``foo``, not ``respond-async``.
+    """
+    raw = headers.get("Preference-Applied")
+    if raw is None:
+        return False
+    return _RESPOND_ASYNC in _preference_names(raw)
+
+
+def _preference_names(raw: str) -> list[str]:
+    """The lowercased preference names in an RFC 7240 header value."""
+    names: list[str] = []
+    token: list[str] = []
+    in_quotes = escaped = False
+    in_name = True
+    for ch in raw + ",":
+        if in_quotes:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_quotes = False
+        elif ch == '"':
+            in_quotes = True
+        elif ch == ",":
+            names.append("".join(token).strip().lower())
+            token, in_name = [], True
+        elif ch in ";=":
+            in_name = False
+        elif in_name:
+            token.append(ch)
+    return names
+
+
+def _handoff_request_id(handoff: RunHandoff, headers: Mapping[str, str]) -> str:
+    """The queue request id a ``202`` handoff names, or a :class:`ComfyError`.
+
+    A ``202`` counts as a handoff when it answers the preference --
+    ``Preference-Applied: respond-async`` is how Router says this ``202`` is
+    the queue taking the run -- or when it is ``Idempotent-Replayed``: a
+    replay of a handoff answers a resend under the key, and RFC 7240 does not
+    require ``Preference-Applied`` on a reply to a request that sent no
+    ``Prefer``. Any other ``202`` is one this SDK has no contract for. Raised
+    rather than guessed at, and never returned as a result -- the body is not
+    the partner's output. The error carries the run's ``idempotency_key``, the
+    ``202``'s ``X-Comfy-Request-Id`` and, on ``details["handle"]``, the body
+    itself, so a queue ``request_id`` it names can still be collected through
+    ``models.handle()`` rather than lost.
+    """
+    if not (_preference_applied(headers) or headers.get("Idempotent-Replayed") is not None):
+        queue_id = handoff.handle.get("request_id")
+        hint = (
+            f"collect the queue request it names with models.handle(model, {queue_id!r})"
+            if isinstance(queue_id, str) and queue_id
+            else "resend under the same idempotency_key rather than a new one"
+        )
+        raise ComfyError(
+            "Router answered the model run 202 without 'Preference-Applied: respond-async', "
+            "so the response is neither a finished result nor a queue handoff this SDK can "
+            f"follow; {hint}",
+            code="invalid_response",
+            http_status=202,
+            request_id=clean_request_id(headers.get("X-Comfy-Request-Id")),
+            details={"handle": handoff.handle},
+        )
+    return _request_id_of(handoff.handle)
+
+
+def _handoff_headers(accepted: Mapping[str, str], collected: Mapping[str, str]) -> httpx.Headers:
+    """The headers a handed-off run reports: the result's, over the ``202``'s.
+
+    The result fetch is the response that carried the output, so where both
+    name a header (the cost) it is the one reported. Two are the run
+    request's own and are kept from the ``202``: ``Idempotent-Replayed`` --
+    it is the run request that was replayed -- and ``X-Comfy-Request-Id``,
+    the id of the request that started (and was billed for) the generation,
+    which is the one to quote in a support request. Their absence is kept
+    too: a ``202`` that named no request id reports none, rather than the
+    result fetch's id passed off as the run's.
+    """
+    merged = httpx.Headers(accepted)
+    merged.update(collected)
+    for name in ("Idempotent-Replayed", "X-Comfy-Request-Id"):
+        if name in accepted:
+            merged[name] = accepted[name]
+        elif name in merged:
+            del merged[name]
+    return merged
+
+
+def _handoff_wait(
+    respond_async: bool, timeout: float | httpx.Timeout | None, started: float
+) -> float | None:
+    """How long a followed ``202`` may be polled, in seconds, or ``None`` for unbounded.
+
+    A caller that opted in asked for the long wait, so it is unbounded, as
+    documented on :meth:`Models._run`. A caller that did not -- following a
+    replayed handoff under a reused key -- asked for an ordinary bounded run,
+    so it is followed only for what is left of a numeric ``timeout`` counted
+    from the start of the call, and running out raises ``TimeoutError`` without
+    cancelling the run.
+
+    That window bounds the *following*, not the retries before the ``202``:
+    they keep the retry policy's own budget, which outlasts ``timeout`` on
+    purpose (a collect attempt exists for the answer that arrives once a full
+    ``timeout`` is spent). When they have used the window up the answer is
+    zero, which is one look at the queue: a run that is already done is still
+    returned.
+    """
+    if respond_async or not isinstance(timeout, (int, float)):
+        return None
+    return max(0.0, started + timeout - _now())
+
+
+def _handoff_timed_out(exc: TimeoutError, key: str, accepted: Mapping[str, str]) -> TimeoutError:
+    """``exc``, stamped with what resending under ``key`` needs, as every run failure is.
+
+    The poll's ``TimeoutError`` is a builtin and so outside what
+    :func:`~comfy_sdk.exceptions.translating` stamps; without this a caller
+    following the documented recovery -- read ``exc.idempotency_key`` and
+    resend -- would hit ``AttributeError`` instead. ``request_id`` is the
+    ``202``'s, the run request that started (and was billed for) the
+    generation, reduced to a displayable id as on every other failure.
+    """
+    if not hasattr(exc, "request_id"):
+        request_id = clean_request_id(accepted.get("X-Comfy-Request-Id"))
+        exc.request_id = request_id  # type: ignore[attr-defined]
+    return _stamp(exc, key)
+
+
 class _ModelsBase:
     """Read-only view of the configuration inherited from the host client."""
 
@@ -251,7 +395,8 @@ class RouterRunResult:
     Present ONLY when ``fallback_provider`` retried against a second provider
     and that retry succeeded -- never a provider that was attempted and also
     failed. ``None`` therefore means "the provider asked for served it", which
-    is the common case; it does not mean "unknown".
+    is the common case; it does not mean "unknown" -- except on a run that was
+    :attr:`handed_off`, where it means "not disclosed".
     """
 
     dropped_params: tuple[str, ...] | None
@@ -260,7 +405,8 @@ class RouterRunResult:
     Present only when ``model_provider`` translated the body
     (``strict_mode=False``, the default) and one or more native fields could not
     be expressed exactly on the alternate provider's schema; each entry names the
-    field and why. ``None`` when no translation ran or it dropped nothing.
+    field and why. ``None`` when no translation ran or it dropped nothing --
+    except on a run that was :attr:`handed_off`, where it means "not disclosed".
     """
 
     replayed: bool
@@ -315,6 +461,19 @@ class RouterRunResult:
     The field defaults to ``None``, so this stayed an additive change: code
     that already constructed a :class:`RouterRunResult` by hand -- a fake, a
     fixture, an adapter -- still does.
+    """
+
+    handed_off: bool = False
+    """Whether Router handed the run to its queue (``respond_async``) and it was polled.
+
+    Such a run is accepted with a ``202`` before any provider is dispatched,
+    and its output is collected from the queue's result route, which is not
+    declared to carry ``X-Comfy-Router-Fallback-Provider`` or
+    ``X-Comfy-Router-Dropped-Params``. So when this is ``True``, a ``None``
+    :attr:`serving_provider` or :attr:`dropped_params` means "not disclosed",
+    not "the provider asked for served it" or "nothing was dropped" -- a
+    caller that has to prove which leg ran should not use the handoff.
+    Defaults to ``False`` so constructing one by hand stays additive.
     """
 
 
@@ -382,7 +541,9 @@ def _credits_used(raw: str | None) -> str | None:
     return candidate if parsed.is_finite() else None
 
 
-def _run_result(body: dict[str, Any] | BinaryResult, headers: Mapping[str, str]) -> RouterRunResult:
+def _run_result(
+    body: dict[str, Any] | BinaryResult, headers: Mapping[str, str], *, handed_off: bool = False
+) -> RouterRunResult:
     """Build a :class:`RouterRunResult` from one run's body and response headers."""
     return RouterRunResult(
         output=body,
@@ -391,6 +552,7 @@ def _run_result(body: dict[str, Any] | BinaryResult, headers: Mapping[str, str])
         replayed=headers.get("Idempotent-Replayed") is not None,
         request_id=headers.get("X-Comfy-Request-Id"),
         credits_used=_credits_used(headers.get("X-Comfy-Credits-Used")),
+        handed_off=handed_off,
     )
 
 
@@ -414,8 +576,9 @@ class Models(_ModelsBase):
         model_provider: str | None = None,
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
+        respond_async: bool = False,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> tuple[dict[str, Any] | BinaryResult, Mapping[str, str]]:
+    ) -> tuple[dict[str, Any] | BinaryResult, Mapping[str, str], bool]:
         """Run ``model`` with ``arguments`` and return the completed result.
 
         ``model`` is the canonical ``{provider}/{model}`` id — exactly the two
@@ -454,6 +617,47 @@ class Models(_ModelsBase):
         There is no separate submit/await step and no ``run_async`` variant: the
         awaitable form of this method is :meth:`AsyncModels.run` on
         ``AsyncComfy``.
+
+        **``respond_async=True`` lets Router hand a long run to its queue
+        instead of holding the connection.** It sends ``Prefer:
+        respond-async`` (RFC 7240). Router honours it only for a model it is
+        configured to hand off; it then answers ``202`` with a queue handle and
+        ``Preference-Applied: respond-async``, and this call polls that handle
+        — the same status and result reads :meth:`submit`'s
+        :class:`~comfy_sdk.model_requests.RequestHandle` makes — until the run
+        completes, then returns exactly what it would have returned for the
+        ``200``. Polling is a read and is not billed; the run is billed once,
+        by the request that started it. Everywhere else the preference is
+        ignored and the answer is the ordinary ``200``, returned as always, so
+        the flag is safe to pass for any model. The default sends no
+        ``Prefer`` header at all. On the handed-off path ``timeout`` bounds the
+        run request and not the wait, which — like :meth:`RequestHandle.get`
+        with no ``timeout`` — lasts until the queue says the run is done; use
+        :meth:`subscribe` for a client-side bound on the whole wait. A
+        completion carrying an ``error_type`` raises the typed router
+        exception, as on the queued surface.
+
+        The ``Idempotency-Key`` is sent either way, and ``Prefer`` is not part
+        of what the key identifies, so a resend under the same key with or
+        without the flag collects the generation the first request started. A
+        ``202`` that carries ``Preference-Applied: respond-async`` or
+        ``Idempotent-Replayed`` is therefore followed even on a call that did
+        not ask, because it is the answer to a request under this key that
+        did; on such a call it is followed only for what is left of a numeric
+        ``timeout`` counted from the start of the call, then raises
+        ``TimeoutError`` without cancelling. Retries before the ``202`` keep
+        the retry policy's own budget; if they have used that window up, the
+        queue is looked at once, and a run already done is returned. On either
+        path each status and result read keeps the ``timeout`` the run was
+        called with as its HTTP timeout, so an ``httpx.Timeout`` passed here
+        bounds every request rather than only the first and ``None`` limits
+        none of them, whatever the client's own timeout is, and that
+        ``TimeoutError`` carries ``idempotency_key``, ``request_id`` and
+        ``retry_after`` like every other failure of the call. A ``202``
+        with neither is not a contract this SDK knows and raises
+        :class:`~comfy_sdk.ComfyError` (``code="invalid_response"``) carrying
+        the key and the body on ``details["handle"]``, rather than being
+        returned as if it were the output.
 
         The return value is the provider's own payload, handed back as-is. It
         comes in **two shapes**, decided by the response's ``Content-Type``,
@@ -617,6 +821,7 @@ class Models(_ModelsBase):
         # and earn the 422 this snapshot exists to prevent. The body is JSON on
         # the wire, so everything legal in it is deep-copyable.
         payload = deepcopy(dict(arguments))
+        started = _now()
         retrier = Retrier(self._retry, now=_now)
         # The first retryable failure, kept so a key refusal on a later attempt
         # cannot bury it. Only the first: every later one is the same call
@@ -629,15 +834,17 @@ class Models(_ModelsBase):
         with translating(idempotency_key=key):
             while True:
                 try:
-                    return low.post_model_run(
+                    body, headers = low.post_model_run(
                         model,
                         payload,
                         idempotency_key=key,
                         model_provider=model_provider,
                         strict_mode=strict_mode,
                         fallback_provider=fallback_provider,
+                        respond_async=respond_async,
                         timeout=timeout,
                     )
+                    break
                 except _CANDIDATE_FAILURES as exc:
                     if claimed is not None and _is_key_reuse(exc):
                         # The resend could never have succeeded — the server
@@ -654,6 +861,26 @@ class Models(_ModelsBase):
                     if may_have_claimed_key(exc):
                         claimed = exc
                     time.sleep(delay)
+            if not isinstance(body, RunHandoff):
+                return body, headers, False
+            # Inside the `translating` block on purpose: a poll that fails
+            # still raises carrying the key, and resending under it collects
+            # this same handed-off generation.
+            handle = RequestHandle(low, model, _handoff_request_id(body, headers), self._retry)
+            # Each read keeps the HTTP limits the run was called with (`None`
+            # is no limit); the client's own may be looser or tighter.
+            handle._request_timeout = timeout
+            wait = _handoff_wait(respond_async, timeout, started)
+            deadline = None if wait is None else _now() + wait
+            try:
+                completion = _last(handle.iter_events(timeout=wait))
+                output, collected = handle._collect_with_headers(
+                    completion, budget=_remaining(deadline)
+                )
+            except TimeoutError as exc:
+                _handoff_timed_out(exc, key, headers)
+                raise
+            return output, _handoff_headers(headers, collected), True
 
     # -- the queued form: submit, hold a handle, collect ------------------
     def run(
@@ -665,6 +892,7 @@ class Models(_ModelsBase):
         model_provider: str | None = None,
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
+        respond_async: bool = False,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any] | BinaryResult:
         """Run ``model`` with ``arguments`` and return the partner's native output.
@@ -684,6 +912,10 @@ class Models(_ModelsBase):
         back to this model's native contract, so the body alone cannot tell an
         alt-provider run from a native one -- only the headers can, and most
         callers should not pay an envelope for them.
+
+        ``respond_async=True`` opts into Router's queue handoff for a long run:
+        the result is the same, collected by polling rather than over one held
+        connection. Off by default — see :meth:`_run`.
         """
         return self._run(
             model,
@@ -692,6 +924,7 @@ class Models(_ModelsBase):
             model_provider=model_provider,
             strict_mode=strict_mode,
             fallback_provider=fallback_provider,
+            respond_async=respond_async,
             timeout=timeout,
         )[0]
 
@@ -704,6 +937,7 @@ class Models(_ModelsBase):
         model_provider: str | None = None,
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
+        respond_async: bool = False,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
     ) -> RouterRunResult:
         """:meth:`run`, plus what Router disclosed about how the call ran.
@@ -715,17 +949,25 @@ class Models(_ModelsBase):
         back to this model's native contract, so the body alone cannot tell an
         alt-provider run from a native one -- only the headers can, and most
         callers should not pay an envelope for them.
+
+        Under ``respond_async=True`` a handed-off run reports the headers of the
+        result fetch that carried its output, over those of the ``202`` that
+        handed it off -- except :attr:`RouterRunResult.replayed` and
+        :attr:`RouterRunResult.request_id`, which stay the run request's -- and
+        sets :attr:`RouterRunResult.handed_off`, under which a missing provider
+        disclosure means "not disclosed".
         """
-        body, headers = self._run(
+        body, headers, handed_off = self._run(
             model,
             arguments,
             idempotency_key=idempotency_key,
             model_provider=model_provider,
             strict_mode=strict_mode,
             fallback_provider=fallback_provider,
+            respond_async=respond_async,
             timeout=timeout,
         )
-        return _run_result(body, headers)
+        return _run_result(body, headers, handed_off=handed_off)
 
     def submit(
         self,
@@ -988,8 +1230,9 @@ class AsyncModels(_ModelsBase):
         model_provider: str | None = None,
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
+        respond_async: bool = False,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
-    ) -> tuple[dict[str, Any] | BinaryResult, Mapping[str, str]]:
+    ) -> tuple[dict[str, Any] | BinaryResult, Mapping[str, str], bool]:
         """Awaitable :meth:`Models.run` — same arguments, same result shape.
 
         This *is* the async form of ``run``: awaiting it on ``AsyncComfy`` is
@@ -1010,6 +1253,7 @@ class AsyncModels(_ModelsBase):
         # event loop, so another task is free to run and mutate `arguments`,
         # nested values included.
         payload = deepcopy(dict(arguments))
+        started = _now()
         retrier = Retrier(self._retry, now=_now)
         # The most recent failure that could have claimed the key — see
         # :meth:`Models.run`.
@@ -1020,15 +1264,17 @@ class AsyncModels(_ModelsBase):
         with translating(idempotency_key=key):
             while True:
                 try:
-                    return await low.post_model_run(
+                    body, headers = await low.post_model_run(
                         model,
                         payload,
                         idempotency_key=key,
                         model_provider=model_provider,
                         strict_mode=strict_mode,
                         fallback_provider=fallback_provider,
+                        respond_async=respond_async,
                         timeout=timeout,
                     )
+                    break
                 except _CANDIDATE_FAILURES as exc:
                     if claimed is not None and _is_key_reuse(exc):
                         # The rejected resend replaces nothing — see
@@ -1042,6 +1288,24 @@ class AsyncModels(_ModelsBase):
                     if may_have_claimed_key(exc):
                         claimed = exc
                     await asyncio.sleep(delay)
+            if not isinstance(body, RunHandoff):
+                return body, headers, False
+            # Followed inside `translating` — see :meth:`Models._run`.
+            handle = AsyncRequestHandle(low, model, _handoff_request_id(body, headers), self._retry)
+            handle._request_timeout = timeout
+            wait = _handoff_wait(respond_async, timeout, started)
+            deadline = None if wait is None else _now() + wait
+            completion: QueueUpdate | None = None
+            try:
+                async for update in handle.iter_events(timeout=wait):
+                    completion = update
+                output, collected = await handle._collect_with_headers(
+                    _completed(completion), budget=_remaining(deadline)
+                )
+            except TimeoutError as exc:
+                _handoff_timed_out(exc, key, headers)
+                raise
+            return output, _handoff_headers(headers, collected), True
 
     # -- the queued form: submit, hold a handle, collect ------------------
     async def run(
@@ -1053,16 +1317,18 @@ class AsyncModels(_ModelsBase):
         model_provider: str | None = None,
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
+        respond_async: bool = False,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
     ) -> dict[str, Any] | BinaryResult:
         """Awaitable :meth:`Models.run` — same ``dict | BinaryResult`` result."""
-        body, _ = await self._run(
+        body, _, _ = await self._run(
             model,
             arguments,
             idempotency_key=idempotency_key,
             model_provider=model_provider,
             strict_mode=strict_mode,
             fallback_provider=fallback_provider,
+            respond_async=respond_async,
             timeout=timeout,
         )
         return body
@@ -1076,19 +1342,21 @@ class AsyncModels(_ModelsBase):
         model_provider: str | None = None,
         strict_mode: bool | None = None,
         fallback_provider: bool | str | None = None,
+        respond_async: bool = False,
         timeout: float | httpx.Timeout | None = MODEL_RUN_TIMEOUT,
     ) -> RouterRunResult:
         """Awaitable :meth:`Models.run_detailed` — same arguments, same result shape."""
-        body, headers = await self._run(
+        body, headers, handed_off = await self._run(
             model,
             arguments,
             idempotency_key=idempotency_key,
             model_provider=model_provider,
             strict_mode=strict_mode,
             fallback_provider=fallback_provider,
+            respond_async=respond_async,
             timeout=timeout,
         )
-        return _run_result(body, headers)
+        return _run_result(body, headers, handed_off=handed_off)
 
     async def submit(
         self,
