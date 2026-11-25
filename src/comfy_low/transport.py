@@ -273,7 +273,10 @@ def is_json_media_type(media: str) -> bool:
     including ``text/plain`` and ``text/html``: the SDK cannot tell a partner's
     native text output from a proxy interstitial, and on this route the
     contract says the body is the partner's, so it hands the bytes back rather
-    than throwing away a generation the caller was billed for.
+    than throwing away a generation the caller was billed for. The same holds
+    for ``text/event-stream``, the route's stream-direct answer to a body
+    sending ``stream: true``: the event stream is read whole and returned as
+    bytes, not parsed.
     """
     return media == "application/json" or media.endswith("+json")
 

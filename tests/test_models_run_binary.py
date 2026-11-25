@@ -68,6 +68,22 @@ def test_an_audio_200_returns_the_bytes_verbatim(server) -> None:
     assert server.state.model_run_generations == 1
 
 
+def test_a_stream_direct_event_stream_200_comes_back_as_its_bytes(server) -> None:
+    # The run route's 200 also declares `text/event-stream`: a model enrolled
+    # in stream-direct may answer a body sending `stream: true` with the
+    # provider's own event stream. The SDK does not parse it; it reads the
+    # whole stream and hands it back as the binary branch's `BinaryResult`,
+    # so the generation the caller asked to stream is still delivered intact.
+    events = b'data: {"delta": "a"}\n\ndata: {"delta": "b"}\n\ndata: [DONE]\n\n'
+    server.state.model_run_binary_body = events
+    server.state.model_run_binary_content_type = "text/event-stream; charset=utf-8"
+    with Comfy(retry=NO_RETRY) as client:
+        result = client.models.run(MODEL, {**ARGS, "stream": True})
+    assert isinstance(result, BinaryResult)
+    assert result.content == events
+    assert result.content_type == "text/event-stream; charset=utf-8"
+
+
 async def test_the_async_client_returns_the_same_binary_result(server) -> None:
     _serve_audio(server)
     server.state.model_run_request_id = "req_audio_01"

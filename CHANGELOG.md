@@ -12,6 +12,21 @@ the fuller account of each version, including verification notes.
 
 ### Added
 
+- `BudgetExceeded`, `BudgetCheckUnavailable` and `ByokCredentialRejected` in
+  `comfy_sdk.router_exceptions`, for the Router buckets `budget_exceeded`,
+  `budget_check_unavailable` and `byok_credential_rejected` from the synced Router spec.
+  `BudgetExceeded` is a `402` for a hard spend cap that has been reached; it is not
+  `InsufficientCredits`, and a bare `402` naming no bucket still reads as that.
+  `BudgetCheckUnavailable` is a `503` for a spend cap that could not be checked; the contract says
+  to retry after `Retry-After` (carried on `retry_after`), and like `ServiceUnavailable` the
+  default retry policy does not make that retry (`RetryPolicy(retry_possibly_in_flight=True)`
+  opts in, with the same `Idempotency-Key`). `ByokCredentialRejected` is a `401` for a provider
+  key supplied for the call that the provider refused; sending the same key again is refused the
+  same way. Before this, all three arrived as a bare `RouterError`.
+- A `text/event-stream` success from `models.run` (the run route's stream-direct answer to a
+  body sending `stream: true`) is now a declared case: the event stream is read whole and
+  returned as a `BinaryResult`, as any other non-JSON success already was.
+
 - `respond_async=True` on `models.run` and `models.run_detailed` (and the `AsyncModels` twins):
   sends `Prefer: respond-async`, so Router may hand a long run to its queue and answer `202` with
   a handle instead of holding the connection. A `202` carrying `Preference-Applied:

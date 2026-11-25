@@ -18,6 +18,9 @@ from comfy_sdk.router_exceptions import (
     REQUEST_ID_HEADER,
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
+    BudgetCheckUnavailable,
+    BudgetExceeded,
+    ByokCredentialRejected,
     Cancelled,
     ClientDisconnected,
     ConcurrencyLimitExceeded,
@@ -61,6 +64,8 @@ CASES: list[tuple[str, int, type[RouterError]]] = [
     ("provider_error", 502, ProviderError),
     ("provider_timeout", 504, ProviderTimeout),
     ("insufficient_credits", 402, InsufficientCredits),
+    ("budget_exceeded", 402, BudgetExceeded),
+    ("budget_check_unavailable", 503, BudgetCheckUnavailable),
     ("model_not_found", 404, ModelNotFound),
     ("unauthorized", 401, Unauthorized),
     ("forbidden", 403, Forbidden),
@@ -76,6 +81,7 @@ CASES: list[tuple[str, int, type[RouterError]]] = [
     ("request_not_found", 404, RequestNotFound),
     ("queue_backlog_full", 429, QueueBacklogFull),
     ("result_expired", 410, ResultExpired),
+    ("byok_credential_rejected", 401, ByokCredentialRejected),
 ]
 
 # Deliberately not in the set this SDK version knows: a later milestone adds it,

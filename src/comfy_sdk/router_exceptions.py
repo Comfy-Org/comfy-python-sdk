@@ -298,13 +298,22 @@ class InvalidInput(RouterError):
 class ContentPolicyViolation(RouterError):
     """The model's content policy refused the request.
 
-    Deterministic: the same input will be refused again, so this is never a
-    retry candidate. It is deliberately not a :class:`ProviderError` -- the two
-    differ in whether a retry can ever succeed.
+    A refusal of the caller's *input* is deterministic: the same input will be
+    refused again, so re-sending it unchanged is not a retry candidate. It is
+    deliberately not a :class:`ProviderError` -- the two differ in whether a
+    retry can ever succeed.
+
+    The exception is a refusal of the model's own generated *output*. On the
+    synchronous route, when Router can tell that is what the provider refused,
+    ``detail`` says so and what may succeed: a changed prompt or references, or
+    for some providers the same input retried. The queued collect says so only
+    for the providers whose same input may succeed on a retry. The SDK's retry
+    policy never retries this bucket either way; read ``detail`` before
+    deciding to.
     """
 
     error_type = "content_policy_violation"
-    _spec_meaning_digest: str = "bf2e91e6a6dd"
+    _spec_meaning_digest: str = "80a3d8b6f9cc"
 
 
 class ProviderError(RouterError):
@@ -332,6 +341,21 @@ class InsufficientCredits(RouterError):
     _spec_meaning_digest: str = "303c7b5e1b47"
 
 
+class BudgetExceeded(RouterError):
+    """A hard spend cap has been reached.
+
+    Returned under ``402``, which it shares with :class:`InsufficientCredits`
+    and is not the same thing: that one says the workspace has run out of
+    credits, this one says a spend cap set on the workspace has been reached,
+    whatever its balance. Re-sending the same call is refused the same way until
+    the cap resets or is raised. A bare ``402`` that names no bucket still reads
+    as :class:`InsufficientCredits`, the plain HTTP meaning of the status.
+    """
+
+    error_type = "budget_exceeded"
+    _spec_meaning_digest: str = "946503260fd6"
+
+
 class ModelNotFound(RouterError):
     """No such model Router can run. An unknown provider, an unenrolled id, an
     id the catalog has retired past its sunset date, and a catalogued id the
@@ -353,6 +377,24 @@ class ModelNotFound(RouterError):
 
     error_type = "model_not_found"
     _spec_meaning_digest: str = "6c0e0e327e4d"
+
+
+class ByokCredentialRejected(RouterError):
+    """The provider rejected the key supplied for this call.
+
+    Returned under ``401``; an upstream ``403`` is the same refusal and is
+    returned as this ``401`` too, with the provider's own status on
+    ``X-Comfy-Upstream-Status``. Check the key stored for this provider:
+    sending the same key again will be refused the same way, so do not retry.
+
+    It names the caller's *provider* key, not the caller's Comfy credential
+    (:class:`Unauthorized`, :class:`Forbidden`), and not an outage of the
+    provider (:class:`ProviderError`). The provider's response body is not
+    included.
+    """
+
+    error_type = "byok_credential_rejected"
+    _spec_meaning_digest: str = "1e89db8bfad2"
 
 
 # -- transport-level buckets -------------------------------------------------
@@ -496,15 +538,41 @@ class ServiceUnavailable(RouterError):
     _spec_meaning_digest: str = "28b40d6c0f89"
 
 
+class BudgetCheckUnavailable(RouterError):
+    """A hard spend cap could not be checked, so the call was not run.
+
+    Returned under ``503``; the contract's advice is to retry after the
+    ``Retry-After`` delay, which is carried on ``retry_after``. It is not
+    :class:`BudgetExceeded`: no cap is known to have been reached, the check
+    itself failed.
+
+    Like :class:`ServiceUnavailable`, the SDK does **not** make that retry by
+    default: the retry policy sorts a ``503`` by whether the one
+    ``Idempotency-Key`` is provably spendable again, and no vendored contract
+    says this one releases it. ``RetryPolicy(retry_possibly_in_flight=True)``
+    opts in, keeps the one key across the retry and waits the ``Retry-After``
+    the server named. Calling ``models.run()`` again by hand mints a fresh key;
+    pass the same explicit ``idempotency_key=`` both times instead.
+    """
+
+    error_type = "budget_check_unavailable"
+    _spec_meaning_digest: str = "9461ca3d07cf"
+
+
 class RateLimited(RouterError):
     """The caller has spent an allowance measured over a *window* and must wait
-    for that window to roll.
+    for that window to roll, or the model provider throttled the call before
+    starting any generation.
 
     It shares ``429`` with :class:`ConcurrencyLimitExceeded` and is not the same
     thing: that one clears the moment one of the caller's own in-flight calls
     finishes, so retrying in seconds is right, whereas nothing the caller does
     drains this one early. On the Router surface, ``detail`` names the window,
-    and ``Retry-After`` the seconds to wait, carried on ``retry_after``.
+    and ``Retry-After`` the seconds to wait, carried on ``retry_after``. On a
+    provider's limit, ``X-Comfy-Upstream-Status`` carries the provider's
+    ``429``, and ``Retry-After`` carries the provider's own wait only when it
+    sent one -- so ``retry_after`` can be ``None`` there, and a ``429`` without
+    a pace is not retried by default.
 
     The window guarantee above is Router's. The v2 jobs/assets gateway raises
     this same class for ``code == "rate_limited"``, and there it has two causes:
@@ -515,7 +583,7 @@ class RateLimited(RouterError):
     """
 
     error_type = "rate_limited"
-    _spec_meaning_digest: str = "e94bd188240b"
+    _spec_meaning_digest: str = "24b19c6028a7"
 
 
 # -- queue buckets -----------------------------------------------------------
@@ -683,8 +751,11 @@ _BY_CANCEL_REFUSAL: dict[str, type[CancelRefused]] = {
 }
 
 
-#: Every class in the closed set, in the order the error set declares it: the
-#: request-level buckets, then the transport-level ones. The order is the
+#: Every class in the closed set, in the order the error set declares it --
+#: mostly the request-level buckets, then the transport-level ones, but the
+#: spec places ``budget_check_unavailable`` beside ``budget_exceeded`` and
+#: appends ``byok_credential_rejected`` last, so the tier sections above do not
+#: dictate it. The order is the
 #: vendored spec's ``x-comfy-error-types`` order, and
 #: ``tests/test_router_spec_contract.py`` asserts that -- so this tuple cannot
 #: drift from the contract two SDKs generate their surface from.
@@ -694,6 +765,8 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     ProviderError,
     ProviderTimeout,
     InsufficientCredits,
+    BudgetExceeded,
+    BudgetCheckUnavailable,
     ModelNotFound,
     Unauthorized,
     Forbidden,
@@ -709,6 +782,7 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     RequestNotFound,
     QueueBacklogFull,
     ResultExpired,
+    ByokCredentialRejected,
 )
 
 _BY_ERROR_TYPE: dict[str, type[RouterError]] = {cls.error_type: cls for cls in ROUTER_EXCEPTIONS}
@@ -979,6 +1053,9 @@ __all__ = [
     "ROUTER_ERROR_TYPES",
     "ROUTER_EXCEPTIONS",
     "AlreadyCompleted",
+    "BudgetCheckUnavailable",
+    "BudgetExceeded",
+    "ByokCredentialRejected",
     "CancelRefused",
     "Cancelled",
     "ClientDisconnected",
