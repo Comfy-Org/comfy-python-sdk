@@ -65,8 +65,8 @@ the fuller account of each version, including verification notes.
   workspace's final charge. `None` means no quote is available, never no charge:
   the estimate is off for the caller, the submit was answered by an idempotent replay, or the
   handle was rebuilt with `client.models.handle`. A malformed quote reads as `None` and never
-  fails the submit, and so does a quote marked free whose `amount_cents` or `credits` figure is
-  non-zero or unreadable, since it contradicts itself.
+  fails the submit, and so does a quote marked free whose `amount` is non-zero or whose
+  `amount_cents` or `credits` figure is non-zero or unreadable, since it contradicts itself.
 - `client.realtime.connect` on `Comfy` and `AsyncComfy`: opens a Comfy Router realtime
   session over `GET /v2/realtime/{serving}/{model}` on `COMFY_ROUTER_BASE_URL`, authenticated
   by the client's API key (`X-API-Key`) or an `id_token=` sent in the subprotocol offer. A
