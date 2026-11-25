@@ -45,10 +45,11 @@ uv run --extra codegen bash scripts/gen_models.sh   # rewrites src/comfy_low/mod
 uv run --extra codegen python scripts/check_drift.py  # the exact check CI runs
 ```
 
-`check_drift.py` runs two checks, not one: the byte-for-byte model comparison
-above, and the Router error-type comparison described under "Other things that
-are not obvious" below. Both run on every invocation, so a failure in one does
-not hide the other.
+`check_drift.py` runs four checks, not one: the byte-for-byte model comparison
+above, the Router error-type comparison described under "Other things that are
+not obvious" below, the bound model-run route, and `SpendBudgetDetail` against
+the Router spec's `RouterSpendBudgetDetail`. All run on every invocation, so a
+failure in one does not hide another.
 
 Then commit `src/comfy_low/models/_generated.py`.
 

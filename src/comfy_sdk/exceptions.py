@@ -48,6 +48,7 @@ from .router_exceptions import (
     RateLimited,
     RouterError,
     Unauthorized,
+    _budget_kwargs,
     _detail_from,
 )
 
@@ -298,6 +299,7 @@ def to_sdk_error(exc: ApiError) -> ComfyError:
             retry_after=exc.retry_after,
             errors=tuple(_detail_from(entry) for entry in exc.validation_errors),
             organization_id=exc.organization_id,
+            **_budget_kwargs(cls, exc.budget, exc.blocking_budgets),
         )
     # No `errors=` below, deliberately: `.errors` is a `RouterError` attribute
     # and none of the remaining classes takes the argument. A validation body

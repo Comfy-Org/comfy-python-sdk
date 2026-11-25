@@ -339,6 +339,10 @@ class ServerState:
     # one). None omits the field, as Router does on an idempotent replay or
     # with the cost estimate off for the caller.
     queue_submit_estimate: Any = None
+    # `X-Comfy-Router-Dropped-Params` on the 201, verbatim; None sends no header.
+    queue_submit_dropped_params: str | None = None
+    # Extra members of the body of a `queue_submit_error` refusal.
+    queue_submit_error_body: dict[str, Any] = field(default_factory=dict)
     # The id the queue hands back, and the one every later route answers for.
     queue_request_id: str = "req_stub_01"
     # Sent as `X-Comfy-Request-Id` on the queue result route's 200 — a real
@@ -1000,14 +1004,19 @@ def _make_handler(state: ServerState):
                 return
             if state.queue_submit_error:
                 status, code = state.queue_submit_error
-                self._router_err(status, code)
+                self._router_err(status, code, extra=state.queue_submit_error_body)
                 return
             body: dict[str, Any] = {"status": state.queue_pending_status}
             if not state.queue_submit_omits_request_id:
                 body["request_id"] = state.queue_request_id
             if state.queue_submit_estimate is not None:
                 body["estimate"] = state.queue_submit_estimate
-            self._json(state.queue_submit_status, body)
+            headers = (
+                {"X-Comfy-Router-Dropped-Params": state.queue_submit_dropped_params}
+                if state.queue_submit_dropped_params is not None
+                else None
+            )
+            self._json(state.queue_submit_status, body, headers=headers)
 
         def _serve_queue_status(self, request_id: str) -> None:
             state.queue_status_count += 1
@@ -1160,13 +1169,19 @@ def _make_handler(state: ServerState):
             self._json(200, state.schema_document, headers=headers)
 
         def _router_err(
-            self, status: int, code: str, message: str = "err", retry_after: str | None = None
+            self,
+            status: int,
+            code: str,
+            message: str = "err",
+            retry_after: str | None = None,
+            extra: dict[str, Any] | None = None,
         ) -> None:
             """Router's own error shape: the bucket on the header and in the body."""
             headers = {"X-Comfy-Error-Type": code}
             if retry_after:
                 headers["Retry-After"] = retry_after
-            self._json(status, {"detail": message, "error_type": code}, headers=headers)
+            body = {"detail": message, "error_type": code, **(extra or {})}
+            self._json(status, body, headers=headers)
 
         def _post_model_run(self, provider: str, model: str) -> None:
             state.model_run_count += 1

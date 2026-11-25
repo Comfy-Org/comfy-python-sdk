@@ -23,6 +23,14 @@ the fuller account of each version, including verification notes.
   opts in, with the same `Idempotency-Key`). `ByokCredentialRejected` is a `401` for a provider
   key supplied for the call that the provider refused; sending the same key again is refused the
   same way. Before this, all three arrived as a bare `RouterError`.
+- `budget` and `blocking_budgets` on `BudgetExceeded`: the exhausted budget and every exhausted hard
+  budget from the response body, as read-only `SpendBudgetDetail` objects (new in
+  `comfy_sdk.router_exceptions`). `None` and empty when the body does not carry them; identifiers,
+  mode and amounts are shown to the workspace Owner only. `comfy_low.ApiError` carries the same two
+  raw.
+- `dropped_params` on `RequestHandle` and `AsyncRequestHandle`: the native fields a translated
+  `models.submit` could not carry, from `X-Comfy-Router-Dropped-Params` on the submit's response.
+  `None` when the header is absent, and always on a handle rebuilt with `models.handle`.
 - A `text/event-stream` success from `models.run` (the run route's stream-direct answer to a
   body sending `stream: true`) is now a declared case: the event stream is read whole and
   returned as a `BinaryResult`, as any other non-JSON success already was.

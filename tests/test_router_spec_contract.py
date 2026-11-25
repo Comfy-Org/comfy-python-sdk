@@ -49,11 +49,12 @@ from comfy_low.transport import (
 )
 from comfy_sdk import COMFY_ROUTER_BASE_URL, router_exceptions
 from comfy_sdk.model_requests import CostEstimate
-from comfy_sdk.models import RouterRunResult, _run_result
+from comfy_sdk.models import _DROPPED_PARAMS_HEADER, RouterRunResult, _run_result
 from comfy_sdk.router_exceptions import (
     ROUTER_ERROR_TYPES,
     ROUTER_EXCEPTIONS,
     RouterError,
+    SpendBudgetDetail,
     _meaning_digest,
     exception_for,
 )
@@ -368,6 +369,23 @@ def test_every_cost_estimate_property_the_spec_declares_is_modelled() -> None:
     assert [ref["$ref"] for ref in submit_fields["estimate"]["allOf"]] == [
         "#/components/schemas/RouterCostEstimate"
     ]
+
+
+def test_the_budget_detail_models_exactly_the_spec_s_properties() -> None:
+    schemas = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))["components"]["schemas"]
+    assert set(schemas["RouterSpendBudgetDetail"]["properties"]) == {
+        f.name for f in fields(SpendBudgetDetail)
+    }
+
+
+def test_a_queued_submit_declares_the_dropped_params_header() -> None:
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    submit = next(
+        item["post"]
+        for item in doc["paths"].values()
+        if item.get("post", {}).get("operationId") == "submitRouterModelRequest"
+    )
+    assert _DROPPED_PARAMS_HEADER in submit["responses"]["201"]["headers"]
 
 
 def test_the_bound_path_has_exactly_the_two_segments_the_binding_fills() -> None:

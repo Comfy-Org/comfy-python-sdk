@@ -21,6 +21,7 @@ What each group here is for:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -94,6 +95,43 @@ def test_submit_posts_to_the_requests_route_under_the_model_id(server, fast_poll
         "acme",
         "fast-sdxl",
     )
+
+
+# --- the submit's dropped-params disclosure ---------------------------------
+
+DROPPED = "moderation (fal applies its own, non-configurable safety filtering)"
+
+
+def test_submit_exposes_dropped_params_on_the_handle(server, fast_poll) -> None:
+    # The entry carries a comma on purpose: the header is JSON, not a comma list.
+    server.state.queue_submit_dropped_params = json.dumps([DROPPED, "seed (unsupported)"])
+    with _client() as client:
+        handle = client.models.submit(MODEL, ARGS)
+        assert handle.dropped_params == (DROPPED, "seed (unsupported)")
+        # The header is on the submit's response only, so a rebuilt handle has none.
+        assert client.models.handle(MODEL, handle.request_id).dropped_params is None
+
+
+async def test_async_submit_exposes_dropped_params_on_the_handle(server, fast_poll) -> None:
+    server.state.queue_submit_dropped_params = json.dumps([DROPPED])
+    async with AsyncComfy(api_key="k") as client:
+        handle = await client.models.submit(MODEL, ARGS)
+        assert handle.dropped_params == (DROPPED,)
+        rebuilt = await client.models.handle(MODEL, handle.request_id)
+        assert rebuilt.dropped_params is None
+
+
+async def test_dropped_params_is_none_when_the_submit_sends_no_header(server, fast_poll) -> None:
+    with _client() as client:
+        assert client.models.submit(MODEL, ARGS).dropped_params is None
+    async with AsyncComfy(api_key="k") as client:
+        assert (await client.models.submit(MODEL, ARGS)).dropped_params is None
+
+
+def test_a_malformed_dropped_params_header_is_one_intact_entry(server, fast_poll) -> None:
+    server.state.queue_submit_dropped_params = "not json, at all"
+    with _client() as client:
+        assert client.models.submit(MODEL, ARGS).dropped_params == ("not json, at all",)
 
 
 # --- the submit's cost estimate ---------------------------------------------

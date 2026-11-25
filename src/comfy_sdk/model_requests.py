@@ -606,6 +606,7 @@ class _RequestHandleBase:
     _request_id: str
     _retry: RetryPolicy
     _estimate: CostEstimate | None
+    _dropped_params: tuple[str, ...] | None
     #: The per-request HTTP timeout a poll or result fetch uses when it has no
     #: budget of its own. :data:`_INHERIT_TIMEOUT` -- every handle a caller
     #: builds -- is the client's timeout; ``models.run`` following a ``202``
@@ -648,6 +649,23 @@ class _RequestHandleBase:
         """
         return self._estimate
 
+    @property
+    def dropped_params(self) -> tuple[str, ...] | None:
+        """The native fields translation could not carry, or ``None``.
+
+        Read from ``X-Comfy-Router-Dropped-Params`` on the submit's own
+        response; each entry names the field and why, as
+        :attr:`~comfy_sdk.RouterRunResult.dropped_params` does for a run.
+
+        On a handle ``client.models.submit`` returned, ``None`` means no
+        translation ran or it dropped nothing. The queue's status and result
+        responses do not carry the header, so it is always ``None``, meaning
+        "not disclosed", on a handle rebuilt with ``client.models.handle``. A
+        same-key replay of the submit carries the original's value, unlike
+        :attr:`estimate`.
+        """
+        return self._dropped_params
+
     def __repr__(self) -> str:
         estimate = "" if self._estimate is None else f", estimate={self._estimate.source!r}"
         return (
@@ -662,8 +680,9 @@ class RequestHandle(_RequestHandleBase):
     Built by ``client.models.submit`` and by ``client.models.handle``; there is
     nothing to construct by hand, and nothing in it that a second process
     cannot rebuild from :attr:`model` and :attr:`request_id` -- except
-    :attr:`estimate`, which only the submitting process ever holds. Keep the
-    quote alongside the two ids if a later process needs it.
+    :attr:`estimate` and :attr:`dropped_params`, which arrive only on the
+    submit's response. Keep them alongside the two ids if a later process needs
+    them.
     """
 
     def __init__(
@@ -674,12 +693,14 @@ class RequestHandle(_RequestHandleBase):
         retry: RetryPolicy = DEFAULT_RETRY,
         *,
         estimate: CostEstimate | None = None,
+        dropped_params: tuple[str, ...] | None = None,
     ) -> None:
         self._low = low
         self._model = model
         self._request_id = request_id
         self._retry = retry
         self._estimate = estimate
+        self._dropped_params = dropped_params
 
     # -- polling (authoritative) ------------------------------------------
     def status(self) -> QueueUpdate:
@@ -899,12 +920,14 @@ class AsyncRequestHandle(_RequestHandleBase):
         retry: RetryPolicy = DEFAULT_RETRY,
         *,
         estimate: CostEstimate | None = None,
+        dropped_params: tuple[str, ...] | None = None,
     ) -> None:
         self._low = low
         self._model = model
         self._request_id = request_id
         self._retry = retry
         self._estimate = estimate
+        self._dropped_params = dropped_params
 
     async def status(self) -> QueueUpdate:
         """Awaitable :meth:`RequestHandle.status` — one authoritative poll."""

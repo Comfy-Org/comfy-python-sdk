@@ -845,9 +845,14 @@ and the settled charge in your workspace's usage and billing records is what you
 pay. It is not a price lock either: the run is charged at the rates in force
 when it is rated.
 
+When Router translated the body for another provider and could not carry every
+native field, `handle.dropped_params` names each dropped field and why, as it
+does on a `run_detailed` result; `None` means no translation ran or it dropped
+nothing.
+
 Rehydrate a handle in another process from the two ids that address the
-request, with no call made (the cost quote does not come back with it, so keep
-`handle.estimate` alongside the ids if a later process needs it):
+request, with no call made (the cost quote and `dropped_params` do not come back
+with it, so keep them alongside the ids if a later process needs them):
 
 ```python
 handle = client.models.handle("fal-ai/flux-pro", request_id)
@@ -1256,6 +1261,11 @@ except NotEnabled:
 except RouterError as exc:
     print(exc.error_type, exc.request_id)                # every other bucket
 ```
+
+`BudgetExceeded` carries the spend budgets that blocked the call as `budget` (one
+`SpendBudgetDetail` or `None`) and `blocking_budgets` (a tuple, empty when the
+response did not carry the list). Their ids, mode and amounts are shown to the
+workspace Owner only and are `None` for anyone else.
 
 `RouterError` covers every refusal Router itself answered with, including a
 bucket newer than your installed version — Router names the bucket on every
