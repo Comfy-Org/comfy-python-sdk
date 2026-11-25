@@ -54,8 +54,11 @@ ROUTER_SPEC = ROOT / "spec" / "router-openapi.yaml"
 #: JSON branch that decodes to a ``dict``, one catch-all binary branch that
 #: comes back as a ``BinaryResult``. Unlike the path and host below, there is no
 #: constant in the SDK to compare against, because the branch is control flow
-#: rather than data; so the expectation lives here.
-_BOUND_RUN_MEDIA_TYPES = ["*/*", "application/json"]
+#: rather than data; so the expectation lives here. ``text/event-stream`` is
+#: the stream-direct answer to a body sending ``stream: true``: it is not a
+#: third branch, the SDK reads the event stream whole and returns it as a
+#: ``BinaryResult`` like any other non-JSON success.
+_BOUND_RUN_MEDIA_TYPES = ["*/*", "application/json", "text/event-stream"]
 
 
 def _generate(out: Path) -> None:

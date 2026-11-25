@@ -32,6 +32,7 @@ which is the gate that catches it even for someone who only ran the linters.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import MISSING, fields
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,7 @@ from comfy_low.transport import (
     _MODEL_SCHEMA_PATH_TEMPLATE,
     model_catalog_path,
 )
-from comfy_sdk import COMFY_ROUTER_BASE_URL
+from comfy_sdk import COMFY_ROUTER_BASE_URL, router_exceptions
 from comfy_sdk.model_requests import CostEstimate
 from comfy_sdk.models import RouterRunResult, _run_result
 from comfy_sdk.router_exceptions import (
@@ -184,24 +185,47 @@ def test_the_spec_states_a_meaning_and_a_tier_for_every_bucket() -> None:
         assert isinstance(entry.get("meaning"), str) and entry["meaning"].strip(), entry
 
 
-def test_every_request_tier_bucket_precedes_every_transport_tier_one() -> None:
-    """The assumption that lets the order check above stand in for a tier check.
+def _section_line(marker: str) -> int:
+    """The 1-based line in ``router_exceptions.py`` holding a section comment."""
+    lines = inspect.getsource(router_exceptions).splitlines()
+    matches = [number for number, line in enumerate(lines, start=1) if line.startswith(marker)]
+    assert len(matches) == 1, f"expected exactly one {marker!r} section in router_exceptions.py"
+    return matches[0]
 
-    Nothing else in this file reads ``tier``: the class table is compared as a
-    flat ordered list, which only carries the request/transport split as long
-    as the spec keeps the two runs contiguous and request-first. A sync that
-    interleaved them would leave the section comments in
-    ``router_exceptions.py`` describing an order the spec no longer declares,
-    with every other assertion here green.
+
+@pytest.mark.parametrize(
+    "entry", DECLARED_ENTRIES, ids=[entry["value"] for entry in DECLARED_ENTRIES]
+)
+def test_every_class_sits_in_the_section_its_spec_tier_names(entry: dict[str, Any]) -> None:
+    """The tier check the flat order comparison above cannot make.
+
+    The class table is compared as a flat ordered list, and the spec does not
+    keep the tiers contiguous (``budget_check_unavailable`` is a transport
+    bucket declared beside ``budget_exceeded``; ``byok_credential_rejected`` is
+    a request bucket declared last), so order says nothing about tier. What
+    does is where each class is *defined*: a ``request``-tier class under the
+    request-level section comment of ``router_exceptions.py``, a
+    ``transport``-tier one under the transport-level (or queue) sections. A sync
+    that moved a bucket between tiers would otherwise leave those section
+    comments describing a split the spec no longer declares, with every other
+    assertion here green.
     """
-    tiers = [entry["tier"] for entry in DECLARED_ENTRIES]
-    first_transport = tiers.index("transport") if "transport" in tiers else len(tiers)
-    assert "request" not in tiers[first_transport:], (
-        "the spec's x-comfy-error-types no longer declares every `request`-tier bucket "
-        f"before every `transport`-tier one: {tiers} -- the flat order comparison in this "
-        "file no longer implies the tier split the section comments in "
-        "src/comfy_sdk/router_exceptions.py describe"
-    )
+    request_start = _section_line("# -- request-level buckets")
+    transport_start = _section_line("# -- transport-level buckets")
+    transport_end = _section_line("# -- cancel refusals")
+    cls = exception_for(entry["value"])
+    assert cls is not RouterError, f"no class for {entry['value']!r}"
+    defined_at = inspect.getsourcelines(cls)[1]
+    if entry["tier"] == "request":
+        assert request_start < defined_at < transport_start, (
+            f"{cls.__name__} is a request-tier bucket but is not defined under the "
+            "request-level section of src/comfy_sdk/router_exceptions.py"
+        )
+    else:
+        assert transport_start < defined_at < transport_end, (
+            f"{cls.__name__} is a transport-tier bucket but is not defined under the "
+            "transport-level sections of src/comfy_sdk/router_exceptions.py"
+        )
 
 
 @pytest.mark.parametrize(
@@ -377,10 +401,14 @@ def test_the_run_200_declares_both_a_json_and_a_binary_branch() -> None:
     SDK's behaviour rather than the server's contract.
     """
     content = _run_200_content()
-    assert set(content) == {"application/json", "*/*"}, (
+    # `text/event-stream` is the stream-direct answer to a body sending
+    # `stream: true`; the SDK reads it whole and returns it down the binary
+    # branch, so it adds a declared type without adding a third case.
+    assert set(content) == {"application/json", "*/*", "text/event-stream"}, (
         f"the vendored spec's runRouterModel 200 declares {sorted(content)}; "
         "comfy_low.transport._Prepared.parse_run_result branches on exactly two "
-        "cases (JSON -> dict, anything else -> BinaryResult)"
+        "cases (JSON -> dict, anything else -- text/event-stream included -> "
+        "BinaryResult)"
     )
 
 

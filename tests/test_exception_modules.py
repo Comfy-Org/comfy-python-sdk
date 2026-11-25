@@ -56,6 +56,8 @@ REFUSALS: list[tuple[int, str]] = [
     (502, "provider_error"),
     (504, "provider_timeout"),
     (402, "insufficient_credits"),
+    (402, "budget_exceeded"),
+    (503, "budget_check_unavailable"),
     (404, "model_not_found"),
     (401, "unauthorized"),
     (403, "forbidden"),
@@ -71,6 +73,7 @@ REFUSALS: list[tuple[int, str]] = [
     (404, "request_not_found"),
     (429, "queue_backlog_full"),
     (410, "result_expired"),
+    (401, "byok_credential_rejected"),
     (418, "something_invented_later"),
 ]
 
