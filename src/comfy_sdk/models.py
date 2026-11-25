@@ -404,9 +404,13 @@ class RouterRunResult:
 
     Present only when ``model_provider`` translated the body
     (``strict_mode=False``, the default) and one or more native fields could not
-    be expressed exactly on the alternate provider's schema; each entry names the
-    field and why. ``None`` when no translation ran or it dropped nothing --
-    except on a run that was :attr:`handed_off`, where it means "not disclosed".
+    be expressed exactly on the alternate provider's schema; entries name dropped
+    fields and why. The disclosure is bounded in size, so it may not be a
+    complete list: an entry cut short ends in ``…``, one entry may stand for
+    several fields, and entries left out are replaced by a final one stating how
+    many, a lower bound on the fields affected. ``None`` when no translation ran
+    or it dropped nothing -- except on a run that was :attr:`handed_off`, where
+    it means "not disclosed".
     """
 
     replayed: bool
@@ -1031,8 +1035,8 @@ class Models(_ModelsBase):
         no quote is available — the estimate is off for the caller, or the
         submit was answered by an idempotent replay — and never "no charge".
 
-        Native fields Router's translation of the body could not carry are
-        named on the handle's
+        Router's bounded disclosure of the native fields its translation of the
+        body could not carry is the handle's
         :attr:`~comfy_sdk.model_requests.RequestHandle.dropped_params`.
         """
         low = cast(ComfyLow, self._low)

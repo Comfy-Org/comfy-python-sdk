@@ -28,9 +28,10 @@ the fuller account of each version, including verification notes.
   `comfy_sdk.router_exceptions`). `None` and empty when the body does not carry them; identifiers,
   mode and amounts are shown to the workspace Owner only. `comfy_low.ApiError` carries the same two
   raw.
-- `dropped_params` on `RequestHandle` and `AsyncRequestHandle`: the native fields a translated
-  `models.submit` could not carry, from `X-Comfy-Router-Dropped-Params` on the submit's response.
-  `None` when the header is absent, and always on a handle rebuilt with `models.handle`.
+- `dropped_params` on `RequestHandle` and `AsyncRequestHandle`: Router's bounded disclosure of the
+  native fields a translated `models.submit` could not carry, from `X-Comfy-Router-Dropped-Params`
+  on the submit's response; a long list is cut or summarised, so it may be incomplete. `None` when
+  the header is absent, and always on a handle rebuilt with `models.handle`.
 - A `text/event-stream` success from `models.run` (the run route's stream-direct answer to a
   body sending `stream: true`) is now a declared case: the event stream is read whole and
   returned as a `BinaryResult`, as any other non-JSON success already was.

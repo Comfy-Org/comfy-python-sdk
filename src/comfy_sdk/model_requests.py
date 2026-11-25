@@ -651,11 +651,15 @@ class _RequestHandleBase:
 
     @property
     def dropped_params(self) -> tuple[str, ...] | None:
-        """The native fields translation could not carry, or ``None``.
+        """Router's disclosure of what translation could not carry, or ``None``.
 
         Read from ``X-Comfy-Router-Dropped-Params`` on the submit's own
-        response; each entry names the field and why, as
-        :attr:`~comfy_sdk.RouterRunResult.dropped_params` does for a run.
+        response; entries name dropped native fields and why, as
+        :attr:`~comfy_sdk.RouterRunResult.dropped_params` does for a run. Like
+        it, the disclosure is bounded in size, so it may not be a complete list:
+        an entry may be cut (it ends in ``…``) or stand for several fields, and
+        a final entry may state how many were left out, a lower bound on the
+        fields affected.
 
         On a handle ``client.models.submit`` returned, ``None`` means no
         translation ran or it dropped nothing. The queue's status and result

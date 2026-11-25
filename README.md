@@ -846,8 +846,12 @@ pay. It is not a price lock either: the run is charged at the rates in force
 when it is rated.
 
 When Router translated the body for another provider and could not carry every
-native field, `handle.dropped_params` names each dropped field and why, as it
-does on a `run_detailed` result. On the handle `submit` returned, `None` means no
+native field, `handle.dropped_params` discloses what was dropped and why, as it
+does on a `run_detailed` result. Entries are sentences to read, and the list
+is not guaranteed complete: Router bounds its size, so a long entry is cut (it
+ends in `…`), one entry can stand for several fields, and entries that did not
+fit are replaced by a final one stating how many were left out, a lower bound on
+the fields affected. On the handle `submit` returned, `None` means no
 translation ran or it dropped nothing; on a rebuilt handle (below) it is always
 `None`, meaning "not disclosed", whatever the original submit dropped.
 
