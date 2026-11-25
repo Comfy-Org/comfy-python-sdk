@@ -8,11 +8,14 @@ under test rather than the lookup table on its own.
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from typing import Any
 
 import pytest
 
+from comfy_sdk import AsyncComfy, Comfy
 from comfy_sdk.exceptions import ComfyError
+from comfy_sdk.retry import NO_RETRY
 from comfy_sdk.router_exceptions import (
     ERROR_TYPE_HEADER,
     REQUEST_ID_HEADER,
@@ -41,6 +44,7 @@ from comfy_sdk.router_exceptions import (
     ResultExpired,
     RouterError,
     ServiceUnavailable,
+    SpendBudgetDetail,
     Unauthorized,
     ValidationErrorDetail,
     error_from_completion,
@@ -717,3 +721,120 @@ def test_the_per_field_entries_stay_raw() -> None:
     )
     assert exc.errors[0].msg == HOSTILE
     _assert_bounded_and_printable(exc.detail)
+
+
+# -- budget detail on `budget_exceeded` ---------------------------------------
+
+OWNER_BUDGET = {
+    "id": "bud_1",
+    "scope_kind": "workspace",
+    "scope_id": "ws_1",
+    "mode": "hard",
+    "limit_micro_usd": 5_000_000,
+    "spent_micro_usd": 5_100_000,
+    "limit_credits": 1055,
+    "spent_credits": 1076,
+    "resets_at": "2026-12-01T00:00:00Z",
+    "set_by": "owner",
+}
+OWNER_DETAIL = SpendBudgetDetail(**OWNER_BUDGET)  # type: ignore[arg-type]
+#: What a caller who is not the workspace Owner is shown.
+MEMBER_BUDGET = {key: OWNER_BUDGET[key] for key in ("scope_kind", "resets_at", "set_by")}
+
+
+def _budget_bodies() -> list[RouterError]:
+    """One ``budget_exceeded`` body through both builders that read a body."""
+    body = {
+        "detail": "cap reached",
+        "error_type": "budget_exceeded",
+        "budget": OWNER_BUDGET,
+        "blocking_budgets": [OWNER_BUDGET, MEMBER_BUDGET],
+    }
+    completion = error_from_completion(body)
+    assert completion is not None
+    return [error_from_response(402, {ERROR_TYPE_HEADER: "budget_exceeded"}, body), completion]
+
+
+def test_budget_exceeded_exposes_the_budgets_the_body_carries() -> None:
+    for exc in _budget_bodies():
+        assert isinstance(exc, BudgetExceeded)
+        assert exc.budget == OWNER_DETAIL
+        assert exc.blocking_budgets == (
+            OWNER_DETAIL,
+            SpendBudgetDetail(
+                scope_kind="workspace", resets_at="2026-12-01T00:00:00Z", set_by="owner"
+            ),
+        )
+        assert exc.blocking_budgets[1].limit_credits is None
+
+
+def test_budget_detail_is_read_only() -> None:
+    exc = _budget_bodies()[0]
+    assert isinstance(exc, BudgetExceeded) and exc.budget is not None
+    with pytest.raises(AttributeError):
+        exc.budget = None  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        exc.blocking_budgets = ()  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        exc.budget.limit_credits = 1  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},
+        {"budget": None, "blocking_budgets": None},
+        {"budget": "x", "blocking_budgets": "x"},
+        {"budget": [], "blocking_budgets": [None, "x", 3]},
+    ],
+)
+def test_budget_exceeded_without_budget_detail_is_none_and_empty(extra) -> None:
+    exc = error_from_response(402, {}, {"detail": "d", "error_type": "budget_exceeded", **extra})
+    assert isinstance(exc, BudgetExceeded)
+    assert exc.budget is None
+    assert exc.blocking_budgets == ()
+    assert BudgetExceeded("by hand").budget is None
+
+
+def test_a_wrongly_typed_budget_field_reads_as_absent() -> None:
+    body = {
+        "detail": "d",
+        "error_type": "budget_exceeded",
+        "budget": {**OWNER_BUDGET, "limit_credits": True, "spent_credits": "9", "id": 4},
+    }
+    exc = error_from_response(402, {}, body)
+    assert isinstance(exc, BudgetExceeded) and exc.budget is not None
+    assert (exc.budget.limit_credits, exc.budget.spent_credits, exc.budget.id) == (None, None, None)
+    assert exc.budget.limit_micro_usd == 5_000_000
+
+
+def test_other_buckets_ignore_budget_members() -> None:
+    body = {"detail": "d", "error_type": "insufficient_credits", "budget": OWNER_BUDGET}
+    exc = error_from_response(402, {}, body)
+    assert type(exc) is InsufficientCredits
+    assert not hasattr(exc, "budget")
+
+
+async def test_the_call_paths_carry_budget_detail(server) -> None:
+    # Through `comfy_low` and `to_sdk_error`, which carry the body separately
+    # from the builders above.
+    server.state.queue_submit_error = (402, "budget_exceeded")
+    server.state.queue_submit_error_body = {
+        "budget": OWNER_BUDGET,
+        "blocking_budgets": [OWNER_BUDGET],
+    }
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(BudgetExceeded) as caught:
+            client.models.submit("acme/m", {})
+    async with AsyncComfy(retry=NO_RETRY) as aclient:
+        with pytest.raises(BudgetExceeded) as acaught:
+            await aclient.models.submit("acme/m", {})
+    for exc in (caught.value, acaught.value):
+        assert exc.budget == OWNER_DETAIL
+        assert exc.blocking_budgets == (OWNER_DETAIL,)
+
+    server.state.queue_submit_error_body = {}
+    with Comfy(retry=NO_RETRY) as client:
+        with pytest.raises(BudgetExceeded) as bare:
+            client.models.submit("acme/m", {})
+    assert bare.value.budget is None and bare.value.blocking_budgets == ()

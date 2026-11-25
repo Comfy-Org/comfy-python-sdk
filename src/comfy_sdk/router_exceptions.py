@@ -103,7 +103,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from comfy_low.errors import _location, clean_body_excerpt, clean_request_id, summarise_detail
+from comfy_low.errors import (
+    _location,
+    clean_body_excerpt,
+    clean_request_id,
+    raw_budgets,
+    summarise_detail,
+)
 
 from ._errors import ComfyError
 
@@ -191,6 +197,39 @@ class ValidationErrorDetail:
         same array can never disagree about what a field is called.
         """
         return _location(self.loc)
+
+
+@dataclass(frozen=True)
+class SpendBudgetDetail:
+    """One spend budget that blocked a call, as :class:`BudgetExceeded` carries it.
+
+    ``scope_kind``, ``resets_at`` and ``set_by`` are the fields the contract
+    requires. The identifiers, mode and amounts are visible to the workspace
+    Owner only, so each is ``None`` for anyone else -- which is "not disclosed",
+    never zero. ``scope_kind``, ``set_by`` and ``mode`` are open strings.
+    """
+
+    #: What the budget is set on. ``""`` only if the body left it out.
+    scope_kind: str = ""
+    #: When the budget resets, as the server's RFC 3339 string. ``""`` only if
+    #: the body left it out.
+    resets_at: str = ""
+    #: Who set the budget. ``""`` only if the body left it out.
+    set_by: str = ""
+    #: The budget's id. Owner only.
+    id: str | None = None
+    #: The id of the thing the budget is set on. Owner only.
+    scope_id: str | None = None
+    #: The budget's mode. Owner only.
+    mode: str | None = None
+    #: The cap, in millionths of a US dollar. Owner only.
+    limit_micro_usd: int | None = None
+    #: What has been spent against it, in millionths of a US dollar. Owner only.
+    spent_micro_usd: int | None = None
+    #: The cap, in Comfy credits. Owner only.
+    limit_credits: int | None = None
+    #: What has been spent against it, in Comfy credits. Owner only.
+    spent_credits: int | None = None
 
 
 class RouterError(ComfyError):
@@ -350,10 +389,40 @@ class BudgetExceeded(RouterError):
     whatever its balance. Re-sending the same call is refused the same way until
     the cap resets or is raised. A bare ``402`` that names no bucket still reads
     as :class:`InsufficientCredits`, the plain HTTP meaning of the status.
+
+    :attr:`budget` is the exhausted budget and :attr:`blocking_budgets` every
+    exhausted hard budget, both read off the response body. The identifiers and
+    amounts inside them are visible to the workspace Owner only.
     """
 
     error_type = "budget_exceeded"
     _spec_meaning_digest: str = "946503260fd6"
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        budget: SpendBudgetDetail | None = None,
+        blocking_budgets: Sequence[SpendBudgetDetail] = (),
+        **kw: Any,
+    ) -> None:
+        super().__init__(detail, **kw)
+        self._budget = budget
+        self._blocking_budgets = tuple(blocking_budgets)
+
+    @property
+    def budget(self) -> SpendBudgetDetail | None:
+        """The exhausted budget, or ``None`` when the body did not carry one."""
+        return self._budget
+
+    @property
+    def blocking_budgets(self) -> tuple[SpendBudgetDetail, ...]:
+        """Every exhausted hard budget, visible to the workspace Owner.
+
+        Empty when the body did not carry the list, so an empty tuple does not
+        mean nothing blocked the call.
+        """
+        return self._blocking_budgets
 
 
 class ModelNotFound(RouterError):
@@ -904,7 +973,8 @@ def error_from_response(
     if detail is None:
         detail = f"HTTP {http_status}"
 
-    return exception_for(error_type)(
+    cls = exception_for(error_type)
+    return cls(
         detail,
         error_type=error_type,
         http_status=http_status,
@@ -912,6 +982,7 @@ def error_from_response(
         retry_after=retry_after,
         errors=errors,
         refusal_code=refusal_code,
+        **_budget_kwargs(cls, *raw_budgets(body)),
     )
 
 
@@ -965,7 +1036,8 @@ def error_from_completion(
     if detail is None:
         detail = f"the request completed with error_type {error_type!r}"
 
-    return exception_for(error_type)(
+    cls = exception_for(error_type)
+    return cls(
         detail,
         error_type=error_type,
         # Filtered, not merely stripped, and by the same function
@@ -975,6 +1047,7 @@ def error_from_completion(
         request_id=clean_request_id(request_id),
         retry_after=retry_after,
         errors=errors,
+        **_budget_kwargs(cls, *raw_budgets(payload)),
     )
 
 
@@ -1045,6 +1118,48 @@ def _detail_from(entry: Mapping[str, Any]) -> ValidationErrorDetail:
     )
 
 
+def _budget_from(entry: Mapping[str, Any]) -> SpendBudgetDetail:
+    """One ``RouterSpendBudgetDetail``, tolerating a missing or wrongly-typed field.
+
+    Every field is optional here, for the reason :func:`_detail_from` gives.
+    """
+
+    def text(name: str) -> str | None:
+        value = entry.get(name)
+        return value if isinstance(value, str) else None
+
+    def integer(name: str) -> int | None:
+        value = entry.get(name)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    return SpendBudgetDetail(
+        scope_kind=text("scope_kind") or "",
+        resets_at=text("resets_at") or "",
+        set_by=text("set_by") or "",
+        id=text("id"),
+        scope_id=text("scope_id"),
+        mode=text("mode"),
+        limit_micro_usd=integer("limit_micro_usd"),
+        spent_micro_usd=integer("spent_micro_usd"),
+        limit_credits=integer("limit_credits"),
+        spent_credits=integer("spent_credits"),
+    )
+
+
+def _budget_kwargs(
+    cls: type[ComfyError],
+    budget: Mapping[str, Any] | None,
+    blocking_budgets: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """:class:`BudgetExceeded`'s extra arguments, and none for any other class."""
+    if not issubclass(cls, BudgetExceeded):
+        return {}
+    return {
+        "budget": None if budget is None else _budget_from(budget),
+        "blocking_budgets": tuple(_budget_from(entry) for entry in blocking_budgets),
+    }
+
+
 __all__ = [
     "CANCEL_REFUSALS",
     "ERROR_TYPE_HEADER",
@@ -1078,6 +1193,7 @@ __all__ = [
     "ResultExpired",
     "RouterError",
     "ServiceUnavailable",
+    "SpendBudgetDetail",
     "Unauthorized",
     "ValidationErrorDetail",
     "error_from_completion",

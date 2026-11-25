@@ -131,6 +131,8 @@ class ApiError(Exception):
         error_type: str | None = None,
         validation_errors: Sequence[Mapping[str, Any]] = (),
         organization_id: str | None = None,
+        budget: Mapping[str, Any] | None = None,
+        blocking_budgets: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -208,6 +210,14 @@ class ApiError(Exception):
         #: read, so an ``sso_required`` refusal of one surfaces as a plain
         #: ``forbidden`` with this left ``None``.
         self.organization_id = organization_id
+        #: On Router's ``budget_exceeded``: the body's ``budget`` object and the
+        #: mapping members of its ``blocking_budgets`` array, raw. ``None`` and
+        #: ``()`` on every other code and when the body carried none. Untyped
+        #: for the reason :attr:`validation_errors` is: the typed view is
+        #: ``comfy_sdk.router_exceptions.SpendBudgetDetail``, converted at the
+        #: translation boundary onto ``BudgetExceeded``.
+        self.budget = budget
+        self.blocking_budgets: tuple[Mapping[str, Any], ...] = tuple(blocking_budgets)
 
     def __str__(self) -> str:
         """``message``, plus the body excerpt whenever there is one.
@@ -485,6 +495,28 @@ def _cancel_refusal_code(http_status: int, body: dict[str, Any] | None) -> str |
     return _CODE_BY_CANCEL_STATUS.get(status.upper()) if status else None
 
 
+def raw_budgets(
+    body: Any,
+) -> tuple[Mapping[str, Any] | None, tuple[Mapping[str, Any], ...]]:
+    """The ``budget`` and ``blocking_budgets`` a ``budget_exceeded`` body carries, raw.
+
+    Never raises: a missing or wrongly-typed value reads as absent, and a
+    member of the array that is not a mapping is dropped, because this runs
+    while handling a failure and one malformed member must not cost the caller
+    the others. Shared with ``comfy_sdk.router_exceptions`` so both surfaces
+    read one wire body the same way.
+    """
+    if not isinstance(body, Mapping):
+        return None, ()
+    budget, blocking = body.get("budget"), body.get("blocking_budgets")
+    if not isinstance(blocking, Sequence) or isinstance(blocking, (str, bytes)):
+        blocking = ()
+    return (
+        budget if isinstance(budget, Mapping) else None,
+        tuple(entry for entry in blocking if isinstance(entry, Mapping)),
+    )
+
+
 def error_from_envelope(
     http_status: int,
     body: dict[str, Any] | None,
@@ -655,6 +687,7 @@ def error_from_envelope(
     # 429. Reduced to an id-shaped token, so a non-string, empty or malformed
     # value reads as absent rather than reaching a URL.
     organization_id = clean_organization_id(raw_organization_id) if code == "sso_required" else None
+    budget, blocking_budgets = raw_budgets(body) if code == "budget_exceeded" else (None, ())
     cls = _BY_CODE.get(code, ApiError)
     return cls(
         message,
@@ -667,6 +700,8 @@ def error_from_envelope(
         error_type=bucket,
         validation_errors=validation_errors,
         organization_id=organization_id,
+        budget=budget,
+        blocking_budgets=blocking_budgets,
     )
 
 

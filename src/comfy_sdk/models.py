@@ -404,9 +404,13 @@ class RouterRunResult:
 
     Present only when ``model_provider`` translated the body
     (``strict_mode=False``, the default) and one or more native fields could not
-    be expressed exactly on the alternate provider's schema; each entry names the
-    field and why. ``None`` when no translation ran or it dropped nothing --
-    except on a run that was :attr:`handed_off`, where it means "not disclosed".
+    be expressed exactly on the alternate provider's schema; entries name dropped
+    fields and why. The disclosure is bounded in size, so it may not be a
+    complete list: an entry cut short ends in ``…``, one entry may stand for
+    several fields, and entries left out are replaced by a final one stating how
+    many, a lower bound on the fields affected. ``None`` when no translation ran
+    or it dropped nothing -- except on a run that was :attr:`handed_off`, where
+    it means "not disclosed".
     """
 
     replayed: bool
@@ -477,6 +481,11 @@ class RouterRunResult:
     """
 
 
+#: Where Router discloses the native fields a translation could not carry: on a
+#: run's response, and on a queued submit's.
+_DROPPED_PARAMS_HEADER = "X-Comfy-Router-Dropped-Params"
+
+
 def _dropped_params(raw: str | None) -> tuple[str, ...] | None:
     """Parse the ``X-Comfy-Router-Dropped-Params`` header value.
 
@@ -492,13 +501,16 @@ def _dropped_params(raw: str | None) -> tuple[str, ...] | None:
     So: parse as JSON, and fall back to the raw value as a single entry rather
     than guessing at delimiters. The fallback is deliberately not a comma split
     -- on a malformed value, one intact entry a human can read beats two
-    confident fragments. (The spec bug is filed separately against the server's
+    confident fragments. A value nested deeply enough to exhaust the parser's
+    recursion limit takes the same fallback: on a submit the request is already
+    queued when this runs, so a bad disclosure must never cost the caller the
+    handle. (The spec bug is filed separately against the server's
     own openapi.yml, which this vendored copy is synced from; correcting it
     here would be reverted by the next sync.)
     """
     if raw is None:
         return None
-    with contextlib.suppress(ValueError, TypeError):
+    with contextlib.suppress(ValueError, TypeError, RecursionError):
         parsed = json.loads(raw)
         if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
             return tuple(parsed)
@@ -548,7 +560,7 @@ def _run_result(
     return RouterRunResult(
         output=body,
         serving_provider=headers.get("X-Comfy-Router-Fallback-Provider"),
-        dropped_params=_dropped_params(headers.get("X-Comfy-Router-Dropped-Params")),
+        dropped_params=_dropped_params(headers.get(_DROPPED_PARAMS_HEADER)),
         replayed=headers.get("Idempotent-Replayed") is not None,
         request_id=headers.get("X-Comfy-Request-Id"),
         credits_used=_credits_used(headers.get("X-Comfy-Credits-Used")),
@@ -1022,6 +1034,10 @@ class Models(_ModelsBase):
         :class:`~comfy_sdk.model_requests.CostEstimate`. ``None`` there means
         no quote is available — the estimate is off for the caller, or the
         submit was answered by an idempotent replay — and never "no charge".
+
+        Router's bounded disclosure of the native fields its translation of the
+        body could not carry is the handle's
+        :attr:`~comfy_sdk.model_requests.RequestHandle.dropped_params`.
         """
         low = cast(ComfyLow, self._low)
         key = (
@@ -1038,7 +1054,7 @@ class Models(_ModelsBase):
         with translating(idempotency_key=key):
             while True:
                 try:
-                    body, _headers = low.post_model_submit(model, payload, idempotency_key=key)
+                    body, headers = low.post_model_submit(model, payload, idempotency_key=key)
                     break
                 except _CANDIDATE_FAILURES as exc:
                     delay = retrier.delay_before_retry(exc)
@@ -1047,7 +1063,14 @@ class Models(_ModelsBase):
                     time.sleep(delay)
             request_id = _request_id_of(body)
             estimate = _estimate_of(body)
-        return RequestHandle(low, model, request_id, self._retry, estimate=estimate)
+        return RequestHandle(
+            low,
+            model,
+            request_id,
+            self._retry,
+            estimate=estimate,
+            dropped_params=_dropped_params(headers.get(_DROPPED_PARAMS_HEADER)),
+        )
 
     def subscribe(
         self,
@@ -1136,9 +1159,10 @@ class Models(_ModelsBase):
         a retry after a restart — reaches the same
         :class:`~comfy_sdk.model_requests.RequestHandle` the submitting process
         held, save for its
-        :attr:`~comfy_sdk.model_requests.RequestHandle.estimate`: the cost quote
-        arrives only on the submit's response, so a rebuilt handle's is always
-        ``None``, and a process that needs it must keep it with the ids. Makes
+        :attr:`~comfy_sdk.model_requests.RequestHandle.estimate` and
+        :attr:`~comfy_sdk.model_requests.RequestHandle.dropped_params`: both
+        arrive only on the submit's response, so a rebuilt handle's are always
+        ``None``, and a process that needs them must keep them with the ids. Makes
         no request of its own: an id that names nothing surfaces on
         the first :meth:`~comfy_sdk.model_requests.RequestHandle.status` or
         :meth:`~comfy_sdk.model_requests.RequestHandle.get`, as the server's
@@ -1381,9 +1405,7 @@ class AsyncModels(_ModelsBase):
         with translating(idempotency_key=key):
             while True:
                 try:
-                    body, _headers = await low.post_model_submit(
-                        model, payload, idempotency_key=key
-                    )
+                    body, headers = await low.post_model_submit(model, payload, idempotency_key=key)
                     break
                 except _CANDIDATE_FAILURES as exc:
                     delay = retrier.delay_before_retry(exc)
@@ -1392,7 +1414,14 @@ class AsyncModels(_ModelsBase):
                     await asyncio.sleep(delay)
             request_id = _request_id_of(body)
             estimate = _estimate_of(body)
-        return AsyncRequestHandle(low, model, request_id, self._retry, estimate=estimate)
+        return AsyncRequestHandle(
+            low,
+            model,
+            request_id,
+            self._retry,
+            estimate=estimate,
+            dropped_params=_dropped_params(headers.get(_DROPPED_PARAMS_HEADER)),
+        )
 
     async def subscribe(
         self,

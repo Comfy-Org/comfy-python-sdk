@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail if the committed tree drifts from the vendored specs.
 
-Three checks, one job:
+Four checks, one job:
 
 1. **Models vs ``spec/openapi.yaml``.** Regenerates the models into a temp file
    and diffs against the committed one, so a spec edit without a regen (or a
@@ -30,6 +30,10 @@ Three checks, one job:
    ``application/json`` success decodes to a ``dict`` and any other one comes
    back as a ``BinaryResult``, so a branch added or dropped upstream changes
    what ``post_model_run`` returns.
+4. **The budget detail vs ``spec/router-openapi.yaml``.** Also hand-written:
+   ``SpendBudgetDetail`` in ``comfy_sdk.router_exceptions`` models
+   ``RouterSpendBudgetDetail`` field by field, and has no ``raw`` escape hatch,
+   so a property a sync adds would never reach a caller until it is added here.
 
 ``tests/test_router_spec_contract.py`` asserts the same things from the test
 suite. Both exist on purpose: the suite is where a contributor sees it, and
@@ -443,6 +447,70 @@ def _check_router_error_types() -> int:
     return 0
 
 
+def _check_router_budget_detail() -> int:
+    if not ROUTER_SPEC.exists():
+        print(f"ERROR: {ROUTER_SPEC.name} is missing from spec/", file=sys.stderr)
+        return 1
+    sys.path.insert(0, str(ROOT / "src"))
+    from dataclasses import fields
+    from typing import get_args, get_type_hints
+
+    import yaml
+
+    from comfy_sdk.router_exceptions import SpendBudgetDetail
+
+    doc = yaml.safe_load(ROUTER_SPEC.read_text(encoding="utf-8"))
+    schemas = doc["components"]["schemas"]
+    declared = set(schemas["RouterSpendBudgetDetail"]["properties"])
+    modelled = {f.name for f in fields(SpendBudgetDetail)}
+    if declared != modelled:
+        print(
+            "DRIFT: comfy_sdk.router_exceptions.SpendBudgetDetail does not match "
+            "RouterSpendBudgetDetail in spec/router-openapi.yaml\n"
+            f"  not modelled by the SDK: {sorted(declared - modelled)}\n"
+            f"  not declared by the spec: {sorted(modelled - declared)}",
+            file=sys.stderr,
+        )
+        return 1
+    # Names alone are not enough: `_budget_from` reads a non-`int` amount as
+    # "not disclosed", so a sync that retyped an amount would blank it for
+    # Owners too. Each property's type, and whether it is required, must match
+    # the dataclass annotation -- required fields are the non-optional ones.
+    spec_types = {"string": str, "integer": int}
+    required = set(schemas["RouterSpendBudgetDetail"].get("required", []))
+    hints = get_type_hints(SpendBudgetDetail)
+    mismatched = []
+    for name, prop in schemas["RouterSpendBudgetDetail"]["properties"].items():
+        members = set(get_args(hints[name])) or {hints[name]}
+        optional = type(None) in members
+        if members - {type(None)} != {spec_types.get(prop.get("type"))} or optional == (
+            name in required
+        ):
+            mismatched.append(name)
+    if mismatched:
+        print(
+            "DRIFT: comfy_sdk.router_exceptions.SpendBudgetDetail types or "
+            "requiredness differ from RouterSpendBudgetDetail in "
+            f"spec/router-openapi.yaml for: {sorted(mismatched)}",
+            file=sys.stderr,
+        )
+        return 1
+    ref = "#/components/schemas/RouterSpendBudgetDetail"
+    body = schemas["RouterErrorResponse"]["properties"]
+    if body["budget"] != {"$ref": ref} or body["blocking_budgets"].get("items") != {"$ref": ref}:
+        print(
+            "DRIFT: RouterErrorResponse no longer declares `budget` and "
+            "`blocking_budgets` as RouterSpendBudgetDetail",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "OK: SpendBudgetDetail models every field of RouterSpendBudgetDetail, "
+        "with matching types and requiredness"
+    )
+    return 0
+
+
 def _run(name: str, check: Callable[[], int]) -> int:
     """One check's exit code, with a raised exception counted as a failure.
 
@@ -461,13 +529,14 @@ def _run(name: str, check: Callable[[], int]) -> int:
 
 
 def main() -> int:
-    # All three run every time: reporting only the first failure would hide the
+    # All four run every time: reporting only the first failure would hide the
     # others behind a fix for it. `max` over the results rather than a
     # short-circuit for the same reason.
     return max(
         _run("models", _check_models),
         _run("router error types", _check_router_error_types),
         _run("router run route", _check_router_run_route),
+        _run("router budget detail", _check_router_budget_detail),
     )
 
 
