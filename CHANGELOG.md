@@ -10,6 +10,8 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-25
+
 ### Added
 
 - `respond_async=True` on `models.run` and `models.run_detailed` (and the `AsyncModels` twins):
@@ -63,7 +65,8 @@ the fuller account of each version, including verification notes.
   workspace's final charge. `None` means no quote is available, never no charge:
   the estimate is off for the caller, the submit was answered by an idempotent replay, or the
   handle was rebuilt with `client.models.handle`. A malformed quote reads as `None` and never
-  fails the submit.
+  fails the submit, and so does a quote marked free whose `amount_cents` or `credits` figure is
+  non-zero or unreadable, since it contradicts itself.
 - `client.realtime.connect` on `Comfy` and `AsyncComfy`: opens a Comfy Router realtime
   session over `GET /v2/realtime/{serving}/{model}` on `COMFY_ROUTER_BASE_URL`, authenticated
   by the client's API key (`X-API-Key`) or an `id_token=` sent in the subprotocol offer. A
@@ -508,7 +511,8 @@ First public release of the Comfy API v2 Python SDK (`comfy-sdk`).
   upload/dedup inputs, submit, follow (poll or SSE), download outputs.
 - Sync and async clients. Python 3.10+.
 
-[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.5.0...HEAD
+[unreleased]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Comfy-Org/comfy-python-sdk/compare/v0.2.0...v0.3.0
