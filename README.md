@@ -847,8 +847,9 @@ when it is rated.
 
 When Router translated the body for another provider and could not carry every
 native field, `handle.dropped_params` names each dropped field and why, as it
-does on a `run_detailed` result; `None` means no translation ran or it dropped
-nothing.
+does on a `run_detailed` result. On the handle `submit` returned, `None` means no
+translation ran or it dropped nothing; on a rebuilt handle (below) it is always
+`None`, meaning "not disclosed", whatever the original submit dropped.
 
 Rehydrate a handle in another process from the two ids that address the
 request, with no call made (the cost quote and `dropped_params` do not come back
