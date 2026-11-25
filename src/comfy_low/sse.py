@@ -27,10 +27,15 @@ class SSEDecoder:
     """
 
     def __init__(self) -> None:
+        self._at_start = True
         self._event: str | None = None
         self._data: list[str] = []
 
     def push(self, line: str) -> list[RawEvent]:
+        # SSE's UTF-8 decoding strips exactly one BOM at the start of a stream.
+        if self._at_start:
+            self._at_start = False
+            line = line.removeprefix("\ufeff")
         # Strip a single trailing newline; callers may or may not have kept it.
         line = line.rstrip("\r\n")
 

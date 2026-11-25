@@ -117,6 +117,11 @@ the fuller account of each version, including verification notes.
   (`Forbidden`) or `job_not_found` (`NotFound`), instead of silently reconnecting. An `error`
   event with any other code, or no readable one, still falls back to polling and reconnecting.
 
+### Fixed
+
+- Ignore one leading UTF-8 byte order mark in each SSE connection so the first
+  event or data field is decoded correctly, including after reconnecting.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added

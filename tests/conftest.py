@@ -133,6 +133,9 @@ class ServerState:
     sse_hold_on_connect: int | None = None
     sse_hold_seconds: float = 0.0
     stall_seconds: float = 2.0
+    # Optional raw SSE bodies, one per connection (then repeat the last),
+    # delivered in one-byte HTTP chunks to exercise UTF-8 and line boundaries.
+    sse_wire_streams: list[bytes] | None = None
     # GET /jobs/{id}/events answers 501 not_implemented — a surface without SSE.
     events_not_implemented: bool = False
     # When set, GET /jobs/{id}/events sends one `running` status frame and then
@@ -865,6 +868,20 @@ def _make_handler(state: ServerState):
                 return
             if state.events_not_implemented:
                 self._err(501, "not_implemented", "SSE is not supported on this surface")
+                return
+            if state.sse_wire_streams is not None:
+                self.protocol_version = "HTTP/1.1"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                index = min(state.events_connect_count - 1, len(state.sse_wire_streams) - 1)
+                for byte in state.sse_wire_streams[index]:
+                    self.wfile.write(b"1\r\n" + bytes([byte]) + b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
