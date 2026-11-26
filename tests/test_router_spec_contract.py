@@ -202,8 +202,8 @@ def test_every_class_sits_in_the_section_its_spec_tier_names(entry: dict[str, An
 
     The class table is compared as a flat ordered list, and the spec does not
     keep the tiers contiguous (``budget_check_unavailable`` is a transport
-    bucket declared beside ``budget_exceeded``; ``byok_credential_rejected`` is
-    a request bucket declared last), so order says nothing about tier. What
+    bucket declared beside ``budget_exceeded``; ``byok_credential_rejected`` and
+    ``no_output`` are request buckets declared last), so order says nothing about tier. What
     does is where each class is *defined*: a ``request``-tier class under the
     request-level section comment of ``router_exceptions.py``, a
     ``transport``-tier one under the transport-level (or queue) sections. A sync

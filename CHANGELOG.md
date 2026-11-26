@@ -10,6 +10,15 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Added
+
+- `NoOutput` in `comfy_sdk.router_exceptions`, for the Router bucket `no_output` from the synced
+  Router spec: a `502` when the model finished without producing the image it was asked for and
+  named no content policy. The same request usually succeeds on a retry, but only with a new
+  `Idempotency-Key` -- a same-key retry does not run it again, so neither the default retry policy
+  nor `retry_possibly_in_flight=True` makes it; calling `models.run()` again mints a fresh key.
+  Before this, it arrived as a bare `RouterError`.
+
 ## [0.6.0] - 2026-11-25
 
 ### Added

@@ -34,6 +34,7 @@ from comfy_sdk.router_exceptions import (
     InternalError,
     InvalidInput,
     ModelNotFound,
+    NoOutput,
     NotEnabled,
     ProviderError,
     ProviderTimeout,
@@ -86,6 +87,7 @@ CASES: list[tuple[str, int, type[RouterError]]] = [
     ("queue_backlog_full", 429, QueueBacklogFull),
     ("result_expired", 410, ResultExpired),
     ("byok_credential_rejected", 401, ByokCredentialRejected),
+    ("no_output", 502, NoOutput),
 ]
 
 # Deliberately not in the set this SDK version knows: a later milestone adds it,
