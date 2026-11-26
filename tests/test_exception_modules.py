@@ -74,6 +74,7 @@ REFUSALS: list[tuple[int, str]] = [
     (429, "queue_backlog_full"),
     (410, "result_expired"),
     (401, "byok_credential_rejected"),
+    (502, "no_output"),
     (418, "something_invented_later"),
 ]
 

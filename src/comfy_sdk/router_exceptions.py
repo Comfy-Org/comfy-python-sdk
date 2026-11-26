@@ -466,6 +466,29 @@ class ByokCredentialRejected(RouterError):
     _spec_meaning_digest: str = "1e89db8bfad2"
 
 
+class NoOutput(RouterError):
+    """The model finished without producing the image it was asked for, and
+    named no content policy for it.
+
+    Returned under ``502``: the provider answered successfully and nothing
+    about the request was wrong, so the same request usually succeeds on a
+    retry. ``detail`` names the model's finish reason when the provider gave
+    one. It is not a :class:`ContentPolicyViolation` (whose retry of the same
+    input is pointless) nor a :class:`ProviderError` (the provider failed). It
+    says nothing about whether the call was charged.
+
+    The retry has to carry a *new* ``Idempotency-Key``: a retry with the same
+    key does not run the request again. The SDK's default retry policy does not
+    retry a ``502``, and ``RetryPolicy(retry_possibly_in_flight=True)`` would
+    resend the same key, so it is not the route here either. Calling
+    ``models.run()`` again without an explicit ``idempotency_key=`` mints a
+    fresh key, which is the retry the contract asks for.
+    """
+
+    error_type = "no_output"
+    _spec_meaning_digest: str = "449a2c29d2f7"
+
+
 # -- transport-level buckets -------------------------------------------------
 
 
@@ -823,7 +846,7 @@ _BY_CANCEL_REFUSAL: dict[str, type[CancelRefused]] = {
 #: Every class in the closed set, in the order the error set declares it --
 #: mostly the request-level buckets, then the transport-level ones, but the
 #: spec places ``budget_check_unavailable`` beside ``budget_exceeded`` and
-#: appends ``byok_credential_rejected`` last, so the tier sections above do not
+#: appends ``byok_credential_rejected`` and ``no_output`` last, so the tier sections above do not
 #: dictate it. The order is the
 #: vendored spec's ``x-comfy-error-types`` order, and
 #: ``tests/test_router_spec_contract.py`` asserts that -- so this tuple cannot
@@ -852,6 +875,7 @@ ROUTER_EXCEPTIONS: tuple[type[RouterError], ...] = (
     QueueBacklogFull,
     ResultExpired,
     ByokCredentialRejected,
+    NoOutput,
 )
 
 _BY_ERROR_TYPE: dict[str, type[RouterError]] = {cls.error_type: cls for cls in ROUTER_EXCEPTIONS}
@@ -1183,6 +1207,7 @@ __all__ = [
     "InternalError",
     "InvalidInput",
     "ModelNotFound",
+    "NoOutput",
     "NotEnabled",
     "ProviderError",
     "ProviderTimeout",
