@@ -299,7 +299,7 @@ requires-dist = [
     { name = "pillow", marker = "extra == 'pil'", specifier = ">=10" },
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "~=9.1.1" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = "~=1.4.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.4,<1.6" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = "~=7.0" },
     { name = "pyyaml", marker = "extra == 'codegen'", specifier = ">=6" },
     { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6" },

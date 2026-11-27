@@ -10,6 +10,15 @@ the fuller account of each version, including verification notes.
 
 ## [Unreleased]
 
+### Added
+
+- `created_at`, `started_at`, `completed_at`, `expires_at`, `progress`, `queue_position`,
+  `metrics` and `urls` on `Job` and `AsyncJob`. The timestamps are timezone-aware `datetime`s
+  (`started_at` and `completed_at` are `None` until the server sets them), so
+  `job.completed_at - job.started_at` is how long a job ran. `progress` is the same `Progress`
+  type `events()` yields, or `None`. Like the existing properties, these read the state the
+  handle last fetched and never re-fetch.
+
 ## [0.6.0] - 2026-11-25
 
 ### Added

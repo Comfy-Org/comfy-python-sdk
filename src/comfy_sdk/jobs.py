@@ -22,11 +22,13 @@ from pydantic import TypeAdapter, ValidationError
 
 from comfy_low.errors import ApiError, sse_error_from_frame
 from comfy_low.models import Job as LowJob
+from comfy_low.models import JobUrls
 from comfy_low.models import Output as LowOutput
+from comfy_low.models import Progress as LowProgress
 from comfy_low.transport import AsyncComfyLow, ComfyLow, job_labels
 
 from . import _core
-from .events import Event, StatusChange, event_from_raw
+from .events import Event, Progress, StatusChange, event_from_raw
 from .exceptions import (
     ComfyError,
     FailureCategory,
@@ -67,6 +69,27 @@ class JobWorkflow:
 
     graph: dict[str, Any]
     format: Literal["save", "api"]
+
+
+def _progress_of(progress: LowProgress | None) -> Progress | None:
+    # The same type `events()` yields, so a snapshot read off the handle and
+    # one pushed on the stream compare and match alike.
+    if progress is None:
+        return None
+    return Progress(
+        value=progress.value,
+        message=progress.message,
+        nodes_done=progress.nodes_done,
+        nodes_total=progress.nodes_total,
+        current_node=progress.current_node,
+        step=progress.step,
+        steps=progress.steps,
+    )
+
+
+def _metrics_of(model: LowJob) -> dict[str, int | None] | None:
+    # A copy, so editing it does not change the handle.
+    return None if model.metrics is None else dict(model.metrics)
 
 
 def _metadata_of(model: LowJob) -> dict[str, str]:
@@ -206,6 +229,72 @@ class Job:
         ``{}``, and a non-string value is dropped, rather than raising.
         """
         return _metadata_of(self._model)
+
+    @property
+    def created_at(self) -> datetime:
+        """When the job was created, timezone-aware."""
+        return self._model.created_at
+
+    @property
+    def started_at(self) -> datetime | None:
+        """When the job started running, or ``None`` when the server reports no start.
+
+        ``None`` while the job is queued, and it can stay ``None`` on a job that
+        ended without running (one canceled while queued), so check it before
+        doing arithmetic with it.
+        """
+        return self._model.started_at
+
+    @property
+    def completed_at(self) -> datetime | None:
+        """When the job reached a terminal status, or ``None`` when the server reports none.
+
+        With :attr:`started_at`, ``job.completed_at - job.started_at`` is how
+        long it ran, once both are set.
+        """
+        return self._model.completed_at
+
+    @property
+    def expires_at(self) -> datetime:
+        """When the server stops keeping the job and its outputs.
+
+        A platform retention deadline, not an API constant, so read it per job.
+        """
+        return self._model.expires_at
+
+    @property
+    def progress(self) -> Progress | None:
+        """The latest progress snapshot, or ``None`` when the job has none.
+
+        The same type :meth:`events` yields. A server may not report progress
+        on a poll at all, so ``None`` does not mean the job is idle; use
+        :meth:`events` for live progress.
+        """
+        return _progress_of(self._model.progress)
+
+    @property
+    def queue_position(self) -> int | None:
+        """The job's place in the queue, or ``None`` when the server reports none."""
+        return self._model.queue_position
+
+    @property
+    def metrics(self) -> dict[str, int | None] | None:
+        """Timings such as ``queue_ms`` and ``execution_ms``, or ``None`` when absent.
+
+        A metric not available yet (``execution_ms`` before the job runs) is
+        ``None`` rather than missing. A copy, so editing it does not change this
+        handle.
+        """
+        return _metrics_of(self._model)
+
+    @property
+    def urls(self) -> JobUrls:
+        """The job's follow-up links, as the server sent them.
+
+        A link may be host-relative (a leading ``/``); resolve it against the
+        API origin, not against a base URL that carries a path prefix.
+        """
+        return self._model.urls
 
     def get_outputs(self, node_id: str) -> list[Output]:
         """The outputs produced by one node, in server order.
@@ -389,6 +478,46 @@ class AsyncJob:
     def metadata(self) -> dict[str, str]:
         """:attr:`Job.metadata` — the labels given at submit, ``{}`` when none."""
         return _metadata_of(self._model)
+
+    @property
+    def created_at(self) -> datetime:
+        """:attr:`Job.created_at` — when the job was created."""
+        return self._model.created_at
+
+    @property
+    def started_at(self) -> datetime | None:
+        """:attr:`Job.started_at` — ``None`` when the server reports no start."""
+        return self._model.started_at
+
+    @property
+    def completed_at(self) -> datetime | None:
+        """:attr:`Job.completed_at` — ``None`` when the server reports none."""
+        return self._model.completed_at
+
+    @property
+    def expires_at(self) -> datetime:
+        """:attr:`Job.expires_at` — when the server stops keeping the job."""
+        return self._model.expires_at
+
+    @property
+    def progress(self) -> Progress | None:
+        """:attr:`Job.progress` — the latest snapshot, or ``None``."""
+        return _progress_of(self._model.progress)
+
+    @property
+    def queue_position(self) -> int | None:
+        """:attr:`Job.queue_position` — ``None`` when the server reports none."""
+        return self._model.queue_position
+
+    @property
+    def metrics(self) -> dict[str, int | None] | None:
+        """:attr:`Job.metrics` — a copy, or ``None`` when absent."""
+        return _metrics_of(self._model)
+
+    @property
+    def urls(self) -> JobUrls:
+        """:attr:`Job.urls` — the follow-up links as the server sent them."""
+        return self._model.urls
 
     def get_outputs(self, node_id: str) -> list[AsyncOutput]:
         """:meth:`Job.get_outputs`, bound to async outputs. Not a coroutine —
