@@ -292,9 +292,10 @@ class Job:
         """The job's follow-up links, as the server sent them.
 
         A link may be host-relative (a leading ``/``); resolve it against the
-        API origin, not against a base URL that carries a path prefix.
+        API origin, not against a base URL that carries a path prefix. A copy,
+        so editing it does not redirect this handle's later requests.
         """
-        return self._model.urls
+        return self._model.urls.model_copy()
 
     def get_outputs(self, node_id: str) -> list[Output]:
         """The outputs produced by one node, in server order.
@@ -516,8 +517,8 @@ class AsyncJob:
 
     @property
     def urls(self) -> JobUrls:
-        """:attr:`Job.urls` — the follow-up links as the server sent them."""
-        return self._model.urls
+        """:attr:`Job.urls` — a copy of the follow-up links as the server sent them."""
+        return self._model.urls.model_copy()
 
     def get_outputs(self, node_id: str) -> list[AsyncOutput]:
         """:meth:`Job.get_outputs`, bound to async outputs. Not a coroutine —

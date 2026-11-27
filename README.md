@@ -312,7 +312,8 @@ output handles regardless of which node produced them (`job.get_outputs(node_id)
 filters to one node, as in the quickstart above).
 
 The rest of the job's state reads the same way, off whatever the handle last
-fetched — nothing re-fetches until you call `refresh()`, `wait()` or `result()`:
+fetched — the properties themselves never re-fetch; `refresh()`, `wait()`,
+`result()`, `cancel()` and `events()` (which refreshes when a stream ends) replace it:
 
 ```python
 job.created_at, job.expires_at   # timezone-aware datetimes
@@ -321,7 +322,7 @@ job.completed_at - job.started_at  # how long it ran (a timedelta), once both ar
 job.queue_position               # int, or None
 job.progress                     # the latest Progress snapshot (the type events() yields), or None
 job.metrics                      # {"queue_ms": 9000, "execution_ms": 42000}, or None
-job.urls                         # the job's follow-up links
+job.urls                         # a copy of the job's follow-up links
 ```
 
 `job.progress` can be `None` on a running job — a server need not report

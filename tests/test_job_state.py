@@ -137,6 +137,13 @@ def test_metrics_are_a_copy(handle) -> None:
     assert job.metrics == {"queue_ms": 9000, "execution_ms": 42500}
 
 
+def test_urls_are_a_copy(handle) -> None:
+    job = handle()
+    job.urls.self = "/elsewhere"
+
+    assert job.urls.self == "/api/v2/jobs/job_01"
+
+
 def test_urls_pass_through(handle) -> None:
     job = handle()
 
