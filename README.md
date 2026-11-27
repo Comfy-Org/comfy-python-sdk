@@ -313,7 +313,12 @@ filters to one node, as in the quickstart above).
 
 The rest of the job's state reads the same way, off whatever the handle last
 fetched — the properties themselves never re-fetch; `refresh()`, `wait()`,
-`result()`, `cancel()` and `events()` (which refreshes when a stream ends) replace it:
+`result()` and `cancel()` replace it. `events()` replaces it only some of the
+time: it refreshes when the stream ends early and when the stream reports a
+terminal status other than `succeeded`, but a stream that reports `succeeded`
+returns without a refresh, so a handle submitted while queued can still read
+`queued` with unset timestamps afterwards. Call `refresh()`, `wait()` or
+`result()` after a successful stream for the authoritative state:
 
 ```python
 job.created_at, job.expires_at   # timezone-aware datetimes
