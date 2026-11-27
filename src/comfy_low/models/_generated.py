@@ -130,7 +130,7 @@ class OutputType(Enum):
 
 class JobNodeErrorReason(BaseModel):
     """
-    One problem found with a node. `type` is the code for it: ComfyUI's (for example `value_not_in_list`, `value_bigger_than_max`, `dependency_cycle`), or one of the gateway's, sent where its submit checks are switched on: `unknown_node_class` (a node class the deployment's build does not contain), `waits_for_browser` (a node the workflow would run whose class waits for a browser tab to answer while the job runs, which a deployment never has), `invalid_node` (the node is not a JSON object), `invalid_inputs` (its `inputs` is present but not an object, refused only where the deployment's ComfyUI would fail such a node anyway, so no workflow that runs today is refused), or `invalid_class_type` (its `class_type` is missing or is not a non-empty string). ComfyUI's `missing_node_type` means the same as `unknown_node_class`, found after dispatch rather than at submit. For either, `message` ends naming the node pack that provides the class where the Comfy node registry knows one. `details` usually starts with the input it is about.
+    One problem found with a node. `type` is the code for it: ComfyUI's (for example `value_not_in_list`, `value_bigger_than_max`, `dependency_cycle`), or one of the gateway's. The gateway always sends `model_not_allowed`: a node the workflow would run loads a model from the workspace's library that the deployment's Release model policy does not allow, because the build runs only the models it allows and this one is not among them, or because the policy blocks it; add the model to the build to use it. Where its submit checks are switched on, it also sends `unknown_node_class` (a node class the deployment's build does not contain), `waits_for_browser` (a node the workflow would run whose class waits for a browser tab to answer while the job runs, which a deployment never has), `invalid_node` (the node is not a JSON object), `invalid_inputs` (its `inputs` is present but not an object, refused only where the deployment's ComfyUI would fail such a node anyway, so no workflow that runs today is refused), or `invalid_class_type` (its `class_type` is missing or is not a non-empty string). ComfyUI's `missing_node_type` means the same as `unknown_node_class`, found after dispatch rather than at submit. For either, `message` ends naming the node pack that provides the class where the Comfy node registry knows one. `details` usually starts with the input it is about.
     """
 
     type: Annotated[str, Field(examples=['value_not_in_list'])]
@@ -192,7 +192,8 @@ class ErrorEnvelope(BaseModel):
     but its GPU provider is not taking work on it yet; retry),
     `deployment_lookup_unavailable` (503 + Retry-After, on any
     operation: the deployment the address names could not be looked up
-    just now; nothing was done, so retry), `database_unavailable` (503 +
+    just now, or, on a job submit, the model policy of its Release could
+    not be read; nothing was done, so retry), `database_unavailable` (503 +
     Retry-After, only on a job submit: the job could not be saved just
     now and nothing was started, so retry), `auth_unavailable` (503 +
     Retry-After, on any operation: the credential could not be checked
